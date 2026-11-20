@@ -277,3 +277,104 @@ export const REPORTS_SEND_DDL = `
 `;
 
 export const REPORTS_SEND_TABLES = Object.freeze(["report_recipients", "report_sends"]);
+
+/**
+ * The custom-step half: the small file bundles a report may run, the assets they read, the hosts they
+ * may reach, and the credential bindings for those hosts.
+ *
+ * `report_custom_steps` keeps one row per (report, step key, revision). A step is a SMALL FILE BUNDLE
+ * (code plus templates), stored as `files_json`: a JSON envelope `{"files": {<relative posix path>:
+ * <text>}, "assets": [<asset name>]}`. The envelope is what makes the bound assets part of the
+ * sealed content: a step's bundle hash covers every file, the requirements text and the sha256 of every
+ * asset it names, so swapping an asset under an approval fails verification the same way editing a
+ * file does. `bundle_hash` is that hash as last computed; `entry` names the file the runtime starts.
+ * `state` is one of proposed, approved, refused, revoked. An approved row carries an approval nonce
+ * and a seal over (report, step key and revision, bundle hash, language, entry, nonce) under the
+ * keychain key (servers/gateway/reports/seal.js, kind "step"); refusing or revoking NULLS both, so an
+ * old seal can
+ * never re-approve a row, and the hash is recomputed from the row and the asset rows whenever a seal is
+ * verified, so a direct UPDATE of a file, the requirements or an asset row reads as unapproved. A step
+ * approval also names the bundle hash its view showed, so a bundle that moved between the view and the
+ * tap is refused rather than sealed.
+ *
+ * `report_assets` is one row per named input such as a large JSON file: the sha256 and the size, with
+ * the bytes on disk at `<CROW_HOME>/reports/<report id>/assets/<sha256>`. The name is the key, so a
+ * replaced asset keeps its name and changes its hash, which is exactly what breaks the seals of the
+ * steps that bind it; the bytes of the hash that name no longer points at are removed when no other row
+ * of the report names them.
+ *
+ * `report_hosts` is the owner's list of sites a step may reach: an exact lower-case host name or a
+ * `*.suffix` wildcard, one row per (report, host), with the same nonce and seal shape (kind "host").
+ * `report_credentials` binds one host of one report to one keychain row (`connection_uuid`, never the
+ * secret): `inject_json` holds where the relay attaches it (`{header, format}` or `{query}`) plus the
+ * path prefixes and the methods the rule covers. Its seal covers (report, credential reference, host,
+ * the digest of that rule, nonce), kind "credential". Nothing in this module stores a secret value.
+ *
+ * Epoch-ms times; states, host shapes and inject rules are validated in the module
+ * (servers/gateway/reports/steps.js), never by a CHECK. No foreign keys: the reports store removes one
+ * report's rows itself. Every table is LOCAL ONLY (instance-sync LOCAL_ONLY_TABLES): a step bundle, an
+ * asset, a host and a credential binding all describe one report, and a report never leaves the
+ * instance holding it. Additive, no SCHEMA_GENERATION bump.
+ */
+export const REPORTS_STEPS_DDL = `
+  CREATE TABLE IF NOT EXISTS report_custom_steps (
+    report_id TEXT NOT NULL,
+    step_key TEXT NOT NULL,
+    rev INTEGER NOT NULL,
+    language TEXT NOT NULL,
+    entry TEXT NOT NULL,
+    files_json TEXT NOT NULL,
+    requirements TEXT NOT NULL DEFAULT '',
+    bundle_hash TEXT,
+    proposed_by TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'proposed',
+    approval_nonce TEXT,
+    approval_seal TEXT,
+    approved_at INTEGER,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (report_id, step_key, rev)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_report_custom_steps_report
+    ON report_custom_steps(report_id, step_key, rev);
+
+  CREATE TABLE IF NOT EXISTS report_assets (
+    report_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (report_id, name)
+  );
+
+  CREATE TABLE IF NOT EXISTS report_hosts (
+    report_id TEXT NOT NULL,
+    host TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'proposed',
+    approval_nonce TEXT,
+    approval_seal TEXT,
+    approved_at INTEGER,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (report_id, host)
+  );
+
+  CREATE TABLE IF NOT EXISTS report_credentials (
+    report_id TEXT NOT NULL,
+    host TEXT NOT NULL,
+    connection_uuid TEXT NOT NULL,
+    inject_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'proposed',
+    approval_nonce TEXT,
+    approval_seal TEXT,
+    approved_at INTEGER,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (report_id, host)
+  );
+`;
+
+export const REPORTS_STEPS_TABLES = Object.freeze([
+  "report_custom_steps",
+  "report_assets",
+  "report_hosts",
+  "report_credentials",
+]);

@@ -36,7 +36,9 @@
  */
 import { createServer, connect as netConnect, isIP, BlockList } from "node:net";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { isDoorPath, RELAY_SOURCE_V4, ADDON_RELAY_SOURCE_V4 } from "../../servers/shared/bot-doors.js";
+import { createStreamRedactor, createTaintDetector, redactHeaderValues } from "./pi_inject_redact.mjs";
 import { TTS_PORT_EXCEPTION, addrInCidr, bridgeSubnetsFromInterfaces } from "../addon-sandbox/listener-owner.mjs";
 import { spawnSync } from "node:child_process";
 import { lookup as dnsLookup } from "node:dns/promises";
@@ -714,6 +716,321 @@ function safeDoorTarget(rawTarget) {
   return !(rawTarget.includes("//") || rawTarget.includes("..") || rawTarget.includes("%"));
 }
 
+// ---- inject mode: one credentialed upstream, for a reports custom step ------
+// A custom step is untrusted code, and it never holds a credential. It asks for
+// `http://<host>/...` in absolute form through this relay; the relay resolves
+// and checks the host exactly as it does for CONNECT, opens its OWN verified
+// TLS request to port 443, and attaches the credential there. The answer comes
+// back with every spelling of the credential replaced, an encoded answer is
+// refused rather than decoded, and a redirect is passed on untouched: the
+// credential is there for this one host and this one request. The credential
+// lives in the locals of one request in `forwardInject` and nowhere else, not
+// on the relay object, not in a log line, not in an error.
+//
+// What a rule may name is deliberately narrow. It names ONE host and the path
+// prefixes a report actually needs: a report that reads an issue list names
+// `/v1/issues`, not `/`. A scoped, read-only credential is preferred over a
+// full-access one, because a rule can restrain where a credential is sent but
+// never what the endpoint does with it. The relay cannot know whether an
+// allowed endpoint mints ANOTHER credential (a token, a session cookie, a
+// signed URL) and hands it back, so it does the next best thing: response
+// headers that commonly carry a derived credential are dropped whole, and a
+// body or a header holding even a partial echo of the injected secret is not
+// passed on at all. A response slice (206, Content-Range) is refused whole,
+// because one part of a body is a part the relay cannot judge. An answer in a
+// wide charset is refused too, and the request carries an allowlist of headers,
+// so a step cannot re-aim the request it already got judged.
+//
+// One accepted risk, named here rather than half handled: a `Location` value is
+// redacted only for the exact secret (and its spellings). A redirect URL that
+// carries a token DERIVED from the credential is passed on, because only the
+// upstream can mint one. A rule names only the endpoints a report needs, and a
+// signed redirect URL may carry a derived token.
+
+/** Methods an inject-mode request may use. */
+const INJECT_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]);
+/** What a rule allows when it names no methods: a report reads. */
+const INJECT_DEFAULT_METHODS = ["GET", "HEAD"];
+/** A rule's path prefixes: at most this many, each at most this many characters. */
+const INJECT_MAX_PREFIXES = 20;
+const INJECT_MAX_PREFIX_CHARS = 200;
+/** The bytes a normalised path segment keeps as they are (RFC 3986 pchar). */
+const INJECT_PCHAR = /[A-Za-z0-9\-._~!$&'()*+,;=:@]/;
+/** The taint window: this many consecutive bytes of a spelling is no coincidence. */
+const INJECT_TAINT_WINDOW = 8;
+/** The request headers an inject request carries: an ALLOWLIST, not a subtractive list.
+ *  A step may name an ordinary header (a media type, a language, a user agent, a
+ *  correlation id) and nothing that could re-aim a request the relay already judged:
+ *  a method override (X-HTTP-Method-Override, X-Method-Override) would walk around
+ *  the methods rule, a rewrite header (X-Original-URL, X-Rewrite-URL, X-Forwarded-*)
+ *  would walk around the path prefixes and the host, and a charset for the answer or
+ *  a session of the step's own (Cookie, Range and its validators) is state the rule
+ *  never approved. Everything else a client sends is dropped here. */
+const INJECT_REQUEST_HEADERS = new Set(["accept", "accept-language", "content-type", "user-agent", "x-request-id"]);
+/** A charset whose answer this relay cannot judge: two or four bytes per character, so
+ *  a spelling of the credential looks nothing like the bytes that were injected. */
+const INJECT_WIDE_CHARSET_RE = /charset\s*=\s*"?[^";]*?(utf-?16|utf-?32|ucs-?2)/i;
+/** Response headers that can carry a credential DERIVED from the injected one
+ *  (a token, a session, a challenge, a signed URL). They are dropped whole and
+ *  never redacted-and-passed-on: a redacted derived credential is still a
+ *  credential the step could try. */
+const INJECT_DROP_RESPONSE = new Set(["set-cookie", "set-cookie2", "authorization",
+  "proxy-authenticate", "www-authenticate", "authentication-info", "proxy-authentication-info"]);
+const INJECT_DROP_RESPONSE_RE = /^x-.*(token|key|secret|auth|session|credential)/i;
+const INJECT_DROP_RESPONSE_SUFFIX_RE = /(^|-)(token|apikey|api-key)$/i;
+/** A credential shorter than this is not used at all, and nothing is sent: a short
+ *  value cannot be told apart from ordinary text in the taint window's terms. */
+export const INJECT_SECRET_MIN_BYTES = 16;
+/** Bodies: what the step may upload, and what it may receive. */
+const INJECT_MAX_REQUEST = 8 * 1024 * 1024;
+const INJECT_MAX_RESPONSE = 16 * 1024 * 1024;
+/** An HTTP token (RFC 9110), and the query name a credential may be carried in. */
+const INJECT_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const INJECT_QUERY_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+/** Header names a credential is never attached to: they frame the request itself. */
+const INJECT_BAD_HEADER = new Set(["host", "content-length", "transfer-encoding", "connection"]);
+
+const injectError = (code, message) => Object.assign(new Error(message), { code });
+
+/** Does a body start with a UTF-16 or UTF-32 byte order mark? */
+function startsWithWideBom(buf) {
+  if (!buf || buf.length < 2) return false;
+  if (buf[0] === 0xff && buf[1] === 0xfe) return true;   // UTF-16LE, and the UTF-32LE prefix
+  if (buf[0] === 0xfe && buf[1] === 0xff) return true;   // UTF-16BE
+  return buf.length >= 4 && buf[0] === 0x00 && buf[1] === 0x00 && buf[2] === 0xfe && buf[3] === 0xff;
+}
+
+/**
+ * The path prefixes a rule must name. A rule without one is refused: an empty
+ * or absent prefix list, and a bare `/` that names no segment at all, would make
+ * the credential reachable everywhere on the host, which is the thing the list
+ * exists to prevent.
+ * @returns {string[]}
+ */
+function normalizeInjectPrefixes(raw) {
+  const bad = (why) => injectError("inject_bad_path_prefixes", why);
+  if (!Array.isArray(raw) || raw.length === 0) throw bad("pathPrefixes must be a non-empty array of strings");
+  if (raw.length > INJECT_MAX_PREFIXES) throw bad("pathPrefixes holds at most " + INJECT_MAX_PREFIXES + " entries");
+  const out = [];
+  for (const p of raw) {
+    if (typeof p !== "string" || p === "") throw bad("a path prefix must be a non-empty string");
+    if (p.length > INJECT_MAX_PREFIX_CHARS) throw bad("a path prefix is at most " + INJECT_MAX_PREFIX_CHARS + " characters");
+    if (p[0] !== "/") throw bad("a path prefix starts with /");
+    if (!p.split("/").some((segment) => segment !== "")) {
+      throw bad("a path prefix names at least one path segment");
+    }
+    if (p.includes("..") || p.includes("?") || p.includes("#")) throw bad("a path prefix holds no .., ? or #");
+    if (/[\u0000-\u001f\u007f]/.test(p)) throw bad("a path prefix holds no control character");
+    if (!out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
+/** The methods a rule allows: GET and HEAD unless it says, drawn from the inject set. */
+function normalizeInjectMethods(raw) {
+  if (raw === undefined || raw === null) return new Set(INJECT_DEFAULT_METHODS);
+  const bad = (why) => injectError("inject_bad_methods", why);
+  if (!Array.isArray(raw) || raw.length === 0) throw bad("methods must be a non-empty array");
+  const out = new Set();
+  for (const m of raw) {
+    if (typeof m !== "string" || !INJECT_METHODS.has(m)) throw bad("a method is one of " + [...INJECT_METHODS].join(", "));
+    out.add(m);
+  }
+  return out;
+}
+
+/**
+ * Validate `o.inject`: exact hosts, each with exactly one of a header or a query
+ * parameter, a format holding one `{}`, a secret function, and the path
+ * prefixes (and optionally the methods) the rule covers. A bad entry is a
+ * construction error with a stable `code`, never a relay that half works: a
+ * guess here would attach a credential somewhere nobody approved. `allow` is the
+ * relay's own egress list, which the host must also pass.
+ * @returns {Map<string, {host, header, query, format, secret, pathPrefixes: string[], methods: Set<string>}>}
+ */
+function normalizeInject(list, allow) {
+  const out = new Map();
+  if (list === undefined || list === null) return out;
+  if (!Array.isArray(list)) throw injectError("inject_bad_list", "inject must be an array");
+  for (const raw of list) {
+    if (!raw || typeof raw !== "object") throw injectError("inject_bad_entry", "an inject entry must be an object");
+    const host = typeof raw.host === "string" ? raw.host : "";
+    if (!host || host !== host.toLowerCase() || isIP(host) || !HOSTNAME_RE.test(host)) {
+      throw injectError("inject_bad_host", "an inject host must be one exact lower-case host name");
+    }
+    if (out.has(host)) throw injectError("inject_duplicate_host", "an inject host is listed twice: " + host);
+    const hasHeader = raw.header !== undefined && raw.header !== null;
+    const hasQuery = raw.query !== undefined && raw.query !== null;
+    if (hasHeader === hasQuery) throw injectError("inject_bad_target", "exactly one of header or query is required");
+    if (typeof raw.secret !== "function") throw injectError("inject_bad_secret", "secret must be a function");
+    if (!hostAllowed(host, allow)) {
+      throw injectError("inject_host_not_allowed", "an inject host must also be in the egress list: " + host);
+    }
+    let header = null;
+    let query = null;
+    let format = "{}";
+    if (hasHeader) {
+      header = String(raw.header);
+      const lower = header.toLowerCase();
+      if (!INJECT_TOKEN_RE.test(header) || INJECT_BAD_HEADER.has(lower) || lower.startsWith("proxy-")) {
+        throw injectError("inject_bad_header", "not a header a credential may be attached to: " + header);
+      }
+      if (raw.format !== undefined && raw.format !== null) {
+        format = String(raw.format);
+        if (format.split("{}").length !== 2) throw injectError("inject_bad_format", "format must hold {} exactly once");
+      }
+    } else {
+      query = String(raw.query);
+      if (!INJECT_QUERY_RE.test(query)) throw injectError("inject_bad_query", "a query name is 1-64 of A-Z a-z 0-9 _ . -");
+      if (raw.format !== undefined && raw.format !== null) {
+        throw injectError("inject_bad_format", "format applies to a header, not to a query parameter");
+      }
+    }
+    out.set(host, {
+      host, header, query, format, secret: raw.secret,
+      pathPrefixes: normalizeInjectPrefixes(raw.pathPrefixes),
+      methods: normalizeInjectMethods(raw.methods),
+    });
+  }
+  return out;
+}
+
+/**
+ * The absolute-form request line's target, parsed without trusting it: an http
+ * URL to a bare host name, port 80 (written or not), no userinfo, no fragment
+ * and no trailing dot. `host` comes back even when the shape is refused, so the
+ * log line names the host and nothing else, but only for a host name that is
+ * well formed.
+ */
+function parseInjectTarget(rawTarget) {
+  if (typeof rawTarget !== "string" || rawTarget.length > 4096) return { host: "", reason: "not an absolute-form http target" };
+  const at = rawTarget.indexOf("://");
+  if (at < 0 || rawTarget.slice(0, at).toLowerCase() !== "http") return { host: "", reason: "not an absolute-form http target" };
+  let u = null;
+  try { u = new URL(rawTarget); } catch { u = null; }
+  if (!u || u.protocol !== "http:") return { host: "", reason: "not an absolute-form http target" };
+  const host = String(u.hostname || "").toLowerCase();
+  const name = HOSTNAME_RE.test(host) && !isIP(host)
+    ? host
+    : (host.endsWith(".") ? host.slice(0, -1) : "");
+  const deny = (reason) => ({ host: name, reason });
+  if (rawTarget.includes("#")) return deny("fragment refused");
+  if (u.username || u.password) return deny("userinfo refused");
+  if (host.endsWith(".")) return deny("trailing dot refused");
+  if (!name) return deny("not a host name");
+  // Only the default port: an inject host is one host, and a port is a second
+  // destination the approval never named.
+  if (u.port && Number(u.port) !== 80) return deny("port not allowed");
+  // The path is read from the request line as it was WRITTEN, not from what the
+  // URL parser made of it: normalisation happens once, in one place, on the
+  // bytes that will be sent upstream.
+  const rest = rawTarget.slice(at + 3);
+  const slash = rest.indexOf("/");
+  const qmark = rest.indexOf("?");
+  const path = slash >= 0 ? rest.slice(slash) : "/" + (qmark >= 0 ? rest.slice(qmark) : "");
+  return { host: name, path };
+}
+
+/** `path` with every parameter of `name` removed and `name=value` appended. */
+function withInjectQuery(path, name, value) {
+  const at = path.indexOf("?");
+  const base = at < 0 ? path : path.slice(0, at);
+  const query = at < 0 ? "" : path.slice(at + 1);
+  const keep = query.split("&").filter((part) => {
+    if (!part) return false;
+    const eq = part.indexOf("=");
+    const key = eq < 0 ? part : part.slice(0, eq);
+    if (key === name) return false;
+    let decoded = key;
+    try { decoded = decodeURIComponent(key.replace(/\+/g, " ")); } catch { decoded = key; }
+    return decoded !== name;
+  });
+  keep.push(name + "=" + value);
+  return base + "?" + keep.join("&");
+}
+
+/**
+ * One percent-decode of a path segment, or null when an escape is not two hex
+ * digits: a broken escape does not read the same way twice, so it is refused
+ * rather than guessed at. Bytes are kept as latin1 code units, so re-encoding
+ * one is exact.
+ */
+function decodePathSegment(text) {
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch !== "%") { out += ch; continue; }
+    const hex = text.slice(i + 1, i + 3);
+    if (!/^[0-9A-Fa-f]{2}$/.test(hex)) return null;
+    out += String.fromCharCode(parseInt(hex, 16));
+    i += 2;
+  }
+  return out;
+}
+
+/** A decoded segment in the one spelling that goes on the wire (latin1 bytes). */
+function encodePathSegment(seg) {
+  let out = "";
+  for (let i = 0; i < seg.length; i++) {
+    const ch = seg[i];
+    if (INJECT_PCHAR.test(ch)) out += ch;
+    else out += "%" + (seg.charCodeAt(i) & 0xff).toString(16).toUpperCase().padStart(2, "0");
+  }
+  return out;
+}
+
+/**
+ * The path an inject request is JUDGED on and the bytes it is SENT with: one
+ * percent-decode per segment, dot segments dropped, double slashes collapsed,
+ * re-encoded to one canonical spelling. Check and use are the same bytes by
+ * construction, so an encoding cannot read as one path here and another at the
+ * upstream. An encoded `/`, `\` or NUL, a control character, or a `..` that
+ * survives the decode is refused: those are the shapes that name two routes.
+ * @returns {{path: string, full: string}|{reason: string}}
+ */
+function normalizeInjectPath(rawTarget) {
+  const text = String(rawTarget ?? "");
+  const at = text.indexOf("?");
+  const rawPath = at < 0 ? text : text.slice(0, at);
+  const query = at < 0 ? "" : text.slice(at);
+  const reason = "inject_path_not_allowed";
+  if (!rawPath.startsWith("/")) return { reason };
+  // A space or a control character in the query would end the request line
+  // early, whatever the upstream made of the path.
+  if (/[\u0000-\u0020\u007f]/.test(query)) return { reason };
+  const kept = [];
+  for (const rawSeg of rawPath.split("/")) {
+    if (rawSeg === "") continue;
+    const seg = decodePathSegment(rawSeg);
+    if (seg === null) return { reason };
+    if (seg === ".") continue;
+    if (seg.includes("..") || seg.includes("/") || seg.includes("\\") || /[\u0000-\u001f\u007f]/.test(seg)) {
+      return { reason };
+    }
+    kept.push(encodePathSegment(seg));
+  }
+  let path = "/" + kept.join("/");
+  if (kept.length && rawPath.endsWith("/")) path += "/";
+  return { path, full: path + query };
+}
+
+/** Does `path` sit at, or below, one of `prefixes`, at a path-segment boundary? */
+function pathAllowed(path, prefixes) {
+  for (const p of prefixes) {
+    if (p.endsWith("/")) { if (path.startsWith(p)) return true; }
+    else if (path === p || path.startsWith(p + "/")) return true;
+  }
+  return false;
+}
+
+/** Is this response header one that can carry a derived credential (so: dropped)? */
+const dropsDerivedCredential = (name) => {
+  const lower = String(name || "").toLowerCase();
+  return INJECT_DROP_RESPONSE.has(lower)
+    || INJECT_DROP_RESPONSE_RE.test(lower)
+    || INJECT_DROP_RESPONSE_SUFFIX_RE.test(lower);
+};
+
 /**
  * @param {object} o
  * @param {string} o.dir            fresh dir for the socket (created 0700, removed on close)
@@ -731,6 +1048,8 @@ function safeDoorTarget(rawTarget) {
  * @param {number} [o.idleMs=120000]  idle keep-alive timeout on a door connection
  * @param {number} [o.abandonMs=30000]  a bot that half-closes while its request waits: closed after this
  * @param {Function} [o.lookup]     async (host) => [{address, family}]
+ * @param {Array} [o.inject]        credential injection: [{host, pathPrefixes, methods?, header|query, format?, secret: () => string}]
+ * @param {object} [o._injectUpstreamTls]  test seam: {ca} adds trust anchors for the inject upstream
  * @param {Function} [o.log]
  * @returns {Promise<{dir, socketPath, close: () => Promise<void>}>}
  */
@@ -746,6 +1065,9 @@ export async function startEgressRelay(o) {
  * leaves the bot with no network at all (fail closed) and is logged.
  */
 export function createEgressRelay(o) {
+  // An `inject` list is judged before anything is created: a bad entry is a
+  // construction error, not a relay that listens and then refuses everything.
+  const injectRules = normalizeInject(o.inject, Array.isArray(o.egressAllow) ? o.egressAllow : null);
   const dir = o.dir;
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   chmodSync(dir, 0o700);
@@ -764,6 +1086,9 @@ export function createEgressRelay(o) {
   // is then unreachable and the bot path is unchanged.
   const addon = o.addon && typeof o.addon === "object" ? o.addon : null;
   const cfg = addon ? normalizeAddon(addon) : null;
+  // Injection is a bot-relay feature only: a walled add-on's relay has its own
+  // lists and never sees this path.
+  const injectOn = injectRules.size > 0 && !addon;
   const log = o.log || ((l) => console.error(l));
   const local = { local: o.local, hostAddrs: o.hostAddrs,
     denyNets: o.denyNets || String(process.env.CROW_PI_EGRESS_DENY_NETS || "").split(",").map((x) => x.trim()).filter(Boolean) };
@@ -1135,6 +1460,378 @@ export function createEgressRelay(o) {
     c.resume();
   };
 
+  // ---- inject mode: the credentialed upstream ----------------------------
+  // The step's request is an absolute-form plain-HTTP request that reaches this
+  // relay through the PROXY line. It is judged there (host, method, path) and
+  // then handed to its own one-request HTTP parser, which sees the head and
+  // body the client sent; `forwardInject` re-originates it over its own TLS.
+  const injectedTargets = new WeakMap(); // socket -> { host, addrs, path: the normalised path and query }
+  const injectedUsed = new WeakSet(); // sockets that have already had their one request
+  const injected = injectOn ? createHttpServer({ requestTimeout: 0, headersTimeout: 60000 }) : null;
+  if (injected) {
+    injected.httpAllowHalfOpen = true;
+    injected.maxRequestsPerSocket = 1;
+    injected.keepAliveTimeout = 0;
+    injected.on("request", (req, res) => {
+      const ht = headTimers.get(req.socket);
+      if (ht) { clearTimeout(ht); headTimers.delete(req.socket); }
+      const t = injectedTargets.get(req.socket);
+      if (!t) return refuseInject(req, res, 403, "forbidden", "not a checked target");
+      if (injectedUsed.has(req.socket)) {
+        refuseInject(req, res, 403, "forbidden", "one request per connection");
+        try { req.socket.destroy(); } catch {}
+        return;
+      }
+      injectedUsed.add(req.socket);
+      forwardInject(req, res, t).catch(() => failInject(req, res, t.host));
+    });
+    // `Expect: 100-continue` would otherwise be answered by node itself.
+    injected.on("checkContinue", (req, res) => refuseInject(req, res, 417, "expect_refused", "expect refused"));
+    injected.on("upgrade", (req, socket) => refuseRaw(req, socket, "upgrade refused"));
+    injected.on("connect", (req, socket) => refuseRaw(req, socket, "CONNECT refused"));
+    injected.on("clientError", (err, socket) => {
+      if (!socket.writable || (err && err.code === "ECONNRESET")) { try { socket.destroy(); } catch {} return; }
+      try { socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"); } catch { try { socket.destroy(); } catch {} }
+    });
+  }
+
+  /**
+   * An inject-mode refusal. The reason is a fixed string: nothing from node, TLS
+   * or the upstream (and nothing from the request) reaches the log or the
+   * client, and the note carries the host only.
+   */
+  function refuseInject(req, res, status, code, reason, host = null) {
+    const target = host || (injectedTargets.get(req.socket) || {}).host || "inject request";
+    note("deny", target, reason);
+    const body = JSON.stringify({ error: code });
+    try {
+      res.useChunkedEncodingByDefault = false;
+      res.shouldKeepAlive = false;
+      res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body), connection: "close" });
+      res.end(body);
+    } catch { try { req.socket.destroy(); } catch {} }
+  }
+
+  /** Upstream trouble on an inject request: one fixed reason, no error text. */
+  function failInject(req, res, host) {
+    if (res.headersSent || res.writableEnded || res.destroyed) {
+      note("deny", host, "inject upstream failed");
+      try { res.destroy(); } catch {}
+      return;
+    }
+    refuseInject(req, res, 502, "bad_gateway", "inject upstream failed", host);
+  }
+
+  /**
+   * One checked inject request: attach the credential to a TLS request of our
+   * own and stream the answer back redacted.
+   */
+  async function forwardInject(req, res, t) {
+    const rule = injectRules.get(t.host);
+    if (!rule) return refuseInject(req, res, 403, "forbidden", "not an inject host", t.host);
+    // Judged again on the bytes this function is about to send: the request
+    // line's head and the parser's request are re-read here, so a difference
+    // between what was checked and what is written cannot survive.
+    if (!rule.methods.has(req.method)) {
+      return refuseInject(req, res, 405, "inject_method_not_allowed", "inject_method_not_allowed", t.host);
+    }
+    const judged = normalizeInjectPath(t.path);
+    if (judged.reason || !pathAllowed(judged.path, rule.pathPrefixes)) {
+      return refuseInject(req, res, 403, "inject_path_not_allowed", "inject_path_not_allowed", t.host);
+    }
+    // Framing: only a declared Content-Length body is carried, so what leaves
+    // here is one request and one body with no chunk framing to reinterpret.
+    if (req.headers["transfer-encoding"] !== undefined) {
+      return refuseInject(req, res, 411, "chunked_request_refused", "chunked_request_refused", t.host);
+    }
+    if (req.headers.expect !== undefined) {
+      return refuseInject(req, res, 417, "expect_refused", "expect refused", t.host);
+    }
+    const declared = req.headers["content-length"];
+    let bodyLen = 0;
+    if (declared !== undefined) {
+      if (!/^\d+$/.test(String(declared))) return refuseInject(req, res, 400, "bad_request", "bad content length", t.host);
+      bodyLen = Number(declared);
+      if (bodyLen > INJECT_MAX_REQUEST) {
+        return refuseInject(req, res, 413, "request_too_large", "request body too large", t.host);
+      }
+    }
+    if (upstreamLive >= maxUpstream) {
+      return refuseInject(req, res, 503, "unavailable", "relay upstream cap " + maxUpstream, t.host);
+    }
+    // The credential: read once for this request, used once. Nothing is sent
+    // when it is missing or too short to be worth redacting.
+    let secret = null;
+    try { secret = rule.secret(); } catch { secret = null; }
+    if (typeof secret !== "string" || Buffer.byteLength(secret, "utf8") < INJECT_SECRET_MIN_BYTES) {
+      return refuseInject(req, res, 503, "inject_secret_missing", "inject_secret_missing", t.host);
+    }
+    // What the upstream may echo: the bytes that were injected, and the bare
+    // secret (a server that splits a formatted value may quote the bare part).
+    // A format holding `$&`, `$'` or `` $` `` is literal text around the value, never a
+    // replacement pattern: the secret goes in whole, as it is.
+    const attached = rule.header ? rule.format.split("{}").join(secret) : encodeURIComponent(secret);
+    const echoForms = [attached, secret];
+    // The request carries an allowlist of headers and nothing else (INJECT_REQUEST_HEADERS):
+    // a header a client could use to override the method, rewrite the path, name a hop or
+    // pick the answer's charset never leaves this relay. A client may not name the
+    // credential's own header either: a step cannot choose its own credential.
+    const headers = {};
+    for (const name of INJECT_REQUEST_HEADERS) {
+      if (rule.header && name === rule.header.toLowerCase()) continue;
+      const v = req.headers[name];
+      if (v !== undefined) headers[name] = v;
+    }
+    headers["accept-encoding"] = "identity";
+    headers["host"] = t.host;
+    headers["connection"] = "close";
+    headers["content-length"] = String(bodyLen);
+    let path = judged.full;
+    if (rule.header) headers[rule.header.toLowerCase()] = attached;
+    else path = withInjectQuery(path, rule.query, attached);
+    // The address was checked when the connection arrived; connect to that
+    // address, not to the name again (no DNS rebinding), and verify the
+    // certificate against the host the approval named.
+    const addr = t.addrs[0];
+    const dest = o._connectOverride ? o._connectOverride(addr, 443) : { host: addr, port: 443 };
+    const opts = {
+      host: dest.host, port: dest.port, method: req.method, path, headers,
+      servername: t.host, rejectUnauthorized: true, minVersion: "TLSv1.2",
+      ALPNProtocols: ["http/1.1"], agent: false,
+    };
+    // A test seam only: extra trust anchors, never a weaker check.
+    if (o._injectUpstreamTls && o._injectUpstreamTls.ca) opts.ca = o._injectUpstreamTls.ca;
+    let up;
+    try { up = httpsRequest(opts); } catch { return failInject(req, res, t.host); }
+    upstreamLive++;
+    let released = false;
+    const release = () => { if (!released) { released = true; upstreamLive--; } };
+    // Set once this request's answer is decided (refused whole, capped, or sent
+    // to its last byte): a socket error after that is teardown, not a new
+    // failure, and must not rewrite an answer the client already has.
+    let finished = false;
+    up.setTimeout(plainStallMs, () => {
+      try { up.destroy(Object.assign(new Error("upstream idle timeout"), { code: "ETIMEDOUT" })); } catch {}
+    });
+    up.on("error", () => { release(); if (finished) return; failInject(req, res, t.host); });
+    up.on("close", release);
+    // One place that refuses a whole answer: the upstream socket is destroyed
+    // before any body byte is forwarded, and the client gets one fixed 502.
+    const refuseAnswer = (ur, reason) => {
+      if (finished) return;
+      finished = true;
+      note("deny", t.host, reason);
+      try { ur.destroy(); } catch {}
+      try { up.destroy(); } catch {}
+      const body = "upstream response refused";
+      try {
+        res.useChunkedEncodingByDefault = false;
+        res.shouldKeepAlive = false;
+        res.writeHead(502, { "content-type": "text/plain", "content-length": Buffer.byteLength(body), connection: "close" });
+        res.end(body);
+      } catch { try { req.socket.destroy(); } catch {} }
+    };
+    up.on("response", (ur) => {
+      // One slice of a body is a body this relay cannot judge: a 206, or any
+      // Content-Range, is refused whole and nothing of it is forwarded.
+      if (ur.statusCode === 206 || Object.keys(ur.headers).some((k) => k.toLowerCase() === "content-range")) {
+        return refuseAnswer(ur, "partial_response_refused");
+      }
+      // An encoded answer cannot be judged by this relay, so it is not passed
+      // on at all: nothing of its body reaches the client.
+      const encoding = String(ur.headers["content-encoding"] || "").trim().toLowerCase();
+      if (encoding && encoding !== "identity") return refuseAnswer(ur, "encoded_response_refused");
+      // A wide-character answer is not the text the step asked for: an echo in UTF-16 or
+      // UTF-32 shares no bytes with the injected value, so the relay cannot judge it.
+      const charset = String(ur.headers["content-type"] || "");
+      if (INJECT_WIDE_CHARSET_RE.test(charset)) return refuseAnswer(ur, "charset_refused");
+      const out = {};
+      for (const [k, v] of Object.entries(ur.headers)) {
+        const lower = k.toLowerCase();
+        if (HOP_BY_HOP.has(lower) || lower.startsWith("proxy-")) continue;
+        // Redaction can shorten a body, so its length is never carried over:
+        // the answer is framed by closing the connection.
+        if (lower === "content-length") continue;
+        // A header that can carry a credential the endpoint minted from this
+        // one is dropped, never redacted and passed on.
+        if (dropsDerivedCredential(lower)) continue;
+        out[lower] = v;
+      }
+      const redacted = redactHeaderValues(out, echoForms);
+      // The head is judged before it is written: an exact echo was replaced
+      // above, and a PARTIAL echo is still bytes of the secret, so a header
+      // holding one refuses the whole answer.
+      const headTaint = createTaintDetector(echoForms, { window: INJECT_TAINT_WINDOW });
+      for (const v of Object.values(redacted)) {
+        const text = Array.isArray(v) ? v.join("\n") : String(v ?? "");
+        if (headTaint.scan(Buffer.from(text, "latin1"))) return refuseAnswer(ur, "tainted_response_refused");
+      }
+      redacted.connection = "close";
+      const redactor = createStreamRedactor(echoForms);
+      const taint = createTaintDetector(echoForms, { window: INJECT_TAINT_WINDOW });
+      let sent = 0;
+      // The bytes the taint detector has not yet had a full window to judge.
+      // They are never written, so a window found late cannot leave with its
+      // first bytes already on the wire (the redactor's own held-back tail sits
+      // inside this window of raw bytes as well).
+      let held = Buffer.alloc(0);
+      // The head goes on the wire with the FIRST body byte and not before: the first bytes
+      // decide whether this answer is in a charset the relay cannot judge (a BOM), and a 502
+      // is only a refusal if no part of the answer has been sent.
+      let headWritten = false;
+      const writeHeadOnce = () => {
+        if (headWritten) return true;
+        headWritten = true;
+        try {
+          res.useChunkedEncodingByDefault = false;
+          res.shouldKeepAlive = false;
+          res.writeHead(ur.statusCode || 502, redacted);
+          res.flushHeaders();
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      let rawHead = Buffer.alloc(0);
+      let bomChecked = false;
+      /** Judge the body's first bytes; false means the answer was refused whole. */
+      const judgeBom = (chunk, final) => {
+        if (bomChecked) return true;
+        if (chunk.length) rawHead = Buffer.concat([rawHead, chunk]).subarray(0, 4);
+        if (rawHead.length < 4 && !final) return true;
+        bomChecked = true;
+        if (!startsWithWideBom(rawHead)) return true;
+        refuseAnswer(ur, "charset_refused");
+        return false;
+      };
+      const write = (buf) => {
+        if (!buf.length) return true;
+        if (!writeHeadOnce()) { finished = true; return false; }
+        if (sent + buf.length > INJECT_MAX_RESPONSE) {
+          finished = true;
+          const room = INJECT_MAX_RESPONSE - sent;
+          if (room > 0) { try { res.write(buf.subarray(0, room)); } catch {} }
+          note("deny", t.host, "response too large");
+          try { ur.destroy(); } catch {}
+          try { res.destroy(); } catch {}
+          return false;
+        }
+        sent += buf.length;
+        try { res.write(buf); } catch { return false; }
+        return true;
+      };
+      /** Scan, then write only what no window can still reach. */
+      const forward = (buf, final) => {
+        const all = held.length ? Buffer.concat([held, buf]) : buf;
+        if (taint.scan(buf)) {
+          if (finished) return false;
+          // Before the head is on the wire the whole answer can be refused: the client gets one
+          // 502 and never a status it would read as an answer.
+          if (!headWritten) { refuseAnswer(ur, "tainted_response_refused"); return false; }
+          // Both ends go at once: the client sees the answer cut, never the
+          // bytes of the window that was found.
+          finished = true;
+          note("deny", t.host, "tainted_response_refused");
+          try { ur.destroy(); } catch {}
+          try { up.destroy(); } catch {}
+          try { req.socket.destroy(); } catch {}
+          try { res.destroy(); } catch {}
+          return false;
+        }
+        const cut = final ? all.length : Math.max(0, all.length - taint.holdback);
+        held = Buffer.from(all.subarray(cut));
+        return cut ? write(all.subarray(0, cut)) : true;
+      };
+      ur.on("data", (chunk) => {
+        if (!judgeBom(chunk, false)) return;
+        forward(redactor.push(chunk), false);
+      });
+      ur.on("end", () => {
+        if (!judgeBom(Buffer.alloc(0), true)) return;
+        if (!forward(redactor.end(), true)) return;
+        if (!writeHeadOnce()) { finished = true; return; }
+        finished = true;
+        try { res.end(); } catch {}
+      });
+      const cut = () => { if (finished) return; try { res.destroy(); } catch {} };
+      ur.on("error", cut);
+      ur.on("aborted", cut);
+    });
+    res.on("close", () => { try { up.destroy(); } catch {} });
+    req.on("error", () => { try { up.destroy(); } catch {} });
+    if (bodyLen > 0) req.pipe(up);
+    else { req.resume(); up.end(); }
+  }
+
+  /** Hand a checked inject connection to its parser (the head bytes are already back on the stream). */
+  const enterInject = (c) => {
+    injected.emit("connection", c);
+    const ht = setTimeout(() => { try { c.destroy(); } catch {} }, headTimeoutMs);
+    if (ht.unref) ht.unref();
+    headTimers.set(c, ht);
+    c.once("close", () => { clearTimeout(ht); headTimers.delete(c); });
+    c.on("timeout", () => { try { c.destroy(); } catch {} });
+    c.resume();
+  };
+
+  /**
+   * An absolute-form plain-HTTP request on the PROXY line, when this relay has
+   * an inject list: accepted only for an inject host, over the same closed-
+   * network checks a CONNECT gets, and only for a method a report step needs.
+   * Any throw on the way ends the connection with a fixed reason, never with an
+   * error text.
+   */
+  async function handleInject(c, headText) {
+    try {
+      return await acceptInject(c, headText);
+    } catch {
+      note("deny", "inject request", "inject request failed");
+      refuse(c, 502, "Bad Gateway");
+      try { c.destroy(); } catch {}
+    }
+  }
+
+  /** The checks an inject request goes through before its own parser sees it. */
+  async function acceptInject(c, headText) {
+    const line = String(headText).split("\r\n")[0] || "";
+    const m = line.match(/^(\S+)\s+(\S+)\s+HTTP\/1\.[01]$/);
+    if (!m) return refuse(c, 400, "Bad Request");
+    const parsed = parseInjectTarget(m[2]);
+    if (parsed.reason) {
+      note("deny", parsed.host || "inject request", parsed.reason);
+      return refuse(c, 403, "Forbidden");
+    }
+    const host = parsed.host;
+    const rule = injectRules.get(host);
+    if (!rule) { note("deny", host, "not an inject host"); return refuse(c, 403, "Forbidden"); }
+    // What this rule allows, judged before anything is resolved or opened: a
+    // method it does not name, and a path outside its prefixes, cost no DNS
+    // query and no connection.
+    if (!INJECT_METHODS.has(m[1]) || !rule.methods.has(m[1])) {
+      note("deny", host, "inject_method_not_allowed");
+      return refuse(c, 405, "Method Not Allowed");
+    }
+    const judged = normalizeInjectPath(parsed.path);
+    if (judged.reason || !pathAllowed(judged.path, rule.pathPrefixes)) {
+      note("deny", host, "inject_path_not_allowed");
+      return refuse(c, 403, "Forbidden");
+    }
+    let addrs = null;
+    try { addrs = await lookup(host); } catch { note("deny", host, "does not resolve"); return refuse(c, 502, "Bad Gateway"); }
+    if (!Array.isArray(addrs) || !addrs.length) { note("deny", host, "no address"); return refuse(c, 403, "Forbidden"); }
+    const view = localView(local); // one host view per request, as for a CONNECT
+    noteOwnHostView(view);
+    const why = addrs.map((a) => egressDenyReason(a && a.address, { view })).find(Boolean);
+    if (why) { note("deny", host, why); return refuse(c, 403, "Forbidden"); }
+    if (c.destroyed || c.readableEnded) { try { c.destroy(); } catch {} return; }
+    note("allow", host, "resolved " + addrs.map((a) => a.address).join(", "));
+    injectedTargets.set(c, { host, addrs: addrs.map((a) => a.address), path: judged.full });
+    c.pause();
+    // The head goes back on the stream AFTER the bytes that came with it.
+    c.unshift(Buffer.from(headText + "\r\n\r\n", "latin1"));
+    enterInject(c);
+  }
+
   /** Resolve and check one listed target: a CONNECT entry or a D1 plain-HTTP entry. */
   async function checkListedTarget(host) {
     if (cfg.selfNames.has(host)) return { reason: "own host" };
@@ -1496,6 +2193,9 @@ export function createEgressRelay(o) {
     // add-on mode (D1): an absolute-form plain-HTTP request arrives through the
     // same PROXY line the in-namespace forwarder writes for HTTP_PROXY.
     if (addon && m[1] !== "CONNECT") return handleAddonPlain(c, head);
+    // inject mode: a plain-HTTP absolute-form request to an approved host is
+    // the only shape that gets a credential, and CONNECT never is.
+    if (injectOn && m[1] !== "CONNECT") return handleInject(c, head);
     if (m[1] !== "CONNECT") { note("deny", m[1] + " " + m[2].slice(0, 80), "only CONNECT"); return refuse(c, 405, "Method Not Allowed"); }
     const hp = m[2].match(/^\[([0-9a-fA-F:.]+)\]:(\d+)$/) || m[2].match(/^([^:\[\]]+):(\d+)$/);
     if (!hp) return refuse(c, 400, "Bad Request");
@@ -1503,6 +2203,9 @@ export function createEgressRelay(o) {
     if (!isIP(host) && !HOSTNAME_RE.test(host)) return refuse(c, 400, "Bad Request");
     const target = host + ":" + port;
     if (addon) return handleAddonConnect(c, host, port, target);
+    // A tunnel would carry the step's own TLS: the credential is only ever
+    // attached by this relay to a request it wrote itself.
+    if (injectRules.has(host)) { note("deny", host, "inject_host_requires_http_form"); return refuse(c, 403, "Forbidden"); }
     if (!ports.has(port)) { note("deny", target, "port not allowed"); return refuse(c, 403, "Forbidden"); }
     if (!hostAllowed(host, allow)) { note("deny", target, "host not in the bot's egress list"); return refuse(c, 403, "Forbidden"); }
     let addrs;

@@ -49,6 +49,8 @@ function sample(kind, overrides = {}) {
       reportId: "rpt-0011223344556677",
       stepId: "booking-lookup",
       bundleHash: "c".repeat(64),
+      language: "python",
+      entry: "run.py",
       nonce,
     },
     host: { reportId: "rpt-0011223344556677", host: "api.example.test", nonce },
@@ -56,6 +58,7 @@ function sample(kind, overrides = {}) {
       reportId: "rpt-0011223344556677",
       credentialRef: "cred-0011223344556677",
       host: "api.example.test",
+      injectHash: "e".repeat(64),
       nonce,
     },
     proposal: {
@@ -89,13 +92,76 @@ test("the domain, the kinds and each kind's field order are fixed", () => {
     "a title is a label, not something the owner approves");
   assert.deepEqual([...SEAL_FIELDS.recipient],
     ["reportId", "recipientId", "address", "commentTier", "nonce"]);
-  assert.deepEqual([...SEAL_FIELDS.step], ["reportId", "stepId", "bundleHash", "nonce"]);
+  assert.deepEqual([...SEAL_FIELDS.step], ["reportId", "stepId", "bundleHash", "language", "entry", "nonce"]);
   assert.deepEqual([...SEAL_FIELDS.host], ["reportId", "host", "nonce"]);
-  assert.deepEqual([...SEAL_FIELDS.credential], ["reportId", "credentialRef", "host", "nonce"]);
+  assert.deepEqual([...SEAL_FIELDS.credential],
+    ["reportId", "credentialRef", "host", "injectHash", "nonce"]);
   assert.deepEqual([...SEAL_FIELDS.proposal],
     ["reportId", "proposalId", "baseRev", "diffHash", "nonce"]);
   for (const kind of APPROVAL_KINDS) {
     assert.equal(SEAL_FIELDS[kind].at(-1), "nonce", `${kind} binds its nonce last`);
+  }
+});
+
+/**
+ * The four kinds whose field lists did not change when `step` and `credential` grew one digest each. A
+ * seal is a MAC over the version, the kind tag and the length-prefixed fields, so pinning one value per
+ * untouched kind pins that whole encoding: a bump to the payload version, a reordered list, a different
+ * tag or a different framing would change every one of these. The values were read from a run of
+ * `approvalSeal` before that change, over a fixed nonce and a fixed seed.
+ */
+test("the seals of the unchanged kinds are byte-identical to their values before step and credential grew", () => {
+  const nonce = "0f".repeat(16);
+  const pinned = {
+    live: {
+      fields: {
+        reportId: "rpt-0011223344556677",
+        rev: 3,
+        recipeHash: "a".repeat(64),
+        sourcesHash: "b".repeat(64),
+        cron: "0 7 * * 1",
+        tz: "Europe/Berlin",
+        senderAccountId: "ma-0011223344556677",
+        botId: "bot-1",
+        projectId: 7,
+        artifactId: "art-0011223344556677",
+        scheduleId: 12,
+        deliveryMode: "email_link",
+        commentTierDefault: "c",
+        commentVisibility: "own",
+        aiCommentary: 0,
+        modelRef: "",
+      },
+      seal: "cbbdffe4a9ce8aa839b53199313672ba734d5560bc51f6aab082408ccf3b924b",
+    },
+    recipient: {
+      fields: {
+        reportId: "rpt-0011223344556677",
+        recipientId: "rcp-0011223344556677",
+        address: "sam@example.com",
+        commentTier: "b",
+      },
+      seal: "d94f3aabf93c84e578762252cb8e79cb167f19bd38dd829c3e997b2dd2a48c38",
+    },
+    host: {
+      fields: { reportId: "rpt-0011223344556677", host: "api.example.test" },
+      seal: "802f1765ab48ce17657988769b98e7546675df38c9e031af18cce1c48f8a901e",
+    },
+    proposal: {
+      fields: {
+        reportId: "rpt-0011223344556677",
+        proposalId: "prp-0011223344556677",
+        baseRev: 4,
+        diffHash: "d".repeat(64),
+      },
+      seal: "ec3da168743817fa6383822f3afc7c0c930cb3c1f621c8877733d9fc66dce5b7",
+    },
+  };
+  for (const [kind, entry] of Object.entries(pinned)) {
+    const fields = { ...entry.fields, nonce };
+    assert.equal(approvalSeal(kind, fields, SEED), entry.seal, `${kind} seals to its pinned value`);
+    assert.equal(verifyApprovalSeal(kind, fields, entry.seal, SEED), true,
+      `${kind}: the pinned seal is the seal over these fields`);
   }
 });
 

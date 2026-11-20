@@ -121,6 +121,23 @@ const PAUSE_REASON_MAX = 300;
 /** The longest title `updateSettings` accepts. */
 const TITLE_MAX = 200;
 
+/**
+ * The few helpers a sibling approval module borrows instead of copying: the owner rule, the keychain
+ * seed reader, the report lookup, the refusal constructor, the string coercion and the provenance word
+ * (`owner` or `bot:<id>`). Frozen, and read-only by construction: nothing here writes or decides
+ * anything on its own, so `reports/steps.js` can hold the same rules without a second copy that could
+ * drift. Every existing export of this module is unchanged.
+ */
+export const approvalInternals = Object.freeze({
+  fail,
+  text,
+  requireOwner,
+  requireReport,
+  seedOf,
+  resolveDeps,
+  normalizeProposedBy,
+});
+
 /** C0 controls, DEL, C1 controls and the Unicode line and paragraph separators. */
 const CONTROL_CHARS_ALL = /[\u0000-\u001f\u007f\u0080-\u009f\u2028\u2029]+/g;
 

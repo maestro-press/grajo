@@ -11,8 +11,9 @@
  * UTC: a cap counter must never throw because a stored zone stopped being valid.
  *
  * `report_usage` holds one row per (report, day) and the writes only ever ADD deltas, so two runs that
- * finish at once cannot lose each other's counts. The email cap is taken with `claimEmailSlot`, one
- * conditional increment, so two sends that are claimed at once cannot both pass a cap of one.
+ * finish at once cannot lose each other's counts. The email cap is taken with `claimEmailSlot`, and the
+ * extra step runs with `claimExtraStepRun`: one conditional increment each, so two claims that are
+ * taken at once cannot both pass a cap of one.
  *
  * The per-recipient comment cap is not a per-report counter, so it has no row here: it is only read
  * through `getCaps` by the recipient-facing paths that count a recipient's comments.
@@ -219,6 +220,36 @@ export async function claimEmailSlot(db, { reportId, day, max } = {}) {
     {
       sql: `UPDATE report_usage SET emails = emails + 1
              WHERE report_id = ? AND day = ? AND emails < ?`,
+      args: [reportId, day, max],
+    },
+  ]);
+  return Number(claim?.rowsAffected ?? 0) === 1;
+}
+
+/**
+ * Take one extra step run for the day, or answer false because the cap is already used up. The same
+ * shape as `claimEmailSlot`: one batch (one transaction), the row created at zero first and a
+ * conditional increment (`extra_step_runs < max`), so two manual runs or bot previews claimed at the
+ * same moment cannot both pass a cap of one. There is no way back: a claimed run is spent even if the
+ * step it was claimed for then fails, which is what a per-day cap counts.
+ *
+ * @param {object} db a libsql-shaped client
+ * @param {{reportId: string, day: string, max: number}} fields
+ * @returns {Promise<boolean>} whether this caller took the run
+ * @throws {Error} `bad_input` for a bad id, day or bound
+ */
+export async function claimExtraStepRun(db, { reportId, day, max } = {}) {
+  reportOf(reportId);
+  dayOf(day);
+  if (typeof max !== "number" || !Number.isFinite(max) || max < 0) throw fail("bad_input", "max");
+  const [, claim] = await db.batch([
+    {
+      sql: "INSERT OR IGNORE INTO report_usage (report_id, day, extra_step_runs) VALUES (?, ?, 0)",
+      args: [reportId, day],
+    },
+    {
+      sql: `UPDATE report_usage SET extra_step_runs = extra_step_runs + 1
+             WHERE report_id = ? AND day = ? AND extra_step_runs < ?`,
       args: [reportId, day, max],
     },
   ]);

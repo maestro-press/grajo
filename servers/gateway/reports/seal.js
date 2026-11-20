@@ -22,6 +22,13 @@
  * (no sender account yet, no model, no proposal base). null, undefined, a non-finite number and any
  * other type are refused in the signing path with `code: "bad_seal_field"`.
  *
+ * A kind's field list covers everything the owner's tap was about, which is why two of them carry a
+ * digest of a structured value rather than the value: a step's `language` and `entry` say WHICH file of
+ * the approved bundle runs and in which runtime, and a credential's `injectHash` is the sha256 of the
+ * canonical text of its rule (its own module writes that text: fixed key order, sorted path prefixes,
+ * sorted methods, no other keys), so widening a path prefix, adding a method or moving the header is a
+ * different approval.
+ *
  * The honest limit: this is a tamper check, not a capability. A process that can read the keychain key
  * file could mint a seal, and a writer that copied a row could replay it until the row changes. What
  * the nonce buys is that every approval is a distinct seal; what the stores buy is that refusing or
@@ -54,9 +61,14 @@ export const SEAL_FIELDS = Object.freeze({
     "deliveryMode", "commentTierDefault", "commentVisibility", "aiCommentary", "modelRef", "nonce",
   ]),
   recipient: Object.freeze(["reportId", "recipientId", "address", "commentTier", "nonce"]),
-  step: Object.freeze(["reportId", "stepId", "bundleHash", "nonce"]),
+  // `language` and `entry` are sealed: they choose which file of the approved bundle runs, in which of
+  // the two runtimes, so a direct UPDATE of either is a different thing to approve.
+  step: Object.freeze(["reportId", "stepId", "bundleHash", "language", "entry", "nonce"]),
   host: Object.freeze(["reportId", "host", "nonce"]),
-  credential: Object.freeze(["reportId", "credentialRef", "host", "nonce"]),
+  // `injectHash` is the digest of the canonical text of the credential's rule (header or query, the
+  // format, the sorted path prefixes, the sorted methods), so the SHAPE of what the relay will attach
+  // is under the seal and not only the keychain row and the host.
+  credential: Object.freeze(["reportId", "credentialRef", "host", "injectHash", "nonce"]),
   proposal: Object.freeze(["reportId", "proposalId", "baseRev", "diffHash", "nonce"]),
 });
 

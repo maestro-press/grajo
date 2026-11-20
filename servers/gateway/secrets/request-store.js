@@ -38,6 +38,13 @@ export const SECRET_NOTES = Object.freeze({
 
 const ID_RE = /^[0-9a-f]{32}$/;
 const LABEL_MAX = 80;
+/**
+ * The label cap for the `report-credential` target: the tool schema's own bound on `label`
+ * (`crow_request_secret`'s `label: z.string().max(400)`). That target's label is not a name, it is the
+ * binding spec `reports/steps.js`'s `parseCredentialSpec` reads (`report=...;host=...;...;end`), which
+ * does not fit in 80 characters for any realistic rule. Every other target keeps `LABEL_MAX`.
+ */
+export const REPORT_CREDENTIAL_LABEL_MAX = 400;
 
 let clock = () => Date.now();
 let setTimer = (fn, ms) => { const h = setTimeout(fn, ms); if (h && typeof h.unref === "function") h.unref(); return h; };
@@ -89,11 +96,14 @@ export class SecretRequestError extends Error {
 
 /** A bot-supplied label as a short single line, or null. Control characters are dropped, and a
  *  known secret in it is masked (display mode): the label is rendered in the card, in a note and
- *  in the keychain entry's name, so a value a bot pasted into its own label never travels there. */
-export function cleanLabel(v) {
+ *  in the keychain entry's name, so a value a bot pasted into its own label never travels there.
+ *  `max` is the caller's cap: 80 for a name, the tool schema's 400 for the `report-credential`
+ *  target, whose label is a binding spec (see `createSecretRequest`). */
+export function cleanLabel(v, max = LABEL_MAX) {
   if (typeof v !== "string") return null;
+  const cap = Number.isInteger(max) && max > 0 ? max : LABEL_MAX;
   // eslint-disable-next-line no-control-regex
-  const t = v.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim().slice(0, LABEL_MAX).trim();
+  const t = v.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ").replace(/\s+/g, " ").trim().slice(0, cap).trim();
   if (!t) return null;
   let masked = t;
   try { masked = maskSecrets(t); } catch { /* a masking bug leaves the label as typed */ }
@@ -178,7 +188,7 @@ export function createSecretRequest({ sessionId, threadId, botId, kind = "passwo
     botId: String(botId),
     kind: String(kind),
     target: typeof target === "string" ? target : "",
-    label: cleanLabel(label),
+    label: cleanLabel(label, target === "report-credential" ? REPORT_CREDENTIAL_LABEL_MAX : LABEL_MAX),
   };
   let valid = false;
   try { valid = kind === "password" && !!t && t.validate(req) === true; } catch { valid = false; }

@@ -35,7 +35,7 @@
  * `report_recipients` seal or nonce: the recipient view is the approvals module's own, which drops
  * both.
  */
-import { Router, json as jsonParserOf } from "express";
+import { Router, json as jsonParserOf, raw as rawParserOf } from "express";
 import { createDbClient } from "../../db.js";
 import { isLocalPasswordSessionOn } from "../dashboard/local-session.js";
 import {
@@ -47,6 +47,12 @@ import { listRuns } from "../reports/run.js";
 import { requestRun } from "../reports/run-requests.js";
 import { kickReportsHook } from "../reports/schedule-hook.js";
 import { createSendToRest, listSends } from "../reports/send-log.js";
+import {
+  ASSET_NAME_RE, ASSET_MAX_BYTES, STEP_KEY_RE, approveCredential, approveHost, approveStep,
+  listAssets, listCredentials, listHosts, listStepsForPage, normalizeHost, proposeCredential,
+  proposeHost, proposeStep, refuseStep, revokeCredential, revokeHost, revokeStep, saveAsset,
+  stepDetail, stepDiff,
+} from "../reports/steps.js";
 import { createReport, getReport, listReports } from "../reports/store.js";
 
 /** The mount point. */
@@ -67,6 +73,18 @@ export const RECIPIENT_ID_RE = /^rrc-[0-9a-f]{16}$/;
 /** A run id, exactly what run.js mints. A malformed one in a path is a 404 here. */
 export const RUN_ID_RE = /^rrn-[0-9a-f]{16}$/;
 
+/** A credential reference in a path: the connection uuid the row names. */
+export const CREDENTIAL_REF_RE = /^[A-Za-z0-9-]{8,80}$/;
+
+/** The rule digest an owner's view carries into the approval, exactly what `injectHashOf` writes. */
+const INJECT_HASH_RE = /^[0-9a-f]{64}$/;
+
+/** The bundle hash an owner's view carries into a step approval, exactly what `bundleHashOf` writes. */
+const BUNDLE_HASH_RE = /^[0-9a-f]{64}$/;
+
+/** A step revision in a path. */
+const STEP_REV_RE = /^\d{1,7}$/;
+
 /** The largest body this router accepts. */
 const BODY_LIMIT_BYTES = 256 * 1024;
 const JSON_LIMIT = "256kb";
@@ -85,6 +103,11 @@ const FIXED_TEXT = Object.freeze({
   go_live_needed: "Preview and go live again.",
   conflict: "That report changed while this request was in flight. Try again.",
   recipient_changed: "That report changed while this request was in flight. Try again.",
+  step_changed: "That step changed while this request was in flight. Try again.",
+  host_changed: "That host changed while this request was in flight. Try again.",
+  credential_changed: "That credential changed while this request was in flight. Try again.",
+  bad_inject: "A credential needs a header or a query name and at least one path it may be sent to.",
+  host_not_approved: "Approve that site for this report first.",
   no_schedule: "Choose when this report runs before going live.",
   sender_not_ready: "Choose a mail account that is ready to send.",
   model_unresolved: "Crow could not work out which model this report uses, so it cannot go live.",
@@ -99,12 +122,18 @@ const STATUS_BY_CODE = Object.freeze({
   bad_input: 400,
   bad_recipe: 400,
   bad_seal_field: 400,
+  too_large: 413,
   preview_missing: 409,
   preview_stale: 409,
   preview_failed: 409,
   go_live_needed: 409,
   conflict: 409,
   recipient_changed: 409,
+  step_changed: 409,
+  host_changed: 409,
+  credential_changed: 409,
+  bad_inject: 400,
+  host_not_approved: 409,
   no_schedule: 409,
   sender_not_ready: 409,
   model_unresolved: 409,
@@ -252,6 +281,36 @@ export function reportsApiRouter(dashboardAuth, deps = {}) {
     if (status === 413 || err.type === "entity.too.large") return sendError(res, 413, "too_large");
     return sendError(res, 400, "bad_input");
   });
+
+  /**
+   * The one route whose body is not JSON: an asset upload carries the file's raw bytes, up to one
+   * asset's cap. It is registered BEFORE the shared guards below, because those guards install this
+   * router's 256 KB JSON parser for every path under the prefix. It therefore carries the three that
+   * matter itself, in the same order: the no-store header, the owner check and a parser bounded to the
+   * asset cap. Nothing else on this router is reachable without the shared chain.
+   */
+  const assetParser = rawParserOf({ type: () => true, limit: ASSET_MAX_BYTES });
+
+  router.put(
+    `${REPORTS_API_PREFIX}/:id/assets/:name`,
+    guardHeaders,
+    ownerGuard,
+    (req, res, next) => assetParser(req, res, (err) => {
+      if (!err) return next();
+      const status = Number(err.status || err.statusCode || 0);
+      if (status === 413 || err.type === "entity.too.large") return sendError(res, 413, "too_large");
+      return sendError(res, 400, "bad_input");
+    }),
+    route("PUT /:id/assets/:name", async (db, req, res) => {
+      const id = String(req.params?.id ?? "");
+      const name = String(req.params?.name ?? "");
+      if (!isReportId(id) || !ASSET_NAME_RE.test(name)) return sendError(res, 404, "not_found");
+      if (!(await getReport(db, id))) return sendError(res, 404, "not_found");
+      if (!Buffer.isBuffer(req.body) || req.body.length === 0) return sendError(res, 400, "bad_input");
+      const asset = await saveAsset(db, approvalsDeps, { reportId: id, name, bytes: req.body });
+      res.status(201).json({ asset });
+    }),
+  );
 
   router.use(REPORTS_API_PREFIX, guardHeaders);
   router.use(REPORTS_API_PREFIX, ownerGuard);
@@ -542,6 +601,258 @@ export function reportsApiRouter(dashboardAuth, deps = {}) {
       res.status(201).json(out);
     },
   ));
+
+  /* ------------------------------------------------------------------------- steps */
+
+  /** A step key and revision in a path: a malformed one is a 404 before anything is read. */
+  const stepPathOf = (req, res) => {
+    const key = String(req.params?.key ?? "");
+    const rev = String(req.params?.rev ?? "");
+    if (!STEP_KEY_RE.test(key) || !STEP_REV_RE.test(rev)) {
+      sendError(res, 404, "not_found");
+      return null;
+    }
+    return { key, rev: Number(rev) };
+  };
+
+  // GET /:id/steps — every step key at its newest revision: the state, whether the approval still
+  // verifies, and its files as paths, sizes and hashes. No file text, no seal, no nonce.
+  router.get(`${REPORTS_API_PREFIX}/:id/steps`, route("GET /:id/steps", async (db, req, res) => {
+    const id = idOf(req, res);
+    if (!id) return;
+    if (!(await getReport(db, id))) return sendError(res, 404, "not_found");
+    res.json({ steps: await listStepsForPage(db, id, approvalsDeps) });
+  }));
+
+  // GET /:id/steps/:key/:rev — one revision, with its files' text and the per-file line diff against
+  // the previous APPROVED revision (that is what the owner reads before a tap).
+  router.get(`${REPORTS_API_PREFIX}/:id/steps/:key/:rev`, route(
+    "GET /:id/steps/:key/:rev",
+    async (db, req, res) => {
+      const id = idOf(req, res);
+      if (!id) return;
+      const step = stepPathOf(req, res);
+      if (!step) return;
+      if (!(await getReport(db, id))) return sendError(res, 404, "not_found");
+      const detail = await stepDetail(db, id, step.key, step.rev, approvalsDeps);
+      if (!detail) return sendError(res, 404, "not_found");
+      res.json({ step: detail, diff: await stepDiff(db, id, step.key, step.rev) });
+    },
+  ));
+
+  // POST /:id/steps — the owner proposes a revision of one step. A proposal approves nothing: the
+  // answer is `proposed` and the step runs only after an approval of that revision.
+  router.post(`${REPORTS_API_PREFIX}/:id/steps`, route("POST /:id/steps", async (db, req, res) => {
+    const id = idOf(req, res);
+    if (!id) return;
+    const body = req.body == null ? {} : req.body;
+    if (typeof body !== "object" || Array.isArray(body)) return sendError(res, 400, "bad_input");
+    const step = await proposeStep(db, approvalsDeps, {
+      reportId: id,
+      stepKey: body.stepKey,
+      language: body.language,
+      entry: body.entry,
+      files: body.files,
+      assets: body.assets,
+      requirements: body.requirements,
+      proposedBy: OWNER_LABEL,
+    });
+    res.status(201).json({ step });
+  }));
+
+  /** One step decision: the same path shape for approve, refuse and revoke. */
+  const decideStep = (label, action) => route(label, async (db, req, res) => {
+    const id = idOf(req, res);
+    if (!id) return;
+    const step = stepPathOf(req, res);
+    if (!step) return;
+    if (!(await getReport(db, id))) return sendError(res, 404, "not_found");
+    const row = await action(db, id, step.key, step.rev);
+    res.json({ step: row });
+  });
+
+  // POST /:id/steps/:key/:rev/approve — a fresh nonce and seal over the bundle hash recomputed now,
+  // for the bundle the owner was shown: the body carries the hash that view displayed, and a bundle
+  // that moved since then (a file, a requirement, an asset) answers 409.
+  router.post(`${REPORTS_API_PREFIX}/:id/steps/:key/:rev/approve`, route(
+    "POST /:id/steps/:key/:rev/approve",
+    async (db, req, res) => {
+      const id = idOf(req, res);
+      if (!id) return;
+      const step = stepPathOf(req, res);
+      if (!step) return;
+      const body = req.body == null ? {} : req.body;
+      if (typeof body !== "object" || Array.isArray(body)) return sendError(res, 400, "bad_input");
+      const bundleHash = body.bundleHash;
+      if (typeof bundleHash !== "string" || !BUNDLE_HASH_RE.test(bundleHash)) {
+        return sendError(res, 400, "bad_input");
+      }
+      if (!(await getReport(db, id))) return sendError(res, 404, "not_found");
+      const row = await approveStep(db, approvalsDeps, {
+        reportId: id, stepKey: step.key, rev: step.rev, bundleHash, actor: { kind: "owner" },
+      });
+      res.json({ step: row });
+    },
+  ));
+
+  // POST /:id/steps/:key/:rev/refuse — the state and a NULLED seal, so an old approval cannot return.
+  router.post(`${REPORTS_API_PREFIX}/:id/steps/:key/:rev/refuse`, decideStep(
+    "POST /:id/steps/:key/:rev/refuse",
+    (db, id, key, rev) => refuseStep(db, approvalsDeps, {
+      reportId: id, stepKey: key, rev, actor: { kind: "owner" },
+    }),
+  ));
+
+  // POST /:id/steps/:key/:rev/revoke — the same for an approval already given.
+  router.post(`${REPORTS_API_PREFIX}/:id/steps/:key/:rev/revoke`, decideStep(
+    "POST /:id/steps/:key/:rev/revoke",
+    (db, id, key, rev) => revokeStep(db, approvalsDeps, {
+      reportId: id, stepKey: key, rev, actor: { kind: "owner" },
+    }),
+  ));
+
+  /* ------------------------------------------------------------------------- hosts */
+
+  /** A host in a path, as the row stores it (an exact name or a `*.suffix` wildcard), or a 404. */
+  const hostPathOf = (req, res) => {
+    const raw = String(req.params?.host ?? "");
+    try {
+      return normalizeHost(raw);
+    } catch {
+      sendError(res, 404, "not_found");
+      return null;
+    }
+  };
+
+  // GET /:id/hosts — every host of this report, with whether its approval still verifies.
+  router.get(`${REPORTS_API_PREFIX}/:id/hosts`, route("GET /:id/hosts", async (db, req, res) => {
+    const id = idOf(req, res);
+    if (!id) return;
+    if (!(await getReport(db, id))) return sendError(res, 404, "not_found");
+    res.json({ hosts: await listHosts(db, id, approvalsDeps) });
+  }));
+
+  // POST /:id/hosts — the owner adds one site: propose and approve in this one tap. The answer carries
+  // the sentence about automated access, which is the owner's responsibility to check.
+  router.post(`${REPORTS_API_PREFIX}/:id/hosts`, route("POST /:id/hosts", async (db, req, res) => {
+    const id = idOf(req, res);
+    if (!id) return;
+    const body = req.body == null ? {} : req.body;
+    if (typeof body !== "object" || Array.isArray(body)) return sendError(res, 400, "bad_input");
+    const host = normalizeHost(body.host);
+    await proposeHost(db, approvalsDeps, { reportId: id, host });
+    const approved = await approveHost(db, approvalsDeps, {
+      reportId: id, host, actor: { kind: "owner" },
+    });
+    res.status(201).json(approved);
+  }));
+
+  /** One host decision, addressed by the host itself (URL-encoded). */
+  const decideHost = (label, action) => route(label, async (db, req, res) => {
+    const id = idOf(req, res);
+    if (!id) return;
+    const host = hostPathOf(req, res);
+    if (!host) return;
+    if (!(await getReport(db, id))) return sendError(res, 404, "not_found");
+    res.json(await action(db, id, host));
+  });
+
+  // POST /:id/hosts/:host/approve — a fresh nonce and seal, and the same sentence as an add.
+  router.post(`${REPORTS_API_PREFIX}/:id/hosts/:host/approve`, decideHost(
+    "POST /:id/hosts/:host/approve",
+    (db, id, host) => approveHost(db, approvalsDeps, { reportId: id, host, actor: { kind: "owner" } }),
+  ));
+
+  // POST /:id/hosts/:host/revoke — a NULLED seal, and every credential bound to that host stops.
+  router.post(`${REPORTS_API_PREFIX}/:id/hosts/:host/revoke`, decideHost(
+    "POST /:id/hosts/:host/revoke",
+    async (db, id, host) => ({ host: await revokeHost(db, approvalsDeps, { reportId: id, host, actor: { kind: "owner" } }) }),
+  ));
+
+  /* ------------------------------------------------------------------- credentials */
+
+  /**
+   * The host of one credential of THIS report, looked up by the connection reference the path names, or
+   * a 404. The list is the module's own (it carries no secret and no seal), so a reference of another
+   * report is simply not in it.
+   */
+  const credentialHostOf = async (db, res, reportId, ref) => {
+    const rows = await listCredentials(db, reportId, approvalsDeps);
+    const found = rows.find((row) => row.connectionUuid === ref) ?? null;
+    if (!found) {
+      sendError(res, 404, "not_found");
+      return null;
+    }
+    return found.host;
+  };
+
+  // GET /:id/credentials — the bindings this report holds: the host, the keychain reference, the rule
+  // and the digest of that rule (which is what an approval hands back), and never the secret, the seal
+  // or the nonce.
+  router.get(`${REPORTS_API_PREFIX}/:id/credentials`, route("GET /:id/credentials", async (db, req, res) => {
+    const id = idOf(req, res);
+    if (!id) return;
+    if (!(await getReport(db, id))) return sendError(res, 404, "not_found");
+    res.json({ credentials: await listCredentials(db, id, approvalsDeps) });
+  }));
+
+  /** The revoke decision, addressed by the connection reference in the path. */
+  const decideCredential = (label, action) => route(label, async (db, req, res) => {
+    const id = idOf(req, res);
+    if (!id) return;
+    const ref = String(req.params?.uuid ?? "");
+    if (!CREDENTIAL_REF_RE.test(ref)) return sendError(res, 404, "not_found");
+    if (!(await getReport(db, id))) return sendError(res, 404, "not_found");
+    const host = await credentialHostOf(db, res, id, ref);
+    if (!host) return;
+    res.json({ credential: await action(db, id, host) });
+  });
+
+  // POST /:id/credentials/:uuid/approve — a fresh nonce and seal over the report, the reference and the
+  // host, for the row the owner was shown: the body carries the rule digest that view displayed and the
+  // path carries the reference it displayed, and a row that moved since then answers 409. A credential
+  // also needs an approved host: `injectRulesFor` re-checks it at run time.
+  router.post(`${REPORTS_API_PREFIX}/:id/credentials/:uuid/approve`, route(
+    "POST /:id/credentials/:uuid/approve",
+    async (db, req, res) => {
+      const id = idOf(req, res);
+      if (!id) return;
+      const ref = String(req.params?.uuid ?? "");
+      if (!CREDENTIAL_REF_RE.test(ref)) return sendError(res, 404, "not_found");
+      const body = req.body == null ? {} : req.body;
+      if (typeof body !== "object" || Array.isArray(body)) return sendError(res, 400, "bad_input");
+      const injectHash = body.injectHash;
+      if (typeof injectHash !== "string" || !INJECT_HASH_RE.test(injectHash)) {
+        return sendError(res, 400, "bad_input");
+      }
+      if (!(await getReport(db, id))) return sendError(res, 404, "not_found");
+      const host = await credentialHostOf(db, res, id, ref);
+      if (!host) return;
+      const credential = await approveCredential(db, approvalsDeps, {
+        reportId: id, host, connectionUuid: ref, injectHash, actor: { kind: "owner" },
+      });
+      res.json({ credential });
+    },
+  ));
+
+  // POST /:id/credentials/:uuid/revoke — a NULLED seal, and the keychain row it named stops being served.
+  router.post(`${REPORTS_API_PREFIX}/:id/credentials/:uuid/revoke`, decideCredential(
+    "POST /:id/credentials/:uuid/revoke",
+    (db, id, host) => revokeCredential(db, approvalsDeps, {
+      reportId: id, host, actor: { kind: "owner" },
+    }),
+  ));
+
+  /* ------------------------------------------------------------------------ assets */
+
+  // GET /:id/assets — the named inputs of this report: name, hash, size and whether the file on disk
+  // still hashes to the row. The bytes are never in the answer; an upload is the raw-body route above.
+  router.get(`${REPORTS_API_PREFIX}/:id/assets`, route("GET /:id/assets", async (db, req, res) => {
+    const id = idOf(req, res);
+    if (!id) return;
+    if (!(await getReport(db, id))) return sendError(res, 404, "not_found");
+    res.json({ assets: await listAssets(db, id, approvalsDeps) });
+  }));
 
   return router;
 }

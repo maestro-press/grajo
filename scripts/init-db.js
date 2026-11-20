@@ -13,7 +13,7 @@ import {
 } from "../servers/shared/project-services-schema.js";
 import { SATELLITE_DDL } from "../servers/shared/satellite-schema.js";
 import { MAIL_DDL, MAIL_ACCOUNT_SEND_COLUMNS, MAIL_DRAFTS_DDL } from "../servers/shared/mail-schema.js";
-import { REPORTS_DDL, REPORTS_RUNS_DDL, REPORTS_VERSIONS_DDL, REPORTS_SEND_DDL } from "../servers/shared/reports-schema.js";
+import { REPORTS_DDL, REPORTS_RUNS_DDL, REPORTS_VERSIONS_DDL, REPORTS_SEND_DDL, REPORTS_STEPS_DDL } from "../servers/shared/reports-schema.js";
 import { MESSAGE_DRAFTS_BOT_NAME_COLUMN, MESSAGE_DRAFTS_DDL } from "../servers/shared/message-drafts-schema.js";
 import { PROVENANCE_COLUMNS, PROVENANCE_INDEX_SQL, NOTE_WITHDRAWAL_COLUMNS } from "../servers/research/provenance-schema.js";
 
@@ -3146,6 +3146,18 @@ await initTable("reports versions tables", REPORTS_VERSIONS_DDL);
 // servers/shared/reports-schema.js, which scripts/migrations/0034-reports-send.mjs also runs — one
 // shape, two rails; additive, no SCHEMA_GENERATION bump. The earlier reports constants are untouched.
 await initTable("reports send tables", REPORTS_SEND_DDL);
+
+// reports steps tables: a report's custom steps (one row per report, step key and revision, holding the
+// small file bundle, its bundle hash, its state word and the owner's approval nonce and seal), its named
+// assets (sha256 and size; the bytes live under this instance's reports directory), the hosts a step may
+// reach (an exact name or a *.suffix wildcard) and the credential bindings for those hosts (a keychain
+// row reference, where the relay attaches it, and the path prefixes and methods it covers). Epoch-ms
+// times; states, host shapes and inject rules are validated in servers/gateway/reports/steps.js, never
+// by a CHECK, and there are no foreign keys. LOCAL ONLY (instance-sync LOCAL_ONLY_TABLES): every row
+// describes one report, and a report never leaves its instance. Same DDL as REPORTS_STEPS_DDL in
+// servers/shared/reports-schema.js, which scripts/migrations/0035-reports-steps.mjs also runs — one
+// shape, two rails; additive, no SCHEMA_GENERATION bump. The earlier reports constants are untouched.
+await initTable("reports steps tables", REPORTS_STEPS_DDL);
 
 // message draft tables (Crow Messages): the draft of a message to one conversation — a contact or a
 // room — with the body, the version an autosave compares against and the sealed recipient set, plus

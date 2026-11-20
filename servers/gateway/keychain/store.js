@@ -129,12 +129,18 @@ export async function ensureWriteKey(db, { crowHome, onNewKey } = {}) {
 /** The bundle id Crow Mail's keychain rows carry (servers/gateway/mail/credentials.js, MAIL_BUNDLE_ID). */
 export const MAIL_BUNDLE = "crow-mail";
 
+/** The bundle id a Crow Recurring Reports credential's keychain row carries (env key
+ *  `REPORT_CREDENTIAL`, kind 'service', keyed by the report_credentials row's connection uuid; written
+ *  by the `report-credential` secret target). Like Crow Mail's rows, no installed bundle stands behind
+ *  it, so it is a Crow-owned id: an add-on may neither overwrite it nor be handed it. */
+export const REPORTS_BUNDLE = "crow-reports";
+
 /** Keychain "bundle ids" that belong to Crow itself, never to an add-on: the off-site backup key
  *  (servers/shared/crow-vault.js OFFSITE_KEY) and Crow Mail's own rows (kind 'service', bundle id
  *  MAIL_BUNDLE, written by the mail credentials module; no installed bundle stands behind them).
  *  An add-on installed under such an id must neither overwrite the entry, be handed it, revive it
  *  from 'extension_removed' nor mark it removed, so every add-on path skips or refuses these ids. */
-export const SYSTEM_BUNDLE_IDS = Object.freeze(new Set(["offsite-backup", MAIL_BUNDLE]));
+export const SYSTEM_BUNDLE_IDS = Object.freeze(new Set(["offsite-backup", MAIL_BUNDLE, REPORTS_BUNDLE]));
 export const isSystemBundleId = (id) => SYSTEM_BUNDLE_IDS.has(String(id));
 
 /** The reserved-id refusal, kept ahead of any DB work, exactly as saveExtensionSecret had it. */
