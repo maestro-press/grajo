@@ -35,7 +35,7 @@ const { MAIL_ERROR_TEXT, MailError } = await import("../servers/gateway/mail/err
 const { probeAccount } = await import("../servers/gateway/mail/probe.js");
 const { createMailCredentials } = await import("../servers/gateway/mail/credentials.js");
 const { accountsOverview } = await import("../servers/gateway/mail/accounts-overview.js");
-const { addressHash, checkClaim, claimKey, listClaims, writeClaim } = await import("../servers/gateway/mail/claims.js");
+const { addressHash, checkClaim, claimKey, listClaims, releaseClaim, writeClaim } = await import("../servers/gateway/mail/claims.js");
 const { createAccount, getAccount, setSyncState, addImageAllow } = await import("../servers/gateway/mail/store/accounts.js");
 const { upsertFolders, upsertMessage } = await import("../servers/gateway/mail/store/messages.js");
 const { createMailSupervisor } = await import("../servers/gateway/mail/sync/supervisor.js");
@@ -156,8 +156,10 @@ let n = 0;
  * One test's world. `adapterFactory` defaults to a working in-memory adapter, `supervisor` to one that
  * records its calls, `recordSecrets` to an in-memory recorder. `supervisorFactory({db, credentials,
  * adapterFactory})` builds a real supervisor over this test's database instead; `wrapDb` sees each
- * request's own client before the router does; `writeContext` runs every request inside an owner
- * write context, exactly as dashboardAuth does; `ownerCheck` replaces the owner rule.
+ * request's own client before the router does; `wrapCredentials` sees the real keychain credentials
+ * before the router does; `claims` replaces the claim code at the router's own seam; `writeContext`
+ * runs every request inside an owner write context, exactly as dashboardAuth does; `ownerCheck`
+ * replaces the owner rule.
  */
 async function setup({
   adapterFactory = null,
@@ -166,6 +168,8 @@ async function setup({
   recordSecrets = null,
   localInstance = LOCAL,
   credentials: credentialsOverride = null,
+  wrapCredentials = null,
+  claims: claimsOverride = null,
   wrapDb = null,
   writeContext = false,
   ownerCheck = undefined,
@@ -179,7 +183,8 @@ async function setup({
   const db = createDbClient(crow);
   const credDb = createDbClient(crow);
   open.push(db, credDb);
-  const credentials = credentialsOverride ?? createMailCredentials({ db: credDb, crowHome: process.env.CROW_HOME });
+  const baseCredentials = credentialsOverride ?? createMailCredentials({ db: credDb, crowHome: process.env.CROW_HOME });
+  const credentials = wrapCredentials == null ? baseCredentials : (wrapCredentials(baseCredentials) ?? baseCredentials);
 
   const factoryCalls = [];
   const mail = adapterFactory ?? (() => createFakeMailAdapter());
@@ -243,6 +248,7 @@ async function setup({
     credentials,
     localInstance,
     recordSecrets: record,
+    ...(claimsOverride === null ? {} : { claims: claimsOverride }),
     ...(ownerCheck === undefined ? {} : { ownerCheck }),
   }));
   app.use(dash);
@@ -543,6 +549,54 @@ test("a connect that loses the post-write claim re-check is undone whole and ans
   const ours = (await listClaims(s.db, ADDRESS)).find((c) => c.key === claimKey(ADDRESS, LOCAL.instanceId));
   assert.ok(ours, "our claim row is still there");
   assert.equal(ours.released, true, "…as a tombstone, so the address is not held by a phantom");
+  await flush();
+  assert.deepEqual(s.supervisorCalls, [], "no sync of an account that does not exist");
+});
+
+test("a post-write claim re-check that throws is undone whole: no account, no secret, a released claim", async () => {
+  // Not a lost claim but a fault: the second checkClaim (the one after writeClaim) throws like a
+  // database would. Nothing of the connect may survive it — a half-connected address is exactly what
+  // peers would see as held here.
+  const saves = [];
+  let rechecks = 0;
+  const s = await setup({
+    wrapCredentials: (real) => ({
+      ...real,
+      async saveSecret(id, key, value) { saves.push(id); return real.saveSecret(id, key, value); },
+    }),
+    claims: {
+      async checkClaim(db, address, opts) {
+        rechecks += 1;
+        if (rechecks === 2) throw new Error("SQLITE_IOERR: disk I/O error (dashboard_settings)");
+        return checkClaim(db, address, opts);
+      },
+      writeClaim,
+      releaseClaim,
+    },
+  });
+
+  const { lines, result: r } = await warnings(() => post(accountsPath, BODY));
+  assert.equal(rechecks, 2, "the fault landed on the re-check after the claim was written");
+  assert.equal(r.status, 500, r.text);
+  assert.deepEqual(r.json, { error: "internal", message: "Something went wrong." });
+  assert.equal(r.text.includes(ADDRESS), false, "the answer names no address");
+
+  assert.equal(saves.length, 1, "the account's secret really was stored before the fault");
+  const id = saves[0];
+  assert.equal(await s.count("mail_accounts", "WHERE id = ?", [id]), 0, "the account row was undone");
+  assert.equal(await s.count("mail_accounts", "WHERE address = ?", [ADDRESS]), 0, "no row for that address");
+  assert.deepEqual(await s.keychainRows(id), [], "the keychain secret was undone");
+
+  const ours = (await listClaims(s.db, ADDRESS)).find((c) => c.key === claimKey(ADDRESS, LOCAL.instanceId));
+  assert.ok(ours, "our claim row is still there");
+  assert.equal(ours.released, true, "…as a tombstone, so the address is not held by a phantom");
+  assert.deepEqual(
+    await checkClaim(s.db, ADDRESS, { localInstanceId: "instC" }),
+    { ok: true },
+    "the address is free for another instance",
+  );
+
+  assert.equal(lines.join("\n").includes("SQLITE_IOERR"), false, "the log carries the code, never the store's text");
   await flush();
   assert.deepEqual(s.supervisorCalls, [], "no sync of an account that does not exist");
 });

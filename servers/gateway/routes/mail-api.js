@@ -365,6 +365,22 @@ function credentialsFor(db, deps) {
   return createMailCredentials({ db });
 }
 
+/**
+ * The claim code this router calls, or a test's own stand-in: the same seam `credentials` and
+ * `adapterFactory` use. A partial stand-in falls back to the real function it does not replace.
+ */
+const REAL_CLAIMS = Object.freeze({ checkClaim, writeClaim, releaseClaim });
+
+function claimsFor(deps) {
+  const claims = deps.claims;
+  if (claims == null) return REAL_CLAIMS;
+  return {
+    checkClaim: typeof claims.checkClaim === "function" ? claims.checkClaim : checkClaim,
+    writeClaim: typeof claims.writeClaim === "function" ? claims.writeClaim : writeClaim,
+    releaseClaim: typeof claims.releaseClaim === "function" ? claims.releaseClaim : releaseClaim,
+  };
+}
+
 function adapterFactoryFor(deps) {
   if (typeof deps.adapterFactory === "function") return deps.adapterFactory;
   if (typeof runtime.adapterFactory === "function") return runtime.adapterFactory;
@@ -408,9 +424,9 @@ async function undoConnect(db, credentials, accountId) {
   }
 }
 
-async function releaseClaimQuietly(db, address, localInstanceId) {
+async function releaseClaimQuietly(claims, db, address, localInstanceId) {
   try {
-    await releaseClaim(db, address, { localInstanceId });
+    await claims.releaseClaim(db, address, { localInstanceId });
   } catch (err) {
     logCode("undo_claim", err);
   }
@@ -472,10 +488,12 @@ function endRemovalFor(deps, accountId, started) {
  *
  * @param {Function} dashboardAuth the dashboard's auth middleware
  * @param {{openDb?: Function, adapterFactory?: Function, supervisor?: object|null,
- *   credentials?: object, localInstance?: object|Function, tokenProvider?: Function,
+ *   credentials?: object, claims?: {checkClaim?: Function, writeClaim?: Function, releaseClaim?: Function},
+ *   localInstance?: object|Function, tokenProvider?: Function,
  *   recordSecrets?: Function, ownerCheck?: Function}} [deps]
  *   `openDb` mints the request's crow.db client; `recordSecrets(values)` records masked values and
- *   defaults to `recordServiceSecretValues`; `ownerCheck` defaults to `isLocalPasswordSessionOn`.
+ *   defaults to `recordServiceSecretValues`; `ownerCheck` defaults to `isLocalPasswordSessionOn`;
+ *   `claims` replaces the claim code (any function it leaves out stays the real one).
  * @returns {import("express").Router}
  */
 export function mailApiRouter(dashboardAuth, deps = {}) {
@@ -621,7 +639,8 @@ export function mailApiRouter(dashboardAuth, deps = {}) {
       logCode("record_secret", err);
     }
 
-    const claim = await checkClaim(db, input.address, { localInstanceId: local.instanceId });
+    const claims = claimsFor(deps);
+    const claim = await claims.checkClaim(db, input.address, { localInstanceId: local.instanceId });
     if (!claim.ok) return sendError(res, 409, "CLAIMED_ELSEWHERE", claimedElsewhereSentence(claim.instanceName));
 
     // Before anything is stored: a refused sign-in leaves no account, no secret and no claim behind.
@@ -647,20 +666,25 @@ export function mailApiRouter(dashboardAuth, deps = {}) {
     }
 
     const credentials = credentialsFor(db, deps);
+    // The re-check belongs to this same failure handling: a claim written a moment ago can still lose
+    // to one another instance wrote concurrently (the winner is computed from the whole set), and the
+    // re-check itself can fail — a DB fault there must undo the connect too, never leave the account,
+    // its secret and the claim behind as a half-connected address peers see as held here.
+    let after;
     try {
       await credentials.saveSecret(account.id, "MAIL_PASSWORD", input.password);
-      await writeClaim(db, input.address, { localInstanceId: local.instanceId, instanceName: local.instanceName });
+      await claims.writeClaim(db, input.address, { localInstanceId: local.instanceId, instanceName: local.instanceName });
+      after = await claims.checkClaim(db, input.address, { localInstanceId: local.instanceId });
     } catch (err) {
       await undoConnect(db, credentials, account.id);
+      await releaseClaimQuietly(claims, db, input.address, local.instanceId);
       throw err;
     }
 
-    // A claim written a moment ago can still lose to one another instance wrote concurrently: the
-    // winner is computed from the whole set, and on a loss nothing of this connect may remain.
-    const after = await checkClaim(db, input.address, { localInstanceId: local.instanceId });
+    // A lost claim: nothing of this connect may remain.
     if (!after.ok) {
       await undoConnect(db, credentials, account.id);
-      await releaseClaimQuietly(db, input.address, local.instanceId);
+      await releaseClaimQuietly(claims, db, input.address, local.instanceId);
       return sendError(res, 409, "CLAIMED_ELSEWHERE", claimedElsewhereSentence(after.instanceName));
     }
 
@@ -702,7 +726,7 @@ export function mailApiRouter(dashboardAuth, deps = {}) {
       } catch (err) {
         logCode("delete_secret", err);
       }
-      await releaseClaimQuietly(db, account.address, local.instanceId);
+      await releaseClaimQuietly(claimsFor(deps), db, account.address, local.instanceId);
       res.json({ ok: true, messages: removed.messages });
     } finally {
       endRemovalFor(deps, id, removalBegan);
