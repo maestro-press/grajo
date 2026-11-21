@@ -32,8 +32,9 @@ const { REPORTS_BUNDLE, saveServiceSecret } = await import("../servers/gateway/k
 const {
   approveCredential, approveHost, injectHashOf, proposeCredential, proposeHost,
 } = await import("../servers/gateway/reports/steps.js");
-const { approveGoLive, approveRecipient, proposeRecipient } =
-  await import("../servers/gateway/reports/approvals.js");
+const { approveGoLive, approveRecipient, ownerAuthorSealerFor, proposeRecipient } = await import(
+  "../servers/gateway/reports/approvals.js"
+);
 const { deliver } = await import("../servers/gateway/reports/delivery.js");
 const { executeRun, getRun, startRun } = await import("../servers/gateway/reports/run.js");
 const { makeStateAccess, runRecipe } = await import(
@@ -180,6 +181,10 @@ function approvalsDeps(report, over = {}) {
 function runDeps(over = {}) {
   return {
     ...blockDeps(),
+    // The approval gate reads `loadSeed` at the top of the seam (`gateDeps` in blocks/run-recipe.js),
+    // so a run that brought its own approvals seam carries one there and every other run gets this
+    // file's seed.
+    ...(over.approvals === undefined ? { loadSeed: () => ({ seed: SEED }) } : {}),
     deliver: async () => {},
     ...over,
   };
@@ -203,6 +208,9 @@ async function prepare(db, { recipe = CUSTOM_RECIPE, registry } = {}) {
     reportId: id,
     recipe,
     authorKind: "owner",
+    // The revision this save writes is the owner's own, sealed under the keychain seed: that seal, not
+    // the `author_kind` column, is what the source gate's owner-history path reads.
+    authorSeal: ownerAuthorSealerFor({ loadSeed: () => ({ seed: SEED }) }),
     ...(registry === undefined ? {} : { registry }),
   });
   await updateReportColumns(db, id, {
@@ -288,12 +296,17 @@ async function queueRun(db, reportId, over = {}) {
   return runId;
 }
 
+/**
+ * The state keys this run wrote. The owner revision's author seal lives in the same table under the
+ * reserved `revision_author:` prefix (revision-author.js), which is not run state: these readers answer
+ * with the run's own keys.
+ */
 async function stateRows(db, reportId) {
   const { rows } = await db.execute({
     sql: "SELECT key FROM report_state WHERE report_id = ? ORDER BY key",
     args: [reportId],
   });
-  return rows.map((row) => row.key);
+  return rows.map((row) => row.key).filter((key) => !key.startsWith("revision_author:"));
 }
 
 /* ---------------------------------------------------------------- the executor's ctx */

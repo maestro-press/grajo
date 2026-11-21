@@ -4,20 +4,18 @@
  * Settings: `{accountId, label?|folder?, sinceDays}`. Exactly one of `label` and `folder`; `sinceDays`
  * is a whole number from 1 to 60.
  *
- * WHOSE MAIL: the account must be the one this report's owner approved as its sender, which is the
- * report row's `sender_account_id` (the field the go-live seal covers, and the one the injected
- * `adapterFor` seam is handed). Any other account is `account_not_approved`: a recipe is
- * bot-authorable, and a bot naming another mailbox must not read it. That is also why the settings
- * carry an account id at all rather than taking the report's account by default: the seal covers what
- * the owner saw.
+ * WHOSE MAIL: the account must be the one this report's owner approved as its sender. Any other account
+ * is `account_not_approved`: a recipe is bot-authorable, and a bot naming another mailbox must not read
+ * it. That is also why the settings carry an account id at all rather than taking the report's account by
+ * default: the seal covers what the owner saw.
  *
- * THE LIVE SET COMES FIRST, AND THE ROW IS THE FALLBACK: `ctx.live.senderAccountId` is the VERIFIED live
- * set, so a run of a live report reads the account the owner sealed. A preview of a draft has no live
- * set, and the fallback to the row's own `sender_account_id` is unsealed. That fallback is safe only
- * because that column is owner-only: no bot tool, recipe or MCP door writes it (`updateSettings` is the
- * owner's route, and a bot's save moves the recipe, never the settings), so a bot cannot point the
- * fallback at another mailbox. Keep it that way: a writer that lets a bot set `sender_account_id` would
- * turn this fallback into exactly the hole the account rule exists to close.
+ * THE TWO MEMBERS THAT NAME IT, and never a row of this block's own: `ctx.live.senderAccountId` is the
+ * VERIFIED live set, so a run of a live report reads the account the owner sealed; a preview has no live
+ * set, and its fallback is `ctx.previewSender`, which the executor resolved through the approval rails
+ * (source-approvals.js's `approvedSenderAccount`: the report row's own `sender_account_id` only when the
+ * report's head revision carries an owner author seal). This block reads neither `reports` nor
+ * `report_state` itself, so an unsealed column can never become the account it measures against: keep it
+ * that way, and keep `sender_account_id` owner-only as well.
  *
  * HOW IT READS: only through the injected `ctx.mail.adapterFor(account, fn)`, the same seam the reports
  * send door takes from boot. This module builds no connection, imports no mail supervisor, and never
@@ -248,8 +246,9 @@ async function run(ctx, input) {
   const reportId = text(ctx?.report?.id);
   if (!reportId) return refuse("bad_settings");
 
-  // The account the owner approved for this report, and no other.
-  const approvedAccountId = text(ctx?.live?.senderAccountId) || text(ctx?.report?.sender_account_id);
+  // The account the owner approved for this report, and no other: the sealed live set's sender, or the
+  // account the executor resolved through the approval rails for a preview. Never the report row here.
+  const approvedAccountId = text(ctx?.live?.senderAccountId) || text(ctx?.previewSender);
   const accountId = text(settings.accountId).trim();
   if (!approvedAccountId || accountId !== approvedAccountId) return refuse("account_not_approved");
 

@@ -941,10 +941,14 @@ function fakeMail(messages, calls) {
   };
 }
 
-/** A mail account plus a report that names it as its sender. */
-async function mailWorld(db, { provider } = {}) {
+/**
+ * A mail account plus a report that names it as its sender. `previewSender` is what the executor resolves
+ * through the approval rails for a mail block (source-approvals.js's `approvedSenderAccount`); the block
+ * itself reads that member and never the row.
+ */
+async function mailWorld(db, { provider, address } = {}) {
   const account = await createAccount(db, {
-    address: provider ? "alex@example.com" : "reports@example.com",
+    address: address || (provider ? "alex@example.com" : "reports@example.com"),
     label: "Reports",
     ...(provider ? { provider } : {}),
     imap: { host: "imap.example.com", port: 993, security: "ssl" },
@@ -952,12 +956,17 @@ async function mailWorld(db, { provider } = {}) {
   });
   const reportId = await makeReport(db);
   await updateReportColumns(db, reportId, { sender_account_id: account.id });
-  return { account, reportId, report: { id: reportId, sender_account_id: account.id } };
+  return {
+    account,
+    reportId,
+    report: { id: reportId, sender_account_id: account.id },
+    previewSender: account.id,
+  };
 }
 
 test("mail_alerts reads through the injected adapterFor", async () => {
   const db = await freshDb();
-  const { account, report } = await mailWorld(db);
+  const { account, report, previewSender } = await mailWorld(db);
   const messages = [
     {
       uid: 1,
@@ -981,6 +990,7 @@ test("mail_alerts reads through the injected adapterFor", async () => {
   const ctx = blockCtx({ accountId: account.id, folder: "INBOX", sinceDays: 7 }, {
     db,
     report,
+    previewSender,
     deps: deps({ now: () => T0 }),
     mail: async (accountArg, fn) => {
       seams.push(accountArg.id);
@@ -1010,6 +1020,7 @@ test("mail_alerts reads through the injected adapterFor", async () => {
   }, {
     db,
     report,
+    previewSender,
     deps: deps({ now: () => T0 }),
     mail: async (_account, fn) => fn(fakeMail(messages, labelCalls)),
   }), {});
@@ -1019,13 +1030,14 @@ test("mail_alerts reads through the injected adapterFor", async () => {
 
 test("mail_alerts never reads an unapproved account", async () => {
   const db = await freshDb();
-  const { account, report } = await mailWorld(db);
+  const { account, report, previewSender } = await mailWorld(db);
   let seamCalls = 0;
   const out = await mailAlertsBlock.run(blockCtx({
     accountId: "ma-0000000000000000", folder: "INBOX", sinceDays: 7,
   }, {
     db,
     report,
+    previewSender,
     deps: deps({ now: () => T0 }),
     mail: async () => { seamCalls += 1; return []; },
   }), {});
@@ -1035,13 +1047,28 @@ test("mail_alerts never reads an unapproved account", async () => {
   // The report's own account with no seam at all is a named error too.
   const missing = await mailAlertsBlock.run(blockCtx({
     accountId: account.id, folder: "INBOX", sinceDays: 7,
-  }, { db, report, deps: deps({ now: () => T0 }) }), {});
+  }, { db, report, previewSender, deps: deps({ now: () => T0 }) }), {});
   assert.deepEqual(missing, { sourceError: { message: "mail_not_available" } });
+
+  // A report whose row names an account but whose run resolved none (a head revision no owner seal
+  // covers) is refused as well: the block reads the resolved account, never the row.
+  const tampered = await mailWorld(db, { address: "second@example.com" });
+  const none = await mailAlertsBlock.run(blockCtx({
+    accountId: tampered.account.id, folder: "INBOX", sinceDays: 7,
+  }, {
+    db,
+    report: tampered.report,
+    previewSender: "",
+    deps: deps({ now: () => T0 }),
+    mail: async () => { seamCalls += 1; return []; },
+  }), {});
+  assert.deepEqual(none, { sourceError: { message: "account_not_approved" } });
+  assert.equal(seamCalls, 0, "the row's own account is not an approval");
 });
 
 test("mail_alerts without read scope is a named source error", async () => {
   const db = await freshDb();
-  const { account, report } = await mailWorld(db);
+  const { account, report, previewSender } = await mailWorld(db);
   const settings = { accountId: account.id, folder: "INBOX", sinceDays: 7 };
   assert.equal(MAIL_READ_SENTENCE, "Mail alerts need read access. Reconnect Google with reading turned on.");
 
@@ -1049,6 +1076,7 @@ test("mail_alerts without read scope is a named source error", async () => {
   const withoutRead = await mailAlertsBlock.run(blockCtx(settings, {
     db,
     report,
+    previewSender,
     deps: deps({ now: () => T0 }),
     mail: async (_account, fn) => fn({}),
   }), {});
@@ -1061,6 +1089,7 @@ test("mail_alerts without read scope is a named source error", async () => {
   }, {
     db,
     report: google.report,
+    previewSender: google.previewSender,
     deps: deps({ now: () => T0 }),
     mail: async () => { throw Object.assign(new Error("AUTH_FAILED"), { code: "AUTH_FAILED" }); },
   }), {});
@@ -1070,6 +1099,7 @@ test("mail_alerts without read scope is a named source error", async () => {
   const imapRefused = await mailAlertsBlock.run(blockCtx(settings, {
     db,
     report,
+    previewSender,
     deps: deps({ now: () => T0 }),
     mail: async () => { throw Object.assign(new Error("AUTH_FAILED"), { code: "AUTH_FAILED" }); },
   }), {});

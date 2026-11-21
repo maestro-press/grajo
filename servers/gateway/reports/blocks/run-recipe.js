@@ -48,8 +48,9 @@
  *   - `getState(key)` reads `report_state` through the store, and sees a value this run has already
  *     buffered (so two blocks reading the same key in one run agree).
  *   - `setState(key, value)` BUFFERS only, and refuses (throws `reserved_state_key`) every key the
- *     artifact bridge owns: `preview_artifact_id` and anything under `source_approval:`. A recipe is
- *     bot-authorable, and the bridge trusts those keys to decide where a run writes.
+ *     artifact bridge owns: `preview_artifact_id` and anything under `source_approval:` or
+ *     `revision_author:`. A recipe is bot-authorable, and the bridge trusts those keys to decide where a
+ *     run writes while the approval rails trust theirs to say what the owner approved.
  *   - `extraStepClaim` is a function that takes this run's ONE `extra_step_runs` on the block's behalf
  *     (see THE EXTRA STEP CAP below), and `extraStepClaimToken` is the executor's own
  *     `CLAIMED_BY_EXECUTOR` token (claim-token.js). A block calls the function where the spend really
@@ -60,6 +61,13 @@
  *   - `blockUnapproved` is `true` only on a GATED preview (see below) whose model block the owner has not
  *     approved. A model block that names a role writes the templated fallback rather than spending that
  *     role's model, so a bot's new model block costs no model time before the owner's tap.
+ *   - `previewSender` is the mail account the approval rails name for this report
+ *     (`approvedSenderAccount`, source-approvals.js): the live set's sealed sender account (read there for
+ *     a caller that hands no live set, which a preview always does), or the report row's own
+ *     `sender_account_id` only when the head revision carries an owner author seal, and "" otherwise. It
+ *     is computed for a `mail_alerts` block and for no other kind, so a preview of a never-live report
+ *     has an account to measure its mail block against without this module ever reading the unsealed
+ *     column itself. A read that fails leaves "".
  *
  * A present block has a `run` now: it turns the items into a document section (and, for a model block,
  * adds one section of the model's writing). Its failures are the SHAPE kind of failure (a warning), with
@@ -83,8 +91,9 @@
  * or `kind: "custom"`) of a PREVIEW is gated before its `run` is called unless its CONTENT is approved
  * (`isSourceApprovedForBot`, source-approvals.js): its `{type, settings}` hash is in the verified live
  * recipe, or the owner approved it at that exact hash, or that hash under that block id has an unbroken
- * owner-introduced history up to this revision (the owner put it there and no revision since dropped it
- * or carried the id at another hash). Anything else is gated, whoever asked and whoever
+ * owner-introduced history up to this revision (the owner put it there — a revision carrying a sealed
+ * author proof — and no revision since dropped it or carried the id at another hash). Anything else is
+ * gated, whoever asked and whoever
  * saved last. A scheduled or manual run executes the verified live set (`run.js`), which the owner
  * sealed, so it is not gated. A blocked block becomes a source error with the one sentence
  * `Source <blockId> is waiting for your OK`, and nothing reaches the network, a mailbox or a file: the
@@ -117,7 +126,7 @@ import { claimExtraStepRun, dayInTz, getCaps } from "../caps.js";
 import { CLAIMED_BY_EXECUTOR } from "../claim-token.js";
 import { assembleDocument, isAiSection } from "../document.js";
 import { getState as readState } from "../store.js";
-import { isSourceApprovedForBot, ownerChainAnswers, waitingForOkText } from "../source-approvals.js";
+import { isSourceApprovedForBot, ownerChainAnswers, approvedSenderAccount, waitingForOkText } from "../source-approvals.js";
 import { ACTIVE_PROJECT_WHERE } from "../../../shared/shell-items.js";
 import { BLOCKS } from "./index.js";
 
@@ -222,6 +231,15 @@ function emptyTextOf(recipe) {
 /** Is this run a preview, the one trigger that reads a revision the owner has not sealed? */
 function isPreview(run) {
   return run != null && typeof run === "object" && run.trigger === "preview";
+}
+
+/**
+ * The deps the approval gate reads. A run engine hands the approvals members at the top of the seam; a
+ * caller that passes them nested under `approvals` (the shape a block reads) is the same seam here, so a
+ * gate never reads an empty one only because a caller spelled it differently.
+ */
+function gateDeps(seam) {
+  return isPlainObject(seam.approvals) ? { ...seam.approvals, ...seam } : seam;
 }
 
 /** The day a cap is counted against: the caller's own, else today in the caller's zone, else UTC. */
@@ -372,12 +390,13 @@ export async function runRecipe(db, deps, { report, recipe, run, live = null, st
 
   // The owner-history answers of this run's gate: ONE read of the report's revisions, asked for on the
   // first gated block and reused by every gated block after it.
+  const gateSeam = gateDeps(seam);
   let gate = null;
   const gateFor = async () => {
     if (gate === null) {
       const reportId = report && typeof report.id === "string" ? report.id : "";
       const headRev = Number(report?.recipe_rev);
-      gate = { headRev, ownerChain: await ownerChainAnswers(db, reportId, headRev) };
+      gate = { headRev, ownerChain: await ownerChainAnswers(db, reportId, headRev, gateSeam) };
     }
     return gate;
   };
@@ -401,7 +420,7 @@ export async function runRecipe(db, deps, { report, recipe, run, live = null, st
     // A gated preview reads only approved sources: asked BEFORE the block's `run`, so a blocked block
     // opens no socket, reads no mailbox and opens no file.
     if (gated && (entry.kind === "source" || entry.kind === "custom")) {
-      const verdict = await isSourceApprovedForBot(db, seam, report, block, await gateFor());
+      const verdict = await isSourceApprovedForBot(db, gateSeam, report, block, await gateFor());
       if (!verdict || verdict.ok !== true) {
         sourceErrors.push({
           source: blockId,
@@ -416,11 +435,23 @@ export async function runRecipe(db, deps, { report, recipe, run, live = null, st
     // role's model, and writes the templated fallback instead (blocks/present/ai-commentary.js).
     let blockUnapproved = false;
     if (gated && entry.kind === "present" && entry.sourceBearing === true) {
-      const verdict = await isSourceApprovedForBot(db, seam, report, block, await gateFor());
+      const verdict = await isSourceApprovedForBot(db, gateSeam, report, block, await gateFor());
       blockUnapproved = !(verdict && verdict.ok === true);
     }
 
+    const isMailAlerts = block != null && block.type === "mail_alerts";
     const blockCtx = { ...ctx, block, blockId, blockUnapproved };
+    if (isMailAlerts) {
+      // The account a mail block is measured against, from the approval rails and never from a row this
+      // module reads: only a mail block needs it, and it never takes a run down.
+      let previewSender = "";
+      try {
+        previewSender = await approvedSenderAccount(db, gateSeam, live, report);
+      } catch {
+        previewSender = "";
+      }
+      blockCtx.previewSender = previewSender;
+    }
     const input = { items, sections };
     let output;
     try {

@@ -26,6 +26,7 @@ const WORKSPACE = join(root, "workspace");
 const { createDbClient } = await import("../servers/db.js");
 const { createReport, getReport, saveRecipe, stampAuthoredBy, updateReportColumns } = await import(
   "../servers/gateway/reports/store.js");
+const { ownerAuthorSealerFor } = await import("../servers/gateway/reports/approvals.js");
 const { canonicalJson, recipeHash } = await import("../servers/gateway/reports/recipe-hash.js");
 const { runRecipe } = await import("../servers/gateway/reports/blocks/run-recipe.js");
 const { chartBlock } = await import("../servers/gateway/reports/blocks/present/chart.js");
@@ -107,6 +108,10 @@ function headingTokens(markdown) {
 const PROJECT = 7;
 const T0 = 1_700_000_000_000;
 const CSV = "items.csv";
+
+/** The seed this file's owner saves and gated previews share, and the sealer an owner save writes. */
+const SEED = Buffer.alloc(32, 61);
+const sealAuthor = ownerAuthorSealerFor({ loadSeed: () => ({ seed: SEED }) });
 
 const ANSWER_URL = "https://example.com/a";
 const SECRET = "https://example.com/item/secret";
@@ -1052,7 +1057,11 @@ test("a gated preview writes the automatic summary for an unapproved model block
   });
   // The source block is the owner's own (an unbroken owner history), the model block is a bot's addition.
   const src = { id: "src", type: "workspace_file", settings: { path: CSV } };
-  await saveRecipe(db, { reportId: id, recipe: { blocks: [src] }, authorKind: "owner" });
+  // The owner's save carries the author seal the gate's owner-history path reads; a bare owner revision
+  // would prove nothing and the block would wait.
+  await saveRecipe(db, {
+    reportId: id, recipe: { blocks: [src] }, authorKind: "owner", authorSeal: sealAuthor,
+  });
   await saveRecipe(db, {
     reportId: id,
     recipe: { blocks: [src, { id: "ai1", type: "ai_commentary", settings: { modelRole: ROLE } }] },
@@ -1065,6 +1074,7 @@ test("a gated preview writes the automatic summary for an unapproved model block
   const deps = {
     testSeams: true,
     approvals: {
+      loadSeed: () => ({ seed: SEED }),
       resolveModelRef: async () => MODEL,
       resolveRoleModelRef: async () => { roleAsked += 1; return ROLE_MODEL; },
     },

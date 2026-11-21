@@ -9,8 +9,10 @@
  *
  * `saveRecipe` is the only writer of a recipe. It validates and hashes the recipe first (a refused
  * recipe writes nothing at all), then in ONE transaction reads the head revision, moves the head under a
- * compare-and-set on the revision it read, and inserts the revision row. A revision row is never
- * updated, so a reader can always see what was saved at rev N; the head columns are the fast path.
+ * compare-and-set on the revision it read, and inserts the revision row. An owner save may also write the
+ * revision's author seal into `report_state` in that same transaction (see THE AUTHOR SEAL below). A
+ * revision row is never updated, so a reader can always see what was saved at rev N; the head columns are
+ * the fast path.
  *
  * Times are epoch ms from an injected clock (`now`), so a test's fake clock moves them. Which function
  * answers a missing report how:
@@ -67,6 +69,14 @@ const WRITABLE_COLUMNS = Object.freeze([
   "pending_free_change",
 ]);
 const WRITABLE = new Set(WRITABLE_COLUMNS);
+
+/** The `report_state` key prefix an owner revision's author seal lives under (revision-author.js reads
+ *  the same keys; this module writes them, so the literal is here and the reader is there). */
+const REVISION_AUTHOR_STATE_PREFIX = "revision_author:";
+
+/** A seal is 64 lower-case hex; a nonce is 32. An answer that is not this pair writes no seal. */
+const AUTHOR_SEAL_HEX = /^[0-9a-f]{64}$/;
+const AUTHOR_NONCE_HEX = /^[0-9a-f]{32}$/;
 
 const ID_RE = /^rpt-[0-9a-f]{16}$/;
 
@@ -272,13 +282,25 @@ export async function listReports(db, { projectId } = {}) {
  * concurrent saves cannot both claim rev N + 1; the loser gets `code: "conflict"` and nothing is
  * written. Revision 0 has no row - a report nobody has saved yet is at 0 - so the first save is rev 1.
  *
+ * THE AUTHOR SEAL (`authorSeal`, optional): a caller may hand over an async callback that makes
+ * `{nonce, seal}` for one revision. On an OWNER save (`authorKind === "owner"`) it is awaited BEFORE the
+ * transaction, with the revision and the recipe hash this save is about, and its answer is written to
+ * `report_state` under `revision_author:<rev>` inside the SAME transaction as the revision row, so a save
+ * that loses the compare-and-set (or is refused before it) writes no seal. A BOT save never calls it and
+ * never writes a seal, whatever a caller passed. A save with no callback writes no seal either: an owner
+ * revision saved that way is not evidence that the owner wrote it, which is the safe side to be wrong on
+ * (revision-author.js is the reader). This module imports no seal code: the callback is the whole seam.
+ * An answer that is not `{nonce: 32 hex, seal: 64 hex}` writes no seal rather than a broken one.
+ *
  * @param {object} db
  * @param {{reportId: string, recipe: object, authorKind: "owner"|"bot",
- *   registry?: Record<string, {sourceBearing?: boolean}>|null, now?: number}} fields
+ *   registry?: Record<string, {sourceBearing?: boolean}>|null, now?: number,
+ *   authorSeal?: ((fields: {reportId: string, rev: number, recipeHash: string,
+ *     authorKind: "owner"}) => Promise<{nonce: string, seal: string}|null>)|null}} fields
  * @returns {Promise<{rev: number, hash: string, sourcesHash: string}>}
  * @throws {Error} `bad_input`, `bad_author_kind`, `bad_recipe`, `not_found`, `conflict`
  */
-export async function saveRecipe(db, { reportId, recipe, authorKind, registry = blockRegistry, now } = {}) {
+export async function saveRecipe(db, { reportId, recipe, authorKind, registry = blockRegistry, now, authorSeal } = {}) {
   idOf(reportId);
   if (!REPORT_AUTHOR_KINDS.includes(authorKind)) throw fail("bad_author_kind", "authorKind");
   // The stamp is read from the head revision's own recipe, so it needs that row before the transaction.
@@ -303,6 +325,18 @@ export async function saveRecipe(db, { reportId, recipe, authorKind, registry = 
   const srcHash = sourcesHash(stamped, registry);
   const recipeJson = canonicalJson(stamped);
   const at = clockOf(now);
+  // The author seal, made before the transaction: an owner save is the only writer of one, and a callback
+  // that answers nothing (or nothing seal-shaped) writes no seal at all rather than a broken one.
+  let authorProof = null;
+  if (authorKind === "owner" && typeof authorSeal === "function") {
+    const answer = await authorSeal({ reportId, rev: headRev + 1, recipeHash: hash, authorKind });
+    const nonce = answer != null && typeof answer === "object" ? answer.nonce : null;
+    const seal = answer != null && typeof answer === "object" ? answer.seal : null;
+    if (typeof nonce === "string" && AUTHOR_NONCE_HEX.test(nonce)
+      && typeof seal === "string" && AUTHOR_SEAL_HEX.test(seal)) {
+      authorProof = { nonce, seal };
+    }
+  }
 
   return db.runTransaction((run) => {
     const head = run({ sql: "SELECT recipe_rev FROM reports WHERE id = ?", args: [reportId] }).rows[0];
@@ -321,6 +355,15 @@ export async function saveRecipe(db, { reportId, recipe, authorKind, registry = 
       sql: `INSERT INTO report_recipe_revisions (${REVISION_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)`,
       args: [reportId, rev, recipeJson, hash, srcHash, authorKind, at],
     });
+    // The seal rides the same transaction as the revision it is about: a refused save leaves neither.
+    if (authorProof) {
+      run({
+        sql: `INSERT INTO report_state (report_id, key, value_json, updated_at) VALUES (?, ?, ?, ?)
+              ON CONFLICT(report_id, key) DO UPDATE SET value_json = excluded.value_json,
+                updated_at = excluded.updated_at`,
+        args: [reportId, `${REVISION_AUTHOR_STATE_PREFIX}${rev}`, canonicalJson(authorProof), at],
+      });
+    }
     return { rev, hash, sourcesHash: srcHash };
   });
 }

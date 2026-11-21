@@ -100,6 +100,7 @@ import { randomBytes } from "node:crypto";
 import { MODEL_BLOCK_TYPES, canonicalJson, recipeCallsModel, recipeHash, sourcesHash } from "./recipe-hash.js";
 import { blockRegistry } from "./blocks/index.js";
 import { approvalSeal, newApprovalNonce, verifyApprovalSeal } from "./seal.js";
+import { sealAuthorRevision } from "./revision-author.js";
 import { getReport, getRevision, recordAudit, saveRecipe, updateReportColumns } from "./store.js";
 import { linkFor } from "./links.js";
 import { loadKeychainKey } from "../keychain/key.js";
@@ -1060,6 +1061,43 @@ async function restampableLiveSet(db, deps, report, saved, newRecipe) {
 }
 
 /**
+ * The sealer an OWNER save hands to `saveRecipe`: it loads the keychain seed through this module's own
+ * seam and makes the `author` seal over the revision the save is about (revision-author.js).
+ *
+ * Only an owner save seals a revision; a bot save passes no sealer and writes nothing, so a bot revision
+ * can never look owner-written whatever an `author_kind` column says. The sealer throws what the seed
+ * reader throws (`keychain_key_missing`), so a caller that must save anyway can catch that one code and
+ * write an unsealed revision instead (a revision with no seal is not owner-chain evidence, which is the
+ * safe side to be wrong on).
+ *
+ * @param {object} [deps] the approvals seam (`loadSeed`)
+ * @returns {(fields: {reportId: string, rev: number, recipeHash: string, authorKind: string})
+ *   => Promise<{nonce: string, seal: string}>}
+ */
+export function ownerAuthorSealerFor(deps) {
+  const d = resolveDeps(deps);
+  return async (fields) => sealAuthorRevision(await seedOf(d), fields);
+}
+
+/**
+ * The `authorSeal` callback `ownerSaveRecipe` passes on: the sealer above, with a missing keychain key
+ * answered as "no seal" instead of a refused save. An instance whose keychain key cannot be read can
+ * still save a recipe; the revision it writes simply carries no proof that the owner wrote it, so the
+ * source gate's owner-history path does not lean on it.
+ */
+function authorSealForSave(d) {
+  const sealAuthor = ownerAuthorSealerFor(d);
+  return async (fields) => {
+    try {
+      return await sealAuthor(fields);
+    } catch (err) {
+      if (err != null && err.code === "keychain_key_missing") return null;
+      throw err;
+    }
+  };
+}
+
+/**
  * The owner's save (route `PUT /recipe`).
  *
  * The recipe is saved first — a refused recipe writes nothing. On a live report whose seal still
@@ -1067,6 +1105,11 @@ async function restampableLiveSet(db, deps, report, saved, newRecipe) {
  * same sources hash and the same model-call status (a free change: a column, a sort, a filter). A save
  * that changed a source-bearing block, or a report whose seal was already broken, leaves the report on
  * its sealed revision and answers `needsGoLive`.
+ *
+ * The revision this save writes is also sealed as the OWNER's own (`authorSeal`, revision-author.js), in
+ * the same transaction as the revision row. That seal is what the source gate's owner-history path reads;
+ * the `author_kind` column alone proves nothing. An instance whose keychain key cannot be read still saves
+ * (the revision carries no seal, so it is not owner-chain evidence).
  *
  * @param {object} db
  * @param {object} deps
@@ -1083,6 +1126,9 @@ export async function ownerSaveRecipe(db, deps, { reportId, recipe, actor } = {}
     recipe,
     authorKind: "owner",
     registry: d.registry,
+    // The revision this save writes is sealed as the owner's own, in the same transaction (see
+    // revision-author.js): that seal, not the `author_kind` column, is what makes it owner-chain evidence.
+    authorSeal: authorSealForSave(d),
   });
   const after = await getReport(db, report.id);
   if (!after) throw fail("not_found", "report");
@@ -1096,8 +1142,8 @@ export async function ownerSaveRecipe(db, deps, { reportId, recipe, actor } = {}
 }
 
 /**
- * A bot's save (this path is used by PR 9a's bot tools). No actor, and no re-stamp ever: the seal
- * always means "the owner approved".
+ * A bot's save (this path is used by PR 9a's bot tools). No actor, no re-stamp ever, and no author seal:
+ * the seal always means "the owner approved".
  *
  * The block registry is the server's own `deps.registry` and there is deliberately no way for a caller
  * to pass one: a caller that could pick the registry could have its own new source block counted as

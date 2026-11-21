@@ -121,10 +121,12 @@ export const RESERVED_STATE_KEYS = Object.freeze([PREVIEW_ARTIFACT_STATE_KEY]);
  * The `report_state` key prefixes the approval rails own, so no recipe block may write under them.
  *
  * `source_approval:` is where an owner's approval of a draft source's settings is stored, keyed by block
- * and settings hash. A bot-authored recipe that could write it could try to look approved, so the block
- * write path refuses the whole prefix rather than one key name.
+ * and settings hash, and `revision_author:` is where one recipe revision's owner-author seal is stored
+ * (revision-author.js), keyed by revision number. A bot-authored recipe that could write either could try
+ * to look approved or to look owner-written, so the block write path refuses the whole prefix rather than
+ * one key name.
  */
-export const RESERVED_STATE_PREFIXES = Object.freeze(["source_approval:"]);
+export const RESERVED_STATE_PREFIXES = Object.freeze(["source_approval:", "revision_author:"]);
 
 /**
  * Is this `report_state` key one the bridge owns?

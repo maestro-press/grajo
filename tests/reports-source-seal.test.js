@@ -25,8 +25,8 @@ const HOME = process.env.CROW_HOME;
 
 const { createDbClient } = await import("../servers/db.js");
 const {
-  applyPendingFreeChange, approveGoLive, botSaveRecipe, isLive, ownerSaveRecipe, updateSettings,
-  verifyLive,
+  applyPendingFreeChange, approveGoLive, botSaveRecipe, isLive, ownerAuthorSealerFor, ownerSaveRecipe,
+  updateSettings, verifyLive,
 } = await import("../servers/gateway/reports/approvals.js");
 const { SEAL_FIELDS } = await import("../servers/gateway/reports/seal.js");
 const {
@@ -46,6 +46,11 @@ const { createAccount } = await import("../servers/gateway/mail/store/accounts.j
 const OWNER = Object.freeze({ kind: "owner" });
 const BOT_ACTOR = Object.freeze({ kind: "bot" });
 const SEED = Buffer.alloc(32, 41);
+/**
+ * The sealer an owner save in this harness writes: the real one over the harness seed, so an owner
+ * revision carries the author seal the source gate's owner-history path reads.
+ */
+const sealAuthor = ownerAuthorSealerFor({ loadSeed: () => ({ seed: SEED }) });
 const PROJECT = 7;
 const T0 = 1_700_000_000_000;
 const PREVIEW = "prv-1";
@@ -182,7 +187,14 @@ async function prepare(db, { recipe, sender = SENDER, authorKind = "owner" } = {
   const { id } = await createReport(db, {
     projectId: PROJECT, owner: "owner", botId: "bot-1", title: "Weekly listings",
   });
-  const saved = await saveRecipe(db, { reportId: id, recipe, authorKind, registry: blockRegistry });
+  const saved = await saveRecipe(db, {
+    reportId: id,
+    recipe,
+    authorKind,
+    registry: blockRegistry,
+    // An owner save seals its revision, the way the owner's own route does; a bot save never does.
+    authorSeal: authorKind === "owner" ? sealAuthor : undefined,
+  });
   await updateReportColumns(db, id, {
     schedule_id: scheduleId,
     sender_account_id: sender,
@@ -551,10 +563,14 @@ test("a preview reads the report's revisions once, however many gated blocks it 
 
   const execute = db.execute.bind(db);
   let chainReads = 0;
+  let authorReads = 0;
   db.execute = async (arg) => {
     const sql = typeof arg === "string" ? arg : arg && arg.sql;
     if (typeof sql === "string" && sql.includes("report_recipe_revisions") && sql.includes("rev <=")) {
-      chainReads += 1;
+      // The owner-history pass reads `rev, author_kind, recipe_json`; the author-seal pass reads the
+      // recipe text beside the hash column. One of each, for the whole run.
+      if (sql.includes("recipe_hash")) authorReads += 1;
+      else chainReads += 1;
     }
     return execute(arg);
   };
@@ -568,6 +584,7 @@ test("a preview reads the report's revisions once, however many gated blocks it 
     db.execute = execute;
   }
   assert.equal(chainReads, 1, "one read of the report's revisions for the whole run");
+  assert.equal(authorReads, 1, "one author-seal read for the whole run");
 });
 
 /* ------------------------------------------------- the gate follows the content, not the author */
