@@ -35,6 +35,7 @@ import {
   guardedFetch,
 } from "./private-address.js";
 import { closePagesBeforeRestart } from "./safe-restart.js";
+import { filterLinks, parseUrlFilter, urlContainsFilter } from "./safe-filter.js";
 
 /** Browser contexts this process already guards: the guard is installed once per context. */
 const GUARDED_CONTEXTS = new WeakSet();
@@ -1178,8 +1179,9 @@ export function createBrowserServer(options = {}) {
         });
 
         if (filter) {
-          const re = new RegExp(filter, "i");
-          links = links.filter((l) => re.test(l.text) || re.test(l.href));
+          const r = filterLinks(links, filter);
+          if (!r.ok) return { content: [{ type: "text", text: r.error }], isError: true };
+          links = r.links;
         }
 
         links = links.slice(0, limit || 100);
@@ -1676,7 +1678,7 @@ export function createBrowserServer(options = {}) {
     "Capture network responses (incl. JSON bodies) via raw CDP — the fastest way to find a site's hidden JSON API. start, then navigate/interact, then stop to get results.",
     {
       action: z.enum(["start", "stop"]).describe("Start or stop capturing"),
-      filter_url_pattern: z.string().optional().describe("Regex; only capture responses whose URL matches"),
+      filter_url_pattern: z.string().optional().describe("Text; only capture responses whose URL contains it (use | for several)"),
       include_response_body: z.boolean().optional().describe("Fetch response bodies (default: false — metadata only)"),
     },
     async ({ action, filter_url_pattern, include_response_body }) => {
@@ -1685,18 +1687,16 @@ export function createBrowserServer(options = {}) {
         if (!cdpSession) return { content: [{ type: "text", text: "CDP session not available" }], isError: true };
 
         if (action === "start") {
+          const parsed = parseUrlFilter(filter_url_pattern);
+          if (!parsed.ok) return { content: [{ type: "text", text: parsed.error }], isError: true };
           if (respCapture) {
             cdpSession.off("Network.responseReceived", respCapture.onResp);
             cdpSession.off("Network.loadingFinished", respCapture.onFinish);
           }
-          let re = null;
-          if (filter_url_pattern) {
-            try { re = new RegExp(filter_url_pattern); } catch (e) { return { content: [{ type: "text", text: `Bad regex: ${e.message}` }], isError: true }; }
-          }
           const buffer = [];
           const meta = {};
           const onResp = (p) => {
-            if (!re || re.test(p.response.url)) {
+            if (urlContainsFilter(p.response.url, parsed.parts)) {
               meta[p.requestId] = { url: p.response.url, status: p.response.status, mimeType: p.response.mimeType };
             }
           };

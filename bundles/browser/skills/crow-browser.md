@@ -53,7 +53,7 @@ Match effort to the target. Don't open a browser to read an API; don't fight a p
 
 ### Network / API discovery
 - `crow_browser_capture_har` `{action}` — start/stop lightweight request logging (URLs/status/type) for API discovery.
-- `crow_browser_capture_responses` `{action, filter_url_pattern?, include_response_body?}` — capture full responses (incl. JSON bodies) via raw CDP. **The fastest path to a site's hidden JSON API** — watch the network, scrape the API, not the DOM.
+- `crow_browser_capture_responses` `{action, filter_url_pattern?, include_response_body?}` — capture full responses (incl. JSON bodies) via raw CDP. **The fastest path to a site's hidden JSON API** — watch the network, scrape the API, not the DOM. filter_url_pattern is plain case-sensitive text, not a regex; use | to give several alternatives.
 - `crow_browser_block_requests` `{patterns}` — block ads/trackers/images for speed and a smaller detection surface.
 
 ### Files
