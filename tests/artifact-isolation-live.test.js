@@ -1099,7 +1099,7 @@ test("design kit: a document with a rendered chart and a house style loads its _
     await harness(t, grantFor("document", files));
     assert.ok(await waitFor(() => loads(t.events, "/__lib/font/").some((x) => x.status === 200), 15000), "a theme font loaded");
     for (const l of loads(t.events, "/__lib/font/")) assert.equal(l.failed, null, `font ${l.url} failed: ${l.failed}`);
-    assert.ok(loads(t.events, "/__render/b3.svg").some((x) => x.status === 200), "the rendered chart image loaded");
+    assert.ok(await waitFor(() => loads(t.events, "/__render/b3.svg").some((x) => x.status === 200), 15000), "the rendered chart image loaded");
     assert.deepEqual(evil.slice(before), []);
   } finally { await t.close(); }
 });

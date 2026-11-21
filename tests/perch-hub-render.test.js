@@ -949,6 +949,16 @@ for (const [w, h] of [[412, 730], [1280, 900]]) {
 // answer to "what does the operator see selected".
 // ---------------------------------------------------------------------------
 
+/** Poll until fn() is truthy or the deadline passes; never throws. */
+async function waitUntil(fn, ms) {
+  const end = Date.now() + ms;
+  for (;;) {
+    try { if (await fn()) return true; } catch { /* page mid-navigation */ }
+    if (Date.now() > end) return false;
+    await new Promise((r) => setTimeout(r, 80));
+  }
+}
+
 for (const [w, h] of [[412, 730], [1280, 900]]) {
   test(`Q1 live @${w}x${h}: the model select shows the model the session is on`, async (t) => {
     if (!available) return t.skip("no CDP endpoint at " + CDP);
@@ -956,7 +966,7 @@ for (const [w, h] of [[412, 730], [1280, 900]]) {
     const s = await session(w, h);
     try {
       await s.evalIn(`location.hash='perchlive-22222222'; 'go'`);
-      await new Promise((r) => setTimeout(r, 900));
+      await waitUntil(() => s.evalIn(`(function(){var sel=document.getElementById('perch-model');return !!sel && !sel.disabled && sel.options.length===3;})()`), 15000);
       const seen = await s.json(`(function(){
         var sel=document.getElementById('perch-model');
         return JSON.stringify({

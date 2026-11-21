@@ -490,12 +490,14 @@ test("a log/tool frame lands in the Activity rail ONCE, not once per surviving i
   try {
     for (let i = 0; i < 3; i++) await s.visit("/dashboard/perch");
     await s.open();
+    assert.ok(await until(() => openStreams.length === 1, 15000), "the page's /events stream is attached before any frame is broadcast");
     broadcast("log", { text: "one line of gateway chatter" });
     broadcast("tool", { phase: "start", name: "crow_search_memories" });
-    await sleep(500);
-    const rows = await s.json(`JSON.stringify(
+    const actRows = `JSON.stringify(
       Array.from(document.querySelectorAll('#perch-activity-list .activity-row'))
-        .map(function(n){return n.textContent;}))`);
+        .map(function(n){return n.textContent;}))`;
+    await until(async () => (await s.json(actRows)).length >= 2, 15000);
+    const rows = await s.json(actRows);
     assert.equal(rows.length, 2, "one row per frame, whatever the visit count: " + JSON.stringify(rows));
     assert.ok(rows[0].includes("one line of gateway chatter"));
     assert.ok(rows[1].includes("[tool: crow_search_memories]"));
