@@ -7,28 +7,33 @@
  * `sources_hash`, `live_rev`, `live_seal`, `live_nonce`, `sender_account_id` and the rest. Nothing
  * secret is stored here: a credential is named by its keychain row, never by the secret.
  *
- * `saveRecipe` is the only writer of a recipe. It hashes the recipe first (a refused recipe writes
- * nothing at all), then in ONE transaction reads the head revision, moves the head under a compare-and-
- * set on the revision it read, and inserts the revision row. A revision row is never updated, so a
- * reader can always see what was saved at rev N; the head columns are the fast path.
+ * `saveRecipe` is the only writer of a recipe. It validates and hashes the recipe first (a refused
+ * recipe writes nothing at all), then in ONE transaction reads the head revision, moves the head under a
+ * compare-and-set on the revision it read, and inserts the revision row. A revision row is never
+ * updated, so a reader can always see what was saved at rev N; the head columns are the fast path.
  *
  * Times are epoch ms from an injected clock (`now`), so a test's fake clock moves them. Which function
  * answers a missing report how:
  *   - `getReport`, `getRevision`, `getState` return null (a caller that lists or reads handles absence).
  *   - `saveRecipe`, `setState`, `updateReportColumns`, `recordAudit` throw `Error` with
  *     `code: "not_found"` (a caller that writes must not silently write nowhere).
- * Every refusal is an Error with a `code` string: `bad_input`, `bad_author_kind`, `bad_recipe` (from
- * the recipe hash), `not_found` or `conflict`.
+ * Every refusal is an Error with a `code` string: `bad_input`, `bad_author_kind`, `bad_recipe` (an
+ * unknown block type, a missing or repeated block id, a block's own settings, or the recipe hash),
+ * `not_found` or `conflict`.
  *
  * The stores never set a status word a report cannot be in: `status` and the delivery, tier and
  * visibility words are validated by the caller that owns them (the approvals module and the routes).
  * What this module validates is the shape it writes: ids, titles, author kinds and column names.
  */
 import { randomBytes } from "node:crypto";
+import { BLOCKS, blockRegistry, validateRecipe } from "./blocks/index.js";
 import { canonicalJson, recipeHash, sourcesHash } from "./recipe-hash.js";
 
 /** The two writers of a recipe revision: the owner, or a bot acting in the report's project. */
 export const REPORT_AUTHOR_KINDS = Object.freeze(["owner", "bot"]);
+
+/** How many blocks one recipe may hold: a recipe is a page of settings, not a database. */
+export const MAX_RECIPE_BLOCKS = 60;
 
 /** The decision words `report_approvals_audit` may hold. */
 export const APPROVAL_DECISIONS = Object.freeze(["approved", "refused", "revoked"]);
@@ -145,11 +150,20 @@ export async function listReports(db, { projectId } = {}) {
 }
 
 /**
- * Save a recipe: hash it, then move the report's head and insert its revision in ONE transaction.
+ * Save a recipe: validate it, hash it, then move the report's head and insert its revision in ONE
+ * transaction.
+ *
+ * The block registry the recipe is VALIDATED against is always the server's own (`blocks/index.js`'s
+ * `BLOCKS`): a caller's `registry` never decides what a save accepts, so a caller that declares its own
+ * types or skips the real settings checks cannot write a recipe the server could not run. `registry`
+ * only affects what `sourcesHash` counts as source-bearing. A recipe the registry refuses - an unknown
+ * block type, a missing or repeated id, a block's own settings - is `bad_recipe` with the first error
+ * path as its detail, and nothing is written. A recipe above `MAX_RECIPE_BLOCKS` is `bad_recipe` with
+ * the detail `too_many_blocks`.
  *
  * The head move is the compare-and-set (`recipe_rev` equal to the revision that was read), so two
  * concurrent saves cannot both claim rev N + 1; the loser gets `code: "conflict"` and nothing is
- * written. Revision 0 has no row — a report nobody has saved yet is at 0 — so the first save is rev 1.
+ * written. Revision 0 has no row - a report nobody has saved yet is at 0 - so the first save is rev 1.
  *
  * @param {object} db
  * @param {{reportId: string, recipe: object, authorKind: "owner"|"bot",
@@ -157,11 +171,15 @@ export async function listReports(db, { projectId } = {}) {
  * @returns {Promise<{rev: number, hash: string, sourcesHash: string}>}
  * @throws {Error} `bad_input`, `bad_author_kind`, `bad_recipe`, `not_found`, `conflict`
  */
-export async function saveRecipe(db, { reportId, recipe, authorKind, registry = null, now } = {}) {
+export async function saveRecipe(db, { reportId, recipe, authorKind, registry = blockRegistry, now } = {}) {
   idOf(reportId);
   if (!REPORT_AUTHOR_KINDS.includes(authorKind)) throw fail("bad_author_kind", "authorKind");
   // Before the transaction: a refused recipe leaves the row and the revision table exactly as they
-  // were, with no transaction ever opened.
+  // were, with no transaction ever opened. The REAL registry is the one that validates, whatever a
+  // caller passed: `registry` only narrows the sources hash below.
+  const errors = validateRecipe(recipe, BLOCKS);
+  if (errors.length) throw fail("bad_recipe", errors[0]);
+  if (recipe.blocks.length > MAX_RECIPE_BLOCKS) throw fail("bad_recipe", "too_many_blocks");
   const hash = recipeHash(recipe);
   const srcHash = sourcesHash(recipe, registry);
   const recipeJson = canonicalJson(recipe);

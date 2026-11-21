@@ -54,8 +54,8 @@ const SEED = Buffer.alloc(32, 19);
 const T0 = 1_700_000_000_000;
 const PROJECT = 7;
 const SENDER = "ma-0011223344556677";
-const REGISTRY = { columns: { sourceBearing: false } };
-const RECIPE = { blocks: [{ id: "b1", type: "columns", settings: { columns: ["subject"] } }] };
+const REGISTRY = { filter: { sourceBearing: false } };
+const RECIPE = { blocks: [{ id: "b1", type: "filter", settings: { field: "title", op: "exists" } }] };
 const RUN_ID = "rrn-00000000000000a1";
 
 const hashToken = (t) => createHash("sha256").update(t).digest("hex");

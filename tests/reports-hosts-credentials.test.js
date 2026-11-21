@@ -564,6 +564,50 @@ test("a tampered binding and a revoked host both stop the secret", async () => {
   assert.deepEqual(await injectRulesFor(db, deps(), { reportId }), []);
 });
 
+test("a revoke does not disconnect a keychain row that is another bundle's connection", async () => {
+  const db = await freshDb();
+  const reportId = await makeReport(db);
+  await approvedHost(db, reportId);
+  await credentialWithSecret(db, reportId);
+  await tapApprove(db, reportId);
+
+  // Two rows that are NOT this bundle's report credential: one belongs to another bundle, and one is
+  // this bundle's id under another env key. A direct UPDATE of the binding row points at the first.
+  const OTHER_BUNDLE = "someone-elses-addon";
+  await saveServiceSecret(db, key, {
+    connectionUuid: UUID_B,
+    bundleId: OTHER_BUNDLE,
+    envKey: "REPORT_CREDENTIAL",
+    label: "another bundle's row",
+    secret: "another-secret-value",
+  });
+  await saveServiceSecret(db, key, {
+    connectionUuid: UUID_B,
+    bundleId: REPORTS_BUNDLE,
+    envKey: "SOME_OTHER_KEY",
+    label: "another env key",
+    secret: "a-third-secret-value",
+  });
+  await db.execute({
+    sql: "UPDATE report_credentials SET connection_uuid = ? WHERE report_id = ? AND host = ?",
+    args: [UUID_B, reportId, "example.com"],
+  });
+
+  // The normal owner revoke route (no `skipDisconnect`) revokes the binding and leaves both of those
+  // rows serving: only a `crow-reports` `REPORT_CREDENTIAL` row is this bundle's to disconnect.
+  const revoked = await revokeCredential(db, deps(), { reportId, host: "example.com", actor: OWNER });
+  assert.equal(revoked.state, "revoked");
+  const { rows } = await db.execute({
+    sql: `SELECT env_key, status FROM crow_keychain
+           WHERE connection_uuid = ? ORDER BY env_key`,
+    args: [UUID_B],
+  });
+  assert.deepEqual(rows.map((row) => [row.env_key, row.status]), [
+    ["REPORT_CREDENTIAL", "active"],
+    ["SOME_OTHER_KEY", "active"],
+  ], "another bundle's connection is not disconnected by a reports revoke");
+});
+
 test("a missing keychain key answers nothing rather than throwing", async () => {
   const db = await freshDb();
   const reportId = await makeReport(db);

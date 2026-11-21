@@ -320,6 +320,42 @@ test("a mixed DNS answer (one allowed address, one blocked) is refused whole", a
   assert.equal(count, before, "nothing connected");
 });
 
+test("a caller's onHop narrows the redirect chain, and nothing is sent to a refused hop", async () => {
+  // A same-origin hop the predicate allows: the chain runs as it does without it.
+  const allowed = [];
+  const res = await guardedRequest(`http://ok.test:${port}/redir-ok`, {
+    lookup: okLookup(),
+    isAllowedAddress: allowAll,
+    onHop: (hop) => { allowed.push(hop.href); return true; },
+  });
+  assert.equal(res.http_status, 200);
+  assert.deepEqual(allowed, [`http://ok.test:${port}/ok`], "the predicate saw the target, once");
+
+  // The same hop refused: EREDIRECT_REFUSED, and the target was never requested.
+  const before = count;
+  let asked = null;
+  await assert.rejects(
+    guardedRequest(`http://ok.test:${port}/redir-ok`, {
+      lookup: okLookup(),
+      isAllowedAddress: allowAll,
+      onHop: (hop) => { asked = hop.pathname; return false; },
+    }),
+    (err) => {
+      assert.equal(err.code, "EREDIRECT_REFUSED");
+      return true;
+    },
+  );
+  assert.equal(asked, "/ok", "the predicate was asked about the redirect target");
+  assert.equal(count - before, 1, "only the first hop was requested");
+
+  // A request with no redirect never consults it.
+  let consulted = 0;
+  await guardedRequest(`http://ok.test:${port}/ok`, {
+    lookup: okLookup(), isAllowedAddress: allowAll, onHop: () => { consulted += 1; return false; },
+  });
+  assert.equal(consulted, 0, "the first hop is the caller's own URL, not a redirect");
+});
+
 test("an HTTP proxy from the environment is never used", async () => {
   // A proxy that would see the request if the guard honoured HTTP_PROXY / NODE_USE_ENV_PROXY
   // (read at process start, so the request runs in a child with that env).

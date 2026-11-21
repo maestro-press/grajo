@@ -50,14 +50,14 @@ const CRON = "0 7 * * 1"; // Mondays at 07:00 UTC
 const NOW = Date.parse("2026-10-26T15:00:00.000Z"); // a Monday
 
 const REGISTRY = Object.freeze({
-  mail_list: { sourceBearing: true },
-  columns: { sourceBearing: false },
+  http_json: { sourceBearing: true },
+  filter: { sourceBearing: false },
 });
 
 const RECIPE = {
   blocks: [
-    { id: "b1", type: "mail_list", settings: { account: SENDER, sinceDays: 7 } },
-    { id: "b2", type: "columns", settings: { columns: ["subject"] } },
+    { id: "b1", type: "http_json", settings: { url: "https://api.example.com/items?page=1" } },
+    { id: "b2", type: "filter", settings: { field: "title", op: "exists" } },
   ],
 };
 

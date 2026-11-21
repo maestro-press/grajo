@@ -13,6 +13,12 @@
  *   b. the cap: a run that is not the schedule counts ONE `extra_step_runs` for the report's day, taken
  *      with one conditional increment (`claimExtraStepRun`), and a claim that finds the cap used up is
  *      `cap_reached`. A manual run and a bot-requested preview both count; the scheduled run does not.
+ *      The claim is taken HERE, after (a), because a step that is still waiting never runs and so spends
+ *      nothing. A run executor (`blocks/run-recipe.js`) hands its own claim for the whole run as
+ *      `claimExtraStep` together with its `CLAIMED_BY_EXECUTOR` token (claim-token.js) as `claimToken`:
+ *      the pair means this run already has a claim to spend (it also goes to a credentialed `http_json`
+ *      block), so it is used instead of a second one. Either half alone is not that pair, `true`
+ *      included, and a caller that hands neither takes its own claim.
  *   c. the files and the hosts the approval covers are re-checked NOW: an asset swapped under it is
  *      `asset_changed`, a host whose seal no longer verifies is `host_unverified`. A step never runs
  *      with an asset or a host the owner did not approve.
@@ -36,6 +42,7 @@ import { tmpdir as osTmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 import { dayInTz, getCaps, claimExtraStepRun } from "./caps.js";
+import { CLAIMED_BY_EXECUTOR } from "./claim-token.js";
 import {
   STEP_MAX_BUNDLE_BYTES,
   STEP_KEY_RE,
@@ -168,6 +175,20 @@ async function notifyNoWallOnce(db, deps, reportId, day, now) {
 }
 
 /**
+ * The run executor's own claim, when it handed one: its token AND its function, or null. The token is
+ * the value only the executor mints, and the function is what makes the run's total one however many
+ * counting blocks it has; either half alone is worth nothing.
+ *
+ * @param {*} claimToken the `claimToken` argument
+ * @param {*} claimExtraStep the `claimExtraStep` argument
+ * @returns {null|(() => Promise<boolean>)} the run's claim, or null for a caller that takes its own
+ */
+function executorClaimOf(claimToken, claimExtraStep) {
+  if (claimToken !== CLAIMED_BY_EXECUTOR) return null;
+  return typeof claimExtraStep === "function" ? claimExtraStep : null;
+}
+
+/**
  * Run one approved custom step of one report.
  *
  * @param {object} db
@@ -175,10 +196,14 @@ async function notifyNoWallOnce(db, deps, reportId, day, now) {
  *   `now`, `crowHome`, `getSecrets`, plus everything the approvals and the runner take (`loadSeed`,
  *   `secrets`, `extraSecrets`, `nodeBin`, `prlimit`, ...). `relayOptions` and `testSeams` are NOT
  *   forwarded to the runner: they belong to a test harness that calls `runCustomStep` directly.
- * @param {{report: object, stepKey: string, input?: any, params?: any, trigger?: string}} run
+ * @param {{report: object, stepKey: string, input?: any, params?: any, trigger?: string,
+ *   claimToken?: symbol|object, claimExtraStep?: function}} run `claimToken` counts only as
+ *   `CLAIMED_BY_EXECUTOR`, and only together with `claimExtraStep`
  * @returns {Promise<{ok: true, output: object}|{ok: false, code: string, error: string}>}
  */
-export async function runCustomStepForReport(db, deps = {}, { report, stepKey, input, params, trigger } = {}) {
+export async function runCustomStepForReport(db, deps = {}, {
+  report, stepKey, input, params, trigger, claimToken, claimExtraStep,
+} = {}) {
   const seam = deps && typeof deps === "object" ? deps : {};
   const reportId = report && typeof report.id === "string" ? report.id : null;
   const redact = (value) => redactSecrets(String(value == null ? "" : value), secretsOf(seam));
@@ -200,16 +225,25 @@ export async function runCustomStepForReport(db, deps = {}, { report, stepKey, i
     }
     const step = runnable.step;
 
-    // (b) One extra step run for anything that is not the schedule.
+    // (b) One extra step run for anything that is not the schedule, taken HERE so a step that is still
+    // waiting spends nothing. A run executor's own claim is used when it handed the token and the claim
+    // together; anything else takes its own.
     const day = dayOf(seam, now);
     if (trigger !== "schedule") {
-      const caps = await getCaps(db);
-      const claimed = await claimExtraStepRun(db, {
-        reportId,
-        day,
-        max: caps.maxExtraStepRunsPerReportDay,
-      });
-      if (!claimed) return { ok: false, code: "cap_reached", error: "cap_reached" };
+      const executorClaim = executorClaimOf(claimToken, claimExtraStep);
+      if (executorClaim) {
+        // The run's one claim: false when this run already spent it, and `cap_reached` when it is
+        // refused, which the block reports as the run's cap error.
+        await executorClaim();
+      } else {
+        const caps = await getCaps(db);
+        const claimed = await claimExtraStepRun(db, {
+          reportId,
+          day,
+          max: caps.maxExtraStepRunsPerReportDay,
+        });
+        if (!claimed) return { ok: false, code: "cap_reached", error: "cap_reached" };
+      }
     }
 
     // (c) The assets and the hosts the approval covers, checked again now.

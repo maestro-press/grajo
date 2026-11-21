@@ -60,7 +60,7 @@ import { recordAudit } from "./store.js";
 import { lineDiff } from "../../shared/line-diff.js";
 import { resolveCrowHome } from "../../shared/crow-home.js";
 import { loadKeychainKey } from "../keychain/key.js";
-import { disconnectServiceSecrets, serviceSecretsFor } from "../keychain/store.js";
+import { REPORTS_BUNDLE, disconnectServiceSecrets, ensureKeychainTable, serviceSecretsFor } from "../keychain/store.js";
 
 const fail = approvalInternals.fail;
 const text = approvalInternals.text;
@@ -1737,17 +1737,24 @@ export async function approveCredential(db, deps, {
 }
 
 /**
- * Revoke one credential binding: the state in one word, both the seal and its nonce NULLED, and the
- * keychain row it named marked as no longer served (the keychain's own disconnect helper), so a revoked
- * binding leaves nothing a reader could still open. A keychain failure never undoes the revocation.
+ * Revoke one credential binding: the state in one word, both the seal and its nonce NULLED, and, unless
+ * `skipDisconnect` is set, the keychain row it named marked as no longer served (the keychain's own
+ * disconnect helper), so a revoked binding leaves nothing a reader could still open. Only a keychain row
+ * that really is this bundle's `REPORT_CREDENTIAL` row is marked (`disconnectKeychainRow`), so a binding
+ * a direct UPDATE pointed at another bundle's connection leaves that connection alone. A keychain
+ * failure never undoes the revocation.
+ *
+ * `skipDisconnect` (default false) is for a caller that knows the named keychain row is not this report's
+ * to touch, which is the delete path's `not_a_reports_credential` case: the binding is revoked and the
+ * connection somebody else owns is left exactly as it is.
  *
  * @param {object} db
  * @param {object} deps
- * @param {{reportId: string, host: string, actor: {kind: "owner"}}} input
+ * @param {{reportId: string, host: string, actor: {kind: "owner"}, skipDisconnect?: boolean}} input
  * @returns {Promise<object>} the credential row as a page reads it
  * @throws {Error} `owner_only`, `bad_input`, `not_found`, `credential_changed`
  */
-export async function revokeCredential(db, deps, { reportId, host, actor } = {}) {
+export async function revokeCredential(db, deps, { reportId, host, actor, skipDisconnect = false } = {}) {
   approvalInternals.requireOwner(actor);
   const d = resolveDeps(deps);
   await approvalInternals.requireReport(db, reportId);
@@ -1762,7 +1769,7 @@ export async function revokeCredential(db, deps, { reportId, host, actor } = {})
     args: [reportId, value, row.state],
   });
   if (Number(written?.rowsAffected ?? 0) !== 1) throw fail("credential_changed");
-  await disconnectKeychainRow(db, text(row.connection_uuid));
+  if (skipDisconnect !== true) await disconnectKeychainRow(db, text(row.connection_uuid));
   await recordAudit(db, {
     reportId,
     kind: "credential",
@@ -1774,9 +1781,32 @@ export async function revokeCredential(db, deps, { reportId, host, actor } = {})
   return credentialView(await credentialRow(db, reportId, value), false);
 }
 
-/** Retire a credential's keychain row from serving, never failing the caller over it. */
+/**
+ * Retire a credential's keychain row from serving, never failing the caller over it.
+ *
+ * ONLY this bundle's own report-credential row is disconnected: the keychain row must be a `service` row
+ * whose bundle id is `crow-reports` and whose env key is `REPORT_CREDENTIAL`. That check lives HERE so
+ * every caller gets it (the owner's revoke route, the report delete path, and whatever comes later): a
+ * row a direct UPDATE pointed at another bundle's connection is somebody else's secret, and marking it
+ * disconnected would take that bundle's credential away on a reports decision. The read is metadata
+ * only and never opens a value.
+ */
 async function disconnectKeychainRow(db, connectionUuid) {
   if (typeof connectionUuid !== "string" || !connectionUuid) return;
+  let ours = false;
+  try {
+    await ensureKeychainTable(db);
+    const { rows } = await db.execute({
+      sql: `SELECT 1 AS ours FROM crow_keychain
+             WHERE kind = 'service' AND connection_uuid = ? AND bundle_id = ? AND env_key = ?`,
+      args: [connectionUuid, REPORTS_BUNDLE, REPORT_CREDENTIAL_ENV_KEY],
+    });
+    ours = rows.length > 0;
+  } catch {
+    // A keychain that cannot be read is not a row this revoke may mark: leave it alone.
+    return;
+  }
+  if (!ours) return;
   try {
     await disconnectServiceSecrets(db, connectionUuid);
   } catch {

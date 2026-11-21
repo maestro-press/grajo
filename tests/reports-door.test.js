@@ -42,14 +42,13 @@ const SEED = Buffer.alloc(32, 7);
 const T0 = 1_700_000_000_000;
 const SECRET = "hunter2-not-a-real-password";
 
-/** A block registry stub: this PR ships no blocks, only the two kinds the recipes name. */
+/** A block registry stub: the two types the recipes here name, with the server's own source flag. */
 const REGISTRY = Object.freeze({
-  columns: { sourceBearing: false },
-  mail_list: { sourceBearing: true },
+  filter: { sourceBearing: false },
 });
 
 const RECIPE = {
-  blocks: [{ id: "b1", type: "columns", settings: { columns: ["subject"] } }],
+  blocks: [{ id: "b1", type: "filter", settings: { field: "title", op: "exists" } }],
 };
 
 const dirs = [];

@@ -22,9 +22,10 @@ const REPO = new URL("..", import.meta.url).pathname;
 const MASTER = join(root, "master", "crow.db");
 
 const { createDbClient } = await import("../servers/db.js");
+const { deleteReport } = await import("../servers/gateway/reports/delete.js");
 const {
-  DELIVERY_NOT_WIRED_TEXT, NOT_LIVE_TEXT, RESTARTED_TEXT, executeRun, getRun, getRunForApproval,
-  listRuns, startRun, statusAuditOk,
+  DELIVERY_NOT_WIRED_TEXT, NOT_LIVE_TEXT, REPORT_GONE_TEXT, RESTARTED_TEXT, executeRun, getRun,
+  getRunForApproval, listRuns, startRun, statusAuditOk,
 } = await import("../servers/gateway/reports/run.js");
 const {
   claimRunRequests, pruneRunRequests, requestRun,
@@ -45,24 +46,22 @@ const T0 = 1_700_000_000_000;
 
 /** The block registry a later PR ships; here it is a stub that marks the two free block types. */
 const REGISTRY = Object.freeze({
-  mail_list: { sourceBearing: true },
-  custom_step: { sourceBearing: true },
-  columns: { sourceBearing: false },
-  sort: { sourceBearing: false },
+  http_json: { sourceBearing: true },
+  filter: { sourceBearing: false },
 });
 
 const SOURCE_RECIPE = {
   blocks: [
-    { id: "b1", type: "mail_list", settings: { account: SENDER, sinceDays: 7 } },
-    { id: "b2", type: "columns", settings: { columns: ["subject", "date"] } },
+    { id: "b1", type: "http_json", settings: { url: "https://api.example.com/items?page=1" } },
+    { id: "b2", type: "filter", settings: { field: "title", op: "exists" } },
   ],
 };
 
 /** A newer head revision whose source block reads something else: a live report must not run this. */
 const NEWER_HEAD_RECIPE = {
   blocks: [
-    { id: "b1", type: "mail_list", settings: { account: SENDER, sinceDays: 30 } },
-    { id: "b2", type: "columns", settings: { columns: ["subject"] } },
+    { id: "b1", type: "http_json", settings: { url: "https://api.example.com/items?page=2" } },
+    { id: "b2", type: "filter", settings: { field: "title", op: "exists" } },
   ],
 };
 
@@ -438,18 +437,87 @@ test("a scheduled run of a draft report is failed and runs no blocks", async () 
     "a refused run never calls deliver: it has no verified live set, and the hook sends the notice");
 });
 
-test("a run whose report row is gone is failed and never calls deliver", async () => {
+test("a run whose report row is gone is not claimed, and nothing runs or goes out", async () => {
   const { db, report, deps } = await liveReport();
   const runId = await queueRun(db, report.id);
+  // A report removed under a still-queued run (a direct SQL delete): the claim changes no row, so no
+  // block reads a source and no delivery seam is reached, and the run is finished failed.
   await db.execute({ sql: "DELETE FROM reports WHERE id = ?", args: [report.id] });
+  let blocks = 0;
   let deliverCalls = 0;
   const out = await executeRun(db, runDeps({
     approvals: deps,
+    runBlocks: async () => { blocks += 1; return { items: [{}] }; },
     deliver: async () => { deliverCalls += 1; },
   }), runId);
-  assert.equal(out.status, "failed");
-  assert.match((await getRun(db, runId)).errorText, /no longer exists/);
+  assert.equal(blocks, 0, "no block ran for a report that is gone");
   assert.equal(deliverCalls, 0, "there is no report and no live set, so nothing goes out");
+  assert.deepEqual(out, { status: "failed", artifactVersion: null });
+  const row = await getRun(db, runId);
+  assert.equal(row.status, "failed", "the queued run is not left for an executor that cannot run it");
+  assert.equal(row.startedAt, null, "nothing claimed it");
+  assert.equal(row.errorText, REPORT_GONE_TEXT);
+  assert.equal(row.endedAt, T0, "it has an end stamped from the caller's clock");
+});
+
+test("a run queued before its report was deleted does nothing when it executes", async () => {
+  const { db, report, deps } = await liveReport();
+  const runId = await queueRun(db, report.id);
+  await deleteReport(db, { now: () => T0, loadSeed: () => ({ seed: SEED }) }, {
+    reportId: report.id, actor: OWNER,
+  });
+  let blocks = 0;
+  let deliverCalls = 0;
+  const out = await executeRun(db, runDeps({
+    approvals: deps,
+    runBlocks: async () => { blocks += 1; return { items: [{}] }; },
+    deliver: async () => { deliverCalls += 1; },
+  }), runId);
+  assert.equal(blocks, 0, "the deleted report's recipe is not run");
+  assert.equal(deliverCalls, 0);
+  assert.deepEqual(out, { status: null, artifactVersion: null }, "the run row went with the report");
+});
+
+test("a report deleted while its run is working is not delivered", async () => {
+  const { db, report, deps } = await liveReport();
+  const runId = await queueRun(db, report.id);
+  let deliverCalls = 0;
+  const out = await executeRun(db, runDeps({
+    approvals: deps,
+    runBlocks: async () => {
+      // The report goes between the claim and the one outgoing step.
+      await db.execute({ sql: "DELETE FROM reports WHERE id = ?", args: [report.id] });
+      return { items: [{ subject: "a" }] };
+    },
+    deliver: async () => { deliverCalls += 1; },
+  }), runId);
+  assert.equal(deliverCalls, 0, "a report that is gone is never delivered");
+  assert.deepEqual(out, { status: "failed", artifactVersion: null });
+  const row = await getRun(db, runId);
+  assert.equal(row.status, "failed");
+  assert.equal(row.errorText, REPORT_GONE_TEXT);
+});
+
+test("a run someone else owns is left exactly as it is", async () => {
+  const { db, report, deps } = await liveReport();
+  const runId = await queueRun(db, report.id);
+  // The report row is still there, but the run is already `running` under another process: the guarded
+  // claim changes nothing, and this executor neither runs it nor rewrites its row.
+  await db.execute({
+    sql: "UPDATE report_runs SET status = 'running', gateway_run_id = 'another-process' WHERE id = ?",
+    args: [runId],
+  });
+  let blocks = 0;
+  const out = await executeRun(db, runDeps({
+    approvals: deps,
+    runBlocks: async () => { blocks += 1; return { items: [{}] }; },
+  }), runId);
+  assert.equal(blocks, 0);
+  assert.deepEqual(out, { status: "running", artifactVersion: null });
+  const row = await getRun(db, runId);
+  assert.equal(row.status, "running");
+  assert.equal(row.errorText, null, "the orphan rule only writes a run that is still queued");
+  assert.equal(row.gatewayRunId, "another-process");
 });
 
 test("a scheduled run of a paused report whose seal no longer verifies is failed and runs no blocks", async () => {

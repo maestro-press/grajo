@@ -68,6 +68,12 @@ function sample(kind, overrides = {}) {
       diffHash: "d".repeat(64),
       nonce,
     },
+    source: {
+      reportId: "rpt-0011223344556677",
+      blockId: "feed",
+      settingsHash: "f".repeat(64),
+      nonce,
+    },
   }[kind];
   assert.ok(base, `no sample for kind ${kind}`);
   return { ...base, ...overrides };
@@ -81,7 +87,7 @@ function changed(value) {
 
 test("the domain, the kinds and each kind's field order are fixed", () => {
   assert.equal(APPROVAL_SEAL_DOMAIN, "crow-reports-approval-v1");
-  assert.deepEqual([...APPROVAL_KINDS], ["live", "recipient", "step", "host", "credential", "proposal"]);
+  assert.deepEqual([...APPROVAL_KINDS], ["live", "recipient", "step", "host", "credential", "proposal", "source"]);
   assert.ok(Object.isFrozen(APPROVAL_KINDS));
   assert.deepEqual([...SEAL_FIELDS.live], [
     "reportId", "rev", "recipeHash", "sourcesHash", "cron", "tz", "senderAccountId",
@@ -98,6 +104,7 @@ test("the domain, the kinds and each kind's field order are fixed", () => {
     ["reportId", "credentialRef", "host", "injectHash", "nonce"]);
   assert.deepEqual([...SEAL_FIELDS.proposal],
     ["reportId", "proposalId", "baseRev", "diffHash", "nonce"]);
+  assert.deepEqual([...SEAL_FIELDS.source], ["reportId", "blockId", "settingsHash", "nonce"]);
   for (const kind of APPROVAL_KINDS) {
     assert.equal(SEAL_FIELDS[kind].at(-1), "nonce", `${kind} binds its nonce last`);
   }
@@ -302,6 +309,20 @@ test("no reports module imports a mail module: the seal and the store stand alon
   // The one file that may reach mail is the sender reader the routes inject.
   const ready = readFileSync(new URL("sender-ready.js", dir), "utf8");
   assert.match(ready, /from "\.\.\/mail\//, "sender-ready.js is where the mail read lives");
+});
+
+test("the source kind is sealed here, and source-approvals.js seals through this module", () => {
+  const src = readFileSync(
+    new URL("../servers/gateway/reports/source-approvals.js", import.meta.url), "utf8",
+  );
+  assert.match(src,
+    /import \{ approvalSeal, newApprovalNonce, verifyApprovalSeal \} from "\.\/seal\.js"/,
+    "the source approval uses the shared encoder");
+  assert.equal(src.includes("createHmac"), false, "and keeps no second encoder of its own");
+  const fields = sample("source");
+  const seal = approvalSeal("source", fields, SEED);
+  assert.equal(verifyApprovalSeal("source", fields, seal, SEED), true);
+  assert.equal(verifyApprovalSeal("source", { ...fields, blockId: "feed2" }, seal, SEED), false);
 });
 
 test("a fresh nonce is a fresh seal, and an old seal never verifies for the new one", () => {

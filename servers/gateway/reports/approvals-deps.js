@@ -14,6 +14,8 @@
  *   - `senderReady`: reports/sender-ready.js, the Crow Mail account read.
  *   - `getRun`: reports/run.js's `getRunForApproval`, the run table's reader.
  *   - `resolveModelRef`: approvals.js's own `defaultResolveModelRef`, the bot's model chain.
+ * `registry` is the base too, and it is `blocks/index.js`'s `blockRegistry`: the block registry the
+ * server's own save, seal and verification paths all read. A caller that passes its own still wins.
  * Anything a caller passes in `overrides` wins (`loadSeed`, `now`, `getSchedule`, `registry`,
  * `getSecrets`, and any of the three above), so a test still drives exactly the seams it means to.
  *
@@ -21,6 +23,7 @@
  * undefined}` is a caller saying nothing, not a caller switching the seam off.
  */
 import { defaultResolveModelRef } from "./approvals.js";
+import { blockRegistry } from "./blocks/index.js";
 import { getRunForApproval } from "./run.js";
 import { senderReady } from "./sender-ready.js";
 
@@ -36,11 +39,13 @@ export function buildApprovalsDeps(overrides = {}) {
     senderReady,
     getRun: getRunForApproval,
     resolveModelRef: defaultResolveModelRef,
+    registry: blockRegistry,
     ...given,
   };
   if (typeof deps.senderReady !== "function") deps.senderReady = senderReady;
   if (typeof deps.getRun !== "function") deps.getRun = getRunForApproval;
   if (typeof deps.resolveModelRef !== "function") deps.resolveModelRef = defaultResolveModelRef;
+  if (deps.registry == null) deps.registry = blockRegistry;
   return deps;
 }
 

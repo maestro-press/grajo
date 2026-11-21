@@ -9,9 +9,9 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 
 const root = mkdtempSync(join(tmpdir(), "reports-custom-step-"));
 process.env.CROW_DATA_DIR = join(root, "master");
@@ -27,6 +27,7 @@ const { createDbClient } = await import("../servers/db.js");
 const { createReport } = await import("../servers/gateway/reports/store.js");
 const { approveStep, proposeStep, saveAsset } = await import("../servers/gateway/reports/steps.js");
 const { getUsage } = await import("../servers/gateway/reports/caps.js");
+const { CLAIMED_BY_EXECUTOR } = await import("../servers/gateway/reports/claim-token.js");
 const { runCustomStepForReport, writeBundleDir } = await import("../servers/gateway/reports/custom-step.js");
 const { runCustomStep } = await import("../scripts/report-steps/runner.mjs");
 
@@ -196,6 +197,61 @@ test("the 11th extra step run of the day is refused, and the first ten are not",
   assert.deepEqual(eleventh, { ok: false, code: "cap_reached", error: "cap_reached" });
   assert.equal(runs.length, 10, "the eleventh never reached the runner");
   assert.equal((await getUsage(db, reportId, DAY)).extraStepRuns, 10);
+});
+
+test("a bare token or a bare claim function does not skip the claim: only the executor's pair does", async () => {
+  const db = await freshDb();
+  const { reportId, runDeps } = await approvedFixture(db);
+  const run = (over = {}) => runCustomStepForReport(db, runDeps, {
+    report: { id: reportId }, stepKey: "fetch", trigger: "manual", ...over,
+  });
+
+  const publicFlag = await run({ claimToken: true, claimExtraStep: true });
+  assert.equal(publicFlag.ok, true, JSON.stringify(publicFlag));
+  assert.equal((await getUsage(db, reportId, DAY)).extraStepRuns, 1,
+    "a public boolean is not the executor's claim");
+
+  // The token WITHOUT the run's claim function is not the pair either: the step takes its own claim.
+  const tokenOnly = await run({ claimToken: CLAIMED_BY_EXECUTOR });
+  assert.equal(tokenOnly.ok, true, JSON.stringify(tokenOnly));
+  assert.equal((await getUsage(db, reportId, DAY)).extraStepRuns, 2, "the token alone skips nothing");
+
+  // A claim function WITHOUT the token is no pass either.
+  const functionOnly = await run({ claimExtraStep: async () => true });
+  assert.equal(functionOnly.ok, true, JSON.stringify(functionOnly));
+  assert.equal((await getUsage(db, reportId, DAY)).extraStepRuns, 3, "a function alone skips nothing");
+
+  // The executor's own pair is the one that claims on the run's behalf, and it is used instead of a
+  // second database claim.
+  let claimed = 0;
+  const paired = await run({
+    claimToken: CLAIMED_BY_EXECUTOR,
+    claimExtraStep: async () => { claimed += 1; return true; },
+  });
+  assert.equal(paired.ok, true, JSON.stringify(paired));
+  assert.equal(claimed, 1, "the step claimed through the executor's own function");
+  assert.equal((await getUsage(db, reportId, DAY)).extraStepRuns, 3, "and took no claim of its own");
+});
+
+test("the claim token module is imported by the reports internals only", () => {
+  const importers = [];
+  for (const entry of readdirSync(join(REPO, "servers"), { recursive: true })) {
+    const name = String(entry);
+    if (!name.endsWith(".js") && !name.endsWith(".mjs")) continue;
+    const file = join(REPO, "servers", name);
+    let source;
+    try {
+      if (!statSync(file).isFile()) continue;
+      source = readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    if (/from\s+["'][^"']*claim-token\.js["']/.test(source)) importers.push(name.split(sep).join("/"));
+  }
+  assert.deepEqual(importers.sort(), [
+    "gateway/reports/blocks/run-recipe.js",
+    "gateway/reports/custom-step.js",
+  ], "no caller outside the reports executor can hand a claim away");
 });
 
 test("a scheduled trigger does not count toward extra step runs", async () => {

@@ -33,7 +33,7 @@ const { createDbClient } = await import("../servers/db.js");
 const { csrfMiddleware } = await import("../servers/gateway/dashboard/shared/csrf.js");
 const { reportsApiRouter, REPORTS_API_PREFIX, OWNER_LABEL } = await import("../servers/gateway/routes/reports-api.js");
 const { SETTINGS_CHANGED_PAUSE_REASON } = await import("../servers/gateway/reports/approvals.js");
-const { createReport, getReport, saveRecipe, updateReportColumns } = await import("../servers/gateway/reports/store.js");
+const { createReport, getReport, getState, saveRecipe, updateReportColumns } = await import("../servers/gateway/reports/store.js");
 const { createAccount } = await import("../servers/gateway/mail/store/accounts.js");
 const { createMailCredentials } = await import("../servers/gateway/mail/credentials.js");
 
@@ -42,17 +42,17 @@ const SSO = "peer-sso-session";
 const SEED = Buffer.alloc(32, 5);
 const PROJECT = 7;
 const SENDER = "ma-0011223344556677";
-const REGISTRY = { mail_list: { sourceBearing: true }, columns: { sourceBearing: false } };
+const REGISTRY = { http_json: { sourceBearing: true }, filter: { sourceBearing: false } };
 const RECIPE = {
   blocks: [
-    { id: "b1", type: "mail_list", settings: { account: SENDER, sinceDays: 7 } },
-    { id: "b2", type: "columns", settings: { columns: ["subject"] } },
+    { id: "b1", type: "http_json", settings: { url: "https://api.example.com/items?page=1" } },
+    { id: "b2", type: "filter", settings: { field: "title", op: "exists" } },
   ],
 };
 const FREE_EDIT = {
   blocks: [
-    { id: "b1", type: "mail_list", settings: { account: SENDER, sinceDays: 7 } },
-    { id: "b2", type: "columns", settings: { columns: ["date"] } },
+    { id: "b1", type: "http_json", settings: { url: "https://api.example.com/items?page=1" } },
+    { id: "b2", type: "filter", settings: { field: "title", op: "contains", value: "listing" } },
   ],
 };
 
@@ -662,4 +662,123 @@ test("a body over 256kb is refused as too large", async () => {
   // no reports path, so a body it would have accepted can still be too large for this router.
   assert.equal(world.hasOwnParser(REPORTS_API_PREFIX), false,
     "index.js's own-parser list does not name reports yet; the byte guard covers that case");
+});
+
+/* ----------------------------------------------------------------------- sources */
+
+test("the owner approves and revokes one draft source, and a non-owner cannot", async () => {
+  const world = await setup();
+  const recipe = {
+    blocks: [
+      { id: "feed", type: "http_json", settings: { url: "https://api.example.com/items?page=1" } },
+      { id: "keep", type: "filter", settings: { field: "title", op: "exists" } },
+    ],
+  };
+  const { id } = await createReport(world.db, { projectId: PROJECT, owner: OWNER_LABEL, title: "Listings" });
+  await saveRecipe(world.db, { reportId: id, recipe, authorKind: "owner" });
+  const sources = `${REPORTS_API_PREFIX}/${id}/sources`;
+  const listed = await get(sources);
+  assert.equal(listed.status, 200, listed.text);
+  assert.equal(listed.headers["cache-control"], "no-store");
+  const [view] = listed.json.sources;
+  assert.deepEqual(
+    { blockId: view.blockId, type: view.type, approved: view.approved },
+    { blockId: "feed", type: "http_json", approved: false },
+  );
+  assert.match(view.settingsHash, /^[0-9a-f]{64}$/);
+  assert.equal(listed.text.includes("seal"), false, "the view carries no seal");
+  assert.equal(listed.text.includes("nonce"), false, "and no nonce");
+
+  for (const opts of [{ token: SSO }, { token: OWNER, laptop: false }]) {
+    for (const action of ["approve", "revoke"]) {
+      const r = await call("POST", `${sources}/feed/${action}`, {
+        body: { settingsHash: view.settingsHash }, ...opts,
+      });
+      assert.equal(r.status, 403, `${action}: ${r.status} ${r.text}`);
+      assert.deepEqual(r.json, { error: "owner_only", message: "Only the owner can see this." });
+      assert.equal(r.text.includes(id), false, `${action}: no id in the answer`);
+    }
+  }
+  assert.equal(await getState(world.db, id, "source_approval:feed"), null, "a refused tap wrote nothing");
+
+  // A tap with a hash the head no longer has, and one with no hash, seal nothing.
+  for (const body of [{ settingsHash: "a".repeat(64) }, {}]) {
+    const stale = await post(`${sources}/feed/approve`, body);
+    assert.equal(stale.status, 409, stale.text);
+    assert.deepEqual(stale.json, {
+      error: "source_changed",
+      message: "That report changed while this request was in flight. Try again.",
+    });
+  }
+  assert.equal(await getState(world.db, id, "source_approval:feed"), null, "a stale tap seals nothing");
+
+  const approved = await post(`${sources}/feed/approve`, { settingsHash: view.settingsHash });
+  assert.equal(approved.status, 200, approved.text);
+  assert.deepEqual(approved.json, { ok: true }, "the answer is only ok");
+  const row = await getState(world.db, id, "source_approval:feed");
+  assert.match(row.seal, /^[0-9a-f]{64}$/);
+  assert.match(row.nonce, /^[0-9a-f]{32}$/);
+  assert.equal(approved.text.includes(row.seal), false, "the seal stays in the module");
+  assert.equal((await get(sources)).json.sources[0].approved, true, "the view says it is approved now");
+
+  const revoked = await post(`${sources}/feed/revoke`, {});
+  assert.equal(revoked.status, 200, revoked.text);
+  assert.deepEqual(revoked.json, { ok: true });
+  assert.equal(await getState(world.db, id, "source_approval:feed"), null, "the seal is nulled");
+
+  // A block id that names no block is a 404; a shape block approves nothing, so it is a 400.
+  const missing = await post(`${sources}/missing/approve`, { settingsHash: view.settingsHash });
+  assert.equal(missing.status, 404, missing.text);
+  assert.deepEqual(missing.json, { error: "not_found", message: "Not found." });
+  const shape = await post(`${sources}/keep/approve`, { settingsHash: view.settingsHash });
+  assert.equal(shape.status, 400, shape.text);
+  assert.deepEqual(shape.json, { error: "bad_input", message: "That request is not valid." });
+  // A block id that is not shaped like one never reaches the module.
+  const malformed = await post(`${sources}/Feed/approve`, { settingsHash: view.settingsHash });
+  assert.equal(malformed.status, 404, malformed.text);
+  // A well-formed report id that names no report is a 404 too.
+  const noReport = await post(`${REPORTS_API_PREFIX}/rpt-ffffffffffffffff/sources/feed/approve`, {});
+  assert.equal(noReport.status, 404, noReport.text);
+});
+
+/* -------------------------------------------------------------------------- delete */
+
+test("the owner deletes a report, and the delete is logged on the gateway's audit trail", async () => {
+  const world = await setup();
+  const report = await prepareReport(world.db);
+  const path = reportPath(report.id);
+
+  // The same rails as every other write: a peer, this machine without the owner's own session, and a
+  // request with no CSRF token never reach the module.
+  for (const opts of [{ token: SSO }, { token: OWNER, laptop: false }]) {
+    const r = await call("DELETE", path, opts);
+    assert.equal(r.status, 403, r.text);
+    assert.deepEqual(r.json, { error: "owner_only", message: "Only the owner can see this." });
+    assert.equal(r.text.includes(report.id), false, "no id in the answer");
+  }
+  const noCsrf = await call("DELETE", path, { csrf: null });
+  assert.equal(noCsrf.status, 403, noCsrf.text);
+  assert.match(noCsrf.text, /CSRF/i, "the dashboard rail answers, not this router");
+  assert.ok((await getReport(world.db, report.id)) !== null, "a refused delete removed nothing");
+
+  const deleted = await call("DELETE", path);
+  assert.equal(deleted.status, 200, deleted.text);
+  assert.deepEqual(deleted.json, { ok: true, artifactId: null }, "the artifact id, and nothing else");
+  assert.equal(deleted.headers["cache-control"], "no-store");
+  assert.equal(await getReport(world.db, report.id), null);
+
+  // The report's own audit rows are gone with it, so the delete is on the gateway's audit trail.
+  const { rows } = await world.db.execute({
+    sql: "SELECT details FROM audit_log WHERE event_type = 'report_deleted' ORDER BY id DESC LIMIT 1",
+    args: [],
+  });
+  assert.equal(rows.length, 1, "the delete is on the audit trail");
+  assert.equal(JSON.parse(rows[0].details).reportId, report.id);
+
+  // Idempotent: the same id again is not found, and a malformed id never reaches the module.
+  const again = await call("DELETE", path);
+  assert.equal(again.status, 404, again.text);
+  assert.deepEqual(again.json, { error: "not_found", message: "Not found." });
+  const malformed = await call("DELETE", `${REPORTS_API_PREFIX}/rpt-xyz`);
+  assert.equal(malformed.status, 404, malformed.text);
 });

@@ -45,32 +45,30 @@ const T0 = 1_700_000_000_000;
 
 /** The block registry a later PR ships; here it is a stub that marks the two free block types. */
 const REGISTRY = Object.freeze({
-  mail_list: { sourceBearing: true },
-  custom_step: { sourceBearing: true },
-  columns: { sourceBearing: false },
-  sort: { sourceBearing: false },
+  http_json: { sourceBearing: true },
+  filter: { sourceBearing: false },
 });
 
 const SOURCE_RECIPE = {
   blocks: [
-    { id: "b1", type: "mail_list", settings: { account: SENDER, sinceDays: 7 } },
-    { id: "b2", type: "columns", settings: { columns: ["subject", "date"] } },
+    { id: "b1", type: "http_json", settings: { url: "https://api.example.com/items?page=1" } },
+    { id: "b2", type: "filter", settings: { field: "title", op: "exists" } },
   ],
 };
 
 /** The same recipe with only the free block's settings changed. */
 const FREE_EDIT_RECIPE = {
   blocks: [
-    { id: "b1", type: "mail_list", settings: { account: SENDER, sinceDays: 7 } },
-    { id: "b2", type: "columns", settings: { columns: ["subject"] } },
+    { id: "b1", type: "http_json", settings: { url: "https://api.example.com/items?page=1" } },
+    { id: "b2", type: "filter", settings: { field: "title", op: "contains", value: "listing" } },
   ],
 };
 
 /** The same recipe with the source-bearing block's settings changed. */
 const SOURCE_EDIT_RECIPE = {
   blocks: [
-    { id: "b1", type: "mail_list", settings: { account: SENDER, sinceDays: 30 } },
-    { id: "b2", type: "columns", settings: { columns: ["subject", "date"] } },
+    { id: "b1", type: "http_json", settings: { url: "https://api.example.com/items?page=2" } },
+    { id: "b2", type: "filter", settings: { field: "title", op: "exists" } },
   ],
 };
 
@@ -723,7 +721,7 @@ test("a bot save cannot bring its own block registry, so a source change never l
   const { db, report, deps } = await liveReport();
   // A registry that calls every block free. If a bot's save honoured it, the new source would hash the
   // same as the old one and the save would land pending_free_change for a one-tap Apply.
-  const freeRegistry = { mail_list: { sourceBearing: false }, columns: { sourceBearing: false } };
+  const freeRegistry = { http_json: { sourceBearing: false }, filter: { sourceBearing: false } };
   const saved = await botSaveRecipe(db, deps, {
     reportId: report.id, recipe: SOURCE_EDIT_RECIPE, registry: freeRegistry,
   });

@@ -9,10 +9,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDbClient } from "../servers/db.js";
 import { REPORTS_DDL } from "../servers/shared/reports-schema.js";
+import { blockRegistry } from "../servers/gateway/reports/blocks/index.js";
 import { recipeHash, sourcesHash } from "../servers/gateway/reports/recipe-hash.js";
 import {
-  APPROVAL_DECISIONS, EMPTY_RECIPE_JSON, REPORT_AUTHOR_KINDS, createReport, getReport, getRevision,
-  getState, listReports, recordAudit, saveRecipe, setState, updateReportColumns,
+  APPROVAL_DECISIONS, EMPTY_RECIPE_JSON, MAX_RECIPE_BLOCKS, REPORT_AUTHOR_KINDS, createReport,
+  getReport, getRevision, getState, listReports, recordAudit, saveRecipe, setState,
+  updateReportColumns,
 } from "../servers/gateway/reports/store.js";
 import {
   CAP_DEFAULTS, CAP_KEYS, addUsage, capState, dayInTz, getCaps, getUsage,
@@ -54,9 +56,11 @@ function recipe(...blocks) {
   return { blocks };
 }
 
+// A recipe the server's own block registry knows: one source block (free of the store's view) and one
+// shape block that is free (a filter change never moves the sources hash).
 const MAIL_RECIPE = recipe(
-  { type: "mail_list", settings: { account: "ma-1", label: "Inbox", sinceDays: 7 } },
-  { type: "columns", settings: { columns: ["subject", "date"] } },
+  { id: "b1", type: "rss", settings: { url: "https://example.com/feed.xml" } },
+  { id: "b2", type: "filter", settings: { field: "title", op: "contains", value: "listing" } },
 );
 
 async function countRows(db, table) {
@@ -168,7 +172,7 @@ test("saveRecipe writes revision 1 and moves the head in one step", async () => 
   assert.deepEqual(saved, {
     rev: 1,
     hash: recipeHash(MAIL_RECIPE),
-    sourcesHash: sourcesHash(MAIL_RECIPE, null),
+    sourcesHash: sourcesHash(MAIL_RECIPE, blockRegistry),
   });
 
   const report = await getReport(db, id);
@@ -192,7 +196,7 @@ test("a second save is revision 2 and keeps revision 1 as it was", async () => {
   const db = await freshDb();
   const id = await makeReport(db);
   const first = await saveRecipe(db, { reportId: id, recipe: MAIL_RECIPE, authorKind: "bot", now: T0 });
-  const next = recipe({ type: "mail_list", settings: { account: "ma-1", label: "Archive" } });
+  const next = recipe({ id: "b1", type: "rss", settings: { url: "https://example.com/archive.xml" } });
   const second = await saveRecipe(db, { reportId: id, recipe: next, authorKind: "owner", now: T0 + 10 });
 
   assert.equal(first.rev, 1);
@@ -213,13 +217,14 @@ test("a second save is revision 2 and keeps revision 1 as it was", async () => {
 test("the saved recipe is stored canonically, so key order cannot fork a revision", async () => {
   const db = await freshDb();
   const id = await makeReport(db);
-  const ordered = recipe({ type: "mail_list", settings: { account: "ma-1", sinceDays: 7 } });
-  const jumbled = recipe({ settings: { sinceDays: 7, account: "ma-1" }, type: "mail_list" });
+  const ordered = recipe({ id: "b1", type: "rss", settings: { url: "https://example.com/feed.xml" } });
+  const jumbled = recipe({ settings: { url: "https://example.com/feed.xml" }, type: "rss", id: "b1" });
   const a = await saveRecipe(db, { reportId: id, recipe: ordered, authorKind: "owner" });
   const b = await saveRecipe(db, { reportId: id, recipe: jumbled, authorKind: "owner" });
   assert.equal(a.hash, b.hash);
   const report = await getReport(db, id);
-  assert.equal(report.recipe_json, '{"blocks":[{"settings":{"account":"ma-1","sinceDays":7},"type":"mail_list"}]}');
+  assert.equal(report.recipe_json,
+    '{"blocks":[{"id":"b1","settings":{"url":"https://example.com/feed.xml"},"type":"rss"}]}');
 });
 
 test("saveRecipe refuses a bad author kind or a bad recipe and writes nothing", async () => {
@@ -246,6 +251,57 @@ test("saveRecipe refuses a bad author kind or a bad recipe and writes nothing", 
   assert.equal(after.recipe_hash, head.recipe_hash);
   assert.equal(after.updated_at, head.updated_at);
   assert.equal(await countRows(db, "report_recipe_revisions"), 1, "no revision was written");
+});
+
+test("saveRecipe validates every recipe against the real registry, whatever the caller passed", async () => {
+  const db = await freshDb();
+  const id = await makeReport(db);
+  // A real type the caller's registry does not know still gets the server's own settings checks.
+  await assert.rejects(
+    () => saveRecipe(db, {
+      reportId: id,
+      recipe: recipe({ id: "s1", type: "sort", settings: { field: "title", direction: "up" } }),
+      authorKind: "owner",
+      registry: { rss: { sourceBearing: true } },
+    }),
+    (err) => err.code === "bad_recipe" && err.detail === "blocks[0].direction",
+  );
+  // A type only the caller declares is not a type this server can run.
+  await assert.rejects(
+    () => saveRecipe(db, {
+      reportId: id,
+      recipe: recipe({ id: "x1", type: "caller_only", settings: {} }),
+      authorKind: "owner",
+      registry: { caller_only: { sourceBearing: true } },
+    }),
+    (err) => err.code === "bad_recipe" && err.detail === "blocks[0].type_unknown",
+  );
+  assert.equal((await getReport(db, id)).recipe_rev, 0, "neither refused save wrote anything");
+
+  // The caller's registry still decides what sourcesHash counts.
+  const saved = await saveRecipe(db, {
+    reportId: id, recipe: MAIL_RECIPE, authorKind: "owner", registry: null,
+  });
+  assert.equal(saved.sourcesHash, sourcesHash(MAIL_RECIPE, null));
+  assert.notEqual(saved.sourcesHash, sourcesHash(MAIL_RECIPE, blockRegistry),
+    "no registry counts every block, so the hash is not the one the server's registry gives");
+});
+
+test("a recipe is capped at 60 blocks", async () => {
+  const db = await freshDb();
+  const id = await makeReport(db);
+  assert.equal(MAX_RECIPE_BLOCKS, 60);
+  const blocks = (n) => recipe(...Array.from({ length: n }, (_, i) => ({
+    id: `t${i}`, type: "text", settings: { body: "x" },
+  })));
+
+  await assert.rejects(
+    () => saveRecipe(db, { reportId: id, recipe: blocks(61), authorKind: "owner" }),
+    (err) => err.code === "bad_recipe" && err.detail === "too_many_blocks",
+  );
+  assert.equal((await getReport(db, id)).recipe_rev, 0, "a refused save writes nothing");
+  const saved = await saveRecipe(db, { reportId: id, recipe: blocks(60), authorKind: "owner" });
+  assert.equal(saved.rev, 1, "sixty blocks is a recipe");
 });
 
 test("saveRecipe on a missing report throws not_found and writes nothing", async () => {

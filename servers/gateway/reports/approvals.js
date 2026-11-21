@@ -59,8 +59,9 @@
  *     `reports/sender-ready.js`, which the routes inject, because this module imports nothing under
  *     `mail/`.
  *   - `registry`: the block registry (`{type: {sourceBearing}}`) or null. It is the server's own and
- *     never a caller's. Null counts every block as source-bearing (fail closed) until PR 4a lands the
- *     real one.
+ *     never a caller's: it defaults to `blocks/index.js`'s `blockRegistry`, so a save, a seal and a
+ *     verification all read the same flags. A caller may narrow it (a test), and null still counts every
+ *     block as source-bearing (fail closed) for a caller measuring exactly that.
  *   - `getSecrets()`: literal secret values a pause reason is scrubbed of.
  *
  * Every refusal is an Error with a `code`: `owner_only`, `not_found`, `bad_input`, `bad_recipe`,
@@ -77,6 +78,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { canonicalJson, recipeCallsModel, recipeHash, sourcesHash } from "./recipe-hash.js";
+import { blockRegistry } from "./blocks/index.js";
 import { approvalSeal, newApprovalNonce, verifyApprovalSeal } from "./seal.js";
 import { getReport, getRevision, recordAudit, saveRecipe, updateReportColumns } from "./store.js";
 import { loadKeychainKey } from "../keychain/key.js";
@@ -371,7 +373,9 @@ function resolveDeps(deps) {
     resolveModelRef: fn("resolveModelRef", defaultResolveModelRef),
     senderReady: fn("senderReady", defaultSenderReady),
     getSecrets: fn("getSecrets", defaultGetSecrets),
-    registry: given.registry ?? null,
+    // The block registry is the server's own; a caller may narrow it, and an explicit null still means
+    // "no registry at all" (every block source-bearing), which is the safe side to be wrong on.
+    registry: given.registry === undefined ? blockRegistry : given.registry,
   };
 }
 

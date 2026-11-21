@@ -104,9 +104,19 @@ export const PREVIEW_ARTIFACT_STATE_KEY = "preview_artifact_id";
  *
  * A recipe block's `setState` (a bot-authored recipe) MUST refuse every key in this list: the bridge
  * trusts what it finds under them to decide where a run writes, so a bot must not be able to name it.
- * The block write path arriving in PR 4 reads this list; a new bridge key is added here, once.
+ * The block write path reads this list and `RESERVED_STATE_PREFIXES` (below); a new bridge key is added
+ * here, once.
  */
 export const RESERVED_STATE_KEYS = Object.freeze([PREVIEW_ARTIFACT_STATE_KEY]);
+
+/**
+ * The `report_state` key prefixes the approval rails own, so no recipe block may write under them.
+ *
+ * `source_approval:` is where an owner's approval of a draft source's settings is stored, keyed by block
+ * and settings hash. A bot-authored recipe that could write it could try to look approved, so the block
+ * write path refuses the whole prefix rather than one key name.
+ */
+export const RESERVED_STATE_PREFIXES = Object.freeze(["source_approval:"]);
 
 /**
  * Is this `report_state` key one the bridge owns?
@@ -117,7 +127,9 @@ export const RESERVED_STATE_KEYS = Object.freeze([PREVIEW_ARTIFACT_STATE_KEY]);
  * @returns {boolean}
  */
 export function isReservedStateKey(key) {
-  return typeof key === "string" && RESERVED_STATE_KEYS.includes(key);
+  if (typeof key !== "string") return false;
+  if (RESERVED_STATE_KEYS.includes(key)) return true;
+  return RESERVED_STATE_PREFIXES.some((prefix) => key.startsWith(prefix));
 }
 
 /** The suffix that makes a preview artifact recognisable in the artifacts list. */

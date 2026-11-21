@@ -38,8 +38,8 @@ const BOT_ACTOR = Object.freeze({ kind: "bot" });
 const SEED = Buffer.alloc(32, 13);
 const T0 = 1_700_000_000_000;
 
-const REGISTRY = Object.freeze({ columns: { sourceBearing: false } });
-const RECIPE = { blocks: [{ id: "b1", type: "columns", settings: { columns: ["subject"] } }] };
+const REGISTRY = Object.freeze({ filter: { sourceBearing: false } });
+const RECIPE = { blocks: [{ id: "b1", type: "filter", settings: { field: "title", op: "exists" } }] };
 
 const open = [];
 

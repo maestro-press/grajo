@@ -52,15 +52,14 @@ const BOT = "bot-1";
 
 /** The block registry a later PR ships; here it marks the source-bearing block types. */
 const REGISTRY = Object.freeze({
-  mail_list: { sourceBearing: true },
-  custom_step: { sourceBearing: true },
-  columns: { sourceBearing: false },
+  http_json: { sourceBearing: true },
+  filter: { sourceBearing: false },
 });
 
 const SOURCE_RECIPE = {
   blocks: [
-    { id: "b1", type: "mail_list", settings: { account: SENDER, sinceDays: 7 } },
-    { id: "b2", type: "columns", settings: { columns: ["subject", "date"] } },
+    { id: "b1", type: "http_json", settings: { url: "https://api.example.com/items?page=1" } },
+    { id: "b2", type: "filter", settings: { field: "title", op: "exists" } },
   ],
 };
 

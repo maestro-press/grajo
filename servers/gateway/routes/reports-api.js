@@ -36,14 +36,16 @@
  * both.
  */
 import { Router, json as jsonParserOf, raw as rawParserOf } from "express";
-import { createDbClient } from "../../db.js";
+import { auditLog, createDbClient } from "../../db.js";
 import { isLocalPasswordSessionOn } from "../dashboard/local-session.js";
 import {
   approveGoLive, approveRecipient, isLive, listRecipients, ownerSaveRecipe, pauseReport,
   proposeRecipient, refuseRecipient, resumeReport, revokeRecipient, updateSettings,
 } from "../reports/approvals.js";
 import { buildApprovalsDeps } from "../reports/approvals-deps.js";
+import { deleteReport } from "../reports/delete.js";
 import { listRuns } from "../reports/run.js";
+import { approveSource, listDraftSources, revokeSource } from "../reports/source-approvals.js";
 import { requestRun } from "../reports/run-requests.js";
 import { kickReportsHook } from "../reports/schedule-hook.js";
 import { createSendToRest, listSends } from "../reports/send-log.js";
@@ -85,6 +87,9 @@ const BUNDLE_HASH_RE = /^[0-9a-f]{64}$/;
 /** A step revision in a path. */
 const STEP_REV_RE = /^\d{1,7}$/;
 
+/** A block id in a path: exactly the shape the block registry accepts (blocks/index.js). */
+const BLOCK_ID_PATH_RE = /^[a-z][a-z0-9_-]{0,31}$/;
+
 /** The largest body this router accepts. */
 const BODY_LIMIT_BYTES = 256 * 1024;
 const JSON_LIMIT = "256kb";
@@ -106,6 +111,7 @@ const FIXED_TEXT = Object.freeze({
   step_changed: "That step changed while this request was in flight. Try again.",
   host_changed: "That host changed while this request was in flight. Try again.",
   credential_changed: "That credential changed while this request was in flight. Try again.",
+  source_changed: "That report changed while this request was in flight. Try again.",
   bad_inject: "A credential needs a header or a query name and at least one path it may be sent to.",
   host_not_approved: "Approve that site for this report first.",
   no_schedule: "Choose when this report runs before going live.",
@@ -115,7 +121,10 @@ const FIXED_TEXT = Object.freeze({
   internal: "Something went wrong.",
 });
 
-/** The status a refusal answers with, by its code. Everything else is a 500. */
+/**
+ * The status a refusal answers with, by its code. Everything else is a 500. The two delete refusals
+ * carry a status only: their answer's code is the word, and no new sentence is written for them.
+ */
 const STATUS_BY_CODE = Object.freeze({
   owner_only: 403,
   not_found: 404,
@@ -132,12 +141,15 @@ const STATUS_BY_CODE = Object.freeze({
   step_changed: 409,
   host_changed: 409,
   credential_changed: 409,
+  source_changed: 409,
   bad_inject: 400,
   host_not_approved: 409,
   no_schedule: 409,
   sender_not_ready: 409,
   model_unresolved: 409,
   keychain_key_missing: 409,
+  report_busy: 409,
+  keychain_disconnect_failed: 409,
 });
 
 function messageFor(code) {
@@ -462,6 +474,19 @@ export function reportsApiRouter(dashboardAuth, deps = {}) {
     if (!id) return;
     const row = await resumeReport(db, approvalsDeps, { reportId: id, actor: { kind: "owner" } });
     res.json({ report: await reportView(db, approvalsDeps, row) });
+  }));
+
+  // DELETE /:id: the owner deletes the report, its credentials (their keychain rows first), its
+  // schedule row, every row of every report table that names it and its directory under the reports
+  // area. The artifact and its versions stay: they belong to the report's project, and the answer
+  // names the artifact so the caller can say so. The report's own approval audit rows go with it, so
+  // the delete is logged on the gateway's own audit trail instead.
+  router.delete(`${REPORTS_API_PREFIX}/:id`, route("DELETE /:id", async (db, req, res) => {
+    const id = idOf(req, res);
+    if (!id) return;
+    const out = await deleteReport(db, approvalsDeps, { reportId: id, actor: { kind: "owner" } });
+    await auditLog(db, "report_deleted", { details: { reportId: id, artifactId: out.artifactId } });
+    res.json({ ok: true, artifactId: out.artifactId });
   }));
 
   /* -------------------------------------------------------------------------- runs */
@@ -840,6 +865,71 @@ export function reportsApiRouter(dashboardAuth, deps = {}) {
     "POST /:id/credentials/:uuid/revoke",
     (db, id, host) => revokeCredential(db, approvalsDeps, {
       reportId: id, host, actor: { kind: "owner" },
+    }),
+  ));
+
+  /* ------------------------------------------------------------------------ sources */
+
+  /** A block id in a path: anything else is a 404 before a report is read. */
+  const blockPathOf = (req, res) => {
+    const blockId = String(req.params?.blockId ?? "");
+    if (!BLOCK_ID_PATH_RE.test(blockId)) {
+      sendError(res, 404, "not_found");
+      return null;
+    }
+    return blockId;
+  };
+
+  /** One source decision: the same path shape for approve and revoke, answering `{ok}` and nothing else. */
+  const decideSource = (label, action) => route(label, async (db, req, res) => {
+    const id = idOf(req, res);
+    if (!id) return;
+    const blockId = blockPathOf(req, res);
+    if (!blockId) return;
+    if (!(await getReport(db, id))) return sendError(res, 404, "not_found");
+    await action(db, id, blockId);
+    res.json({ ok: true });
+  });
+
+  // GET /:id/sources -- the head revision's source-shaped blocks as the owner's view reads them: the
+  // block id, its type, the settings hash an approval hands back and whether an approval for exactly
+  // these settings still verifies. No seal, no nonce.
+  router.get(`${REPORTS_API_PREFIX}/:id/sources`, route("GET /:id/sources", async (db, req, res) => {
+    const id = idOf(req, res);
+    if (!id) return;
+    if (!(await getReport(db, id))) return sendError(res, 404, "not_found");
+    res.json({ sources: await listDraftSources(db, approvalsDeps, id) });
+  }));
+
+  // POST /:id/sources/:blockId/approve: the owner's OK for one draft source, at the settings the view
+  // carried in `settingsHash`. A head revision that moved since that view answers 409 `source_changed`
+  // and seals nothing. Without the approval a gated preview is refused before anything is read.
+  router.post(`${REPORTS_API_PREFIX}/:id/sources/:blockId/approve`, route(
+    "POST /:id/sources/:blockId/approve",
+    async (db, req, res) => {
+      const id = idOf(req, res);
+      if (!id) return;
+      const blockId = blockPathOf(req, res);
+      if (!blockId) return;
+      const body = req.body == null ? {} : req.body;
+      if (typeof body !== "object" || Array.isArray(body)) return sendError(res, 400, "bad_input");
+      if (!(await getReport(db, id))) return sendError(res, 404, "not_found");
+      await approveSource(db, approvalsDeps, {
+        reportId: id,
+        blockId,
+        expectedSettingsHash: body.settingsHash,
+        actor: { kind: "owner" },
+      });
+      res.json({ ok: true });
+    },
+  ));
+
+  // POST /:id/sources/:blockId/revoke: the state value is written null, so the seal is gone and an old
+  // approval can never return.
+  router.post(`${REPORTS_API_PREFIX}/:id/sources/:blockId/revoke`, decideSource(
+    "POST /:id/sources/:blockId/revoke",
+    (db, id, blockId) => revokeSource(db, approvalsDeps, {
+      reportId: id, blockId, actor: { kind: "owner" },
     }),
   ));
 

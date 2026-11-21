@@ -48,8 +48,8 @@ const T0 = 1_700_000_000_000;
 const BOOT = "boot-sweep";
 const RUN_ID = "run-this-process";
 
-const REGISTRY = Object.freeze({ columns: { sourceBearing: false } });
-const RECIPE = { blocks: [{ id: "b1", type: "columns", settings: { columns: ["subject"] } }] };
+const REGISTRY = Object.freeze({ filter: { sourceBearing: false } });
+const RECIPE = { blocks: [{ id: "b1", type: "filter", settings: { field: "title", op: "exists" } }] };
 
 const open = [];
 let notes = [];

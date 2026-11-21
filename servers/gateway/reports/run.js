@@ -2,10 +2,11 @@
  * The run engine: what makes one attempt at running a report happen, and what it leaves behind.
  *
  * `startRun` writes a `queued` row and nothing else; `executeRun` claims it and does the work. The claim
- * is the whole concurrency story: a guarded UPDATE from `queued` to `running`, and a caller that
- * changes no row does nothing at all (a second executor, or a run a boot sweep already failed, never
- * runs twice). The finish is guarded the same way (`status = 'running' AND gateway_run_id = ?`), so a
- * late finish cannot overwrite a run the sweep has already closed.
+ * is the whole concurrency story: a guarded UPDATE from `queued` to `running` that also requires the
+ * report row to still be there, and a caller that changes no row does nothing at all (a second executor,
+ * a run a boot sweep already failed, or a run whose report has been deleted never runs twice and never
+ * starts on a report that is gone). The finish is guarded the same way (`status = 'running' AND
+ * gateway_run_id = ?`), so a late finish cannot overwrite a run the sweep has already closed.
  *
  * WHAT A SCHEDULED OR MANUAL RUN EXECUTES, and why it is not "the report": a run of a live report
  * executes the SEALED live revision's recipe, with the bot, project, artifact and sender from the
@@ -22,19 +23,33 @@
  * `failed` with "Delivery is not wired." and its blocks are not run at all, so a missing seam can never
  * turn into a half-run report. A preview never calls `deliver`, and neither does any run without a
  * VERIFIED live set: a run refused because the report is not live (or because the report row is gone)
- * sends nothing at all, because it never happened. The owner hears about such a run from the scheduler
- * hook's own queue wrapper (`notify`), not from the delivery seam.
+ * sends nothing at all, because it never happened. The report row is read AGAIN immediately before the
+ * one outgoing step, so a report deleted while its blocks were working is not delivered: that run is
+ * finished `failed` instead. The owner hears about such a run from the scheduler hook's own queue
+ * wrapper (`notify`), not from the delivery seam.
  *
  * Every reason text and the block log pass through `redactSecrets` with this instance's secret values
  * (`deps.getSecrets`, the same reader the approvals module uses) and are capped: a source that echoes a
  * credential into an error message cannot put it in the database.
  *
+ * STATE IS THE RECIPE'S MEMORY, AND A RUN WRITES IT LAST: a block that dedupes across runs
+ * (`dedupe_seen`, `diff_last`) buffers a `report_state` value as it works; this module applies those
+ * writes only AFTER the version write, and only for a run that ends not-`failed` and whose trigger is not
+ * `preview`. A failed run, a failed version write and every preview therefore leave `report_state`
+ * exactly as it was: a preview is unapproved text and must not move the report's memory either. A block
+ * cannot reach the keys the artifact bridge owns: `isReservedStateKey` refuses them where it buffers, and
+ * this module refuses them AGAIN here, so a buffered list that arrived any other way cannot write one.
+ * Every write lands in ONE `runTransaction`, so a state write that cannot be applied leaves none of them
+ * applied.
+ *
  * `deps` is the seam:
  *   - `approvals`: the deps `verifyLive` takes (`loadSeed`, `getSchedule`, `resolveModelRef`,
  *     `registry`, ...). Absent, no seal verifies and no scheduled or manual run happens.
- *   - `runBlocks({report, recipe, run, live, state})`: runs the recipe and answers
- *     `{items, sourceErrors, document?, allowedLinks?}`. The default answers no items and no errors;
- *     the real block runner arrives with the source blocks.
+ *   - `runBlocks({report, recipe, run, live, state, db})`: runs the recipe and answers
+ *     `{items, sections, warnings, sourceErrors, stateWrites, document?, allowedLinks?}`. The default is
+ *     the block registry's executor (`blocks/run-recipe.js`), handed this module's own deps so a custom
+ *     block reaches `custom-step.js`. Warnings are recorded nothing: they are a shape block's own
+ *     trouble, and the status rule below is about source errors.
  *   - `deliver(db, {report, run, live, status, artifactVersion})`: required for `schedule` and `manual`.
  *   - `writeVersion(db, {report, run, live, result})` -> `{artifactVersion}`: optional; absent, the run
  *     keeps no artifact version.
@@ -50,6 +65,9 @@
  */
 import { randomBytes } from "node:crypto";
 import { getReport, getRevision } from "./store.js";
+import { isReservedStateKey } from "./artifact-bridge.js";
+import { runRecipeBlocks } from "./blocks/run-recipe.js";
+import { canonicalJson } from "./recipe-hash.js";
 import { verifyLive } from "./approvals.js";
 import { gatewayRunId } from "../run-id.js";
 import { redactSecrets } from "../../shared/redact-secrets.js";
@@ -69,6 +87,9 @@ export const DELIVERY_NOT_WIRED_TEXT = "Delivery is not wired.";
 
 /** The sentence a boot sweep writes over a run whose gateway process went away. */
 export const RESTARTED_TEXT = "Crow restarted during this run";
+
+/** The sentence a run left `queued` for a report that no longer exists is finished with. */
+export const REPORT_GONE_TEXT = "This report no longer exists.";
 
 /** How long a reason text or a block log may be. */
 const TEXT_MAX = 2000;
@@ -105,14 +126,6 @@ function clock(deps) {
 
 /* ------------------------------------------------------------------------- the seam */
 
-/**
- * An empty block run: no items read, no source tried. This is the seam the real block runner plugs
- * into; until it lands, a run over a live report honestly ends `empty`.
- */
-async function defaultRunBlocks() {
-  return { items: [], sourceErrors: [] };
-}
-
 function defaultGetSecrets() {
   try {
     return getSecretValues();
@@ -121,18 +134,31 @@ function defaultGetSecrets() {
   }
 }
 
+/**
+ * The seam one recipe block gets: this module's own resolved deps, the approvals deps (a custom step's
+ * verification needs the seal seed, which lives there), and whatever else the caller injected (a step
+ * runner, an env builder, the report's home). Nothing from a recipe is in here.
+ */
+function blockSeam(given, resolved) {
+  return { ...(given.approvals ?? {}), ...given, ...resolved };
+}
+
 /** `deps` with every member present; a member that is absent falls back to the real thing. */
 function resolveDeps(deps) {
   const given = deps == null ? {} : deps;
   const fn = (key, fallback) => (typeof given[key] === "function" ? given[key] : fallback);
-  return {
+  const resolved = {
     approvals: given.approvals ?? null,
-    runBlocks: fn("runBlocks", defaultRunBlocks),
+    runBlocks: null,
     deliver: typeof given.deliver === "function" ? given.deliver : null,
     writeVersion: typeof given.writeVersion === "function" ? given.writeVersion : null,
     getSecrets: fn("getSecrets", defaultGetSecrets),
     now: fn("now", Date.now),
   };
+  // The default executor is the block registry's, handed a block seam: a custom block needs the step
+  // runner and the seal seed, and a caller that injects `runBlocks` still owns the whole seam.
+  resolved.runBlocks = fn("runBlocks", (args) => runRecipeBlocks({ ...args, deps: blockSeam(given, resolved) }));
+  return resolved;
 }
 
 function secretsOf(deps) {
@@ -370,16 +396,23 @@ export async function startRun(db, deps, { reportId, trigger, requestedBy, sched
  * could only ever see as "still going").
  *
  * The steps, in order (and see the header for why each one is what it is):
- *   1. Claim: `queued` -> `running` in one guarded UPDATE. No row changed means somebody else owns this
- *      run (a second executor, or a sweep that closed it), so answer the run's current state and stop.
+ *   1. Claim: `queued` -> `running` in one guarded UPDATE, which also requires the report row to still
+ *      be there. No row changed means somebody else owns this run (a second executor, a sweep that
+ *      closed it), or its report is gone while the row is still `queued`; that second case is finished
+ *      here with `REPORT_GONE_TEXT` in one more guarded UPDATE (`WHERE id = ? AND status = 'queued'`),
+ *      so a run nobody can execute is not left waiting forever. Either way the answer is the run's
+ *      current state and nothing runs.
  *   2. A preview reads its revision by the number the run recorded. No live check: a draft previews.
  *   3. A scheduled or manual run needs a live report whose seal verifies AND whose newest live-kind audit
  *      decision is `approved`; otherwise `failed`, and no block runs.
  *   4. Run the blocks. Source errors give `failed`, no items gives `empty`, anything else gives `ok`.
  *   5. Write the version, when the caller injects `writeVersion`.
- *   6. Deliver, but only for a run that has a verified live set: a preview and a refused run send
- *      nothing. A delivery throw keeps the status and is appended to the error text.
- *   7. Finish in one guarded UPDATE, so a run a sweep has already closed is left as the sweep left it.
+ *   6. Apply the blocks' buffered `stateWrites`, but only when the run ends not-failed and is not a
+ *      preview (see STATE IS THE RECIPE'S MEMORY above).
+ *   7. Deliver, but only for a run that has a verified live set AND whose report row is still there: a
+ *      preview, a refused run and a run whose report was deleted mid-flight send nothing. A delivery
+ *      throw keeps the status and is appended to the error text.
+ *   8. Finish in one guarded UPDATE, so a run a sweep has already closed is left as the sweep left it.
  *
  * @param {object} db
  * @param {object} deps
@@ -392,10 +425,14 @@ export async function executeRun(db, deps, runId) {
   const claimedAt = clock(d);
   const claim = await db.execute({
     sql: `UPDATE report_runs SET status = 'running', started_at = ?, gateway_run_id = ?
-           WHERE id = ? AND status = 'queued'`,
+           WHERE id = ? AND status = 'queued'
+             AND EXISTS (SELECT 1 FROM reports WHERE id = report_id)`,
     args: [claimedAt, processRunId, runId],
   });
-  if (claim.rowsAffected !== 1) return answerFor(db, runId);
+  if (claim.rowsAffected !== 1) {
+    await finishOrphanedQueuedRun(db, d, runId);
+    return answerFor(db, runId);
+  }
 
   try {
     return await runClaimed(db, d, runId, processRunId);
@@ -418,6 +455,34 @@ export async function executeRun(db, deps, runId) {
   }
 }
 
+/** Is the run's report row still there? One read, immediately before the one outgoing step. */
+async function reportExists(db, reportId) {
+  if (typeof reportId !== "string" || !reportId) return false;
+  const { rows } = await db.execute({ sql: "SELECT id FROM reports WHERE id = ?", args: [reportId] });
+  return rows.length > 0;
+}
+
+/**
+ * A claim that changed no row and left the run `queued` means its report row is gone: the guarded UPDATE
+ * hands the run back as `failed` with `REPORT_GONE_TEXT`, in one more guarded UPDATE that a concurrent
+ * executor or sweep still wins. Never throws: a row that cannot be read or written is a run left as it
+ * was, and the answer is the run's current state either way.
+ */
+async function finishOrphanedQueuedRun(db, d, runId) {
+  try {
+    const row = await getRun(db, runId);
+    if (!row || row.status !== "queued") return;
+    if (await reportExists(db, row.reportId)) return;
+    await db.execute({
+      sql: `UPDATE report_runs SET status = 'failed', ended_at = ?, error_text = ?
+             WHERE id = ? AND status = 'queued'`,
+      args: [clock(d), REPORT_GONE_TEXT, runId],
+    });
+  } catch {
+    // The row cannot be read or written: there is nothing more this executor can do about it.
+  }
+}
+
 /** The claimed run's work, from the row read to the guarded finish. Throws only on a database failure. */
 async function runClaimed(db, d, runId, processRunId) {
   const run = await getRun(db, runId);
@@ -437,7 +502,7 @@ async function runClaimed(db, d, runId, processRunId) {
 
   if (!report) {
     status = "failed";
-    errorText = "This report no longer exists.";
+    errorText = REPORT_GONE_TEXT;
   } else if (run.trigger === "preview") {
     // A preview of a draft or a paused report is exactly what go-live needs, so nothing about the live
     // set is checked here: only that the revision the run recorded can still be read.
@@ -475,7 +540,7 @@ async function runClaimed(db, d, runId, processRunId) {
 
   if (status === "ok" && recipe) {
     try {
-      result = await d.runBlocks({ report, recipe, run, live, state: {} });
+      result = await d.runBlocks({ report, recipe, run, live, state: {}, db });
     } catch (err) {
       status = "failed";
       errorText = redactedText(err?.message || "This run failed.", secrets);
@@ -517,12 +582,55 @@ async function runClaimed(db, d, runId, processRunId) {
     }
   }
 
+  // State: buffered by the blocks, applied here, and only for a run that ends well. A failed run (a
+  // source error, a failed version write), and every preview, leave `report_state` as it was. A key the
+  // artifact bridge owns is not written (and does not change the run's status), and every remaining
+  // write lands in one transaction, so a state write that cannot be applied applies none of them.
+  const stateWrites = result && Array.isArray(result.stateWrites) ? result.stateWrites : [];
+  if (status !== "failed" && run.trigger !== "preview" && report && stateWrites.length) {
+    const writes = stateWrites.filter((write) => write != null
+      && typeof write.key === "string" && write.key
+      && !isReservedStateKey(write.key));
+    try {
+      if (writes.length) {
+        const at = clock(d);
+        await db.runTransaction((runStatement) => {
+          // The report must still be there, the same check the store's own `setState` makes: a report
+          // removed under a run (a direct SQL delete) must not collect rows nobody can reach.
+          const found = runStatement({ sql: "SELECT id FROM reports WHERE id = ?", args: [report.id] });
+          if (!found.rows[0]) throw fail("not_found", "report");
+          for (const write of writes) {
+            runStatement({
+              sql: `INSERT INTO report_state (report_id, key, value_json, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(report_id, key) DO UPDATE SET value_json = excluded.value_json,
+                      updated_at = excluded.updated_at`,
+              args: [report.id, write.key, canonicalJson(write.value === undefined ? null : write.value), at],
+            });
+          }
+        });
+      }
+    } catch {
+      // A state write that cannot land is not a run that did not happen: the version is already written,
+      // so the run keeps its status and says what went wrong in a code word.
+      errorText = redactedText(errorText ? `${errorText} state_write_failed` : "state_write_failed", secrets);
+    }
+  }
+
   const blockLogJson = blockLog ? cappedBlockLog(blockLog, secrets) : null;
 
-  // Delivery: never for a preview, and only for a run that executed a VERIFIED live set. A refused run
-  // (not live, report gone) never happened, so nothing leaves the instance for it; the owner's notice
-  // for such a run is the scheduler hook's, through its own `notify`.
-  if (run.trigger !== "preview" && live && d.deliver) {
+  // Delivery: never for a preview, and only for a run that executed a VERIFIED live set AND whose
+  // report is still there when the one outgoing step is reached. A refused run (not live, report gone)
+  // never happened, so nothing leaves the instance for it; the owner's notice for such a run is the
+  // scheduler hook's, through its own `notify`.
+  const deliverTo = run.trigger !== "preview" && live && d.deliver ? d.deliver : null;
+  // A report removed while the blocks were working (deleted between the claim and here) is not
+  // delivered: the row is read again right before delivery, and the run is finished failed instead.
+  const reportGone = deliverTo ? !(await reportExists(db, run.reportId)) : false;
+  if (reportGone) {
+    status = "failed";
+    errorText = REPORT_GONE_TEXT;
+  } else if (deliverTo) {
     const finished = {
       ...run,
       status,

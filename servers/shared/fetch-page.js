@@ -21,8 +21,24 @@
  *   body read, so a slow redirect chain or a server dripping a byte at a time cannot hold the
  *   caller past `timeoutMs`. The abort surfaces as ETIMEDOUT.
  *
- * Errors carry `code`: EBADURL, EBLOCKED, EREDIRECTS, ETOOBIG, EBADENCODING, ETIMEDOUT, or the
- * DNS/socket code (ENOTFOUND, ECONNREFUSED, ...). Non-2xx responses resolve; the caller decides.
+ * Caller headers: `headers` (optional, added for the reports sources) is an object merged over the
+ * defaults for the FIRST hop, and again on a later hop only when the redirect target has the same
+ * origin (protocol, host, port) as the hop that sent them. A hop that crosses to another origin is
+ * sent without them, and every hop after it as well, so a credential put in a header can never ride
+ * a redirect to another site. The four names that frame the request itself (`host`, `content-length`,
+ * `transfer-encoding`, `connection`) are ignored wherever they appear. With no `headers` the request
+ * is byte-identical to what this file sent before that option existed.
+ *
+ * Redirect hops a caller narrows: `onHop` (optional) is called with the parsed URL of each redirect
+ * target BEFORE that hop is requested, and anything but `true` aborts the chain with
+ * EREDIRECT_REFUSED and sends nothing to that target. It never sees the first request (the caller
+ * chose that URL itself), and with no `onHop` the chain is exactly what it was before the option
+ * existed. The reports sources use it to keep a credentialed request inside one origin and one path
+ * prefix.
+ *
+ * Errors carry `code`: EBADURL, EBLOCKED, EREDIRECTS, EREDIRECT_REFUSED, ETOOBIG, EBADENCODING,
+ * ETIMEDOUT, or the DNS/socket code (ENOTFOUND, ECONNREFUSED, ...). Non-2xx responses resolve; the
+ * caller decides.
  *
  * `allowPrivate` exists only for the reader's operator opt-out. The research server never passes
  * it: bots choose its URLs.
@@ -78,13 +94,52 @@ function checkHop(href, isAllowedAddress, base) {
   return url;
 }
 
+/** The headers a request carries when the caller adds none. */
+function defaultHeaders(accept) {
+  return { "User-Agent": USER_AGENT, Accept: accept, "Accept-Encoding": "gzip, deflate, br" };
+}
+
+/** The header names that frame the request itself, so a caller never sets them. */
+const FRAMING_HEADERS = new Set(["host", "content-length", "transfer-encoding", "connection"]);
+
+/**
+ * A caller's own headers as a plain object, or null when it supplies none worth sending. The framing
+ * names are dropped and a value that is not a string, a number or a list of those is dropped with it.
+ */
+function callerHeaders(value) {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return null;
+  const out = {};
+  let any = false;
+  for (const [name, raw] of Object.entries(value)) {
+    if (typeof name !== "string" || !name) continue;
+    if (FRAMING_HEADERS.has(name.trim().toLowerCase())) continue;
+    if (raw == null) continue;
+    if (Array.isArray(raw)) {
+      const list = raw.filter((entry) => typeof entry === "string" || typeof entry === "number").map(String);
+      if (!list.length) continue;
+      out[name] = list;
+      any = true;
+      continue;
+    }
+    if (typeof raw !== "string" && typeof raw !== "number") continue;
+    out[name] = String(raw);
+    any = true;
+  }
+  return any ? out : null;
+}
+
+/** Two hops are the same origin when protocol, host and port all match (an implied port is ""). */
+function sameOrigin(left, right) {
+  return left.protocol === right.protocol && left.hostname === right.hostname && left.port === right.port;
+}
+
 /** Send one GET; resolves with the response (headers in, body unread). */
-function requestOnce(url, { accept, lookup, signal }) {
+function requestOnce(url, { accept, lookup, signal, headers }) {
   const mod = url.protocol === "https:" ? https : http;
   return new Promise((resolve, reject) => {
     const req = mod.request(url, {
       method: "GET",
-      headers: { "User-Agent": USER_AGENT, Accept: accept, "Accept-Encoding": "gzip, deflate, br" },
+      headers: headers ? { ...defaultHeaders(accept), ...headers } : defaultHeaders(accept),
       lookup,
       agent: false,
       signal,
@@ -133,11 +188,15 @@ function parseContentType(header) {
   return { content_type, charset: m ? m[1].toLowerCase() : null };
 }
 
-const GUARD_CODES = new Set(["EBADURL", "EBLOCKED", "EREDIRECTS", "ETOOBIG", "EBADENCODING"]);
+const GUARD_CODES = new Set([
+  "EBADURL", "EBLOCKED", "EREDIRECTS", "EREDIRECT_REFUSED", "ETOOBIG", "EBADENCODING",
+]);
 const isAbort = (err) => err && (err.name === "AbortError" || err.name === "TimeoutError" || err.code === "ABORT_ERR");
 
 /**
- * GET a URL through the SSRF guard. See the file header for the contract.
+ * GET a URL through the SSRF guard. See the file header for the contract, including how a caller's
+ * `headers` are carried (first hop, then same-origin hops only) and how `onHop` narrows the redirect
+ * chain (each target is offered to it before that hop is requested).
  * @returns {Promise<{final_url: string, http_status: number, content_type: string, charset: string|null, buffer: Buffer}>}
  */
 export async function guardedRequest(url, opts = {}) {
@@ -147,6 +206,7 @@ export async function guardedRequest(url, opts = {}) {
     accept = DEFAULT_ACCEPT,
     allowPrivate = false,
     lookup = dns.lookup,
+    onHop = null,
   } = opts;
   const isAllowedAddress = allowPrivate ? () => true : (opts.isAllowedAddress || isPublicEgressIp);
   const signal = AbortSignal.timeout(timeoutMs); // ONE deadline for every hop and body read
@@ -154,14 +214,23 @@ export async function guardedRequest(url, opts = {}) {
 
   try {
     let current = checkHop(url, isAllowedAddress);
+    // The caller's headers ride the first hop; a redirect that leaves this origin drops them for good.
+    let hopHeaders = callerHeaders(opts.headers);
     for (let hop = 0; ; hop++) {
-      const res = await requestOnce(current, { accept, lookup: connectLookup, signal });
+      const res = await requestOnce(current, { accept, lookup: connectLookup, signal, headers: hopHeaders });
       const status = res.statusCode;
       const location = res.headers.location;
       if (status >= 300 && status < 400 && location) {
         res.destroy(); // never read a redirect body
         if (hop >= MAX_REDIRECTS) throw fail("EREDIRECTS", `more than ${MAX_REDIRECTS} redirects`);
-        current = checkHop(location, isAllowedAddress, current);
+        const next = checkHop(location, isAllowedAddress, current);
+        // The caller's own rule for a hop, asked before anything is sent to that target: a predicate
+        // that does not answer `true` ends the chain here.
+        if (typeof onHop === "function" && onHop(next) !== true) {
+          throw fail("EREDIRECT_REFUSED", `redirect to ${next.href.slice(0, 200)} is not allowed here`);
+        }
+        if (hopHeaders && !sameOrigin(current, next)) hopHeaders = null;
+        current = next;
         continue;
       }
       const buffer = await readBody(res, { maxBytes, signal });
