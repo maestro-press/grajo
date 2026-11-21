@@ -65,8 +65,9 @@
  * never both sweep.
  *
  * NOTHING HERE SENDS ANYTHING BY ITSELF. This module imports no delivery module and nothing under
- * `mail/`: `deps.deliver` is injected by the caller and passed through to `executeRun` (PR 5 is where a
- * real one lands).
+ * `mail/`: `deps.deliver` is injected by the caller and passed through to `executeRun`. Boot wires it to
+ * `reports/delivery.js`'s `makeDeliver` (the real seam, which is the reports-only send door's one caller),
+ * so the one path from a run to a mail is the caller's injection and never a bot door's.
  *
  * `deps`:
  *   - `deliver(db, payload)`: the one outgoing seam, passed to `executeRun`. Absent, a live run is
@@ -888,9 +889,10 @@ export async function startReportsAtBoot({ noAuth = false, db = null, deps = {},
 }
 
 /**
- * The delivery seam until PR 5 lands a real one: a live report run records its result and sends
- * nothing. `run.js` requires a `deliver` for a scheduled or manual run, so without this a booted
- * gateway would record every run `failed` with "Delivery is not wired." and not read the sources.
+ * The delivery seam a caller that wants no mail passes: a live report run records its result and sends
+ * nothing. `run.js` requires a `deliver` for a scheduled or manual run, so this is what a harness hands
+ * the hook when it wants the runs recorded and no mail sent. Boot wires the real one
+ * (`reports/delivery.js`'s `makeDeliver`), so nothing in production uses this.
  *
  * @returns {Promise<{delivered: boolean}>}
  */

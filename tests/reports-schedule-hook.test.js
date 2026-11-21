@@ -1120,7 +1120,11 @@ test("the hook and its boot helper are wired the way post-listen wires them", ()
   const boot = readFileSync(new URL("../servers/gateway/boot/post-listen.js", import.meta.url), "utf8");
   assert.match(boot, /startReportsAtBoot\(\{/);
   assert.match(boot, /if \(!noAuth\) \{\n\s+setImmediate\(async \(\) => \{[\s\S]{0,600}startReportsAtBoot/);
-  assert.match(boot, /deliverNotWired/);
+  // The real delivery seam: boot builds it from delivery.js, with the mail adapter source and the
+  // approvals deps, so a live run's mail goes through the reports-only send door and no other path.
+  assert.match(boot, /import\("\.\.\/reports\/delivery\.js"\)/);
+  assert.match(boot, /deliver: makeDeliver\(\{ adapterFor: reportsAdapterFor/);
+  assert.doesNotMatch(boot, /deliverNotWired/);
 });
 
 test("the pre-PR-5 delivery seam records nothing and sends nothing", async () => {

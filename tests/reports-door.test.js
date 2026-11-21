@@ -587,6 +587,31 @@ test("a long subject is bounded before it becomes a header", async () => {
 
 /* ------------------------------------------------------------------ the outcome mapping */
 
+test("a mail supervisor that is not running settles the row failed, not unknown", async () => {
+  const { db, sends, deps, calls } = await ready();
+  // Boot's adapter source answers NETWORK/`stopped` on a gateway that runs no mail supervisor: nothing
+  // was attempted, so mail that never left must never read as "might have gone".
+  const stopped = { ...deps, adapterFor: () => Promise.reject(new MailError("NETWORK", "stopped")) };
+
+  assert.deepEqual(await sendReportMail(db, stopped, { ...body, sendId: sends }),
+    { status: "failed", reason: "no_adapter" });
+  const row = await rowOf(db, sends);
+  assert.equal(row.status, "failed", "the row is failed, not left as possibly sent");
+  assert.equal(row.reason, "no_adapter");
+  assert.ok(row.claim_token, "the row had been claimed before the adapter source answered");
+  assert.equal(calls.messages.length, 0);
+});
+
+test("a plain NETWORK failure is still unknown", async () => {
+  const { db, sends, deps, calls } = await ready({
+    fake: { throws: new MailError("NETWORK", "ECONNRESET") },
+  });
+  const out = await sendReportMail(db, deps, { ...body, sendId: sends });
+  assert.deepEqual(out, { status: "unknown", reason: "network" });
+  assert.equal(calls.messages.length, 1, "the adapter was reached, so nobody knows");
+  assert.equal((await rowOf(db, sends)).status, "unknown");
+});
+
 test("every mail error code maps the way the send service maps it", async () => {
   const expected = {
     AUTH_FAILED: { status: "failed", reason: "auth_failed" },

@@ -36,6 +36,13 @@ const maskText = (v) => (v == null ? v : maskSecrets(v));
  * @param {object} [opts.metadata] - Structured data (stored as JSON)
  * @param {number} [opts.schedule_id] - FK to schedules table
  * @param {number} [opts.expires_in_minutes] - Auto-expire after N minutes
+ * @param {boolean} [opts.essential=false] - skip the `notification_prefs`
+ *   `types_enabled` gate (typeEnabled below) and write the row whatever the
+ *   operator's type preferences say. Used ONLY by the reports' failed and empty
+ *   run notices and the restart notices: those are the things the owner asked
+ *   to always hear about, so switching a type off must not silence them. Nothing
+ *   else changes: the text is masked, the bell badge refreshes and the deliver
+ *   seam is called exactly as for any other notice.
  * @param {Function|false} [opts.deliver=deliverNotification] - the fan-out seam,
  *   called as `(db, payload)` once the row is written (upsertGroupedNotification's
  *   `deliver`, same shape). `false` writes the row and refreshes the bell badge
@@ -56,12 +63,15 @@ export async function createNotification(db, opts) {
     metadata = null,
     schedule_id = null,
     expires_in_minutes = null,
+    essential = false,
     deliver = deliverNotification,
   } = opts;
   const title = maskText(rawTitle);
   const body = maskText(rawBody);
 
-  if (!(await typeEnabled(db, type))) return null;
+  // An essential notice is written whatever the type preferences say (see the JSDoc above);
+  // every other notice keeps the gate.
+  if (essential !== true && !(await typeEnabled(db, type))) return null;
 
   const expiresAt = expires_in_minutes
     ? new Date(Date.now() + expires_in_minutes * 60000).toISOString()

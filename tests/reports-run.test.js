@@ -668,6 +668,29 @@ test("delivery gets the finished run row, the verified live set and the version"
   assert.equal(payload.report.id, report.id);
 });
 
+test("delivery gets the run's own result, so the mail is built from what the run made", async () => {
+  const { db, report, deps } = await liveReport();
+  const runId = await queueRun(db, report.id);
+  const seen = [];
+  await executeRun(db, runDeps({
+    approvals: deps,
+    runBlocks: async () => ({
+      items: [{ subject: "a" }],
+      document: { markdown: "# The report" },
+      allowedLinks: ["https://listings.example.com/42"],
+      email: { html: "<p>Our own words</p>", text: "Our own words" },
+    }),
+    deliver: async (_db, payload) => { seen.push(payload); },
+  }), runId);
+  assert.equal(seen.length, 1);
+  const payload = seen[0];
+  assert.deepEqual(payload.result.document, { markdown: "# The report" });
+  assert.deepEqual(payload.result.allowedLinks, ["https://listings.example.com/42"]);
+  assert.deepEqual(payload.result.email, { html: "<p>Our own words</p>", text: "Our own words" });
+  assert.equal(payload.status, "ok");
+  assert.equal(payload.run.id, runId, "the finished run row is still beside it");
+});
+
 /* ------------------------------------------------------------------- the secrets */
 
 test("a secret echoed by a source never reaches the error text or the block log", async () => {

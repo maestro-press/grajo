@@ -47,6 +47,10 @@
  * anti-goal invariant keeps its watch over an unchanged file: `AUTH_FAILED`, `TLS`, `BAD_INPUT`,
  * `TOO_LARGE`, `NOT_FOUND`, `CLAIMED_ELSEWHERE` and `CHANGED` settle `failed` (the request provably did
  * not complete); `NETWORK`, `TIMEOUT`, `PROTOCOL` and anything unmapped settle `unknown` (nobody knows).
+ * There is one exception, and it is the difference between "nobody knows" and "nothing was attempted":
+ * a `NETWORK` error whose `detail` is `stopped` is the answer of boot's adapter source
+ * (`boot/mail-boot.js`'s `reportsAdapterFor`) on a gateway that runs no mail supervisor at all, so the
+ * row settles `failed` / `no_adapter`, exactly like a door nobody injected an adapter into.
  * A `sending` or `unknown` row is NEVER resent automatically: only a `pending` row can be claimed, and
  * nothing here moves a row back to `pending`.
  *
@@ -105,6 +109,12 @@ const HEADER_KEYS = new Set(["inReplyTo", "references"]);
 
 /** The failure-with-unknown-outcome codes: the request may or may not have reached the provider. */
 const UNKNOWN_OUTCOMES = Object.freeze({ NETWORK: "network", TIMEOUT: "timeout", PROTOCOL: "protocol" });
+
+/**
+ * The `detail` boot's adapter source answers when no supervisor is running. It is an allow-listed token
+ * (errors.js keeps only short token details), so it reaches this module as the error's `detail`.
+ */
+const NO_ADAPTER_DETAIL = "stopped";
 
 /** The failure-that-did-not-complete codes: the request provably did not finish. */
 const FAILED_OUTCOMES = Object.freeze({
@@ -454,11 +464,20 @@ export async function sendReportMail(db, deps, input) {
     return { status: "sent", messageId };
   } catch (err) {
     // Only the code: an adapter's message can quote a server reply, a username or an address.
-    let code = "PROTOCOL";
+    let mailError = null;
     try {
-      code = err instanceof MailError ? err.code : toMailError(err).code;
+      mailError = err instanceof MailError ? err : toMailError(err);
     } catch {
-      code = "PROTOCOL";
+      mailError = null;
+    }
+    const code = mailError == null ? "PROTOCOL" : mailError.code;
+    // Nowhere to send from is not "nobody knows": boot's adapter source answers NETWORK/`stopped` on a
+    // gateway that runs no mail supervisor (CROW_MAIL unset, or the reports tick before mail boot
+    // finished), so nothing was attempted and mail that never left must never read as possibly sent.
+    if (code === "NETWORK" && mailError.detail === NO_ADAPTER_DETAIL) {
+      const reason = redacted("no_adapter", d);
+      await settleRow(db, send.id, claimToken, { status: "failed", reason, now, messageId });
+      return { status: "failed", reason };
     }
     const unknown = UNKNOWN_OUTCOMES[code];
     const failed = FAILED_OUTCOMES[code];

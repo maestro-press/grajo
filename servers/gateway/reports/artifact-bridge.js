@@ -56,11 +56,16 @@
  * reserved (`RESERVED_STATE_KEYS`): a block's `setState` must refuse it, so the value the bridge reads is
  * one the bridge wrote.
  *
- * A PREVIEW RE-READS THE REPORT: the engine reads the report row once at run start, so a preview that
- * started before go-live would otherwise be aimed at the artifact the seal now covers. `writeRunVersion`
- * reads the row again for a preview and applies the seal decision (and the `preview_into_live` backstop)
- * to what it finds. A non-preview run keeps the row it was handed: the artifact it writes is the one the
- * verified live set names, never a fresh read.
+ * EVERY RUN RE-READS THE REPORT, AND A PREVIEW'S READ IS GUARDED IN THE BATCH: the engine reads the
+ * report row once at run start, so `writeRunVersion` reads it again before it writes anything. That
+ * re-read is an existence check for every trigger (a run whose report row is gone fails `not_found`
+ * instead of writing a version from the caller's stale snapshot), and for a preview it is also where the
+ * seal decision (and the `preview_into_live` backstop) is taken. A non-preview run keeps the row it was
+ * handed for choosing its artifact: that artifact is the one the verified live set names, never a fresh
+ * read. Between the preview's read and its version batch, go-live can still land, so a preview aimed at
+ * the report's PRIMARY artifact writes a `report_versions` row whose `report_id` comes from a subquery
+ * that is NULL once the report is sealed: the NOT NULL column aborts the whole batch, and
+ * `writeRunVersion` re-reads the report and answers `preview_into_live`.
  *
  * RECIPIENT RENDERS PIN A VERSION: `latestRecipientVersion` / `isRecipientSafeVersion` are the reads a
  * recipient-facing or default render has to use, never the artifact's `current_version`.
@@ -95,6 +100,9 @@ export const STORAGE_NEARLY_FULL_TEXT =
 /** The sentence a run is failed with when the installed artifacts bundle is older than this module. */
 export const ARTIFACTS_OUTDATED_TEXT =
   "The artifacts add-on needs to be updated before reports can run.";
+
+/** The sentence a run is failed with when a preview would have become a version of the sealed artifact. */
+export const PREVIEW_INTO_LIVE_TEXT = "A preview never writes into the report's sealed artifact.";
 
 /** The `report_state` key a report's own preview artifact id lives under. */
 export const PREVIEW_ARTIFACT_STATE_KEY = "preview_artifact_id";
@@ -132,6 +140,12 @@ export function isReservedStateKey(key) {
   return RESERVED_STATE_PREFIXES.some((prefix) => key.startsWith(prefix));
 }
 
+/** The map row a run writes in its version's own batch (the plain path: live runs, previews on the
+ *  separate preview artifact). */
+const REPORT_VERSION_INSERT = `INSERT INTO report_versions
+              (artifact_id, n, report_id, run_id, "trigger", allowed_links_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)`;
+
 /** The suffix that makes a preview artifact recognisable in the artifacts list. */
 const PREVIEW_TITLE_SUFFIX = " (preview)";
 
@@ -142,6 +156,14 @@ function fail(code, message) {
   const err = new Error(message || code);
   err.code = code;
   return err;
+}
+
+/**
+ * Does this error read as a constraint refusal (the guard row's NOT NULL, a unique key)? Used only to
+ * decide whether a failed version batch is worth re-reading the report for, never as the answer itself.
+ */
+function isConstraintFailure(err) {
+  return /constraint/i.test(text(err == null ? "" : err.message));
 }
 
 function text(value) {
@@ -430,11 +452,21 @@ export function normalizeAllowedLinks(links) {
  * keeps writing into the primary artifact, which is the one go-live will seal. The `preview_into_live`
  * backstop refuses a preview whose target is the sealed artifact itself and writes nothing.
  *
- * WHICH DECISION IS TAKEN: for a preview, the report row is read AGAIN here, just before the target is
- * chosen, because the run engine read the row once at run start. A preview that started before go-live
- * would otherwise be aimed at the artifact the seal now covers; the seal, the primary artifact id and the
- * backstop are all applied to the fresh row instead. A non-preview run keeps the row it was handed: its
- * artifact is the one the verified live set names (`makeWriteVersion`), never a fresh read of the row.
+ * WHICH DECISION IS TAKEN: the report row is read AGAIN here, just before the target is chosen, because
+ * the run engine read the row once at run start. That read is the existence check for every trigger (a
+ * report row that is gone is `not_found`, never a version written from the caller's snapshot), and for a
+ * preview it is also where the decision is taken: a preview that started before go-live would otherwise
+ * be aimed at the artifact the seal now covers, so the seal, the primary artifact id and the backstop are
+ * all applied to the fresh row instead. A non-preview run keeps the row it was handed for choosing its
+ * artifact: that artifact is the one the verified live set names (`makeWriteVersion`), never a fresh read.
+ *
+ * THE GO-LIVE RACE IS CLOSED IN THE BATCH: go-live can land between that read and the version batch, and
+ * a preview then holds an unsealed verdict for a report that is now sealed. On the one path where that
+ * matters (a preview aimed at the report's primary artifact) the `report_versions` row is written from a
+ * subquery that is NULL once the report is sealed, so the NOT NULL column aborts the batch, the version
+ * rolls back with it, and the re-read answers `preview_into_live`. The same abort describes the other
+ * thing that re-read can find: a report row deleted between the read and the batch is `not_found`, never
+ * a raw database constraint message.
  *
  * AN OLD BUNDLE IS AN HONEST FAILURE: the run to version map rides `addVersion`'s `extraStatements`
  * batch, and that seam arrives with `holdVersion` in the same store release. A store without
@@ -447,7 +479,7 @@ export function normalizeAllowedLinks(links) {
  * @param {{report: object, run: object, source: object, allowedLinks?: string[]}} input
  * @returns {Promise<number>} the version number
  * @throws {Error} `artifacts_missing`, `artifacts_outdated`, `artifact_unsealed`, `preview_into_live`,
- *   `storage_nearly_full`, `bad_input`
+ *   `storage_nearly_full`, `not_found`, `bad_input`
  */
 export async function writeRunVersion(db, deps, { report, run, source, allowedLinks = [] } = {}) {
   if (!report || typeof report !== "object" || !report.id) throw fail("bad_input", "report");
@@ -470,32 +502,66 @@ export async function writeRunVersion(db, deps, { report, run, source, allowedLi
     }
   }
 
+  // The report row is read AGAIN for every trigger, before anything is written: a run whose report row
+  // has since been deleted has no artifact to write to and no row to record, and its caller's snapshot
+  // must not stand in for the report. A non-preview run keeps that snapshot for everything else.
+  const fresh = await getReport(db, report.id);
+  if (!fresh) throw fail("not_found", "report");
   // The seal that decides where a preview writes is read from the ROW, not from the caller's snapshot
   // (the engine read it at run start, and a report can go live between then and now). A non-preview run
   // keeps its row: its artifact comes from the verified live set, never from a fresh read.
-  const target = trigger === "preview" ? ((await getReport(db, report.id)) ?? report) : report;
+  const target = trigger === "preview" ? fresh : report;
   const sealed = hasSeal(target);
   const artifactId = trigger === "preview" && sealed
     ? await ensurePreviewArtifact(db, deps, target)
     : await ensureReportArtifact(db, deps, target);
   // The backstop: a preview is never a version of the sealed artifact, whatever named that target.
   if (trigger === "preview" && sealed && artifactId === text(target.artifact_id).trim()) {
-    throw fail("preview_into_live", "A preview never writes into the report's sealed artifact.");
+    throw fail("preview_into_live", PREVIEW_INTO_LIVE_TEXT);
   }
+  // The one path where go-live can still overtake this write: a preview of a report that was unsealed a
+  // moment ago writes into the artifact a go-live will seal (see the guard in `extraStatements`).
+  const previewOnPrimary = trigger === "preview" && !sealed;
   const links = normalizeAllowedLinks(allowedLinks);
-  const written = await rt.store.addVersion(db, rt.blobs, {
-    artifactId,
-    source,
-    actor: { kind: "session" },
-    untrusted: true,
-    changeNote: changeNoteFor(run),
-    extraStatements: (n) => [{
-      sql: `INSERT INTO report_versions
-              (artifact_id, n, report_id, run_id, "trigger", allowed_links_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      args: [artifactId, n, report.id, run.id, trigger, JSON.stringify(links), clockOf(deps)],
-    }],
-  }, { markdownBlocks: rt.markdownBlocks });
+  let written;
+  try {
+    written = await rt.store.addVersion(db, rt.blobs, {
+      artifactId,
+      source,
+      actor: { kind: "session" },
+      untrusted: true,
+      changeNote: changeNoteFor(run),
+      extraStatements: (n) => {
+        const args = [artifactId, n, report.id, run.id, trigger, JSON.stringify(links), clockOf(deps)];
+        if (!previewOnPrimary) {
+          return [{ sql: REPORT_VERSION_INSERT, args }];
+        }
+        // The map row IS the race guard here: its report_id comes from a subquery that answers NULL once
+        // the report carries a seal, so the NOT NULL column aborts the batch and the version rolls back
+        // with it. No second insert: on this path this row is the version's only `report_versions` row.
+        return [{
+          sql: `INSERT INTO report_versions
+                  (artifact_id, n, report_id, run_id, "trigger", allowed_links_json, created_at)
+                VALUES (?, ?, (SELECT id FROM reports WHERE id = ? AND live_seal IS NULL AND live_rev IS NULL),
+                        ?, ?, ?, ?)`,
+          args,
+        }];
+      },
+    }, { markdownBlocks: rt.markdownBlocks });
+  } catch (err) {
+    // Only a constraint refusal that a re-read explains is the race; every other failure, and a report
+    // that reads back unsealed (or gone), is rethrown exactly as the store threw it.
+    if (previewOnPrimary && isConstraintFailure(err)) {
+      let now = null;
+      try { now = await getReport(db, report.id); } catch { now = null; }
+      if (hasSeal(now)) throw fail("preview_into_live", PREVIEW_INTO_LIVE_TEXT);
+      // The guard subquery answers NULL for a report row that is gone, so the NOT NULL column refuses the
+      // map row and the version rolls back with it. The report is not sealed: it is not there at all, and
+      // the caller is told that instead of a database constraint's own message.
+      if (now == null) throw fail("not_found", "report");
+    }
+    throw err;
+  }
   const n = Number(written.n);
   // The map row is written by the batch; a store that ignored `extraStatements` wrote the version
   // without it, and a run whose version no row claims is reported instead of silently recorded.

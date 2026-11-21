@@ -51,7 +51,9 @@
  *     block reaches `custom-step.js`. Warnings are recorded beside the source errors and NEVER as one
  *     (a shape block's own trouble, a model block's `ai_fallback`): the status rule below is about source
  *     errors, so an advisory note fails no run.
- *   - `deliver(db, {report, run, live, status, artifactVersion})`: required for `schedule` and `manual`.
+ *   - `deliver(db, {report, run, live, status, artifactVersion, result})`: required for `schedule` and
+ *     `manual`. `result` is what `runBlocks` answered (`document`, `allowedLinks`, a custom step's own
+ *     `email`), so the outgoing step builds the mail from the run's own content and not from a re-read.
  *   - `writeVersion(db, {report, run, live, result})` -> `{artifactVersion}`: optional; absent, the run
  *     keeps no artifact version.
  *   - `getSecrets()`: literal secret values to scrub. Absent, this instance's display list.
@@ -652,7 +654,7 @@ async function runClaimed(db, d, runId, processRunId) {
       errorText,
     };
     try {
-      await d.deliver(db, { report, run: finished, live, status, artifactVersion });
+      await d.deliver(db, { report, run: finished, live, status, artifactVersion, result });
     } catch (err) {
       const note = `Delivery failed: ${redactedText(err?.message || "unknown error", secrets, MESSAGE_MAX)}`;
       errorText = redactedText(errorText ? `${errorText} ${note}` : note, secrets);

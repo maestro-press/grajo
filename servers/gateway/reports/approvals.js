@@ -79,10 +79,14 @@
  *     verification all read the same flags. A caller may narrow it (a test), and null still counts every
  *     block as source-bearing (fail closed) for a caller measuring exactly that.
  *   - `getSecrets()`: literal secret values a pause reason is scrubbed of.
+ *   - `linkFor(db, {report, recipient, run, sendId})`: the link one recipient's mail opens, or null when
+ *     this PR cannot make one for that recipient (`reports/links.js`). Go-live asks it about every
+ *     approved recipient, so a report that would mail a link going nowhere is never taken live.
  *
  * Every refusal is an Error with a `code`: `owner_only`, `not_found`, `bad_input`, `bad_recipe`,
  * `keychain_key_missing`, `preview_missing`, `preview_stale`, `preview_failed`, `no_schedule`,
- * `sender_not_ready`, `model_unresolved`, `go_live_needed`, `bad_seal_field`, and `recipient_changed`
+ * `sender_not_ready`, `model_unresolved`, `go_live_needed`, `bad_seal_field`, `link_unavailable` (an
+ * approved recipient has no link kind, so its mail would point nowhere) and `recipient_changed`
  * for a recipient write whose row moved under the decision.
  *
  * Recipients live at the bottom of this module: propose (by the owner or a bot), approve, refuse and
@@ -97,6 +101,7 @@ import { MODEL_BLOCK_TYPES, canonicalJson, recipeCallsModel, recipeHash, sources
 import { blockRegistry } from "./blocks/index.js";
 import { approvalSeal, newApprovalNonce, verifyApprovalSeal } from "./seal.js";
 import { getReport, getRevision, recordAudit, saveRecipe, updateReportColumns } from "./store.js";
+import { linkFor } from "./links.js";
 import { loadKeychainKey } from "../keychain/key.js";
 import { resolveProviderConfig } from "../ai/resolve-profile.js";
 import { getSecretValues } from "../../shared/secret-values.js";
@@ -513,6 +518,7 @@ function resolveDeps(deps) {
     // The block registry is the server's own; a caller may narrow it, and an explicit null still means
     // "no registry at all" (every block source-bearing), which is the safe side to be wrong on.
     registry: given.registry === undefined ? blockRegistry : given.registry,
+    linkFor: fn("linkFor", linkFor),
   };
 }
 
@@ -823,12 +829,49 @@ async function restampLive(db, deps, report, rev, verified) {
 /* --------------------------------------------------------------------------- go live */
 
 /**
+ * Every approved recipient must have a link kind before a report goes live.
+ *
+ * The link is what the recipient's mail carries, so an approved recipient whose `linkFor` answers null
+ * would get a mail pointing nowhere. The refusal names the address as its detail (the API's map answers
+ * one fixed sentence for the owner), and nothing is written: the owner removes the recipient or gives it
+ * a tier this instance can mail.
+ */
+async function requireRecipientLinks(db, d, report, previewRun) {
+  let recipients = [];
+  try {
+    recipients = await listRecipients(db, report.id, d);
+  } catch {
+    recipients = [];
+  }
+  for (const recipient of recipients) {
+    if (recipient == null || recipient.state !== "approved" || recipient.verified !== true) continue;
+    let link = null;
+    try {
+      link = await d.linkFor(db, { report, recipient, run: previewRun, sendId: null });
+    } catch {
+      // A link that cannot be resolved at all is a recipient that has none.
+      link = null;
+    }
+    if (link == null) {
+      // The message is the code and the address with no space, so a log line reads `link_unavailable:<address>`;
+      // the address is the detail, and the sentence the owner sees is the API map's own.
+      const address = text(recipient.address);
+      const err = new Error(`link_unavailable:${address}`);
+      err.code = "link_unavailable";
+      err.detail = address;
+      throw err;
+    }
+  }
+}
+
+/**
  * Approve a report to run: seal the live set over the head revision and make it `live`.
  *
  * The preview must be this report's, of the current head revision, and it must have finished `ok` or
- * `empty`. A schedule must resolve, the sender account must be ready, and a recipe that calls a model
- * must resolve one now (a null resolution is `model_unresolved`, never a guessed default). Nothing is
- * written until every check has passed, and the write is one UPDATE with the fresh nonce and seal.
+ * `empty`. A schedule must resolve, the sender account must be ready, every APPROVED recipient must have
+ * a link its mail can open (`link_unavailable` when one has none), and a recipe that calls a model must
+ * resolve one now (a null resolution is `model_unresolved`, never a guessed default). Nothing is written
+ * until every check has passed, and the write is one UPDATE with the fresh nonce and seal.
  *
  * @param {object} db
  * @param {object} deps
@@ -852,6 +895,8 @@ export async function approveGoLive(db, deps, { reportId, previewRunId, actor } 
   const accountId = text(report.sender_account_id);
   if (!accountId) throw fail("sender_not_ready");
   if ((await d.senderReady(db, accountId)) !== true) throw fail("sender_not_ready");
+
+  await requireRecipientLinks(db, d, report, run);
 
   const liveRev = Number(report.recipe_rev);
   const revision = Number.isInteger(liveRev) ? await getRevision(db, report.id, liveRev) : null;

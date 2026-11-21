@@ -100,6 +100,7 @@ import meteringPanel from "./panels/metering.js";
 import perchHubPanel from "./panels/perch-hub.js";
 import makePanel, { openMakeItem } from "./panels/make.js";
 import projectHomePanel from "./panels/project-home.js";
+import reportRunPanel from "./panels/report-run.js";
 import projectServicesPanel from "./panels/project-services.js";
 import forYouPanel from "./panels/for-you.js";
 import mailPanel from "./panels/mail.js";
@@ -183,6 +184,7 @@ export default function dashboardRouter(mcpAuthMiddleware, { renderLayout: rende
   registerPanel(perchHubPanel);
   registerPanel(makePanel);
   registerPanel(projectHomePanel);
+  registerPanel(reportRunPanel);
   registerPanel(projectServicesPanel);
   registerPanel(forYouPanel); // 404s unless CROW_FOR_YOU=1 (the panel checks per request)
   registerPanel(mailPanel); // 404s unless CROW_MAIL=1 (the panel checks per request)
@@ -1278,6 +1280,9 @@ export default function dashboardRouter(mcpAuthMiddleware, { renderLayout: rende
   // A project's Services page (project services): hidden, and a 404 like any unknown path, while
   // CROW_SERVICES_UI is off.
   router.all("/dashboard/project/:slug/services", (req, res, next) => (servicesUiEnabled() ? dispatchPanel(req, res, next, "project-services") : next()));
+  // One report run's page (R2-1): the run view a `dashboard` link in a report email opens. Hidden, and
+  // the panel answers 404 for a slug, report or run this instance does not have.
+  router.all("/dashboard/project/:slug/reports/:id/runs/:runId", (req, res, next) => dispatchPanel(req, res, next, "report-run"));
   // Version history pages (implementation plan Task 5): the nested paths
   // (/dashboard/history/jobs, /dashboard/history/trash and an item's
   // /dashboard/history/<type>/<id>) are registered before the single-segment

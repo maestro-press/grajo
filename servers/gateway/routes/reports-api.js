@@ -117,6 +117,7 @@ const FIXED_TEXT = Object.freeze({
   no_schedule: "Choose when this report runs before going live.",
   sender_not_ready: "Choose a mail account that is ready to send.",
   model_unresolved: "Crow could not work out which model this report uses, so it cannot go live.",
+  link_unavailable: "A recipient has no way to open the report yet. Remove them, or let them open it only inside Crow.",
   keychain_key_missing: "The keychain key for this password is not on this machine.",
   internal: "Something went wrong.",
 });
@@ -147,6 +148,7 @@ const STATUS_BY_CODE = Object.freeze({
   no_schedule: 409,
   sender_not_ready: 409,
   model_unresolved: 409,
+  link_unavailable: 409,
   keychain_key_missing: 409,
   report_busy: 409,
   keychain_disconnect_failed: 409,
@@ -609,7 +611,8 @@ export function reportsApiRouter(dashboardAuth, deps = {}) {
 
   // POST /:id/runs/:runId/send-rest — the owner's "Send to the rest": a `pending` row for every
   // approved recipient this run has not sent to, is not sending to, and holds no row for. It SENDS
-  // nothing; delivery picks the rows up. A malformed run id is a 404, like every other path id here.
+  // nothing: those rows are sent by `deliverPending` (reports/delivery.js), which a later PR wires to a
+  // trigger. A malformed run id is a 404, like every other path id here.
   router.post(`${REPORTS_API_PREFIX}/:id/runs/:runId/send-rest`, route(
     "POST /:id/runs/:runId/send-rest",
     async (db, req, res) => {

@@ -989,9 +989,12 @@ export async function runPostListenSetup(server, app, deps) {
   // gateway is a loopback companion sharing crow.db, so it registers nothing, sweeps nothing and
   // takes no lease (startReportsAtBoot refuses on `noAuth` alone, not on any sync setting).
   //
-  // Delivery arrives in PR 5: until then `deliverNotWired` gives every live run an honest seam that
-  // records its result and sends nothing. The approvals deps come from `buildApprovalsDeps`, so the
-  // hook's model-change sentence resolves the bot's real model instead of saying "unavailable".
+  // The hook's one outgoing seam is the real delivery: `makeDeliver` builds `reports/delivery.js`'s
+  // deliver with boot's own mail adapter source (`reportsAdapterFor`, the running mail supervisor's
+  // borrowed connection), the approvals deps and this instance's id. The approvals deps come from
+  // `buildApprovalsDeps`, so the hook's model-change sentence resolves the bot's real model instead of
+  // saying "unavailable", and reports' failed and empty notices reach the owner whatever their
+  // notification type settings say.
   //
   // The hook handle is KEPT (`reportsHook`): the lease is let go on a clean stop only, so the gateway's
   // shutdown path calls `stopReportsHook()` beside `stopScheduler()`.
@@ -999,18 +1002,33 @@ export async function runPostListenSetup(server, app, deps) {
     setImmediate(async () => {
       let db = null;
       try {
-        const [{ startReportsAtBoot, deliverNotWired }, { buildApprovalsDeps }, { makeWriteVersion }] = await Promise.all([
+        const [
+          { startReportsAtBoot },
+          { buildApprovalsDeps },
+          { makeWriteVersion },
+          { makeDeliver },
+          { reportsAdapterFor },
+          { getOrCreateLocalInstanceId },
+        ] = await Promise.all([
           import("../reports/schedule-hook.js"),
           import("../reports/approvals-deps.js"),
           import("../reports/artifact-bridge.js"),
+          import("../reports/delivery.js"),
+          import("./mail-boot.js"),
+          import("../instance-registry.js"),
         ]);
         db = createDbClient();
+        const approvals = buildApprovalsDeps();
+        // The mail door's claim check reads this instance's id (`mail/claims.js`); a box whose registry
+        // cannot be read here still runs reports, because the door falls back to the same reader itself.
+        let localInstanceId;
+        try { localInstanceId = getOrCreateLocalInstanceId(); } catch { localInstanceId = undefined; }
         const started = await startReportsAtBoot({
           noAuth,
           db,
           deps: {
-            deliver: deliverNotWired,
-            approvals: buildApprovalsDeps(),
+            deliver: makeDeliver({ adapterFor: reportsAdapterFor, approvals, localInstanceId }),
+            approvals,
             // The artifact bridge loads the Artifacts bundle lazily (it is installed at runtime), so a
             // gateway without that bundle still boots: a run that needs it fails honestly with
             // artifacts_missing instead.

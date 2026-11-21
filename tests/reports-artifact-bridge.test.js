@@ -926,3 +926,103 @@ test("a store whose addVersion ignores extraStatements fails with artifacts_outd
   assert.equal((await reportVersions(db)).length, 0, "and it is unmapped, which is the honest failure");
   assert.equal(await currentVersion(db, artifactId), 2);
 });
+
+/* --------------------------------------- a report that is gone, and the go-live race */
+
+test("a report row deleted before the write fails the run write (no stale snapshot)", async () => {
+  const db = await freshDb();
+  const rt = await runtime(db);
+  const deps = { artifacts: rt };
+  const { artifactId, report } = await reportWithArtifact(db, deps);
+  const before = (await versions(db, artifactId)).length;
+  await db.execute({ sql: "DELETE FROM reports WHERE id = ?", args: [report.id] });
+
+  // The caller still holds the row it read at run start. Neither trigger may write for it: the row it
+  // would name is gone, and an existing artifact id in that snapshot is not a report any more.
+  for (const run of [
+    { id: "rrn-0000000000000051", trigger: "manual", late: 0, createdAt: T0 },
+    previewRun("52"),
+  ]) {
+    await assert.rejects(() => writeRunVersion(db, deps, { report, run, source: PREVIEW_SOURCE }), (err) => {
+      assert.equal(err.code, "not_found");
+      assert.equal(err.message, "report");
+      return true;
+    });
+  }
+
+  assert.equal((await versions(db, artifactId)).length, before, "no version was written");
+  assert.equal((await reportVersions(db)).length, 0, "and no run-to-version row");
+  assert.equal(await artifactCount(db), 1, "no artifact was made either");
+});
+
+test("a preview whose batch fails after the report row is gone says not_found", async () => {
+  const db = await freshDb();
+  const rt = await runtime(db);
+  const deps = { artifacts: rt };
+  const { artifactId, report } = await reportWithArtifact(db, deps);
+  assert.equal(report.live_rev, null, "the row the bridge re-reads is still unsealed");
+
+  // The report row is deleted between the bridge's read and its version batch, so the guard subquery
+  // answers NULL and the NOT NULL column refuses the map row (a constraint failure).
+  const deleting = {
+    ...rt,
+    store: {
+      ...bundleStore,
+      addVersion: async (db2, blobs, input, opts) => {
+        await db2.execute({ sql: "DELETE FROM reports WHERE id = ?", args: [report.id] });
+        return bundleStore.addVersion(db2, blobs, input, opts);
+      },
+    },
+  };
+
+  await assert.rejects(() => writeRunVersion(db, { artifacts: deleting }, {
+    report, run: previewRun("54"), source: PREVIEW_SOURCE,
+  }), (err) => {
+    assert.equal(err.code, "not_found", "not a raw database constraint message");
+    assert.equal(err.message, "report");
+    return true;
+  });
+
+  assert.equal((await versions(db, artifactId)).length, 1, "the version rolled back with the guard row");
+  assert.equal((await reportVersions(db)).length, 0, "no run-to-version row either");
+  assert.equal(await currentVersion(db, artifactId), 1);
+});
+
+test("a preview that raced go-live writes no version and no map row, and says preview_into_live", async () => {
+  const db = await freshDb();
+  const rt = await runtime(db);
+  const deps = { artifacts: rt };
+  const { artifactId, report } = await reportWithArtifact(db, deps);
+  const before = (await versions(db, artifactId)).length;
+  assert.equal(report.live_rev, null, "the row the bridge re-reads is still unsealed");
+
+  // The one moment the bridge can still be overtaken: it read the report as unsealed, so the preview is
+  // aimed at the primary artifact, and go-live lands while its version is being written. The wrapper is
+  // the go-live that overtakes the batch (the guard rides `addVersion`'s own statements).
+  const sealing = {
+    ...rt,
+    store: {
+      ...bundleStore,
+      addVersion: async (db2, blobs, input, opts) => {
+        await db2.execute({
+          sql: "UPDATE reports SET status = 'live', live_rev = 1, live_seal = 'sealed' WHERE id = ?",
+          args: [report.id],
+        });
+        return bundleStore.addVersion(db2, blobs, input, opts);
+      },
+    },
+  };
+
+  await assert.rejects(() => writeRunVersion(db, { artifacts: sealing }, {
+    report, run: previewRun("53"), source: PREVIEW_SOURCE,
+  }), (err) => {
+    assert.equal(err.code, "preview_into_live");
+    return true;
+  });
+
+  assert.equal((await versions(db, artifactId)).length, before, "the version rolled back with the guard row");
+  assert.equal((await reportVersions(db)).length, 0, "no run-to-version row either");
+  assert.equal(await currentVersion(db, artifactId), 1, "the artifact's current version did not move");
+  assert.equal(await getState(db, report.id, PREVIEW_ARTIFACT_STATE_KEY), null,
+    "no preview artifact was made for it either");
+});

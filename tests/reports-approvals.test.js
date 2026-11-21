@@ -24,8 +24,9 @@ const MASTER = join(root, "master", "crow.db");
 
 const { createDbClient } = await import("../servers/db.js");
 const {
-  SETTINGS_CHANGED_PAUSE_REASON, applyPendingFreeChange, approveGoLive, botSaveRecipe, isLive,
-  liveSetFor, ownerSaveRecipe, pauseReport, pauseReportSystem, resumeReport, updateSettings, verifyLive,
+  SETTINGS_CHANGED_PAUSE_REASON, applyPendingFreeChange, approveGoLive, approveRecipient, botSaveRecipe,
+  isLive, liveSetFor, ownerSaveRecipe, pauseReport, pauseReportSystem, proposeRecipient, resumeReport,
+  updateSettings, verifyLive,
 } = await import("../servers/gateway/reports/approvals.js");
 const { senderReady } = await import("../servers/gateway/reports/sender-ready.js");
 const { saveCustomRole, setBinding } = await import("../servers/shared/model-roles-store.js");
@@ -575,6 +576,52 @@ test("a missing keychain seed is its own code, and nothing is written", async ()
   );
   assert.equal((await row(db, report.id)).status, "draft");
   assert.equal((await row(db, report.id)).live_seal, null);
+});
+
+test("go live refuses while an outside recipient has no link kind, and writes nothing", async () => {
+  const { db } = await freshDb();
+  const report = await prepare(db);
+  // One approved recipient at tier a: the public link kinds (and their tokens) arrive with PR 6a, so
+  // this report's mail would point nowhere.
+  const proposed = await proposeRecipient(db, depsWith(), {
+    reportId: report.id, address: "alex@example.com", commentTier: "a", proposedBy: "owner",
+  });
+  const approved = await approveRecipient(db, depsWith(), { recipientId: proposed.id, actor: OWNER });
+  assert.equal(approved.state, "approved");
+
+  await assert.rejects(
+    () => goLive(db, report),
+    (err) => {
+      assert.equal(err.code, "link_unavailable");
+      assert.equal(err.message, "link_unavailable:alex@example.com");
+      assert.equal(err.detail, "alex@example.com");
+      return true;
+    },
+  );
+  const after1 = await row(db, report.id);
+  assert.equal(after1.status, "draft", "nothing was written");
+  assert.equal(after1.live_seal, null);
+  assert.equal(after1.live_nonce, null);
+});
+
+test("go live still works with only tier c recipients", async () => {
+  const { db } = await freshDb();
+  const report = await prepare(db);
+  // The dashboard link is keyed by the project's slug, so the report's project row has to exist.
+  await db.execute({
+    sql: "INSERT INTO project_spaces (id, uuid, slug, name) VALUES (?, ?, ?, ?)",
+    args: [PROJECT, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "weekly-listings", "weekly-listings"],
+  });
+  const proposed = await proposeRecipient(db, depsWith(), {
+    reportId: report.id, address: "alex@example.com", commentTier: "c", proposedBy: "owner",
+  });
+  await approveRecipient(db, depsWith(), { recipientId: proposed.id, actor: OWNER });
+
+  const { result } = await goLive(db, report);
+  assert.equal(result.ok, true);
+  const after1 = await row(db, report.id);
+  assert.equal(after1.status, "live");
+  assert.match(after1.live_seal, /^[0-9a-f]{64}$/);
 });
 
 /* -------------------------------------------------------------- pause / resume */

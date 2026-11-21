@@ -14,9 +14,10 @@
  *
  * `unknown` is the honest answer: nobody knows whether the provider took the message, so it is never
  * resent automatically. The owner gets ONE notice per affected run, with plain counts for that run:
- * how many went, how many nobody can confirm, and how many are still waiting (a `pending` row stays
- * pending; the delivery seam picks it up whenever it runs). The report title is untrusted text, so it
- * loses its control characters and is bounded before it reaches a bell.
+ * how many went, how many nobody can confirm, and how many are still waiting. A `pending` row stays
+ * pending: the rows written by "Send to the rest" are sent by `deliverPending` (delivery.js), which a
+ * later PR wires to a trigger, so this sweep never picks one up itself. The report title is untrusted
+ * text, so it loses its control characters and is bounded before it reaches a bell.
  *
  * This module imports nothing under `mail/`: the notification comes in as a callback, and the caller
  * (reports/schedule-hook.js) already holds the owner's notice channel and the reports lease.
