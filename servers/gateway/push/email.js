@@ -7,7 +7,13 @@
  *
  * Requires RESEND_API_KEY, MPA_EMAIL_FROM, MPA_EMAIL_TO. Skipped silently
  * if any are missing, so non-MPA instances of this gateway code never send.
+ *
+ * The click link's base comes from `resolveClickBase` (../dashboard-link-base.js):
+ * NTFY_CLICK_BASE_URL when set, else the dashboard address (`CROW_DASHBOARD_URL`, this
+ * instance's own registered gateway_url, then CROW_GATEWAY_URL) — never the public
+ * Funnel origin when the dashboard lives on its own port.
  */
+import { resolveClickBase } from "../dashboard-link-base.js";
 
 function shouldEmail({ priority, type }) {
   // Track 3 Task 8: "attention" pushes (bot turn/ask-card/gated-result) are
@@ -82,6 +88,7 @@ export async function sendEmailNotification({
   url,
   priority = "normal",
   type = "system",
+  db = null,
 }) {
   if (!shouldEmail({ priority, type })) return;
 
@@ -90,8 +97,9 @@ export async function sendEmailNotification({
   const to = process.env.MPA_EMAIL_TO;
   if (!apiKey || !from || !to) return;
 
-  const clickBase = process.env.NTFY_CLICK_BASE_URL || process.env.CROW_GATEWAY_URL || "";
-  const clickUrl = url ? (url.startsWith("http") ? url : clickBase + url) : null;
+  // The base is resolved only for a RELATIVE url: an absolute one needs no base, and a notification
+  // with no url at all must not cost a database read.
+  const clickUrl = url ? (url.startsWith("http") ? url : (await resolveClickBase(db)) + url) : null;
 
   const subject = priority === "high" ? `[MPA] ${title}` : title;
   const bodyHtml = renderBodyHtml(body);

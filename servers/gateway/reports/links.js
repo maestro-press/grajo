@@ -20,14 +20,25 @@
  * route is keyed by the project's slug, not its id. A report with no project, or a project row this
  * instance no longer has, has no slug: `linkFor` answers null rather than a wrong URL.
  *
- * THE BASE is the caller's (`baseUrl`), else `CROW_GATEWAY_URL` (this instance's own address). With no
- * base at all the answer is the PATH only, and `isAbsoluteHttpUrl` is how a caller tells: delivery
- * refuses to mail a link that is not an absolute http(s) URL, so an instance that does not know its own
- * address skips the mail instead of sending a relative one.
+ * THE BASE is the caller's (`baseUrl`) when one is given, else the dashboard base
+ * `resolveDashboardBase` resolves for this instance (`servers/gateway/dashboard-link-base.js`):
+ * `CROW_DASHBOARD_URL`, then this instance's own `crow_instances.gateway_url` (never a wildcard bind or
+ * a loopback address), then `CROW_GATEWAY_URL`. A caller that already knows which registry row is this
+ * instance's own passes `localInstanceId`, so the own-row step reads that row instead of the
+ * instance-id file. The order exists because on a Tailscale install
+ * `CROW_GATEWAY_URL` is the PUBLIC Funnel origin on port 443, which serves only the public paths in
+ * PUBLIC_FUNNEL_PREFIXES and answers 404 for `/dashboard`: the dashboard lives on its own tailnet-only
+ * HTTPS port, and that is the door an email link has to name.
+ *
+ * With no base at all the answer is NULL, never the path alone: a mail client cannot open a relative
+ * path, and both callers read null as "this recipient cannot be mailed" (delivery skips it and rings
+ * the owner's own notice; go-live refuses with `link_unavailable`). `isAbsoluteHttpUrl` is the second,
+ * independent check a caller makes on a link it was handed.
  *
  * Nothing here sends anything, writes anything or reads a secret: it is two reads (the project's slug and
  * this instance's secret-free base URL) and one string.
  */
+import { resolveDashboardBase } from "../dashboard-link-base.js";
 /** The link kinds a recipient may get. `public-comment` and `public-view` arrive with PR 6a's tokens. */
 export const LINK_KINDS = Object.freeze(["dashboard", "public-view", "public-comment"]);
 
@@ -114,8 +125,10 @@ export async function projectSlug(db, report) {
 }
 
 /**
- * This instance's own base URL as a link builder takes it: the caller's, else `CROW_GATEWAY_URL`, with
- * trailing slashes trimmed. "" means this instance does not know its own address.
+ * A caller's explicit base URL with its trailing slashes trimmed, falling back to `CROW_GATEWAY_URL`
+ * when none is given. Kept exported for callers that pass their own base: `linkFor` itself resolves a
+ * base through `resolveDashboardBase` (`../dashboard-link-base.js`), which is the order the dashboard
+ * and the public Funnel address need. "" means no base is known.
  *
  * @param {string|null|undefined} baseUrl
  * @returns {string}
@@ -162,11 +175,15 @@ export function publicLinkFor() {
  *
  * @param {object} db a libsql-shaped client
  * @param {{report?: object|null, recipient?: object|null, run?: object|null, sendId?: string|null,
- *   baseUrl?: string|null}} input `sendId` is the recipient's `report_sends` row id (the token PR 6a
- *   mints is per send, so a public link needs it)
+ *   baseUrl?: string|null, localInstanceId?: string|null}} input `sendId` is the recipient's
+ *   `report_sends` row id (the token PR 6a mints is per send, so a public link needs it), and
+ *   `localInstanceId` is this instance's own `crow_instances` row id (optional: with none the
+ *   resolver reads the instance-id file)
  * @returns {Promise<{kind: "dashboard"|"public-view"|"public-comment", url: string}|null>}
  */
-export async function linkFor(db, { report = null, recipient = null, run = null, sendId = null, baseUrl = null } = {}) {
+export async function linkFor(db, {
+  report = null, recipient = null, run = null, sendId = null, baseUrl = null, localInstanceId = null,
+} = {}) {
   const tier = commentTierOf(report, recipient);
   if (tier !== DASHBOARD_TIER) {
     return publicLinkFor(db, { report, recipient, run, sendId, baseUrl, tier });
@@ -176,8 +193,11 @@ export async function linkFor(db, { report = null, recipient = null, run = null,
   const runId = text(run == null ? "" : run.id);
   if (!slug || !reportId || !runId) return null;
   const path = `/dashboard/project/${segment(slug)}/reports/${segment(reportId)}/runs/${segment(runId)}`;
-  const base = baseUrlOf(baseUrl);
-  return { kind: "dashboard", url: base ? `${base}${path}` : path };
+  const given = text(baseUrl).trim();
+  const base = given ? given.replace(/\/+$/, "") : await resolveDashboardBase(db, { localInstanceId });
+  // No base, no link: a relative path in an email is a link nobody can open.
+  if (!base) return null;
+  return { kind: "dashboard", url: `${base}${path}` };
 }
 
 export default linkFor;

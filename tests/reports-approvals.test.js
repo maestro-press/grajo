@@ -18,6 +18,10 @@ process.env.CROW_DATA_DIR = join(root, "master");
 process.env.CROW_HOME = join(root, "home");
 delete process.env.CROW_DB_PATH;
 process.env.CROW_TASKS_DB_PATH = join(root, "master", "tasks.db");
+// Go-live asks `linkFor` about every approved recipient, and a dashboard link needs a base URL a reader
+// could open: this stands in for the operator's private dashboard address.
+process.env.CROW_DASHBOARD_URL = "https://crow.example.ts.net:8444";
+delete process.env.CROW_GATEWAY_URL;
 mkdirSync(process.env.CROW_HOME, { recursive: true });
 const REPO = new URL("..", import.meta.url).pathname;
 const MASTER = join(root, "master", "crow.db");

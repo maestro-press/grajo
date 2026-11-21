@@ -890,13 +890,14 @@ test("makeDeliver hands run.js's payload and its own deps to deliver", async () 
 
 /* --------------------------------------------------- a recipient with no link */
 
-test("a recipient whose link is only a path is skipped, and the owner hears there was no link", async () => {
+test("a recipient with no resolvable dashboard base is skipped, and the owner hears there was no link", async () => {
   const w = await world();
   await recipientFor(w.db, w.reportId, { address: "alex@example.com" });
   await recipientFor(w.db, w.reportId, { address: "sam@example.com" });
   const mail = recorder();
   const bell = notes();
-  // No base URL and no CROW_GATEWAY_URL: links.js answers the path alone, which a mail client cannot open.
+  // No base URL, no CROW_DASHBOARD_URL and no CROW_GATEWAY_URL: links.js answers null, because a mail
+  // client cannot open a path.
   const counts = await deliver(w.db, deliveryDeps({
     sendMail: mail.sendMail, notify: bell.notify, baseUrl: undefined,
   }), {

@@ -5,8 +5,14 @@
  * resolveNtfyConfig() (ntfy-config.js): the NTFY_* environment when NTFY_TOPIC is set
  * (unchanged pre-autowire behavior), else the instance's autowired ntfy-push.json.
  * DB-free by design — the corruption/migration alerts call this directly.
+ *
+ * The CLICK link's base comes from `resolveClickBase` (../dashboard-link-base.js):
+ * NTFY_CLICK_BASE_URL when set, else the dashboard address (`CROW_DASHBOARD_URL`, this
+ * instance's own registered gateway_url, then CROW_GATEWAY_URL). A caller that has a
+ * database hands it in (`db`); one that has none still gets the env answers.
  */
 import { resolveNtfyConfig, recordNtfyStatus } from "./ntfy-config.js";
+import { resolveClickBase } from "../dashboard-link-base.js";
 
 const PRIORITY_MAP = {
   low: "2",
@@ -32,6 +38,8 @@ const TAG_MAP = {
  * @param {string} [opts.url] - Click action URL (relative or absolute)
  * @param {string} [opts.priority='normal'] - 'low', 'normal', 'high'
  * @param {string} [opts.type='system'] - Notification type for tag mapping
+ * @param {object} [opts.db] - a libsql-shaped client, used only to resolve the click link's base
+ *   (a caller with no database passes none and the base comes from the environment alone)
  */
 /**
  * HTTP headers can only carry ISO-8859-1 bytes. Node's fetch throws
@@ -52,7 +60,7 @@ function encodeNtfyHeader(value) {
 /**
  * @returns {Promise<{ok:boolean, status?:number, error?:string, skipped?:boolean}>} never throws
  */
-export async function sendNtfyNotification({ title, body, url, priority = "normal", type = "system" }) {
+export async function sendNtfyNotification({ title, body, url, priority = "normal", type = "system", db = null }) {
   let cfg;
   try { cfg = resolveNtfyConfig(); } catch { cfg = null; }
   if (!cfg) return { ok: false, skipped: true };
@@ -70,12 +78,15 @@ export async function sendNtfyNotification({ title, body, url, priority = "norma
   // the tap destination has to match. Without this override, an MPA push
   // gets `X-Click: https://…:8447/…` (MPA's own URL) and the paired-to-
   // primary APK sees the prefix mismatch and falls back to
-  // `/dashboard/nest` instead of opening the intended page. Falls back to
-  // CROW_GATEWAY_URL for single-instance deployments where the publishing
-  // gateway is also the user's paired gateway.
+  // `/dashboard/nest` instead of opening the intended page. With no override
+  // the base is the DASHBOARD address (resolveClickBase): CROW_DASHBOARD_URL,
+  // then this instance's own registered gateway_url, then CROW_GATEWAY_URL —
+  // because on a Tailscale install CROW_GATEWAY_URL is the public Funnel
+  // origin, which serves only public paths and 404s /dashboard.
   if (url) {
-    const clickBase = process.env.NTFY_CLICK_BASE_URL || process.env.CROW_GATEWAY_URL || "";
-    headers["X-Click"] = url.startsWith("http") ? url : clickBase + url;
+    // Only a RELATIVE url needs a base: an absolute one is passed through, and a push with no url at
+    // all costs no database read.
+    headers["X-Click"] = url.startsWith("http") ? url : (await resolveClickBase(db)) + url;
   }
 
   const tag = TAG_MAP[type];

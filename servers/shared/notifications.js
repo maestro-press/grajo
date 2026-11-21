@@ -161,10 +161,11 @@ export async function deliverNotification(db, { title: rawTitle, body: rawBody =
     // Push module not available (non-gateway context) — skip silently
   }
 
-  // Send ntfy notification (non-blocking, fails silently when not configured)
+  // Send ntfy notification (non-blocking, fails silently when not configured). `db` is
+  // only the click link's base (dashboard-link-base.js), never the message.
   try {
     const { sendNtfyNotification } = await import("../gateway/push/ntfy.js");
-    await sendNtfyNotification({ title, body: body || title, url: action_url, priority, type });
+    await sendNtfyNotification({ title, body: body || title, url: action_url, priority, type, db });
   } catch {
     // ntfy module not available or not configured — skip silently
   }
@@ -175,7 +176,7 @@ export async function deliverNotification(db, { title: rawTitle, body: rawBody =
   // that inherits this code never sends unless explicitly configured.
   try {
     const { sendEmailNotification } = await import("../gateway/push/email.js");
-    await sendEmailNotification({ title, body: body || title, url: action_url, priority, type });
+    await sendEmailNotification({ title, body: body || title, url: action_url, priority, type, db });
   } catch {
     // email module not available or not configured — skip silently
   }

@@ -158,30 +158,30 @@ test("a recipient with no tier of their own takes the report's default", async (
   assert.equal(commentTierOf(reportRow({ comment_tier_default: "b" }), null), "b");
 });
 
-test("with no base URL the answer is the path only, so a caller can refuse to mail it", async () => {
+test("with no base URL there is no link at all: never a relative path in an email", async () => {
   const db = await freshDb();
   await addProject(db);
   const saved = process.env.CROW_GATEWAY_URL;
+  const savedDashboard = process.env.CROW_DASHBOARD_URL;
   delete process.env.CROW_GATEWAY_URL;
+  delete process.env.CROW_DASHBOARD_URL;
   try {
+    // This instance's own row carries no address, so no base resolves anywhere.
     const link = await linkFor(db, {
       report: reportRow(),
       recipient: recipientRow(),
       run: runRow(),
       baseUrl: "",
     });
-    assert.deepEqual(link, {
-      kind: "dashboard",
-      url: `/dashboard/project/weekly-listings/reports/${REPORT_ID}/runs/${RUN_ID}`,
-    });
-    assert.ok(link.url.startsWith("/"), "a path, not a URL");
-    assert.equal(isAbsoluteHttpUrl(link.url), false, "a mail client cannot open it");
+    assert.equal(link, null, "a mail client cannot open a path, so there is no link to mail");
+    assert.equal(isAbsoluteHttpUrl("/dashboard/x"), false, "a path is still not a URL delivery may mail");
   } finally {
     if (saved !== undefined) process.env.CROW_GATEWAY_URL = saved;
+    if (savedDashboard !== undefined) process.env.CROW_DASHBOARD_URL = savedDashboard;
   }
 });
 
-test("the base URL is the caller's, else this instance's own, with trailing slashes trimmed", async () => {
+test("the base URL is the caller's, else this instance's own address, with trailing slashes trimmed", async () => {
   const db = await freshDb();
   await addProject(db);
   const saved = process.env.CROW_GATEWAY_URL;
@@ -193,7 +193,7 @@ test("the base URL is the caller's, else this instance's own, with trailing slas
     });
     assert.ok(link.url.startsWith("https://crow.example.ts.net/dashboard/project/"), link.url);
     assert.equal(baseUrlOf("http://127.0.0.1:8080/"), "http://127.0.0.1:8080");
-    assert.equal(baseUrlOf(undefined), "https://crow.example.ts.net", "the instance's own wins last");
+    assert.equal(baseUrlOf(undefined), "https://crow.example.ts.net", "the instance's own address is the fallback");
   } finally {
     if (saved === undefined) delete process.env.CROW_GATEWAY_URL;
     else process.env.CROW_GATEWAY_URL = saved;

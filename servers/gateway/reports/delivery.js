@@ -44,8 +44,9 @@
  *      still points at. A hold that fails changes no count and is not thrown: the mail already went.
  *   8. If any send ended failed, unknown or refused, the owner gets ONE more essential notice with the
  *      counts, so a partly delivered run is never silent.
- *   9. A recipient skipped for want of a LINK (no link kind yet, or a relative path because this instance
- *      does not know its own address) was never attempted and owns no send row, so the owner gets ONE
+ *   9. A recipient skipped for want of a LINK (no link kind yet, or no dashboard base because this
+ *      instance does not know an address a reader could open, so `links.js` answers null) was never
+ *      attempted and owns no send row, so the owner gets ONE
  *      essential notice about it too: nothing was written anywhere else that says the mail did not go.
  *      That count is kept apart from the other skips: a recipient this run is already spoken for is not
  *      a miss and rings nothing.
@@ -428,7 +429,9 @@ async function deliverToRecipient(db, d, {
 }) {
   let link = null;
   try {
-    link = await d.linkFor(db, { report, recipient, run, sendId, baseUrl: d.baseUrl });
+    link = await d.linkFor(db, {
+      report, recipient, run, sendId, baseUrl: d.baseUrl, localInstanceId: d.localInstanceId,
+    });
   } catch {
     link = null;
   }

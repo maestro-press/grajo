@@ -180,6 +180,10 @@ Then set `CROW_GATEWAY_URL` in your `.env` so RSS feeds, podcast URLs, and sitem
 CROW_GATEWAY_URL=https://yourdomain.com
 ```
 
+::: tip Dashboard links in mail and push
+`CROW_GATEWAY_URL` is the public origin. If a Funnel sits in front of it, that origin serves only the public paths and answers 404 for `/dashboard`, and the dashboard lives on its own tailnet-only port. Set `CROW_DASHBOARD_URL` to that private address (e.g. `https://<host>.<tailnet>.ts.net:8444`) so the "open this report" link in report emails and the tap target of phone push notifications reach the dashboard. Unset, Crow uses this instance's own registered gateway address (a loopback or wildcard bind is skipped), then `CROW_GATEWAY_URL`. Never point it at a Funnel origin.
+:::
+
 Restart both services:
 
 ```bash
