@@ -366,10 +366,30 @@ test("GET /accounts carries no host, port, username or hash, and names where an 
   assert.equal(byId.get(mine.id).heldBy, null);
   assert.equal(byId.get(shared.id).heldBy, "Studio");
   assert.deepEqual(r.json.elsewhere, [{ instanceName: "Studio", claimedAt: 1_000 }]);
-  for (const needle of ["mail.example.test", "993", "465", USERNAME, "imap", "smtp", "MAIL_PASSWORD",
+  for (const needle of ["mail.example.test", USERNAME, "imap", "smtp", "MAIL_PASSWORD",
     addressHash("shared@example.com"), "mail_claim"]) {
     assert.equal(r.text.includes(needle), false, `GET /accounts holds ${needle}`);
   }
+  // The ports are checked as VALUES at any depth, never as a substring of the whole body: random ids
+  // and millisecond timestamps legitimately contain "993"/"465" as digits.
+  const walk = (value, path) => {
+    if (Array.isArray(value)) {
+      value.forEach((entry, i) => walk(entry, `${path}[${i}]`));
+      return;
+    }
+    if (value !== null && typeof value === "object") {
+      for (const [key, inner] of Object.entries(value)) {
+        const keyPath = path === "" ? key : `${path}.${key}`;
+        assert.doesNotMatch(key, /host|port|username|imap|smtp/i,
+          `GET /accounts names ${keyPath}, which is where an account is held`);
+        walk(inner, keyPath);
+      }
+      return;
+    }
+    assert.equal(value === 993 || value === 465 || value === "993" || value === "465", false,
+      `GET /accounts holds a port at ${path}`);
+  };
+  walk(r.json, "");
 
   // The route is the overview function, byte for byte.
   assert.deepEqual(r.json, await accountsOverview(s.db, { localInstanceId: LOCAL.instanceId }));
