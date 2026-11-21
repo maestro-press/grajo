@@ -5626,6 +5626,14 @@ test("m1 (T27): private-address.js's exit cleanup passes its remaining budget in
 const EXIT_SETTLE_RESERVE_MS = 500;
 
 /**
+ * The test reads its own clock (the recorder's `call.at`) a few milliseconds away from
+ * the product's own read, so a later call's budget is compared against a ceiling derived
+ * from a slightly earlier `Date.now()`. This absorbs that difference: the red case this
+ * case exists for sits ~500 ms above the ceiling, far more than 25 ms.
+ */
+const CLOCK_SKEW_TOLERANCE_MS = 25;
+
+/**
  * A fake ownership for `blankPagesOnExit` that RECORDS every settle() it is handed:
  * `{ at, budgetMs }` per call, so "what is left minus the reserve" is a list of numbers
  * and not an impression. `classify` answers BOT for every page — a context holding
@@ -5683,17 +5691,19 @@ test("m2 (T28): the exit cleanup hands settle() its remaining budget MINUS a 500
 
   // A LATER call, after real time passed inside the cleanup: still bounded by what is
   // left minus the reserve, and never below the 1 ms floor. `startedAt` is taken BEFORE
-  // the cleanup starts, so this ceiling is at worst generous by the fraction of a
-  // millisecond in between — never tight enough to be a race.
+  // the cleanup starts and `call.at` by the recorder, so the two clock reads are a few
+  // milliseconds apart: this ceiling carries the CLOCK_SKEW_TOLERANCE_MS allowance for
+  // that difference rather than being tight enough to be a race.
   for (const call of calls.slice(1)) {
     const elapsed = call.at - startedAt;
+    const ceiling = CLEANUP_BUDGET_MS - EXIT_SETTLE_RESERVE_MS - elapsed + CLOCK_SKEW_TOLERANCE_MS;
     assert.ok(
       call.budgetMs >= 1,
       `a later settle budget is still at least 1 ms after ${elapsed} ms, never 0 or a negative number (saw ${call.budgetMs})`,
     );
     assert.ok(
-      call.budgetMs === 1 || call.budgetMs <= CLEANUP_BUDGET_MS - EXIT_SETTLE_RESERVE_MS - elapsed,
-      `a settle taken ${elapsed} ms into the cleanup is still what is left minus the reserve (saw ${call.budgetMs}, ceiling ${CLEANUP_BUDGET_MS - EXIT_SETTLE_RESERVE_MS - elapsed} — RED at HEAD: the whole remainder is handed over)`,
+      call.budgetMs === 1 || call.budgetMs <= ceiling,
+      `a settle taken ${elapsed} ms into the cleanup is still what is left minus the reserve (saw ${call.budgetMs}, ceiling ${ceiling} = ${CLEANUP_BUDGET_MS} ms budget - ${EXIT_SETTLE_RESERVE_MS} ms reserve - ${elapsed} ms elapsed + ${CLOCK_SKEW_TOLERANCE_MS} ms clock-read skew tolerance — RED at HEAD: the whole remainder is handed over)`,
     );
   }
 });

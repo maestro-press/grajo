@@ -185,6 +185,23 @@ test("BEHAVIOR: group 'none' sends null; 'automatic' leaves the group out; an em
 
 // ─── Live layout ────────────────────────────────────────────────────────────
 
+/**
+ * The card the live test needs: a `.mcat-card` that has a non-empty data-companions
+ * list AND an adopt button. Both come from host state (renderModelCard offers Adopt only
+ * for a card that is not running, not registered and not wont_fit), so the first card
+ * with companions is not necessarily adoptable. Defined as source text so the ready gate
+ * waits for exactly this card and the pick uses the same rule.
+ */
+const FIRST_ADOPTABLE_COMPANION_CARD_FN = `function firstAdoptableCompanionCard() {
+  var cards = [].slice.call(document.querySelectorAll('.mcat-card'));
+  var match = cards.filter(function (c) {
+    var companions = [];
+    try { companions = JSON.parse(c.getAttribute('data-companions') || '[]'); } catch (e) { return false; }
+    return companions.length > 0 && !!c.querySelector('[data-action="adopt"]');
+  })[0];
+  return match || null;
+}`;
+
 let chrome = null, server = null, base = "";
 before(async () => {
   chrome = await startHeadlessChrome();
@@ -213,11 +230,17 @@ after(async () => {
 for (const [w, h] of [[412, 915], [1280, 900]]) {
   test(`live ${w}x${h}: the open adopt dialog fits the viewport, scrolls inside, and Save is reachable`, async (t) => {
     if (!chrome) return t.skip("no headless Chrome");
-    const m = await withLivePage(chrome, base + "/dashboard/model-catalog", { width: w, height: h, readyExpr: "!!window.CrowModelDialog && !!document.querySelector('.mcat-card [data-action=\"adopt\"]')" }, async (evalIn) => {
+    const m = await withLivePage(chrome, base + "/dashboard/model-catalog", { width: w, height: h, readyExpr: `!!window.CrowModelDialog && !!(${FIRST_ADOPTABLE_COMPANION_CARD_FN})()` }, async (evalIn) => {
       await evalIn(`(function(){
         var cards = [].slice.call(document.querySelectorAll('.mcat-card'));
-        var withCompanions = cards.filter(function(c){ try { return JSON.parse(c.getAttribute('data-companions') || '[]').length > 0; } catch (e) { return false; } })[0];
-        var card = withCompanions || cards[0];
+        var card = (${FIRST_ADOPTABLE_COMPANION_CARD_FN})();
+        if (!card) {
+          var withCompanions = cards.filter(function (c) {
+            try { return JSON.parse(c.getAttribute('data-companions') || '[]').length > 0; } catch (e) { return false; }
+          }).length;
+          var withAdopt = cards.filter(function (c) { return !!c.querySelector('[data-action="adopt"]'); }).length;
+          throw new Error("no .mcat-card has both companions and an adopt button; cards=" + cards.length + ", with companions=" + withCompanions + ", with adopt=" + withAdopt);
+        }
         card.querySelector('[data-action="adopt"]').click();
         return 1;
       })()`);
