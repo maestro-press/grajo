@@ -2570,6 +2570,97 @@ export { recreateBundleGuarded as _recreateBundleGuardedForTest };
 // It needs no request, so the boot pass may run it exactly as the card's route does.
 export { recreateBundleGuarded };
 
+/**
+ * The LOCAL start of one installed bundle: everything POST /bundles/api/start does once it
+ * knows the bundle is not forwarded to a peer. Extracted (not copied) so an in-process
+ * caller runs the SAME checks in the SAME order — orchestration switch, ownership of the
+ * compose project, the consent + compose safety check on what Compose will apply NOW, then
+ * `up -d [--build] [--force-recreate]` and the post-start re-check of the boot detectors.
+ *
+ * The route maps the result to the status/body it always answered with; the Fix-it card's
+ * restart (restartBundleInProcess) calls this directly.
+ *
+ * @param {string} bundleId
+ * @param {{ recreate?: boolean, crossHost?: boolean }} [opts]  recreate = `--force-recreate`
+ *   (the Configure dialog's explicit Restart); crossHost = the caller is a peer request, so
+ *   the owner's install-time consent is not carried into the check.
+ * @returns {Promise<{ok: true} | {ok: false, status: number, code?: string, error: string}>}
+ */
+export async function startBundleLocal(bundleId, { recreate = false, crossHost = false } = {}) {
+  const orchRefusal = bundleOrchestrationRefusal(bundleId);
+  if (orchRefusal) return { ok: false, status: orchRefusal.status, code: orchRefusal.code, error: orchRefusal.error };
+
+  const bundleDir = join(BUNDLES_DIR, bundleId);
+  const composePath = join(bundleDir, "docker-compose.yml");
+  if (!existsSync(composePath)) {
+    return { ok: false, status: 404, error: `Bundle '${bundleId}' has no Docker containers` };
+  }
+  try {
+    const own = await composeOwnership(bundleId, bundleDir, getInstalledFirstManifest(bundleId));
+    if (own.refusal) return { ok: false, status: 409, code: "compose_project_foreign", error: own.refusal };
+    if (own.warning) console.warn(`[bundles] ${bundleId} start: ${own.warning}`);
+    // The same check as install, on what Compose will apply NOW (Configure may have
+    // changed .env; an override may sit next to the file). The installed bundle was
+    // consented to at install, so a consent bundle keeps its consent here.
+    const sc = startConsent(bundleId, { crossHost });
+    const gate = await checkBundleCompose(bundleDir, { bundleId, manifest: sc.manifest, consentVerified: sc.consentVerified, textCheck: false });
+    if (!gate.valid) return { ok: false, status: 403, code: "compose_security_check", error: `Security check failed: ${gate.reason}` };
+    const content = readFileSync(composePath, "utf8");
+    const upArgs = /^\s+build:/m.test(content) ? ["up", "-d", "--build"] : ["up", "-d"];
+    // recreate:true (the Configure dialog's explicit Restart): new env only
+    // reaches a container that is re-created, so force it.
+    if (recreate === true) upArgs.push("--force-recreate");
+    await runCompose(upArgs, { cwd: bundleDir });
+    // The containers were just (re)created from the installed compose: re-run the
+    // bind-drift check for this bundle so a "restart to apply" card clears now,
+    // without waiting for the next gateway start (N8-1).
+    rebindDriftCheck(bundleId);
+    return { ok: true };
+  } catch (err) {
+    // `compose_failed` is the same code recreateBundleGuarded answers with. Never
+    // `start_failed`: that prefix belongs to the Fix-it remedy's warn line.
+    return { ok: false, status: 500, code: "compose_failed", error: `Failed to start: ${err.stderr || err.message}` };
+  }
+}
+
+/**
+ * Restart one installed bundle from IN PROCESS, with no request: the Extensions Restart
+ * button's own path, run as code. It delegates to startBundleLocal with `recreate: true`,
+ * so it runs the same guards in the same order (orchestration switch, ownership of the
+ * compose project, the consent + compose safety check on what Compose will apply NOW) and
+ * then `up -d --force-recreate` — plus `--build` when the installed compose declares a
+ * build section. For the Fix-it card's restart, which used to re-POST the owner's dashboard
+ * request to this gateway's own listener — an HTTP self-call that can no longer work now the
+ * session cookie is `__Host-` prefixed (the plain-HTTP loopback request reads the wrong
+ * cookie, so the route answers 403/302).
+ *
+ * A bundle whose manifest names another instance's host is refused: its containers run
+ * there, so a local `up` would start the wrong copy.
+ *
+ * Callers must have done their own owner check; this is not an HTTP route and checks no
+ * session. Never throws.
+ *
+ * @param {string} bundleId
+ * @returns {Promise<{ok: true} | {ok: false, status: number, code?: string, error: string}>}
+ *   `code` is present when the refusal names one (`remote_host` for a bundle hosted
+ *   elsewhere); a start that threw answers 500 with `compose_failed`, which the HTTP start
+ *   route does not add to its body (it does for every other status).
+ */
+export async function restartBundleInProcess(bundleId) {
+  try {
+    const hostInfo = resolveManifestHost(bundleId);
+    if (hostInfo.host && hostInfo.host !== "local") {
+      return {
+        ok: false, status: 409, code: "remote_host",
+        error: `Bundle '${bundleId}' is set to run on another Crow instance, so this one cannot restart it`,
+      };
+    }
+    return await startBundleLocal(bundleId, { recreate: true, crossHost: false });
+  } catch (err) {
+    return { ok: false, status: 500, code: "compose_failed", error: `Failed to start: ${err.stderr || err.message}` };
+  }
+}
+
 // Follow-up B: who may allow a folder outside Crow's home (the owner at this machine's own
 // dashboard), and the folders each check may admit.
 let _ownerCheckForTest = null;
@@ -5817,6 +5908,24 @@ export default function bundlesRouter() {
     const orchRefusal = bundleOrchestrationRefusal(bundleId);
     if (orchRefusal) return res.status(orchRefusal.status).json({ error: orchRefusal.error, code: orchRefusal.code });
 
+    // A start IS startBundleLocal — the one local start path, so an in-process caller
+    // (restartBundleInProcess) runs exactly these checks, not a second copy of them.
+    if (action === "start") {
+      const started = await startBundleLocal(bundleId, {
+        recreate: req?.body?.recreate === true,
+        crossHost: !!req?.crossHostAuth,
+      });
+      if (!started.ok) {
+        // The 500 body stays exactly `{ error }`: a `code` rides along only for the other
+        // statuses, so an existing failure response is unchanged.
+        return res.status(started.status).json({
+          error: started.error,
+          ...(started.code && started.status !== 500 ? { code: started.code } : {}),
+        });
+      }
+      return res.json({ ok: true, message: `Bundle '${bundleId}' ${action}ped` });
+    }
+
     const bundleDir = join(BUNDLES_DIR, bundleId);
     const composePath = join(bundleDir, "docker-compose.yml");
     if (!existsSync(composePath)) {
@@ -5826,24 +5935,7 @@ export default function bundlesRouter() {
       const own = await composeOwnership(bundleId, bundleDir, getInstalledFirstManifest(bundleId));
       if (own.refusal) return res.status(409).json({ error: own.refusal, code: "compose_project_foreign" });
       if (own.warning) console.warn(`[bundles] ${bundleId} ${action}: ${own.warning}`);
-      if (action === "start") {
-        // The same check as install, on what Compose will apply NOW (Configure may have
-        // changed .env; an override may sit next to the file). The installed bundle was
-        // consented to at install, so a consent bundle keeps its consent here.
-        const sc = startConsent(bundleId, { crossHost: !!req?.crossHostAuth });
-        const gate = await checkBundleCompose(bundleDir, { bundleId, manifest: sc.manifest, consentVerified: sc.consentVerified, textCheck: false });
-        if (!gate.valid) return res.status(403).json({ error: `Security check failed: ${gate.reason}`, code: "compose_security_check" });
-        const content = readFileSync(composePath, "utf8");
-        const upArgs = /^\s+build:/m.test(content) ? ["up", "-d", "--build"] : ["up", "-d"];
-        // recreate:true (the Configure dialog's explicit Restart): new env only
-        // reaches a container that is re-created, so force it.
-        if (req?.body?.recreate === true) upArgs.push("--force-recreate");
-        await runCompose(upArgs, { cwd: bundleDir });
-        // The containers were just (re)created from the installed compose: re-run the
-        // bind-drift check for this bundle so a "restart to apply" card clears now,
-        // without waiting for the next gateway start (N8-1).
-        rebindDriftCheck(bundleId);
-      } else if (action === "stop") {
+      if (action === "stop") {
         await runComposeTeardown(["stop"], { cwd: bundleDir });
         // Nothing is running any more, so no bind can be wider than the compose:
         // the drift card must resolve now, not at the next boot.

@@ -1,63 +1,63 @@
 /**
- * The browser add-on restart remedy's REAL self-POST — tests/fix-it-restart-browser-addon.test.js
+ * The browser add-on restart remedy runs the route's local start IN PROCESS —
+ * tests/fix-it-restart-browser-addon.test.js
  *
- * The card's action must run the SAME path the Extensions Restart button runs:
- * POST /dashboard/bundles/api/start with `{bundle_id, recreate:true}`, carrying the
- * owner's own session cookie and CSRF token into this gateway's own listener
- * (fix-it/remedies/restart-browser-addon.js). That route is not exported as a
- * function, so the only way to test the real thing is over HTTP.
+ * The card's action must run the SAME path the Extensions Restart button runs, and it
+ * now calls it as code: `restartBundleInProcess("browser")` in routes/bundles.js, which
+ * refuses a bundle hosted elsewhere and otherwise runs `startBundleLocal` with
+ * `recreate: true` (ownership → consent + compose safety check → `up -d --build
+ * --force-recreate` → the detectors' re-check).
  *
- * So this file puts a REAL server on 127.0.0.1 (random port) and points the remedy's
- * dial address at it — `PORT` (gatewayBackendPort) and the gateway bind env var
- * (gatewayListenHost) are read at call time, so both are set for the test and restored
- * afterwards. Only the owner rule is stubbed (`_setRestartDepsForTest({ owner })`);
- * `restart` is never injected here: the request, its headers, its body, the redirect
- * handling and the timeout are the product's.
+ * It must never make an HTTP request. The old implementation re-POSTed the owner's own
+ * dashboard request to this gateway's own loopback listener with the forwarded Cookie and
+ * CSRF token; since the session cookie became `__Host-crow_session` (HTTPS-only), that
+ * plain-HTTP self-call carried the wrong cookie and the route answered 403/302 — it could
+ * never restart anything. So every test here fails if `fetch` is called at all.
  *
- * One block at the bottom goes further and does NOT stub the Chromium guard: only `owner`
- * and `restart` are injected there, so the remedy builds the REAL guard
- * (fix-it/browser-chromium-guard.js) against a temp CROW_HOME holding an installed browser
- * bundle, with bundle-core's docker runner seam (`_setDockerRunnerForTest`) as the only
- * stand-in for docker.
+ * The owner rule, the Chromium-downgrade guard and the restart itself are injected
+ * (`_setRestartDepsForTest`); none of them reaches docker or the network. The last block
+ * goes further and injects NO restart at all: the REAL `restartBundleInProcess` runs
+ * against a temp CROW_HOME holding an installed browser bundle whose compose cannot be
+ * read, with docker and `docker compose` replaced by stubs that throw — so the compose
+ * safety check is what refuses, and `up` is never reached.
  */
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GATEWAY_BIND_ENV } from "../servers/gateway/listen-host.js";
 
 let remedy;
-let START_ROUTE;
 let BUNDLE_ID;
 let RESTART_TIMEOUT_MS;
 let setDeps;
 let setDockerRunner;
+let setComposeConfigRunner;
+let setComposeRunner;
 let OWNER_ONLY_FLASH;
 let OWNER_ONLY_MESSAGE;
 let home;
 
 const OWNER = async () => true;
-/**
- * The Chromium-downgrade guard, allowed: these tests are about the HTTP restart path,
- * not about which Chromium the rebuild installs (tests/fix-it-browser-chromium-guard
- * .test.js is that).
- */
+/** The Chromium-downgrade guard, allowed: these tests are about the restart path, not
+ *  about which Chromium the rebuild installs (tests/fix-it-browser-chromium-guard.test.js
+ *  is that). */
 const GUARD_ALLOWED = async () => ({ blocked: false });
-/** The dashboard request that clicked the button: the owner's own session. */
-const ownerRequest = () => ({ headers: { cookie: "crow_session=abc123" }, csrfToken: "csrf-token-1" });
+
+/** The dashboard request that clicked the button: an OWNER session over HTTPS, the only
+ *  kind that carries a `__Host-` cookie. */
+const ownerRequest = (cookie = "__Host-crow_session=abc123") => ({ headers: { cookie }, secure: true });
 
 /**
- * An installed browser bundle in `crowHome`: the manifest and compose the real guard
- * resolves the running container from, and a lock whose playwright-core 1.58.2 pins the
- * Chromium a rebuild of this image installs (145 — see browser-chromium-guard.js).
+ * An installed browser bundle in `crowHome`: the manifest and compose the real path
+ * resolves, and a lock whose playwright-core 1.58.2 pins the Chromium a rebuild of this
+ * image installs (145 — see browser-chromium-guard.js).
  */
-function writeBrowserBundle(crowHome) {
+function writeBrowserBundle(crowHome, { compose = "name: browser\nservices:\n  browser:\n    image: crow-browser:test\n" } = {}) {
   const dir = join(crowHome, "bundles", "browser");
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, "manifest.json"), JSON.stringify({ id: "browser", version: "1.8.0", docker: { composefile: "docker-compose.yml" } }));
-  writeFileSync(join(dir, "docker-compose.yml"), "name: browser\nservices:\n  browser:\n    image: crow-browser:test\n");
+  writeFileSync(join(dir, "docker-compose.yml"), compose);
   writeFileSync(join(dir, "package-lock.json"), `${JSON.stringify({
     name: "crow-browser",
     lockfileVersion: 3,
@@ -67,19 +67,22 @@ function writeBrowserBundle(crowHome) {
       "node_modules/playwright-core": { version: "1.58.2" },
     },
   }, null, 2)}\n`);
+  writeFileSync(join(crowHome, "installed.json"), JSON.stringify([{ id: "browser", type: "bundle", version: "1.8.0" }]));
 }
 
 before(async () => {
   home = mkdtempSync(join(tmpdir(), "crowhome-browserrestart-"));
   process.env.CROW_HOME = home;
   // The bundle must be on disk BEFORE the import: bundles-config reads CROW_HOME at load
-  // time, and the real-guard test below reads this lock and this compose through it.
+  // time, and every path below (including routes/bundles.js's BUNDLES_DIR) comes from it.
   writeBrowserBundle(home);
   remedy = await import("../servers/gateway/fix-it/remedies/restart-browser-addon.js");
-  // bundle-core's docker runner seam: `dockerRunner()` is resolved per call, so a stub set
-  // here is what the REAL guard asks about `docker ps` / `docker exec`.
-  setDockerRunner = (await import("../servers/gateway/bundle-core.js"))._setDockerRunnerForTest;
-  START_ROUTE = remedy.START_ROUTE;
+  const core = await import("../servers/gateway/bundle-core.js");
+  // bundle-core's runner seams: `dockerRunner()` / `docker compose` are resolved per call,
+  // so a stub set here is what the REAL guard and the REAL start path ask.
+  setDockerRunner = core._setDockerRunnerForTest;
+  setComposeConfigRunner = null; // resolved in the real-path test (routes/bundles.js)
+  setComposeRunner = core._setComposeRunnerForTest;
   BUNDLE_ID = remedy.BUNDLE_ID;
   RESTART_TIMEOUT_MS = remedy.RESTART_TIMEOUT_MS;
   setDeps = remedy._setRestartDepsForTest;
@@ -95,60 +98,24 @@ after(() => {
 
 beforeEach(() => setDeps(null));
 
-const sendJson = (res, obj, status = 200) => {
-  res.writeHead(status, { "content-type": "application/json" });
-  res.end(JSON.stringify(obj));
-};
-
 /**
- * A loopback stand-in for this gateway. It records every request (method, url,
- * headers, raw and parsed body) and answers with `handler`. With `hold > 0` the
- * answer is delayed — a stand-in for the rebuild the real route waits out.
- *
- * PORT + the gateway bind env var are pointed at it for as long as it runs, and both
- * are restored when it closes (`close()` is always called from a finally).
+ * Run `fn` with `globalThis.fetch` replaced by a stub that records and refuses, so any HTTP
+ * request the remedy makes is visible AND cannot reach a server. Restored in a finally.
  */
-async function gateway({ handler = (req, res) => sendJson(res, { ok: true }), hold = 0 } = {}) {
-  const requests = [];
-  const server = createServer((req, res) => {
-    let raw = "";
-    req.setEncoding("utf8");
-    req.on("data", (c) => { raw += c; });
-    req.on("end", () => {
-      let body = null;
-      try { body = JSON.parse(raw); } catch { /* recorded as null */ }
-      requests.push({ method: req.method, url: req.url, headers: req.headers, raw, body });
-      const answer = () => handler(req, res);
-      if (hold > 0) setTimeout(answer, hold); else answer();
-    });
-  });
-  await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  const prevPort = process.env.PORT;
-  const prevBind = process.env[GATEWAY_BIND_ENV];
-  process.env.PORT = String(server.address().port);
-  process.env[GATEWAY_BIND_ENV] = "127.0.0.1";
-  return {
-    port: server.address().port,
-    requests,
-    async close() {
-      if (prevPort === undefined) delete process.env.PORT; else process.env.PORT = prevPort;
-      if (prevBind === undefined) delete process.env[GATEWAY_BIND_ENV]; else process.env[GATEWAY_BIND_ENV] = prevBind;
-      await new Promise((r) => { server.closeAllConnections?.(); server.close(r); });
-    },
+async function withoutFetch(fn) {
+  const prevFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = (...args) => {
+    calls.push(args);
+    throw new Error("the remedy must not make an HTTP request");
   };
+  try {
+    const value = await fn();
+    return { value, calls };
+  } finally {
+    globalThis.fetch = prevFetch;
+  }
 }
-
-/** Run the remedy's real restart path while `fn(gw)` holds the server. */
-async function withGateway(opts, fn) {
-  const gw = await gateway(opts);
-  try { return await fn(gw); } finally { await gw.close(); }
-}
-
-/** Run the remedy as the owner, with the server as the gateway. */
-const restartAs = (req, opts = {}) => withGateway(opts, async () => {
-  setDeps({ owner: OWNER, guard: GUARD_ALLOWED });
-  try { return await remedy.default({ bundle: BUNDLE_ID }, { db: null, item: null, req }); } finally { setDeps(null); }
-});
 
 /** Collect console.warn for the duration of `fn`, and return both its result and the lines. */
 async function captureWarn(fn) {
@@ -160,235 +127,154 @@ async function captureWarn(fn) {
   return { value, lines };
 }
 
-test("(1) the route sees POST /dashboard/bundles/api/start with the cookie, the CSRF header and the {bundle_id, recreate} body → {ok:true} resolves true", async () => {
-  const gw = await gateway();
-  let out;
+/** Run the remedy with the given seams (always restored), returning its result. */
+async function run({ deps = {}, req = ownerRequest(), args = {} } = {}) {
+  setDeps({ owner: OWNER, guard: GUARD_ALLOWED, ...deps });
   try {
-    setDeps({ owner: OWNER, guard: GUARD_ALLOWED });
-    out = await remedy.default({ bundle: BUNDLE_ID }, { db: null, item: null, req: ownerRequest() });
+    return await remedy.default(args, { db: null, item: null, req });
   } finally {
     setDeps(null);
-    await gw.close();
   }
+}
 
-  assert.equal(out.resolved, true);
-  assert.equal(START_ROUTE, "/dashboard/bundles/api/start");
-  assert.equal(gw.requests.length, 1, "exactly one request, to the one route");
+// ── the happy path: in process, no HTTP ─────────────────────────────────────
 
-  const a = gw.requests[0];
-  assert.equal(a.method, "POST");
-  assert.equal(a.url, "/dashboard/bundles/api/start");
-  assert.equal(a.headers.cookie, "crow_session=abc123");
-  assert.equal(a.headers["x-crow-csrf"], "csrf-token-1");
-  assert.deepEqual(a.body, { bundle_id: "browser", recreate: true });
-  assert.match(String(a.headers["content-type"]), /application\/json/);
+test("(a) an owner on a __Host- HTTPS session restarts in process: startBundle once, and NO HTTP request", async () => {
+  const starts = [];
+  const { value, calls } = await withoutFetch(() => run({ deps: { startBundle: async (id) => { starts.push(id); return { ok: true }; } } }));
+
+  assert.equal(value.resolved, true);
+  assert.deepEqual(starts, [BUNDLE_ID], "the route's start ran once, for the browser bundle");
+  assert.deepEqual(calls, [], "no fetch at all: the restart is a function call, not a self-call");
 });
 
-test("HELD REQUEST: a slow rebuild does not make the client give up", async () => {
-  const gw = await gateway({ hold: 400 });
-  let out;
-  let took;
-  try {
-    setDeps({ owner: OWNER, guard: GUARD_ALLOWED });
-    const started = Date.now();
-    out = await remedy.default({ bundle: BUNDLE_ID }, { db: null, item: null, req: ownerRequest() });
-    took = Date.now() - started;
-  } finally {
-    setDeps(null);
-    await gw.close();
-  }
+test("(b) a stale plain crow_session cookie beside the __Host- one changes nothing", async () => {
+  const starts = [];
+  const req = ownerRequest("__Host-crow_session=abc123; crow_session=old");
+  const { value, calls } = await withoutFetch(() => run({ req, deps: { startBundle: async (id) => { starts.push(id); return { ok: true }; } } }));
 
-  assert.equal(out.resolved, true, "the held answer was waited for");
-  assert.ok(took >= 350, `the held request really was held (took ${took} ms)`);
-  assert.equal(gw.requests.length, 1);
-
-  // CONTROL: the same route answering at once resolves too — so the hold, not luck.
-  const quick = await restartAs(ownerRequest());
-  assert.equal(quick.resolved, true);
+  assert.equal(value.resolved, true);
+  assert.deepEqual(starts, [BUNDLE_ID]);
+  assert.deepEqual(calls, [], "no request carries a cookie anywhere");
 });
 
-test("a 302 to the login page is a refusal, not an answer (no follow)", async () => {
-  const out = await restartAs(ownerRequest(), {
-    handler: (req, res) => { res.writeHead(302, { location: "/dashboard/login" }); res.end(); },
-  });
-
-  assert.equal(out.resolved, false);
-});
-
-test("the redirect is not followed: the login page is never fetched", async () => {
-  const seen = [];
-  const out = await restartAs(ownerRequest(), {
-    handler: (req, res) => {
-      seen.push(req.method + " " + req.url);
-      if (req.url === "/dashboard/bundles/api/start") { res.writeHead(302, { location: "/dashboard/login" }); res.end(); return; }
-      res.writeHead(200, { "content-type": "text/html" }); res.end("<html>login</html>");
-    },
-  });
-
-  assert.equal(out.resolved, false);
-  assert.deepEqual(seen, ["POST /dashboard/bundles/api/start"], "the redirect target was never requested");
-});
-
-test("a refusal body {ok:false,error} → false, and the warn names the reason", async () => {
-  const REASON = "the rebuild was refused: port 6080 is already in use";
-  const { value, lines } = await captureWarn(() => restartAs(ownerRequest(), {
-    handler: (req, res) => sendJson(res, { ok: false, error: REASON }),
-  }));
-
-  assert.equal(value.resolved, false);
-  assert.equal(lines.length, 1, "one line, naming why the restart did not run");
-  assert.match(lines[0], /restart did not run/i);
-  assert.ok(lines[0].includes(REASON), `the warn names the reason (got: ${lines[0]})`);
-});
-
-test("HTTP 500 → false, and the warn names the status", async () => {
-  const { value, lines } = await captureWarn(() => restartAs(ownerRequest(), {
-    handler: (req, res) => { res.writeHead(500, { "content-type": "text/plain" }); res.end("Internal Server Error"); },
-  }));
-
-  assert.equal(value.resolved, false);
-  assert.equal(lines.length, 1);
-  assert.match(lines[0], /restart did not run/i);
-  assert.match(lines[0], /500/);
-});
-
-test("a non-JSON body → false, and the warn names what it could read", async () => {
-  const { value, lines } = await captureWarn(() => restartAs(ownerRequest(), {
-    handler: (req, res) => { res.writeHead(200, { "content-type": "text/html" }); res.end("<html>ok?</html>"); },
-  }));
-
-  assert.equal(value.resolved, false, "an unreadable answer is a refusal, never a success");
-  assert.equal(lines.length, 1);
-  assert.match(lines[0], /restart did not run/i);
-  assert.match(lines[0], /HTTP 200/);
-});
-
-test("no dashboard session cookie → false, and no request is made at all", async () => {
-  const gw = await gateway();
-  let out;
-  try {
-    setDeps({ owner: OWNER, guard: GUARD_ALLOWED });
-    out = await remedy.default({ bundle: BUNDLE_ID }, { db: null, item: null, req: { headers: {} } });
-  } finally {
-    setDeps(null);
-    await gw.close();
-  }
-
-  assert.equal(out.resolved, false);
-  assert.equal(out.flash, undefined, "the Nest's generic failure line, not a made-up sentence");
-  assert.equal(gw.requests.length, 0, "there was no session to carry, so nothing was sent");
-});
-
-test("CONTROL: the same call WITH a cookie does reach the route", async () => {
-  let seen = 0;
-  const out = await restartAs(ownerRequest(), {
-    handler: (req, res) => { seen += 1; sendJson(res, { ok: true }); },
-  });
-
-  assert.equal(out.resolved, true);
-  assert.equal(seen, 1, "so the silence above was the missing session, not a broken server");
-});
-
-test("not the owner → the owner-only flash, and the route is never dialed", async () => {
-  const gw = await gateway();
-  let out;
-  try {
-    setDeps({ owner: async () => false, guard: GUARD_ALLOWED });
-    out = await remedy.default({ bundle: BUNDLE_ID }, { db: null, item: null, req: ownerRequest() });
-  } finally {
-    setDeps(null);
-    await gw.close();
-  }
-
-  assert.equal(out.resolved, false);
-  assert.equal(out.flash, OWNER_ONLY_FLASH);
-  assert.equal(out.message, OWNER_ONLY_MESSAGE);
-  assert.equal(gw.requests.length, 0);
-});
-
-test("the request is bounded by the 15-minute constant (and the held case above passed under it)", () => {
+test("the restart path is bounded by the 15-minute constant", () => {
   assert.equal(RESTART_TIMEOUT_MS, 15 * 60 * 1000);
 });
 
-// ── the Chromium-downgrade guard ────────────────────────────────────────────
-// The rebuild installs the Chromium the installed lock pins; a profile written by a
-// NEWER Chromium crash-loops on it. The remedy asks the guard FIRST and never dials
-// the route when it says blocked — and a guard that throws is blocked too.
+// ── the owner rule ────────────────────────────────────────────────────────
 
-test("a blocked guard → {resolved:false}, one warn, and the route is never dialed", async () => {
-  const gw = await gateway();
-  let out;
-  let lines;
-  try {
-    setDeps({ owner: OWNER, guard: async () => ({ blocked: true }) });
-    ({ value: out, lines } = await captureWarn(() => remedy.default({ bundle: BUNDLE_ID }, { db: null, item: null, req: ownerRequest() })));
-  } finally {
-    setDeps(null);
-    await gw.close();
-  }
+test("(c) not the owner → the owner-only flash, nothing restarted, one (owner_only) warn", async () => {
+  let starts = 0;
+  const { value, lines } = await captureWarn(() => run({
+    deps: { owner: async () => false, startBundle: async () => { starts += 1; return { ok: true }; } },
+  }));
 
-  assert.equal(out.resolved, false, "the card stays open, the owner can try later");
-  assert.equal(out.flash, undefined, "the Nest's generic line: the guard adds no user-facing copy");
-  assert.equal(gw.requests.length, 0, "no restart was sent to the Extensions route");
+  assert.equal(value.resolved, false);
+  assert.equal(value.flash, OWNER_ONLY_FLASH);
+  assert.equal(value.message, OWNER_ONLY_MESSAGE);
+  assert.equal(starts, 0, "the restart never ran");
+  assert.equal(lines.length, 1, "exactly one line");
+  assert.match(lines[0], /^\[fix-it\] browser add-on: the restart did not run \(owner_only\)$/);
+});
+
+// ── the Chromium-downgrade guard (fail closed) ─────────────────────────────
+
+for (const [name, guard] of [
+  ["blocked", async () => ({ blocked: true })],
+  ["throwing", async () => { throw new Error("docker is not reachable"); }],
+  ["answering nothing usable", async () => undefined],
+]) {
+  test(`(d) a ${name} guard → resolved false, nothing restarted, one (downgrade_guard) warn`, async () => {
+    let starts = 0;
+    const { value, lines } = await captureWarn(() => run({
+      deps: { guard, startBundle: async () => { starts += 1; return { ok: true }; } },
+    }));
+
+    assert.equal(value.resolved, false, "the card stays open, the owner can try later");
+    assert.equal(value.flash, undefined, "the Nest's generic line: the guard adds no user-facing copy");
+    assert.equal(starts, 0, "no restart is run when the guard refuses");
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /^\[fix-it\] browser add-on: the restart did not run \(downgrade_guard\)$/);
+  });
+}
+
+// ── a restart that did not run ────────────────────────────────────────────
+
+test("(e) the start refuses on the compose safety check → one warn naming its code", async () => {
+  const { value, lines } = await captureWarn(() => run({
+    deps: { startBundle: async () => ({ ok: false, status: 403, code: "compose_security_check", error: "Security check failed: x" }) },
+  }));
+
+  assert.equal(value.resolved, false);
+  assert.equal(value.flash, undefined, "the Nest's generic failure line, not a made-up sentence");
   assert.equal(lines.length, 1);
-  assert.match(lines[0], /older Chromium than the profile holds/);
+  assert.match(lines[0], /^\[fix-it\] browser add-on: the restart did not run \(start_failed:compose_security_check\)$/);
 });
 
-test("a guard that throws is a refusal too (fail closed): no restart is sent", async () => {
-  const gw = await gateway();
-  let out;
-  try {
-    setDeps({ owner: OWNER, guard: async () => { throw new Error("docker is not reachable"); } });
-    out = await remedy.default({ bundle: BUNDLE_ID }, { db: null, item: null, req: ownerRequest() });
-  } finally {
-    setDeps(null);
-    await gw.close();
-  }
+test("(f) the start refuses with only a message → the warn names the message", async () => {
+  const { value, lines } = await captureWarn(() => run({
+    deps: { startBundle: async () => ({ ok: false, status: 500, error: "Failed to start: docker compose up refused" }) },
+  }));
 
-  assert.equal(out.resolved, false);
-  assert.equal(out.flash, undefined);
-  assert.equal(gw.requests.length, 0, "an unanswerable guard must not let the restart through");
+  assert.equal(value.resolved, false);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^\[fix-it\] browser add-on: the restart did not run \(start_failed:/);
+  assert.ok(lines[0].includes("start_failed:Failed to start: docker compose up refused"), lines[0]);
 });
 
-test("a guard that answers nothing usable is a refusal too", async () => {
-  const gw = await gateway();
-  let out;
-  try {
-    setDeps({ owner: OWNER, guard: async () => undefined });
-    out = await remedy.default({ bundle: BUNDLE_ID }, { db: null, item: null, req: ownerRequest() });
-  } finally {
-    setDeps(null);
-    await gw.close();
-  }
+test("(f) a long message is trimmed to 200 characters, and never carries more", async () => {
+  const long = "x".repeat(500);
+  const { lines } = await captureWarn(() => run({ deps: { startBundle: async () => ({ ok: false, error: long }) } }));
 
-  assert.equal(out.resolved, false);
-  assert.equal(gw.requests.length, 0);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^\[fix-it\] browser add-on: the restart did not run \(start_failed:x{200}\)$/);
 });
 
-test("CONTROL: the guard allowing the restart lets it run exactly as before", async () => {
-  const gw = await gateway();
-  let out;
-  try {
-    setDeps({ owner: OWNER, guard: async () => ({ blocked: false }) });
-    out = await remedy.default({ bundle: BUNDLE_ID }, { db: null, item: null, req: ownerRequest() });
-  } finally {
-    setDeps(null);
-    await gw.close();
-  }
+test("(f) a message with newlines and tabs is one single-line warn, collapsed to spaces", async () => {
+  const { value, lines } = await captureWarn(() => run({
+    deps: { startBundle: async () => ({ ok: false, status: 500, error: "Failed to start:\n\tcompose up\trefused\n\n" }) },
+  }));
 
-  assert.equal(out.resolved, true);
-  assert.equal(gw.requests.length, 1, "so the silence above was the guard, not a broken route");
+  assert.equal(value.resolved, false);
+  assert.equal(lines.length, 1, "exactly one warn line");
+  assert.ok(!lines[0].includes("\n"), `no newline in the line: ${JSON.stringify(lines[0])}`);
+  assert.match(lines[0], /^\[fix-it\] browser add-on: the restart did not run \(start_failed:Failed to start: compose up refused\)$/);
 });
 
-// ── the REAL guard, wired as the product wires it ────────────────────────────────────
-// Every test above replaces the guard (`guard: …`). These do NOT: only `owner` and
-// `restart` are injected, so the remedy really calls downgradeGuard() →
-// runningBrowserContainerIds() (docker ps by the bundle's compose project) →
-// restartWouldDowngrade() (the lock's Chromium vs the profile's `Last Version`). The only
-// stand-in is docker itself, through bundle-core's `_setDockerRunnerForTest` seam, and the
-// CROW_HOME the module resolved at import (the temp home `before` fills with an installed
-// browser bundle) — the allowed case can only resolve true if that lock really was read and
-// really says 145.
+test("(g) a restart that hangs is bounded by the seam's timeout → one (timeout) warn", async () => {
+  let settled = false;
+  const { value, lines } = await captureWarn(() => run({
+    deps: {
+      timeoutMs: 25,
+      startBundle: () => new Promise((resolve) => { setTimeout(() => { settled = true; resolve({ ok: true }); }, 5000).unref?.(); }),
+    },
+  }));
+
+  assert.equal(value.resolved, false, "a hung build never holds the click open");
+  assert.equal(settled, false, "the bound resolved first, not the restart");
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^\[fix-it\] browser add-on: the restart did not run \(timeout\)$/);
+});
+
+test("(h) a restart that throws → one (start_failed:…) warn, never a throw into the Nest", async () => {
+  const { value, lines } = await captureWarn(() => run({
+    deps: { startBundle: async () => { throw new Error("the route blew up"); } },
+  }));
+
+  assert.equal(value.resolved, false);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^\[fix-it\] browser add-on: the restart did not run \(start_failed:/);
+  assert.ok(lines[0].includes("the route blew up"), lines[0]);
+});
+
+// ── the REAL guard, wired as the product wires it ─────────────────────────
+// The tests above replace the guard. These do NOT: only `owner` and the start are
+// injected, so the remedy really calls downgradeGuard() → runningBrowserContainerIds()
+// (docker ps by the bundle's compose project) → restartWouldDowngrade() (the lock's
+// Chromium vs the profile's `Last Version`). The only stand-in is docker itself, through
+// bundle-core's `_setDockerRunnerForTest` seam, and the CROW_HOME the module resolved at
+// import (the temp home `before` fills with an installed browser bundle).
 
 const PROFILE_PATH = "/root/.config/chromium-crow/Last Version";
 const BROWSER_CONTAINER_ID = "b0b0b0b0b0b0";
@@ -407,33 +293,30 @@ function fakeDocker(profileVersion) {
 }
 
 /**
- * Run the remedy with the real guard and a `restart` spy. Nothing touches docker or the
- * network: docker is the stub, the restart is recorded, and both are cleared in `finally`.
+ * Run the remedy with the real guard and a start spy. Nothing touches docker or the
+ * network: docker is the stub, the start is recorded, and both are cleared in `finally`.
  */
 async function runWithRealGuard(profileVersion) {
   const docker = fakeDocker(profileVersion);
-  const restarted = [];
+  const started = [];
   setDockerRunner(docker);
-  setDeps({
-    owner: OWNER,
-    restart: async (bundleId, req) => { restarted.push({ bundleId, req }); return { ok: true }; },
-  });
+  // NO `guard` seam on purpose: the remedy must build the real one.
+  setDeps({ owner: OWNER, startBundle: async (id) => { started.push(id); return { ok: true }; } });
   try {
-    const out = await remedy.default({ bundle: BUNDLE_ID }, { db: null, item: null, req: ownerRequest() });
-    return { out, docker, restarted };
+    const { value, lines } = await captureWarn(() => remedy.default({}, { db: null, item: null, req: ownerRequest() }));
+    return { out: value, lines, docker, started };
   } finally {
     setDeps(null);
     setDockerRunner(null);
   }
 }
 
-test("the REAL guard: bundled 145 vs a profile at 159 → blocked, so the restart is never run", async () => {
-  const { value, lines } = await captureWarn(() => runWithRealGuard("159.0.8154.6"));
-  const { out, docker, restarted } = value;
+test("the REAL guard: bundled 145 vs a profile at 159 → blocked, so the restart never runs", async () => {
+  const { out, lines, docker, started } = await runWithRealGuard("159.0.8154.6");
 
   assert.equal(out.resolved, false, "the card stays pending: a rebuild would install an older Chromium than the profile holds");
   assert.equal(out.flash, undefined, "no new copy — the Nest's generic line");
-  assert.deepEqual(restarted, [], "the extension restart was NOT called");
+  assert.deepEqual(started, [], "the restart was NOT run");
 
   // It really asked docker, in the product's own order: which containers run, then what
   // wrote this one's profile.
@@ -442,14 +325,47 @@ test("the REAL guard: bundled 145 vs a profile at 159 → blocked, so the restar
   assert.deepEqual(docker.calls[1].args, ["exec", BROWSER_CONTAINER_ID, "cat", PROFILE_PATH]);
 
   assert.equal(lines.length, 1);
-  assert.match(lines[0], /older Chromium than the profile holds/);
+  assert.match(lines[0], /\(downgrade_guard\)$/);
 });
 
-test("the REAL guard: bundled 145 vs a profile at 145 → allowed, so the restart runs", async () => {
-  const { out, restarted } = await runWithRealGuard("145.0.7632.6");
+test("the REAL guard: bundled 145 vs a profile at 145 → allowed, so the restart runs with no request", async () => {
+  const { out, started } = await runWithRealGuard("145.0.7632.6");
 
   assert.equal(out.resolved, true, "the same Chromium: the rebuild cannot move the profile backwards");
-  assert.equal(restarted.length, 1, "the restart ran exactly once");
-  assert.equal(restarted[0].bundleId, BUNDLE_ID);
-  assert.equal(restarted[0].req.headers.cookie, "crow_session=abc123", "the owner's own request was carried through");
+  assert.deepEqual(started, [BUNDLE_ID], "the restart ran exactly once, for the bundle it holds");
+});
+
+// ── the REAL route code: no seam between the remedy and the start path ────
+
+/**
+ * The last block injects NO restart: `startBundle` and `restart` are both left out, so the
+ * remedy dynamically imports routes/bundles.js and runs the REAL
+ * `restartBundleInProcess("browser")` against the temp CROW_HOME. That path asks docker
+ * about the compose project (a stub that throws: `composeOwnership` treats an unreachable
+ * docker as "nobody else owns it") and then the compose safety check, which cannot read the
+ * model (the `compose config` seam throws) and therefore REFUSES. `up` must never be
+ * reached: the compose runner records every call and fails the test.
+ */
+test("(i) the REAL start path: a compose the safety check cannot read refuses, and `up` never runs", async () => {
+  const composeCalls = [];
+  setDockerRunner(async () => { throw new Error("docker is not available in this test"); });
+  setComposeRunner(async (args) => {
+    composeCalls.push([...args]);
+    throw new Error("docker compose up must not run for a refused start");
+  });
+  setComposeConfigRunner = (await import("../servers/gateway/routes/bundles.js"))._setComposeConfigRunnerForTest;
+  setComposeConfigRunner(async () => { throw new Error("docker compose config is unavailable"); });
+  try {
+    const { value, lines } = await captureWarn(() => run({ deps: {} }));
+
+    assert.equal(value.resolved, false, "the owner is told the fix did not run");
+    assert.equal(value.flash, undefined, "the Nest's generic line");
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /\(start_failed:compose_security_check\)$/, lines[0]);
+    assert.deepEqual(composeCalls, [], "no compose command ran: the refusal came before `up`");
+  } finally {
+    setComposeConfigRunner(null);
+    setComposeRunner(null);
+    setDockerRunner(null);
+  }
 });
