@@ -38,6 +38,14 @@ registerHooks({
 });
 
 const { createBrowserServer, waitForCdp } = await import("../bundles/browser/server/server.js");
+// The gate's intent header, imported rather than retyped: the bundle's own constant is what
+// connectOverCDP carries next to the bearer.
+const { GATE_INTENT_HEADER, GATE_INTENT_VALUE } = await import("../bundles/browser/server/gate-client.js");
+
+/** What connectOverCDP must be given when this instance has a token: the bearer and the gate's intent header. */
+const expectedConnectOptions = () => ({
+  headers: { Authorization: `Bearer ${TOKEN}`, [GATE_INTENT_HEADER]: GATE_INTENT_VALUE },
+});
 
 /** A scratch CROW_HOME whose browser bundle .env holds `lines`; runs `fn` with it active. */
 async function withHome(lines, fn) {
@@ -97,7 +105,7 @@ async function callTool(home, name, args = {}) {
   } finally { await client.close(); }
 }
 
-test("crow_browser_launch: connectOverCDP gets the bearer header when a token is configured", async () => {
+test("crow_browser_launch: connectOverCDP gets the bearer header and the gate's intent header when a token is configured", async () => {
   await withHome([`CROW_BROWSER_CDP_PORT=9222`, `CROW_BROWSER_CDP_TOKEN=${TOKEN}`], async (home) => {
     globalThis.__cdpConnects = [];
     const r = await callTool(home, "crow_browser_launch", {});
@@ -105,7 +113,8 @@ test("crow_browser_launch: connectOverCDP gets the bearer header when a token is
     assert.equal(globalThis.__cdpConnects.length, 1);
     const { url, options } = globalThis.__cdpConnects[0];
     assert.equal(url, "http://127.0.0.1:9222");
-    assert.deepEqual(options, { headers: { Authorization: `Bearer ${TOKEN}` } });
+    assert.deepEqual(options, expectedConnectOptions());
+    assert.equal(options.headers[GATE_INTENT_HEADER], GATE_INTENT_VALUE, "the intent header rides next to the bearer");
   });
 });
 
@@ -116,6 +125,8 @@ test("crow_browser_launch: no token → connectOverCDP gets no options at all", 
     assert.equal(r.isError, true);
     assert.equal(globalThis.__cdpConnects.length, 1);
     assert.equal(globalThis.__cdpConnects[0].options, undefined);
+    assert.equal(globalThis.__cdpConnects.filter((c) => c.options !== undefined).length, 0,
+      "a missing token yields no options at all: the intent header never rides alone");
   });
 });
 
@@ -126,7 +137,7 @@ test("crow_browser_launch: the token is re-read every connect (minted after this
     assert.equal(globalThis.__cdpConnects[0].options, undefined, "no token at boot");
     writeFileSync(join(home, "bundles", "browser", ".env"), `CROW_BROWSER_CDP_PORT=9222\nCROW_BROWSER_CDP_TOKEN=${TOKEN}\n`);
     await callTool(home, "crow_browser_launch", {});
-    assert.deepEqual(globalThis.__cdpConnects[1].options, { headers: { Authorization: `Bearer ${TOKEN}` } }, "the minted token is used without a restart");
+    assert.deepEqual(globalThis.__cdpConnects[1].options, expectedConnectOptions(), "the minted token is used without a restart");
   });
 });
 
@@ -139,7 +150,7 @@ test("crow_browser_launch: CROW_BROWSER_CDP_URL override still wins and still ge
       if (prev === undefined) delete process.env.CROW_BROWSER_CDP_URL; else process.env.CROW_BROWSER_CDP_URL = prev;
     }
     assert.equal(globalThis.__cdpConnects[0].url, "http://127.0.0.1:9444");
-    assert.deepEqual(globalThis.__cdpConnects[0].options, { headers: { Authorization: `Bearer ${TOKEN}` } });
+    assert.deepEqual(globalThis.__cdpConnects[0].options, expectedConnectOptions());
   });
 });
 

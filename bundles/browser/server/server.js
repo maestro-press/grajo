@@ -33,8 +33,11 @@ import {
   blankPageSafely,
   exceptionsFromEnv,
   guardedFetch,
+  relayGuardReadyAccepted,
+  relayOwnsExitCleanup,
 } from "./private-address.js";
 import { closePagesBeforeRestart } from "./safe-restart.js";
+import { GATE_INTENT_HEADER, GATE_INTENT_VALUE, sendGuardReady, readGateStatus } from "./gate-client.js";
 import { filterLinks, parseUrlFilter, urlContainsFilter } from "./safe-filter.js";
 import { withDownloadsAllowed, resetDownloadsOnNewSession } from "./download-behavior.js";
 
@@ -164,10 +167,19 @@ export function createBrowserServer(options = {}) {
     const token = cdpToken();
     return token ? { Authorization: `Bearer ${token}` } : {};
   };
-  /** connectOverCDP options: the header when there is a token, undefined otherwise. */
+  /**
+   * connectOverCDP options: the bearer plus the gate's intent header when there is a
+   * token, undefined otherwise.
+   *
+   * The intent header is the first half of the relay gate's declaration (gate-client.js):
+   * it tells the relay this client means to run a guard, so the relay holds the targets
+   * this connection creates until the guard's own commands are on the wire, rather than
+   * resuming them uncovered. It rides next to the bearer, never instead of it.
+   */
   const cdpConnectOptions = () => {
     const headers = cdpHeaders();
-    return headers.Authorization ? { headers } : undefined;
+    if (!headers.Authorization) return undefined;
+    return { headers: { ...headers, [GATE_INTENT_HEADER]: GATE_INTENT_VALUE } };
   };
 
   const sessionDir = options.sessionDir || stateDir("browser-sessions");
@@ -204,6 +216,15 @@ export function createBrowserServer(options = {}) {
   // exception list (read from the add-on's own settings, re-read per connect).
   let privateGuard = null;
   let privateExceptions = exceptionsFromEnv();
+
+  // Does the RELAY own the exit cleanup for the connection that is CURRENT? True only when
+  // the relay accepted this connection's `Crow.guardReady` (`relayGuardReadyAccepted`) — it
+  // then closes the bot's pages and leaves one empty page when the connection ends, so this
+  // process must do none of that. Reset at the start of every (re)connect and set from that
+  // declaration's answer alone: a gate status read, a header, anything a page controls or an
+  // env var says nothing about it. False until a connect happens, so the cleanup this process
+  // has always run stays the fail-safe.
+  let relayOwnsCleanupHere = false;
 
   // Pending user signal for wait_for_user
   let userWaitResolve = null;
@@ -242,6 +263,9 @@ export function createBrowserServer(options = {}) {
    */
   async function ensureConnected() {
     if (browser && browser.isConnected()) return;
+    // A (re)connect: the old connection's answer belongs to the old connection, so the
+    // relay does NOT own the exit cleanup until this one's declaration is accepted below.
+    relayOwnsCleanupHere = false;
     browser = await chromium.connectOverCDP(cdpUrl, cdpConnectOptions());
     const contexts = browser.contexts();
     context = contexts[0] || await browser.newContext(getContextOptions());
@@ -273,7 +297,38 @@ export function createBrowserServer(options = {}) {
       // go with it and a page left open keeps running unguarded. Blank the bot's
       // pages on the way out (a crash that runs no handler cannot be cleaned up
       // here) and leave the operator's tabs exactly as they are.
-      blankPagesOnExit(() => context, { ownership });
+      // Unless the RELAY owns this connection's cleanup: once it accepts the declaration
+      // below, IT closes the pages and leaves one empty page when the connection ends, so
+      // this process opens no session, makes no survivor, blanks and closes nothing and sends
+      // no crash. The seam answers `false` — and the cleanup above then runs exactly as it
+      // always did — when this connection's declaration was not accepted (an older relay, no
+      // relay at all), when the connection is already gone (nothing left for the relay to
+      // clean), and when the probe itself throws.
+      blankPagesOnExit(() => context, {
+        ownership,
+        relayOwnsCleanup: () => {
+          try {
+            return relayOwnsExitCleanup(relayOwnsCleanupHere, browser);
+          } catch {
+            return false;
+          }
+        },
+      });
+      // The declaration's second half: the guard is installed on this context, so tell
+      // the relay (it verifies the declaration against the guard's own commands on the
+      // wire). Sent once per connection and context, AFTER the install resolved and after
+      // the exit cleanup is registered — never before it, and never when the install
+      // above threw. A relay older than the gate answers an error; the helper logs that one
+      // line and never throws, so the tool turns carry on exactly as before.
+      // A flat string list (the raw setting), not the parsed {hosts, cidrs, rejected} object: sendGuardReady hashes the sorted array, so an object hashes as [] and the relay could not tell one exception list from another.
+      const guardReady = await sendGuardReady(browser, { exceptions: String(process.env.CROW_BROWSER_ALLOW_PRIVATE || "").split(/[\s,]+/).filter(Boolean), log: (line) => console.error(line) });
+      // The declaration's answer, kept for the connection it answers about. `{ok: true}` is the
+      // relay taking this connection's exit cleanup over (it closes the bot's pages and leaves
+      // one empty page when the connection ends); `{ok: false}` and `{ok: false, unsupported:
+      // true}` (a relay older than the gate) leave the cleanup to this process, exactly as
+      // before the gate. Nothing else may set this: it is the relay's answer on THIS
+      // connection and nothing a page, a header, a status read or an env var says about it.
+      relayOwnsCleanupHere = relayGuardReadyAccepted(guardReady);
     } else {
       privateGuard = CONTEXT_GUARDS.get(context) || privateGuard;
     }
@@ -528,6 +583,11 @@ export function createBrowserServer(options = {}) {
 
       const cdpConnected = browser?.isConnected() || false;
       const currentUrl = page?.url() || null;
+      // The gate's own line from the relay's `/json/version` (gate-client.js): a diagnosis
+      // for whoever reads the status, never a control. A relay older than the gate, a dead
+      // relay or any odd answer reads "no" — a status call never fails over it.
+      let gateStatus = "no";
+      try { gateStatus = await readGateStatus(cdpUrl, cdpHeaders()); } catch { gateStatus = "no"; }
 
       return {
         content: [{
@@ -539,6 +599,7 @@ export function createBrowserServer(options = {}) {
             cdp_connected: cdpConnected,
             state_root: stateRoot(),
             current_url: currentUrl,
+            gate: gateStatus,
             vnc_url: containerRunning ? vncUrl : null, // truthy "unknown…" keeps the url
           }, null, 2),
         }],

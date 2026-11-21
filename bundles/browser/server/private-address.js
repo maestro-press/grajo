@@ -1226,6 +1226,45 @@ export async function blankPageSafely(page, opts = {}) {
 }
 
 /**
+ * Did the RELAY accept this connection's guard declaration?
+ *
+ * `sendGuardReady` (gate-client.js) is the ONLY thing that can make a relay the owner of
+ * this connection's exit cleanup, and this is the only read of its answer that decides it:
+ * `{ok: true}` is the relay saying it took `Crow.guardReady`. `{ok: false}` (no session, or a
+ * send that failed) and `{ok: false, unsupported: true}` (a relay older than the gate) are
+ * both "no". Nothing else — a gate status read, a header, anything a page controls, an env
+ * var — can stand in for it.
+ *
+ * @param {{ok?: boolean}|null|undefined} readyResult - what `sendGuardReady` resolved to
+ * @returns {boolean} true only for `{ok: true}`
+ */
+export function relayGuardReadyAccepted(readyResult) {
+  return Boolean(readyResult && readyResult.ok === true);
+}
+
+/**
+ * Does the relay own the exit cleanup RIGHT NOW, i.e. at exit time?
+ *
+ * Both halves are needed: the connection must have had its declaration ACCEPTED
+ * (`relayGuardReadyAccepted`, kept per connection by the caller), and the browser connection
+ * has to still be up. A browser that is already gone has nothing left for the relay to clean
+ * up, so the answer is `false` and the caller's own cleanup runs exactly as it did before this
+ * seam existed. A probe that throws proves nothing either: `false`, and the blank-and-crash
+ * path stays the fail-safe.
+ *
+ * @param {boolean} accepted - `relayGuardReadyAccepted` for the CURRENT connection
+ * @param {{isConnected?: () => boolean}|null} browser - the connection's Playwright Browser
+ * @returns {boolean}
+ */
+export function relayOwnsExitCleanup(accepted, browser) {
+  try {
+    return accepted === true && Boolean(browser) && browser.isConnected() === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Blank the guarded context's pages when this process goes away.
  *
  * The route guard lives in THIS process's Playwright connection: the moment the
@@ -1526,15 +1565,46 @@ export async function blankPageSafely(page, opts = {}) {
  * so the lease guard's SIGTERM/SIGINT exit — which would otherwise cut it off
  * half way — awaits it before it calls `exit`.
  *
+ * A RELAY THAT OWNS THE CLEANUP. When the browser sits behind the Crow relay's gate
+ * (`cdp-relay.mjs --attach`) and the relay ACCEPTED this connection's `Crow.guardReady`
+ * (`sendGuardReady` in gate-client.js, `{ok: true}`), the RELAY is what finishes the cleanup
+ * when this process's connection ends: it closes every page of the bot's, leaves one empty
+ * page and ends in IDLE. But it only does that when NO other intent client is connected, so
+ * this process's pages would otherwise keep running JS and sockets until that other client
+ * left, with no time bound. So such a pair still gets the NORMAL work described above — the
+ * browser session, the survivor where the normal path makes one, the bot's pages blanked,
+ * their commit observed and their closes issued (the operator's pages stay untouched) — and
+ * only the CRASH is withheld: a crash would kill the browser the relay is holding for the
+ * next connection, and the relay finishes whatever this cleanup leaves behind.
+ *
+ * A caller says so with `opts.relayOwnsCleanup`, a function asked ONCE when the cleanup runs,
+ * before its first await. A run whose EVERY registered pair answers exactly `true` may not
+ * crash: wherever it would have — a survivor that cannot be made, a deny-all attach that
+ * fails, a blank that never commits, a budget that expires with pages armed, anything else
+ * that reaches `killBrowser` — it ABANDONS the rest instead: no crash, no further page work,
+ * no more CDP calls, one `console.error` line saying the relay will finish, and the cleanup
+ * resolves so the process exits and its connection closes (which is what makes the relay do
+ * its part). `failed()` still answers true: the pages were not proven cleaned. With a MIXED
+ * set of pairs (one relay-owned, one not) or any pair answering anything but `true` — no
+ * function at all, `false`, anything else, a throw — the crash stays exactly what it was, for
+ * every pair, because the page that would be left armed may belong to a connection no relay
+ * is holding. That fallback also covers a relay with no gate, an older relay that refused
+ * the declaration, and a browser that died before the exit.
+ *
  * @param {() => object|null} getContext - returns the guarded BrowserContext
- * @param {{proc?: object, budgetMs?: number, ownership?: object}} [opts] `ownership`
- *   is the MCP process's page ownership (`page-ownership.js`): when it is passed,
- *   only the bot's pages are cleaned up and the operator's are left untouched.
+ * @param {{proc?: object, budgetMs?: number, ownership?: object, relayOwnsCleanup?: () => boolean}} [opts]
+ *   `ownership` is the MCP process's page ownership (`page-ownership.js`): when it is
+ *   passed, only the bot's pages are cleaned up and the operator's are left untouched.
  *   Calling this again for the same `proc` with a new getter (a reconnect) and the
  *   same ownership updates that server's entry; a DIFFERENT ownership (a second
  *   server in this process) adds one, and the single cleanup walks them all. Without an
  *   ownership (the legacy mode) the GETTER FUNCTION is the pair's identity: the same
  *   getter re-registers on its pair, a different getter is another pair.
+ *   `relayOwnsCleanup` is that pair's "the relay has this connection's cleanup" seam: it is
+ *   carried on the pair, so re-registering the same server (a reconnect) replaces it, and it
+ *   is asked once per run, before the cleanup's first await. Only when EVERY pair answers
+ *   exactly `true` is `Browser.crash` withheld (the rest of the cleanup still runs; see
+ *   A RELAY THAT OWNS THE CLEANUP above).
  * @returns {() => Promise<void>} the cleanup, so a caller can await it
  */
 export function blankPagesOnExit(getContext, opts = {}) {
@@ -1556,12 +1626,12 @@ export function blankPagesOnExit(getContext, opts = {}) {
   // one crash machinery.
   const already = exitRegistrations.get(proc);
   if (already) {
-    already.addOrUpdate(getContext, opts.ownership);
+    already.addOrUpdate(getContext, opts.ownership, opts.relayOwnsCleanup);
     return already.run;
   }
 
   const cleanup = createExitCleanup({ budgetMs: cleanupBudgetMs(opts) });
-  cleanup.own(getContext, opts.ownership);
+  cleanup.own(getContext, opts.ownership, opts.relayOwnsCleanup);
 
   // A signal listener replaces node's default exit, so hand the signal back once
   // the pages are blanked: the MCP server must still stop when it is told to.
@@ -1717,25 +1787,29 @@ async function runCloseGuardedPages(getContext, opts) {
  * builds it and hands back the seams its callers need.
  *
  * @param {{budgetMs: number}} opts
- * @returns {{run: () => Promise<unknown>, own: (getContext: Function, ownership?: object) => void, failed: () => boolean, settled: () => Promise<boolean>, releaseBrowserSession: () => Promise<void>}}
+ * @returns {{run: () => Promise<unknown>, own: (getContext: Function, ownership?: object, relayOwnsCleanup?: Function) => void, failed: () => boolean, settled: () => Promise<boolean>, releaseBrowserSession: () => Promise<void>}}
  *   `run` is the once-only cleanup (raced against the budget), `own` registers (or re-points)
- *   one server's context getter plus ownership, `failed` says whether this run took the crash
- *   path, `settled` answers whether the work behind `run` settled inside its bound (`false`
- *   when the bound passed first), and `releaseBrowserSession` detaches the browser-level
- *   sessions this cleanup opened, each one bounded
+ *   one server's context getter plus ownership and its relay-cleanup seam, `failed` says
+ *   whether this run took the crash path, `settled` answers whether the work behind `run`
+ *   settled inside its bound (`false` when the bound passed first), and
+ *   `releaseBrowserSession` detaches the browser-level sessions this cleanup opened, each one
+ *   bounded
  */
 function createExitCleanup({ budgetMs }) {
   /**
    * One server's cleanup target: {
    *   getter: () => the guarded BrowserContext,
    *   ownership: the page ownership this context is cleaned up for, or null for the
-   *              legacy "blank and close every page" mode.
+   *              legacy "blank and close every page" mode,
+   *   relayOwnsCleanup: () => boolean, or null: the connection's "the relay owns this
+   *              cleanup" seam (see the doc comment above `blankPagesOnExit`).
    * }
    */
   const pairs = [];
-  const addOrUpdate = (nextGetter, nextOwnership) => {
+  const addOrUpdate = (nextGetter, nextOwnership, nextRelayOwnsCleanup) => {
     const getter = typeof nextGetter === "function" ? nextGetter : () => null;
     const ownership = nextOwnership || null;
+    const relayOwnsCleanup = typeof nextRelayOwnsCleanup === "function" ? nextRelayOwnsCleanup : null;
     // A pair is the SAME pair only when it belongs to the same SERVER.
     //
     // With an ownership, that server IS its ownership, matched by identity: two servers
@@ -1754,10 +1828,41 @@ function createExitCleanup({ budgetMs }) {
       : pairs.find((pair) => !pair.ownership && pair.getter === getter);
     if (match) {
       match.getter = getter;
+      // The seam belongs to the CONNECTION, so a re-registration (a reconnect) replaces it
+      // with the new one — including replacing it with nothing, which keeps the cleanup.
+      match.relayOwnsCleanup = relayOwnsCleanup;
       return;
     }
-    pairs.push({ getter, ownership });
+    pairs.push({ getter, ownership, relayOwnsCleanup });
   };
+  /**
+   * Does the RELAY own this pair's exit cleanup?
+   *
+   * Only an answer of exactly `true` says so. A pair that brought no function, a function
+   * that throws, and every other answer keep the crash: not being able to tell is not the
+   * same as "the relay has it", and the blank-and-crash path is the fail-safe.
+   */
+  const relayOwnsPair = (pair) => {
+    if (typeof pair.relayOwnsCleanup !== "function") return false;
+    try {
+      return pair.relayOwnsCleanup() === true;
+    } catch {
+      return false;
+    }
+  };
+  /**
+   * Did EVERY registered pair answer the relay seam with exactly `true`?
+   *
+   * This is the ONE decision that withholds `Browser.crash`, and it is about the RUN, not
+   * about a pair: the crash is the fail-safe for a page left armed by a connection no relay
+   * is holding, so it may only be withheld when there is no such pair at all. A mixed set
+   * (one relay-owned, one not) keeps the crash, exactly as every non-"true" answer does.
+   *
+   * Computed ONCE per run, synchronously, before the cleanup's first await (see
+   * `blankAll`): the pairs cannot disagree halfway through, and a throw inside a seam counts
+   * as a `false` (`relayOwnsPair`).
+   */
+  let allPairsRelayOwned = false;
   /**
    * True once a page of the BOT's is known (or is being blanked) IN ANY registered
    * pair, or an ownership reports one of its own (`botPageCount()`,
@@ -1857,7 +1962,11 @@ function createExitCleanup({ budgetMs }) {
    * ends the cleanup has to be able to wait for it (see `killBrowser`).
    */
   let browserSessionOpening = null;
-  /** True once a crash was actually SENT, or the give-up line was logged. */
+  /**
+   * True once a crash was actually SENT, the give-up line was logged, or the rest of the
+   * cleanup was handed to the relay. Every loop reads it to stop, so an ended cleanup (by a
+   * crash or by an abandonment) touches nothing further.
+   */
   let crashed = false;
   /**
    * The pages a close was already issued for, or scheduled for: ONE cleanup-level
@@ -2046,6 +2155,19 @@ function createExitCleanup({ budgetMs }) {
    */
   let cleanupFailed = false;
 
+  /**
+   * One `console.error` line when the crash is withheld: a run whose pairs are ALL
+   * relay-owned abandons the rest of its cleanup instead of crashing the browser, and a
+   * silent stop would read as a finished cleanup.
+   */
+  const logRelayOwnsTheRest = () => {
+    try {
+      console.error(
+        "[browser] the exit cleanup stopped here: the relay owns the cleanup: leaving the rest to it",
+      );
+    } catch { /* a console that is already gone */ }
+  };
+
   /** One `console.error` line naming why the browser could not be crashed. */
   const logCrashFailure = (failure) => {
     try {
@@ -2061,6 +2183,9 @@ function createExitCleanup({ budgetMs }) {
    * reached are still armed, so a silent browser crash would look like a fault.
    */
   const logBudgetExhausted = () => {
+    // A relay-owned run does not crash, so this line ("the browser is crashed rather than
+    // closed") would be wrong: `logRelayOwnsTheRest` is its one record.
+    if (allPairsRelayOwned) return;
     try {
       console.error(
         `[browser] the exit cleanup ran out of its ${budgetMs} ms budget with pages still open: the pages it ` +
@@ -2075,6 +2200,8 @@ function createExitCleanup({ budgetMs }) {
    * unproven as they are after an expired budget.
    */
   const logSettleBudgetExhausted = () => {
+    // As `logBudgetExhausted`: a relay-owned run has no crash to announce.
+    if (allPairsRelayOwned) return;
     try {
       console.error(
         `[browser] the exit cleanup's classification budget ran out with pages still unclassified: ` +
@@ -2208,10 +2335,29 @@ function createExitCleanup({ budgetMs }) {
     }
   };
 
-  /** The one kill per cleanup: the budget path and a failure path share it. */
+  /**
+   * The one kill per cleanup: the budget path and a failure path share it.
+   *
+   * A run whose pairs are ALL relay-owned never crashes (see `allPairsRelayOwned`): the
+   * browser is the relay's to keep for the next connection, so ending it would destroy the
+   * very browser the relay is holding. The rest of the cleanup is ABANDONED instead — the
+   * same stop the crash is, taken through the flag every loop already reads — and one line
+   * says the relay finishes the job when this connection closes.
+   */
   const killBrowser = () => {
     cleanupFailed = true;
-    killing ||= crashBrowser();
+    if (killing) return killing;
+    if (allPairsRelayOwned) {
+      // No `Browser.crash` and no further page work: `crashed` is the same stop the crash
+      // sets, so the loops end here exactly as they end after a crash.
+      if (!crashed) {
+        crashed = true;
+        logRelayOwnsTheRest();
+      }
+      killing = Promise.resolve();
+      return killing;
+    }
+    killing = crashBrowser();
     return killing;
   };
 
@@ -2632,6 +2778,10 @@ function createExitCleanup({ budgetMs }) {
 
   /** One pair: open its browser session, then clean its context in its own mode. */
   const blankOneContext = async (pair) => {
+    // Called for EVERY registered pair, a relay-owned one included: the relay only takes over
+    // when this connection ENDS (and only when no other intent client is connected), so the
+    // pages of a finished turn are blanked and closed HERE, like any other. What a relay-owned
+    // pair never does is crash the browser — `killBrowser` withholds it.
     let context = null;
     try {
       context = typeof pair.getter === "function" ? pair.getter() : null;
@@ -2728,6 +2878,12 @@ function createExitCleanup({ budgetMs }) {
    * await: see `primeBotWork`.
    */
   const blankAll = async () => {
+    // ONE seam answer per run, taken SYNCHRONOUSLY before this cleanup's first await, for
+    // EVERY registered pair: only a run whose pairs are ALL relay-owned withholds the crash.
+    // The seam is asked once — one answer per run, so the pairs cannot disagree halfway
+    // through. Every pair is then cleaned up as usual (a relay-owned pair included): the
+    // relay only finishes the job when this connection ends.
+    allPairsRelayOwned = pairs.every(relayOwnsPair);
     for (const pair of pairs) primeBotWork(pair);
     for (const pair of pairs) {
       // A crash (or the give-up) already ended the cleanup: nothing further is

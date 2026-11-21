@@ -37,6 +37,16 @@ test("start.sh minimum and root Dockerfile base match the engines major", () => 
   assert.equal(/^FROM node:(\d+)/m.exec(read("Dockerfile"))?.[1], MAJOR);
 });
 
+test("the browser bundle Dockerfile installs the engines major", () => {
+  // bundles/browser/Dockerfile builds the browser image with nodesource's
+  // `setup_<MAJOR>.x` script. It sat on Node 20 (end of life) while CI, engines and
+  // the installer ran 24: the same drift this file exists for, in an image.
+  const dockerfile = read("bundles/browser/Dockerfile");
+  const majors = [...dockerfile.matchAll(/setup_(\d+)\.x/g)].map((m) => m[1]);
+  assert.ok(majors.length > 0, "bundles/browser/Dockerfile installs Node through setup_<MAJOR>.x");
+  for (const v of majors) assert.equal(v, MAJOR, `bundles/browser/Dockerfile setup_${v}.x != engines major ${MAJOR}`);
+});
+
 test("live code never spawns a hardcoded nvm node", () => {
   for (const f of ["servers/gateway/routes/bot-board-api.js"]) {
     assert.ok(!/\.nvm\/versions\/node\/v\d/.test(read(f)), `${f} hardcodes an nvm node path; use process.execPath`);

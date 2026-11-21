@@ -430,17 +430,21 @@ echo ""
 # --- Graceful stop: docker stop (SIGTERM via init) reaches this shell only.
 # The relay owns the graceful part (Chromium's own SIGTERM path exits WITHOUT
 # committing its cookie store): it sends Browser.close over the pipe, waits up to
-# 10 s for Chromium to exit, then kills it. We allow 15 s here, inside compose's
-# 30 s stop_grace_period, and stop the display only after the browser is gone.
+# 10 s for Chromium to exit, then kills it. Since the gate, the supervisor's own
+# budget is a cleanup (5 s) and then that close (10 s) plus 2 s of slack — 17 s —
+# so this waits 20 s, inside compose's 30 s stop_grace_period, and stops the
+# display only after the browser is gone. A supervisor that SIGKILLs the browser
+# in the middle of its cleanup is safe (it is the same stop path the relay asks
+# for) and is the expected outcome on a slow box, not a broken stop.
 shutdown() {
   log "stopping: closing Chromium through the relay..."
   kill -TERM "$RELAY_PID" 2>/dev/null || true
-  for i in $(seq 1 30); do
+  for i in $(seq 1 40); do
     kill -0 "$RELAY_PID" 2>/dev/null || break
     sleep 0.5
   done
   if kill -0 "$RELAY_PID" 2>/dev/null; then
-    log "the relay did not stop within 15s; killing it"
+    log "the relay did not stop within 20s; killing it"
     kill -KILL "$RELAY_PID" 2>/dev/null || true
   fi
   rm -f "$CDP_READY_FILE"

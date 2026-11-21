@@ -120,6 +120,8 @@ const RELAY_INSTALLED = "// the relay: the WebRTC launch flag, and no Target.cre
 const RELAY_OLD = "// the relay: no WebRTC flag yet\n";
 const ENTRYPOINT = "#!/bin/sh\nexec node /app/cdp-relay.mjs\n";
 const PACKAGE_JSON = '{"name":"crow-browser","version":"1.8.0"}\n';
+/** The committed lockfile the real Dockerfile COPYs alongside package.json (`npm ci`). */
+const LOCKFILE = '{"lockfileVersion":3}\n';
 
 /** What the installed bundle holds on disk. */
 const INSTALLED_FILES = {
@@ -196,11 +198,16 @@ function touch(whenIso) {
 
 const sha256 = (text) => createHash("sha256").update(String(text), "utf8").digest("hex");
 
-/** What the RUNNING container holds, at the destinations the browser Dockerfile copies to. */
-function inContainer({ relay = RELAY_INSTALLED, entrypoint = ENTRYPOINT, pkg = PACKAGE_JSON } = {}) {
+/**
+ * What the RUNNING container holds, at the destinations the browser Dockerfile copies to.
+ * A dest the installed Dockerfile does not COPY (package-lock.json, for the fixtures that
+ * build from the shorter DOCKERFILE) is never asked for, so carrying it is harmless.
+ */
+function inContainer({ relay = RELAY_INSTALLED, entrypoint = ENTRYPOINT, pkg = PACKAGE_JSON, lock = LOCKFILE } = {}) {
   return {
     "/app/cdp-relay.mjs": relay,
     "/app/entrypoint.sh": entrypoint,
+    "/app/package-lock.json": lock,
     "/app/package.json": pkg,
   };
 }
@@ -387,16 +394,32 @@ describe("the signal: the CONTENT inside the running container differs from the 
   });
 
   test("(c) the dest paths are the real Dockerfile's COPY destinations under WORKDIR", async () => {
-    installBrowser({ files: { Dockerfile: REAL_DOCKERFILE } });
+    // The real Dockerfile is `COPY package.json package-lock.json ./`, so the build context
+    // it is compared against holds both — a source absent on disk is skipped, not compared.
+    installBrowser({ files: { Dockerfile: REAL_DOCKERFILE, "package-lock.json": LOCKFILE } });
     const s = fakeStore();
     const runner = dockerStub({ containerFiles: { container1: inContainer() } });
 
     await runCheck(s, { runner });
 
     assert.deepEqual(s.upserts, [], "identical content: nothing to say");
-    assert.deepEqual([...execDests(runner)].sort(), ["/app/cdp-relay.mjs", "/app/entrypoint.sh", "/app/package.json"]);
+    assert.deepEqual([...execDests(runner)].sort(), ["/app/cdp-relay.mjs", "/app/entrypoint.sh", "/app/package-lock.json", "/app/package.json"]);
     // The Dockerfile itself is not in the image and is not hashed.
     assert.ok(!execDests(runner).has("/app/Dockerfile"));
+  });
+
+  test("(c) CONTROL: the lockfile inside the container differs from the installed one → card", async () => {
+    installBrowser({ files: { Dockerfile: REAL_DOCKERFILE, "package-lock.json": LOCKFILE } });
+    const s = fakeStore();
+    const runner = dockerStub({
+      containerFiles: { container1: inContainer({ lock: '{"lockfileVersion":2}\n' }) },
+    });
+
+    await runCheck(s, { runner });
+
+    assert.equal(s.upserts.length, 1, "the lockfile is a file the image is built from, so a differing one is stale");
+    assert.ok(execDests(runner).has("/app/package-lock.json"), "the lockfile was hashed inside the container");
+    assert.deepEqual(s.resolved, [], "a raised card is not resolved in the same pass");
   });
 
   test("(c) a dest spelled `./`, `.` or as a full path all resolve against WORKDIR", async () => {

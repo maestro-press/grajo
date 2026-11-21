@@ -14,8 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcomposite1 libxdamage1 libxrandr2 libatspi2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Node.js 20 LTS
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+# Install Node.js 24 LTS
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
@@ -27,9 +27,9 @@ RUN test -x /usr/bin/setpriv
 
 WORKDIR /app
 
-# Install deps
-COPY package.json ./
-RUN npm install
+# Install deps from the committed lockfile (a floating resolve pulls a newer Playwright)
+COPY package.json package-lock.json ./
+RUN npm ci
 
 # Install Playwright Chromium
 RUN npx playwright install chromium --with-deps

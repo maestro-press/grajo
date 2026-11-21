@@ -295,7 +295,17 @@ test("round 3: the browser's close is bounded (10 s in the relay), and the marke
   assert.match(relay, /export const CLOSE_TIMEOUT_MS = 10_000;/, "Browser.close waits 10 s, then the relay kills Chromium");
   assert.match(relay, /method: "Browser\.close"/);
   const fn = CODE.slice(CODE.indexOf("shutdown() {"), CODE.indexOf("\n}\n", CODE.indexOf("shutdown() {")));
-  assert.match(fn, /for i in \$\(seq 1 30\); do/, "15 s for the relay to close Chromium, inside the 30 s grace period");
+  // The gate made the supervisor's stop budget a cleanup (5 s) plus the close (10 s)
+  // plus 2 s of slack — 17 s — so the entrypoint waits 20 s (40 × 0.5 s), still inside
+  // compose's 30 s stop_grace_period.
+  assert.match(fn, /for i in \$\(seq 1 40\); do/, "20 s for the relay's cleanup then close, inside the 30 s grace period");
+  assert.match(fn, /the relay did not stop within 20s; killing it/, "and the fallback says 20s");
+  // The wait and the message agree, and both fit the grace period compose gives the stop.
+  const waitSec = Number(/seq 1 (\d+)/.exec(fn)[1]) * 0.5;
+  assert.equal(waitSec, 20, "the loop waits 20 s (40 × 0.5 s)");
+  const grace = Number(/stop_grace_period:\s*(\d+)s/.exec(COMPOSE)[1]);
+  assert.ok(waitSec < grace, `the wait (${waitSec} s) stays inside compose's ${grace} s grace`);
+  assert.match(fn, new RegExp(`within ${waitSec}s`), "the hard-stop message names the same wait");
   assert.match(CODE, /CROW_INSTANCE="\$\(realpath -m -- "\$CROW_INSTANCE"\)"/);
   assert.match(CODE, /\[ "\$\(realpath -m -- "\$\(cat "\$INSTANCE_MARKER"\)"\)" = "\$CROW_INSTANCE" \]/);
   const script = readFileSync(new URL("scripts/ops/browser-profile-to-volume.sh", REPO), "utf8");
