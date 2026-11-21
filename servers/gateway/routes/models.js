@@ -16,8 +16,10 @@
  * caller is not obviously distinguishable from success without extra
  * client-side plumbing every other panel API in this codebase also skips.
  * `requireDashboardSessionJson` runs the SAME two checks `dashboardAuth`
- * does (`isAllowedNetwork`, then the `crow_session` cookie via
- * `verifySession`) but answers with `401`/`403` JSON instead — the same
+ * does (`isAllowedNetwork`, then the session cookie via `sessionFromRequest` —
+ * which includes the plain → `__Host-` migration rule, so a plain
+ * `crow_session` over HTTPS is a session here only when its row predates
+ * `PLAIN_SESSION_MIGRATION_CUTOFF`) but answers with `401`/`403` JSON instead — the same
  * pattern `routes/admin-backup.js`'s `requireLocalhost`/`requireToken` and
  * `routes/audio-proxy.js`'s `peer_auth_required` already use for JSON-only
  * routes in this codebase. `dashboardAuth` is still accepted as this
@@ -60,7 +62,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join, resolve as resolvePath } from "node:path";
 
 import { createDbClient, resolveDataDir } from "../../db.js";
-import { isAllowedNetwork, verifySession, sessionTokenFromRequest } from "../dashboard/auth.js";
+import { isAllowedNetwork, sessionFromRequest } from "../dashboard/auth.js";
 // One Crow cookie-name list (../cookie-names.js), shared with every setter and
 // with the extension proxy that strips these cookies before forwarding.
 import { listProvidersAll, upsertProvider } from "../../shared/providers-db.js";
@@ -100,18 +102,22 @@ const HF_SEARCH_TIMEOUT_MS = 8000;
 // ---------------------------------------------------------------------------
 
 /** Exported for direct unit testing without booting a whole express app. */
-export function requireDashboardSessionJson(req, res, next) {
+export async function requireDashboardSessionJson(req, res, next) {
   if (!isAllowedNetwork(req)) {
     return res.status(403).json({ error: "Not reachable from this network", code: "NETWORK_DENIED" });
   }
-  const token = sessionTokenFromRequest(req);
-  verifySession(token)
-    .then((valid) => {
-      if (!valid) return res.status(401).json({ error: "Not authenticated", code: "UNAUTHENTICATED" });
-      req.dashboardSession = token;
-      next();
-    })
-    .catch(() => res.status(401).json({ error: "Not authenticated", code: "UNAUTHENTICATED" }));
+  // sessionFromRequest, NOT sessionTokenFromRequest + verifySession: only the
+  // former applies the dashboard's plain → `__Host-` migration rule, so a plain
+  // `crow_session` over HTTPS is a session here only when its row was created
+  // before PLAIN_SESSION_MIGRATION_CUTOFF. Without that rule this JSON gate would
+  // accept the cookie-tossing shape the pages refuse (a sibling host's plain
+  // cookie holding a session IT just created). sessionFromRequest never throws,
+  // and it re-checks the network rule itself — the 403 above stays first so that
+  // refusal keeps its own distinct code.
+  const token = await sessionFromRequest(req);
+  if (!token) return res.status(401).json({ error: "Not authenticated", code: "UNAUTHENTICATED" });
+  req.dashboardSession = token;
+  next();
 }
 
 // ---------------------------------------------------------------------------

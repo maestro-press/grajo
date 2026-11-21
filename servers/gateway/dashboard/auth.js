@@ -10,14 +10,18 @@
  *   `<x>.<tailnet>.ts.net` is the same SITE as the dashboard
  * - Account lockout: 5 failed attempts → 15 min lock
  *
- * Known residual (F3): the plain → `__Host-` migration below has no
- * per-session "already migrated" marker in this release, so its door stays open
- * for as long as a browser presents a plain `crow_session`. An attacker who can
- * evict a victim's `__Host-` cookie (cookie-jar overflow) AND toss a valid
- * plain session for an account of their own can get that session migrated:
- * session fixation into the attacker's account (multi-user instances only).
- * Closing it needs a per-session flag on the session row — a schema change,
- * tracked separately and deliberately NOT in this change.
+ * The plain → `__Host-` migration below is a BOUNDED rail, not a standing door
+ * (the fix for session fixation by cookie tossing): over HTTPS a plain
+ * `crow_session` is read only while the session row it names was created BEFORE
+ * PLAIN_SESSION_MIGRATION_CUTOFF — the deploy that introduced the `__Host-`
+ * cookie — and only until PLAIN_SESSION_GRACE_END, two weeks later. A sibling
+ * host on the same SITE (`ts.net` is a public suffix, so every
+ * `<x>.<tailnet>.ts.net` is same-site with the dashboard) can toss a plain
+ * cookie holding a session IT just created, but such a session is newer than
+ * the cutoff, so it is refused — and the tossed cookie expired — instead of
+ * being migrated into. Once the grace period is over, `__Host-crow_session` is
+ * the only session cookie over HTTPS at all; plain HTTP (a LAN box, where no
+ * Secure cookie exists) keeps `crow_session` exactly as it was.
  */
 
 import { scrypt, randomBytes, timingSafeEqual, createHash } from "node:crypto";
@@ -48,6 +52,54 @@ const SESSION_MAX_AGE = isHosted ? 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000
 export const SSO_SESSION_MAX_AGE = 24 * 60 * 60 * 1000;
 const LOCKOUT_THRESHOLD = 5;
 const LOCKOUT_DURATION = 15 * 60 * 1000; // 15 min
+
+/**
+ * The window in which a plain `crow_session` may still be migrated to
+ * `__Host-crow_session`, and why it is bounded.
+ *
+ * `PLAIN_SESSION_MIGRATION_CUTOFF` is the deploy of the `__Host-` cookie
+ * (2026-11-20 10:41 America/Chicago = 16:41Z). Only a session MINTED before it
+ * can be one a browser legitimately still holds under the old plain name — the
+ * migration exists solely so those sign-ins survive the change. A plain cookie
+ * naming a NEWER session is the cookie-tossing shape: a sibling host on the
+ * tailnet (same SITE; `ts.net` is a public suffix) tosses a plain `crow_session`
+ * holding a session it created itself, and the victim's browser then presents
+ * it as the only session cookie over HTTPS. Migrating that would hand the
+ * victim the attacker's session (fixation into the attacker's account); it is
+ * refused instead.
+ *
+ * `PLAIN_SESSION_GRACE_END` is the cutoff plus 14 days. After it, a plain
+ * cookie over HTTPS is never read again, whatever session it names — the
+ * `__Host-` cookie is the only session cookie there.
+ *
+ * The cutoff is the moment the `__Host-` change MERGED, not each install's own
+ * update time. An install that updates later than the cutoff therefore refuses
+ * plain sessions created between the cutoff and its own update — including the
+ * handful its own browser minted the day before it updated. That fails CLOSED
+ * by design: the owner signs in once more, which is the entire cost, while the
+ * alternative (measuring the window from each install's update) reopens the
+ * tossing shape for as long as a host takes to update.
+ *
+ * Residual (accepted, needs a specific setup): someone who already holds
+ * THEIR OWN valid session on the same instance, created before the cutoff, can
+ * still be migrated into that session until it expires — at most 7 days (1 day
+ * for SSO/hosted sessions). That requires a multi-user instance AND an existing
+ * login there; it is a session the person legitimately had, not one minted for
+ * the attack.
+ */
+export const PLAIN_SESSION_MIGRATION_CUTOFF = "2026-11-20T16:41:00Z";
+export const PLAIN_SESSION_GRACE_END = "2026-12-04T16:41:00Z";
+const PLAIN_SESSION_MIGRATION_CUTOFF_MS = Date.parse(PLAIN_SESSION_MIGRATION_CUTOFF);
+const PLAIN_SESSION_GRACE_END_MS = Date.parse(PLAIN_SESSION_GRACE_END);
+
+/**
+ * The clock this module measures the migration window against. Injectable for
+ * tests (`_setNowFn`, the shape servers/db.js uses for totalmem) so a test can
+ * stand before the cutoff, inside the grace period, or after its end without
+ * waiting two weeks. `_setNowFn()` restores the real clock.
+ */
+let _nowFn = () => Date.now();
+export function _setNowFn(fn) { _nowFn = typeof fn === "function" ? fn : () => Date.now(); }
 
 /**
  * Validate password strength (for set/change only, not login).
@@ -186,31 +238,54 @@ export function requestIsSecure(req) {
  * session name such a request can carry.
  *
  * Migration: a browser still holding ONLY the old plain cookie on an HTTPS
- * request is migrated — `migrate` says so, and dashboardAuth re-issues it as
+ * request is a CANDIDATE — `migrate` says so, and dashboardAuth re-issues it as
  * `__Host-` (keeping the session's own remaining lifetime) and expires the
- * plain name. There is no per-session "already migrated" marker in this
- * release (that is a schema change, tracked separately — see the header's
- * known residual), so the door is open whenever a plain value is presented.
+ * plain name. Being a candidate is not enough: the session row must have been
+ * created before PLAIN_SESSION_MIGRATION_CUTOFF, which only the DB-backed
+ * readers can see (plainSessionMigrationAllowed — dashboardAuth,
+ * sessionFromRequest). A plain cookie whose session is newer is the tossing
+ * shape and is treated as no session at all.
+ *
+ * After PLAIN_SESSION_GRACE_END no plain cookie is even a candidate: over HTTPS
+ * it is never read or migrated again, and `clearPlain` asks the caller to
+ * expire it. The caller can tell a refused/expired plain cookie (`clearPlain`)
+ * from a request that carried none.
  *
  * @param {object} req
- * @returns {{ token: string|null, migrate: boolean }}
+ * @param {{ now?: number }} [opts] the clock to measure the grace period with (tests)
+ * @returns {{ token: string|null, migrate: boolean, clearPlain: boolean }}
  */
-export function sessionFromCookies(req) {
+export function sessionFromCookies(req, { now = _nowFn() } = {}) {
   const { cookies, duplicates } = parseCookieJar(req);
   if (!requestIsSecure(req)) {
-    if (duplicates.has(SESSION_COOKIE)) return { token: null, migrate: false };
-    return { token: cookies[SESSION_COOKIE] || null, migrate: false };
+    if (duplicates.has(SESSION_COOKIE)) return { token: null, migrate: false, clearPlain: false };
+    return { token: cookies[SESSION_COOKIE] || null, migrate: false, clearPlain: false };
   }
-  if (duplicates.has(HOST_SESSION_COOKIE)) return { token: null, migrate: false };
-  if (cookies[HOST_SESSION_COOKIE]) return { token: cookies[HOST_SESSION_COOKIE], migrate: false };
+  if (duplicates.has(HOST_SESSION_COOKIE)) return { token: null, migrate: false, clearPlain: false };
+  if (cookies[HOST_SESSION_COOKIE]) return { token: cookies[HOST_SESSION_COOKIE], migrate: false, clearPlain: false };
   // No `__Host-` cookie: only a lone plain value may migrate. Duplicates here
   // are the tossing shape with nothing trustworthy to prefer.
-  if (duplicates.has(SESSION_COOKIE)) return { token: null, migrate: false };
-  if (cookies[SESSION_COOKIE]) return { token: cookies[SESSION_COOKIE], migrate: true };
-  return { token: null, migrate: false };
+  if (duplicates.has(SESSION_COOKIE)) return { token: null, migrate: false, clearPlain: false };
+  if (cookies[SESSION_COOKIE]) {
+    // The rail is closed for good: over HTTPS a plain cookie is never a session
+    // again, and the caller expires it.
+    if (!(now < PLAIN_SESSION_GRACE_END_MS)) return { token: null, migrate: false, clearPlain: true };
+    return { token: cookies[SESSION_COOKIE], migrate: true, clearPlain: false };
+  }
+  return { token: null, migrate: false, clearPlain: false };
 }
 
-/** The session token this request carries (see sessionFromCookies), or null. */
+/**
+ * The session token this request carries (see sessionFromCookies), or null.
+ *
+ * The raw cookie reader, without a database round trip: a plain cookie inside
+ * the grace period still yields its token here. It is NOT an authorization
+ * check — authorize with sessionFromRequest (or sessionAuth together with
+ * plainSessionMigrationAllowed), which are the DB-backed readers that apply
+ * the plain-cookie created_at rule and so refuse a session minted at/after
+ * PLAIN_SESSION_MIGRATION_CUTOFF. A caller that decides access from this value
+ * alone accepts the cookie-tossing shape.
+ */
 export function sessionTokenFromRequest(req) {
   return sessionFromCookies(req).token;
 }
@@ -795,20 +870,25 @@ export function ownerRequestWriteContext(req) {
  * `expiresAt` rides along because the caller needs it and a second query would
  * be the same row: the `__Host-` migration re-issues the cookie for the lifetime
  * this session has LEFT, never a fresh week (otherwise a plain cookie could be
- * kept alive forever by replaying the migration).
+ * kept alive forever by replaying the migration). `createdAt` is the same row's
+ * `created_at`, which bounds that migration (plainSessionMigrationAllowed): a
+ * session minted at/after the cutoff is never migrated into.
  */
 export async function sessionAuth(token) {
-  if (!token) return { valid: false, ssoSrc: null, sso: false, expiresAt: null };
+  if (!token) return { valid: false, ssoSrc: null, sso: false, expiresAt: null, createdAt: null };
   const db = createDbClient();
   try {
     const row = await readSessionRow(db, token);
-    if (!row) return { valid: false, ssoSrc: null, sso: false, expiresAt: null };
+    if (!row) return { valid: false, ssoSrc: null, sso: false, expiresAt: null, createdAt: null };
     const scopes = String(row.scopes ?? "");
     return {
       valid: true,
       ssoSrc: ssoSourceOf(scopes),
       sso: /(?:^|\s)sso(?:\s|$)/.test(scopes),
       expiresAt: row.expires_at == null ? null : String(row.expires_at),
+      // When the session was minted — the fact the plain → `__Host-` migration
+      // is bounded by (plainSessionMigrationAllowed).
+      createdAt: row.created_at == null ? null : String(row.created_at),
     };
   } finally {
     db.close();
@@ -820,25 +900,65 @@ export async function sessionAuth(token) {
  */
 async function readSessionRow(db, token) {
   const result = await db.execute({
-    sql: "SELECT scopes, expires_at FROM oauth_tokens WHERE token = ? AND client_id = 'dashboard' AND julianday(expires_at) > julianday('now')",
+    sql: "SELECT scopes, expires_at, created_at FROM oauth_tokens WHERE token = ? AND client_id = 'dashboard' AND julianday(expires_at) > julianday('now')",
     args: [hashToken(token)],
   });
   return result.rows[0] || null;
 }
 
 /**
+ * Read a timestamp the way SQLite writes one into oauth_tokens: our own ISO
+ * strings (with a zone) and `datetime('now')` UTC text with NO zone, which
+ * Date.parse would otherwise read in the host's LOCAL time. A zone-less value
+ * is therefore read as UTC.
+ *
+ * @param {unknown} raw
+ * @returns {number|null} epoch ms, or null when it is empty or unreadable
+ */
+export function parseDbTimestamp(raw) {
+  const s = String(raw ?? "").trim();
+  if (!s) return null;
+  const zoned = /(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(s);
+  const at = Date.parse(zoned ? s : s.replace(" ", "T") + "Z");
+  return Number.isFinite(at) ? at : null;
+}
+
+/**
+ * May a plain `crow_session` cookie be migrated to `__Host-crow_session` for a
+ * session whose row was created at `createdAt`?
+ *
+ * Yes only while BOTH hold:
+ *   - the grace period is still open (`now` before PLAIN_SESSION_GRACE_END), and
+ *   - the session was minted BEFORE PLAIN_SESSION_MIGRATION_CUTOFF.
+ *
+ * The second rule is the cookie-tossing fix. A sibling host on the same SITE can
+ * toss a plain `crow_session` holding a session it created seconds ago; that
+ * session is newer than the cutoff, so it is never migrated into. The migration
+ * exists only for sign-ins that predate the `__Host-` cookie.
+ *
+ * A row whose `created_at` is missing or unreadable fails CLOSED (no migration):
+ * a session we cannot date is never assumed to be an old one.
+ *
+ * @param {string|null|undefined} createdAt the session row's `created_at`
+ * @param {number} [now] epoch ms (tests inject this via _setNowFn)
+ * @returns {boolean}
+ */
+export function plainSessionMigrationAllowed(createdAt, now = _nowFn()) {
+  if (!(now < PLAIN_SESSION_GRACE_END_MS)) return false;
+  const at = parseDbTimestamp(createdAt);
+  return at !== null && at < PLAIN_SESSION_MIGRATION_CUTOFF_MS;
+}
+
+/**
  * How long this session has left, in ms, from its `expires_at` — or 0 when it is
- * unreadable or already due. SQLite writes two shapes into that column: our own
- * ISO strings (with a zone) and `datetime('now')` UTC text with no zone, which
- * Date.parse would read in the host's LOCAL time. A zone-less value is therefore
- * read as UTC.
+ * unreadable or already due (see parseDbTimestamp for the shapes SQLite writes).
+ *
+ * Deliberately the WALL clock, not the injectable migration-window clock: how
+ * long a cookie may live is a fact about the session row, not a policy switch.
  */
 export function remainingLifetimeMs(expiresAt, now = Date.now()) {
-  const raw = String(expiresAt ?? "").trim();
-  if (!raw) return 0;
-  const zoned = /(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(raw);
-  const at = Date.parse(zoned ? raw : raw.replace(" ", "T") + "Z");
-  if (!Number.isFinite(at)) return 0;
+  const at = parseDbTimestamp(expiresAt);
+  if (at === null) return 0;
   return Math.max(0, at - now);
 }
 
@@ -903,20 +1023,28 @@ export function dashboardAuth(req, res, next) {
     return;
   }
 
-  const { token, migrate } = sessionFromCookies(req);
+  const now = _nowFn();
+  const { token, migrate, clearPlain } = sessionFromCookies(req, { now });
   const secure = requestIsSecure(req);
 
-  sessionAuth(token).then(({ valid, ssoSrc, sso, expiresAt }) => {
-    if (valid) {
+  sessionAuth(token).then(({ valid, ssoSrc, sso, expiresAt, createdAt }) => {
+    // The plain → `__Host-` migration is a bounded rail, not a standing door:
+    // a plain cookie over HTTPS is a migration CANDIDATE, and it is only a
+    // session when its row was minted before the cutoff (sessionFromCookies has
+    // already refused every plain cookie once the grace period is over). A
+    // plain cookie naming a newer session is the cookie-tossing shape.
+    const migrating = valid && migrate && plainSessionMigrationAllowed(createdAt, now);
+    const accepted = valid && (!migrate || migrating);
+    if (accepted) {
       req.dashboardSession = token;
       // Migration of the pre-`__Host-` cookie: this browser presented the old
-      // plain `crow_session` over HTTPS. The response re-issues it as
-      // `__Host-crow_session` with the session's OWN remaining lifetime (never a
-      // fresh week) and expires the plain one — host-only and, where the request
-      // host has a parent that is not itself a public suffix, at that parent too
-      // (setSessionCookie) — so a sibling host's `Domain=<tailnet>.ts.net` copy
-      // goes with it. (No per-session marker: see the header's known residual.)
-      if (migrate) {
+      // plain `crow_session` over HTTPS, for a session that predates the change.
+      // The response re-issues it as `__Host-crow_session` with the session's
+      // OWN remaining lifetime (never a fresh week) and expires the plain one —
+      // host-only and, where the request host has a parent that is not itself a
+      // public suffix, at that parent too (setSessionCookie) — so a sibling
+      // host's `Domain=<tailnet>.ts.net` copy goes with it.
+      if (migrating) {
         const remaining = remainingLifetimeMs(expiresAt);
         if (remaining > 0) {
           try {
@@ -930,6 +1058,15 @@ export function dashboardAuth(req, res, next) {
       if (ctx) withWriteContext(ctx, () => next());
       else next();
     } else {
+      // A plain cookie that was refused — minted at/after the cutoff (the
+      // tossing shape), or any plain cookie once the grace period is over — is
+      // expired here, host-only and at the request host's parent domain, so a
+      // sibling's tossed copy leaves the jar instead of being retried.
+      if (migrate || clearPlain) {
+        try {
+          expirePlainSessionCookie(res, { secure, req });
+        } catch { /* never block a page on a header */ }
+      }
       res.redirectAfterPost("/dashboard/login");
     }
   }).catch(() => {
@@ -947,11 +1084,16 @@ export function dashboardAuth(req, res, next) {
  */
 export async function sessionFromRequest(req) {
   if (!req || !req.headers || !isAllowedNetwork(req)) return null;
-  const { token } = sessionFromCookies(req);
+  const { token, migrate } = sessionFromCookies(req);
   if (!token) return null;
   try {
     const session = await sessionAuth(token);
     if (!session.valid) return null;
+    // A plain cookie over HTTPS is only a migration candidate: a session minted
+    // at/after the cutoff is the tossing shape, so it is no session here either
+    // (there is no response to expire the cookie on — an upgrade — and the
+    // dashboard's own answer does that on the next page load).
+    if (migrate && !plainSessionMigrationAllowed(session.createdAt)) return null;
     return token;
   } catch {
     return null;
@@ -1039,14 +1181,37 @@ export function setSessionCookie(res, token, maxAgeMs = SESSION_MAX_AGE, { secur
     `${name}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secureSuffix}`,
   ];
   if (expirePlain && name !== SESSION_COOKIE) {
-    const plainExpiry = (domain) =>
-      `${SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${domain ? `; Domain=${domain}` : ''}${secureSuffix}`;
-    cookies.push(plainExpiry(null));
-    const requestHost = host ?? (req && req.headers ? req.headers.host : null);
-    const parent = cookieDomainCandidate(requestHost);
-    if (parent) cookies.push(plainExpiry(parent));
+    cookies.push(...plainSessionExpiryCookies(secureSuffix, { req, host }));
   }
   res.setHeader("Set-Cookie", cookies);
+}
+
+/**
+ * The Set-Cookie values that expire a browser's plain `crow_session`: the
+ * host-only copy this origin set, and — where the request host has a parent that
+ * is not itself a public suffix — the `Domain=<parent>` copy a sibling host
+ * tossed (cookieDomainCandidate). One source, so the migration's re-issue and a
+ * refused migration expire exactly the same set.
+ */
+function plainSessionExpiryCookies(secureSuffix, { req = null, host = null } = {}) {
+  const plainExpiry = (domain) =>
+    `${SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${domain ? `; Domain=${domain}` : ''}${secureSuffix}`;
+  const cookies = [plainExpiry(null)];
+  const requestHost = host ?? (req && req.headers ? req.headers.host : null);
+  const parent = cookieDomainCandidate(requestHost);
+  if (parent) cookies.push(plainExpiry(parent));
+  return cookies;
+}
+
+/**
+ * Expire a plain `crow_session` on a response, with no session cookie set: the
+ * answer to a plain cookie the `__Host-` migration REFUSED — a session minted
+ * at/after PLAIN_SESSION_MIGRATION_CUTOFF (the cookie-tossing shape), or (once
+ * PLAIN_SESSION_GRACE_END has passed) any plain cookie at all. Host-only plus
+ * the request host's parent domain, matching plainSessionExpiryCookies above.
+ */
+export function expirePlainSessionCookie(res, { secure = false, req = null, host = null } = {}) {
+  res.setHeader("Set-Cookie", plainSessionExpiryCookies(secure ? '; Secure' : '', { req, host }));
 }
 
 /**

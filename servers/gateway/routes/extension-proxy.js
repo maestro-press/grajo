@@ -45,7 +45,7 @@ import { Router } from "express";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
-import { isAllowedNetwork, sessionTokenFromRequest, verifySession } from "../dashboard/auth.js";
+import { sessionFromRequest } from "../dashboard/auth.js";
 import { isLocalPasswordSession } from "../dashboard/local-session.js";
 import { scopeProxySetCookieHeader, stripCrowCookiesForBackend, stripSetCookieFromHandshake } from "../proxy-cookie-filter.js";
 import { claimUpgrade } from "../../shared/ws-upgrade-claim.js";
@@ -275,35 +275,31 @@ export function readAuthToken(authTokenFile, crowHome = CROW_HOME) {
  * server.on("upgrade") bypasses Express entirely, so the dashboardAuth
  * middleware mounted on the HTTP routes never runs for WS — previously an
  * unauthenticated LAN/tailnet client could reach extension web UIs
- * (including noVNC) over WS. Mirror the layers here:
- *   1. Network gate — isAllowedNetwork (funnel reject + private-network
- *      allowlist), exactly the layer the HTTP routes get via dashboardAuth.
- *   2. Session check — the crow_session cookie must be a live dashboard
- *      session (verifySession; DB-backed).
+ * (including noVNC) over WS. Mirror the layers here with ONE call:
+ * sessionFromRequest runs the network gate (isAllowedNetwork: funnel reject,
+ * loopback reject, private-network allowlist — exactly the layer the HTTP
+ * routes get via dashboardAuth) and the DB-backed session check, plus the
+ * dashboard's plain → `__Host-` cookie migration rule: over HTTPS a plain
+ * `crow_session` is a session only when its row was created before
+ * PLAIN_SESSION_MIGRATION_CUTOFF. It never throws.
  *
  * @param {import('http').IncomingMessage} req  raw upgrade request
  * @returns {Promise<boolean>} true only when the upgrade may proceed
  */
 export async function authorizeExtensionUpgrade(req) {
-  // Layer parity with the HTTP gate: isAllowedNetwork covers the funnel
-  // reject AND the network allowlist (loopback reject, private-IP ranges,
-  // CROW_DASHBOARD_PUBLIC) — it reads req.headers + req.connection, both
-  // present on a raw upgrade request.
-  if (!isAllowedNetwork(req)) return false;
-  const token = sessionTokenFromRequest(req);
-  if (!token) return false;
-  try {
-    return (await verifySession(token)) === true;
-  } catch {
-    return false;
-  }
+  // sessionFromRequest, not sessionTokenFromRequest + verifySession: the token
+  // reader alone is not an authorization check (it happily hands back a plain
+  // cookie inside the grace period), so gating on it would let a sibling host's
+  // tossed cookie authorize an upgrade the dashboard's own pages refuse.
+  // sessionFromRequest applies the network rule AND the migration rule.
+  return (await sessionFromRequest(req)) !== null;
 }
 
 /**
  * The viewer page for a token-carrying extension (the browser's noVNC) is the
  * OWNER's own sign-in only: the WebSocket token gives full control of the
- * logged-in Chromium, and verifySession accepts any live dashboard session —
- * one a paired peer's single sign-on minted (scopes 'dashboard sso …'), one
+ * logged-in Chromium, and the session check alone accepts any live dashboard
+ * session — one a paired peer's single sign-on minted (scopes 'dashboard sso …'), one
  * from a login on this machine ('dashboard onhost'), or a request from this
  * machine itself. isLocalPasswordSession is the same gate keychain saves,
  * Media Hub and Services use for anything that reaches operator credentials.
@@ -530,11 +526,25 @@ export default function extensionProxyFactory(authMiddleware, { createProxy = cr
               return;
             }
             // A token-carrying upgrade is the owner's own sign-in only: the token gives
-            // full control of the logged-in browser, and verifySession alone would also
+            // full control of the logged-in browser, and the session check alone would also
             // accept a peer's SSO session, an on-host login, or a request from this
             // machine. authMiddleware never ran here, so set the session ourselves.
             if (ext.wsHostTokenEnv) {
-              req.dashboardSession = sessionTokenFromRequest(req);
+              // The session again, read the same way the gate above read it:
+              // sessionTokenFromRequest is NOT a check (it returns a plain
+              // cookie's token inside the grace period whatever the row's
+              // created_at), so a plain `crow_session` over HTTPS only counts
+              // when sessionFromRequest says its session predates the cutoff.
+              const session = await sessionFromRequest(req);
+              if (!session) {
+                // The gate above accepted it, so this is a session that went
+                // away between the two reads: refuse exactly as a non-owner is
+                // refused below (never fall through to the backend).
+                socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+                socket.destroy();
+                return;
+              }
+              req.dashboardSession = session;
               // owner's own sign-in only: the token gives full control of the logged-in browser.
               const owner = await isLocalPasswordSession(req).catch(() => false);
               if (!owner) {

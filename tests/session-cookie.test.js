@@ -10,6 +10,13 @@
  * permanently). Only a duplicated `__Host-` name, which no sibling can set, is
  * refused. The plain-only migration is still refused when the plain name is
  * duplicated.
+ *
+ * The migration is also BOUNDED (session fixation by cookie tossing): the pure
+ * functions here pin both halves — a plain cookie is only a migration candidate
+ * while the grace period is open, and `plainSessionMigrationAllowed` only lets a
+ * session minted BEFORE PLAIN_SESSION_MIGRATION_CUTOFF cross. The middleware's
+ * own behaviour over real session rows is session-cookie-migration.test.js's
+ * subject.
  */
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -20,9 +27,14 @@ const {
   sessionTokenFromRequest,
   sessionFromRequest,
   setSessionCookie,
+  expirePlainSessionCookie,
   clearSessionCookie,
   cookieDomainCandidate,
   remainingLifetimeMs,
+  parseDbTimestamp,
+  plainSessionMigrationAllowed,
+  PLAIN_SESSION_MIGRATION_CUTOFF,
+  PLAIN_SESSION_GRACE_END,
 } = await import("../servers/gateway/dashboard/auth.js");
 
 const saved = {
@@ -89,29 +101,57 @@ test("a TLS socket is secure even without a header", () => {
 // ---- sessionFromCookies ---------------------------------------------------
 
 test("plain HTTP keeps the plain crow_session cookie", () => {
-  assert.deepEqual(sessionFromCookies(cookieReq("crow_session=lan-token")), { token: "lan-token", migrate: false });
+  assert.deepEqual(sessionFromCookies(cookieReq("crow_session=lan-token")), { token: "lan-token", migrate: false, clearPlain: false });
   // A __Host- cookie is never read over plain HTTP.
-  assert.deepEqual(sessionFromCookies(cookieReq("__Host-crow_session=host-token")), { token: null, migrate: false });
+  assert.deepEqual(sessionFromCookies(cookieReq("__Host-crow_session=host-token")), { token: null, migrate: false, clearPlain: false });
 });
 
 test("HTTPS reads only __Host-crow_session, and ignores a plain crow_session once it exists", () => {
   assert.deepEqual(
     sessionFromCookies(cookieReq("__Host-crow_session=host-token", { secure: true })),
-    { token: "host-token", migrate: false },
+    { token: "host-token", migrate: false, clearPlain: false },
   );
   // Both present (a sibling host tossed the plain one): the __Host- value wins,
   // and the plain one is not even a fallback.
   assert.deepEqual(
     sessionFromCookies(cookieReq("__Host-crow_session=host-token; crow_session=tossed", { secure: true })),
-    { token: "host-token", migrate: false },
+    { token: "host-token", migrate: false, clearPlain: false },
   );
   assert.equal(sessionTokenFromRequest(cookieReq("__Host-crow_session=host-token; crow_session=tossed", { secure: true })), "host-token");
 });
 
-test("HTTPS accepts a lone plain crow_session ONCE, for migration", () => {
+test("HTTPS accepts a lone plain crow_session as a migration CANDIDATE", () => {
+  // Within the grace period it is a candidate; the session row's own created_at
+  // is what finally decides (plainSessionMigrationAllowed, below).
   assert.deepEqual(
     sessionFromCookies(cookieReq("crow_session=legacy", { secure: true })),
-    { token: "legacy", migrate: true },
+    { token: "legacy", migrate: true, clearPlain: false },
+  );
+});
+
+test("after the grace end a plain crow_session over HTTPS is refused outright, and flagged for expiry", () => {
+  const after = Date.parse(PLAIN_SESSION_GRACE_END);
+  for (const now of [after, after + 1000]) {
+    assert.deepEqual(
+      sessionFromCookies(cookieReq("crow_session=legacy", { secure: true }), { now }),
+      { token: null, migrate: false, clearPlain: true },
+      `now=${new Date(now).toISOString()}`,
+    );
+  }
+  // ...just before it, the same cookie is still a candidate.
+  assert.deepEqual(
+    sessionFromCookies(cookieReq("crow_session=legacy", { secure: true }), { now: after - 1 }),
+    { token: "legacy", migrate: true, clearPlain: false },
+  );
+  // The __Host- name is untouched: the grace end only closes the PLAIN rail.
+  assert.deepEqual(
+    sessionFromCookies(cookieReq("__Host-crow_session=host-token", { secure: true }), { now: after + 1000 }),
+    { token: "host-token", migrate: false, clearPlain: false },
+  );
+  // Plain HTTP never had a rail to close.
+  assert.deepEqual(
+    sessionFromCookies(cookieReq("crow_session=lan-token"), { now: after + 1000 }),
+    { token: "lan-token", migrate: false, clearPlain: false },
   );
 });
 
@@ -122,13 +162,13 @@ test("a duplicated PLAIN crow_session cannot lock the owner out while __Host- is
   const cookie = "__Host-crow_session=GOOD; crow_session=a; crow_session=b";
   assert.deepEqual(
     sessionFromCookies(cookieReq(cookie, { secure: true })),
-    { token: "GOOD", migrate: false },
+    { token: "GOOD", migrate: false, clearPlain: false },
     "the owner keeps their session",
   );
   assert.equal(sessionTokenFromRequest(cookieReq(cookie, { secure: true })), "GOOD");
   assert.deepEqual(
     sessionFromCookies(cookieReq(`crow_session=a; ${cookie}; crow_session=b`, { secure: true })),
-    { token: "GOOD", migrate: false },
+    { token: "GOOD", migrate: false, clearPlain: false },
     "order in the header does not matter",
   );
 });
@@ -140,7 +180,7 @@ test("a duplicated __Host-crow_session IS refused (no sibling can produce that s
   ]) {
     assert.deepEqual(
       sessionFromCookies(cookieReq(cookie, { secure: true })),
-      { token: null, migrate: false },
+      { token: null, migrate: false, clearPlain: false },
       cookie,
     );
     assert.equal(sessionTokenFromRequest(cookieReq(cookie, { secure: true })), null, cookie);
@@ -156,7 +196,7 @@ test("the migration path is refused when the plain crow_session is duplicated", 
   ]) {
     assert.deepEqual(
       sessionFromCookies(cookieReq(cookie, { secure: true })),
-      { token: null, migrate: false },
+      { token: null, migrate: false, clearPlain: false },
       cookie,
     );
   }
@@ -165,12 +205,12 @@ test("the migration path is refused when the plain crow_session is duplicated", 
 test("plain HTTP keeps refusing a duplicated crow_session, and never reads __Host-", () => {
   assert.deepEqual(
     sessionFromCookies(cookieReq("crow_session=owner; crow_session=tossed")),
-    { token: null, migrate: false },
+    { token: null, migrate: false, clearPlain: false },
     "the only session name a plain-HTTP request carries is the plain one",
   );
   assert.deepEqual(
     sessionFromCookies(cookieReq("crow_session=owner; __Host-crow_session=a; __Host-crow_session=b")),
-    { token: "owner", migrate: false },
+    { token: "owner", migrate: false, clearPlain: false },
     "__Host- is never read over plain HTTP, so its duplicates are inert there",
   );
 });
@@ -179,6 +219,36 @@ test("a tossed duplicate reaches a session-gated caller as no session (401 / re-
   process.env.CROW_DASHBOARD_PUBLIC = "true"; // network gate open; the cookie decides
   const req = cookieReq("crow_session=owner; crow_session=tossed");
   assert.equal(await sessionFromRequest(req), null);
+});
+
+// ---- the bounded migration rail -------------------------------------------
+
+test("plainSessionMigrationAllowed: only a session minted BEFORE the cutoff, only inside the grace period", () => {
+  const now = Date.parse("2026-11-25T12:00:00Z"); // inside the grace period
+  assert.equal(plainSessionMigrationAllowed("2026-11-20 16:40:59", now), true, "one second before the cutoff");
+  assert.equal(plainSessionMigrationAllowed("2026-11-20T16:40:00Z", now), true, "a zoned ISO string is read too");
+  assert.equal(plainSessionMigrationAllowed("2026-06-01 00:00:00", now), true, "an old row, as an upgraded db holds");
+  assert.equal(plainSessionMigrationAllowed("2026-11-20 16:41:00", now), false, "AT the cutoff is not before it");
+  assert.equal(plainSessionMigrationAllowed(PLAIN_SESSION_MIGRATION_CUTOFF, now), false);
+  assert.equal(plainSessionMigrationAllowed("2026-11-21 09:00:00", now), false, "the tossing case");
+  // A row that cannot be dated is never assumed to be an old one.
+  for (const undatable of [null, undefined, "", "not a date", "2026-13-45 99:99:99"]) {
+    assert.equal(plainSessionMigrationAllowed(undatable, now), false, String(undatable));
+  }
+  // The grace end closes the rail for good, even for a genuinely old session.
+  const end = Date.parse(PLAIN_SESSION_GRACE_END);
+  assert.equal(plainSessionMigrationAllowed("2026-06-01 00:00:00", end - 1), true, "one ms before the end");
+  assert.equal(plainSessionMigrationAllowed("2026-06-01 00:00:00", end), false, "at the end");
+  assert.equal(plainSessionMigrationAllowed("2026-06-01 00:00:00", end + 1), false);
+});
+
+test("parseDbTimestamp reads both shapes oauth_tokens is written in", () => {
+  const utc = Date.parse("2026-05-01T12:00:00Z");
+  assert.equal(parseDbTimestamp("2026-05-01T12:00:00.000Z"), utc);
+  assert.equal(parseDbTimestamp("2026-05-01 12:00:00"), utc, "zone-less SQLite text is UTC, not local time");
+  assert.equal(parseDbTimestamp("  "), null);
+  assert.equal(parseDbTimestamp(null), null);
+  assert.equal(parseDbTimestamp("not a date"), null);
 });
 
 // ---- setSessionCookie / clearSessionCookie --------------------------------
@@ -201,6 +271,18 @@ test("the migration re-issue sets __Host- and expires the old plain cookie", () 
   assert.ok(cookies.some((c) => /^__Host-crow_session=tok;/.test(c)), cookies.join(" | "));
   assert.ok(cookies.some((c) => /^crow_session=;.*Max-Age=0/.test(c)), "the plain cookie is expired");
   assert.ok(cookies.some((c) => /^crow_session=;.*; Secure/.test(c)), "with the attributes it was set with");
+});
+
+test("expirePlainSessionCookie expires the plain cookie alone — no __Host- is minted for a refused migration", () => {
+  const cookies = headersOf((res) => expirePlainSessionCookie(res, { secure: true, host: "crow.example.ts.net" }));
+  assert.ok(cookies.every((c) => c.startsWith("crow_session=;")), `only plain expiries: ${cookies.join(" | ")}`);
+  assert.ok(cookies.every((c) => /Max-Age=0/.test(c) && /; Secure/.test(c)), cookies.join(" | "));
+  assert.equal(cookies.filter((c) => /^crow_session=;/.test(c)).length, 2, "host-only + the parent domain a sibling tossed");
+  assert.ok(cookies.some((c) => /; Domain=example\.ts\.net/.test(c)));
+
+  const http = headersOf((res) => expirePlainSessionCookie(res));
+  assert.equal(http.length, 1, "a host with no parent worth naming gets the host-only expiry");
+  assert.doesNotMatch(http[0], /; Secure/);
 });
 
 test("the migration re-issue also expires the parent-domain copy a sibling tossed", () => {

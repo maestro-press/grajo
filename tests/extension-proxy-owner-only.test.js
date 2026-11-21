@@ -65,8 +65,12 @@ setInterfaceTableForTests(() => TABLE);
 // ---------------------------------------------------------------------------
 
 const db = createDbClient(DB_PATH);
+// created_at is part of the real schema (scripts/init-db.js) and sessionFromRequest
+// reads it: over HTTPS a plain crow_session is only a session when its row
+// predates the migration cutoff. These upgrades are plain HTTP, where the rule
+// does not apply — but the column has to exist.
 await db.execute({
-  sql: "CREATE TABLE IF NOT EXISTS oauth_tokens (token TEXT PRIMARY KEY, token_type TEXT, client_id TEXT, scopes TEXT, expires_at TEXT)",
+  sql: "CREATE TABLE IF NOT EXISTS oauth_tokens (token TEXT PRIMARY KEY, token_type TEXT, client_id TEXT, scopes TEXT, expires_at TEXT, created_at TEXT DEFAULT (datetime('now')))",
   args: [],
 });
 

@@ -44,8 +44,11 @@ const REPO_MANIFEST = JSON.parse(readFileSync(new URL("../bundles/browser/manife
  * for here — see tests/extension-proxy-owner-only.test.js for the session tags). */
 const OWNER_SESSION = "test-owner-session";
 const db = createDbClient(DB_PATH);
+// created_at is part of the real schema (scripts/init-db.js): sessionFromRequest
+// reads it, because over HTTPS a plain crow_session is a session only when its
+// row predates the migration cutoff.
 await db.execute({
-  sql: "CREATE TABLE IF NOT EXISTS oauth_tokens (token TEXT PRIMARY KEY, token_type TEXT, client_id TEXT, scopes TEXT, expires_at TEXT)",
+  sql: "CREATE TABLE IF NOT EXISTS oauth_tokens (token TEXT PRIMARY KEY, token_type TEXT, client_id TEXT, scopes TEXT, expires_at TEXT, created_at TEXT DEFAULT (datetime('now')))",
   args: [],
 });
 await db.execute({

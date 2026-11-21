@@ -35,6 +35,7 @@ import { join } from "node:path";
 import { createClient } from "@libsql/client";
 
 import modelsRouter, { requireDashboardSessionJson, HF_TOKEN_PROVIDER_ID } from "../servers/gateway/routes/models.js";
+import { _setNowFn } from "../servers/gateway/dashboard/auth.js";
 import { setProviderSyncManager } from "../servers/shared/providers-db.js";
 import { loadState, registryKey } from "../servers/gateway/models/state.js";
 import { actAsServe, serveHeaders } from "./fixtures/serve-peer.mjs";
@@ -193,6 +194,85 @@ test("GET /api/models/catalog: 200 with a valid session", async () => {
       assert.equal(body.models[0].id, "panel-test-model");
     });
   } finally { await h.cleanup(); }
+});
+
+// ---- the plain → `__Host-` migration rule, at the JSON gate -----------------
+//
+// The gate reads its session through `sessionFromRequest`, so it applies the
+// SAME rule the pages do: a plain `crow_session` over HTTPS is a session only
+// when its row was created before PLAIN_SESSION_MIGRATION_CUTOFF (after which
+// the plain cookie is the cookie-tossing shape). These tests drive the exported
+// middleware directly ("exported for direct unit testing" above) against real
+// oauth_tokens rows, with the migration clock injected so "inside the grace
+// period" means the same thing on any day CI runs (session-cookie-migration
+// idiom).
+
+const MIGRATION_NOW = Date.parse("2026-11-25T12:00:00Z"); // inside the grace period
+const PRE_CUTOFF = "2026-11-18 09:00:00";
+const POST_CUTOFF = "2026-11-21 09:00:00"; // the tossing case: newer than the cutoff
+
+/** A dashboard session row created at `createdAt`, expiring from the real clock. */
+async function seedDatedSession(db, token, createdAt) {
+  const expiresAt = new Date(Date.now() + 600_000).toISOString();
+  await db.execute({
+    sql: "INSERT INTO oauth_tokens (token, token_type, client_id, scopes, expires_at, created_at) " +
+      "VALUES (?, 'access', 'dashboard', 'dashboard', ?, ?)",
+    args: [hashToken(token), expiresAt, createdAt],
+  });
+  return token;
+}
+
+/** An HTTPS request from a tailnet peer: the network gate passes, so only the
+ * cookie half can decide. */
+function httpsGateReq(cookie) {
+  const socket = { remoteAddress: "100.64.0.5" };
+  return { secure: true, method: "GET", headers: { cookie, host: "crow.example.ts.net" }, socket, connection: socket };
+}
+
+/** Run the exported gate; reports what it chose to do. */
+async function runSessionGate(req) {
+  const out = { status: null, body: null, nexted: false, session: undefined };
+  const res = {
+    status(code) { out.status = code; return res; },
+    json(body) { out.body = body; return res; },
+  };
+  await requireDashboardSessionJson(req, res, () => { out.nexted = true; out.session = req.dashboardSession; });
+  return out;
+}
+
+test("requireDashboardSessionJson: a plain crow_session over HTTPS minted AFTER the cutoff is 401 (session fixation)", async () => {
+  const h = freshLibsql();
+  _setNowFn(() => MIGRATION_NOW);
+  try {
+    const token = await seedDatedSession(h.db, "tossed-gate-session", POST_CUTOFF);
+    const r = await runSessionGate(httpsGateReq(`crow_session=${token}`));
+    assert.equal(r.nexted, false, "a plain cookie naming a newer session is the tossing shape, not a session");
+    assert.equal(r.status, 401);
+    assert.deepEqual(r.body, { error: "Not authenticated", code: "UNAUTHENTICATED" });
+
+    // The SAME session under the `__Host-` name is a session: no sibling host on
+    // the tailnet can set or overwrite that cookie, so there is nothing to toss.
+    const host = await runSessionGate(httpsGateReq(`__Host-crow_session=${token}`));
+    assert.equal(host.nexted, true);
+    assert.equal(host.session, token, "req.dashboardSession is the verified token");
+  } finally {
+    _setNowFn();
+    await h.cleanup();
+  }
+});
+
+test("requireDashboardSessionJson: a plain crow_session minted BEFORE the cutoff is still migrated (the rule is created_at, not the name)", async () => {
+  const h = freshLibsql();
+  _setNowFn(() => MIGRATION_NOW);
+  try {
+    const token = await seedDatedSession(h.db, "legacy-gate-session", PRE_CUTOFF);
+    const r = await runSessionGate(httpsGateReq(`crow_session=${token}`));
+    assert.equal(r.nexted, true, "a sign-in that predates the __Host- cookie still works");
+    assert.equal(r.session, token);
+  } finally {
+    _setNowFn();
+    await h.cleanup();
+  }
 });
 
 /** makeCatalog() plus a second, wedge-risk model — for serving_class tests. */
