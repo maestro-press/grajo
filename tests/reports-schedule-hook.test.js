@@ -581,18 +581,29 @@ test("a tick returns before a slow run finishes", async () => {
   const db = await freshDb();
   const report = await liveReport(db, { nextRun: "2026-10-26T07:00:00.000Z" });
   let abort = null;
-  const slowBlocks = () => new Promise((resolve, reject) => {
-    const timer = setTimeout(() => resolve({ items: [{ subject: "a" }] }), 5000);
-    timer.unref?.();
-    abort = () => { clearTimeout(timer); reject(new Error("aborted by the test")); };
-  });
+  let runSettled = false;
+  // The run never finishes on its own: it settles only when the test aborts it.
+  const slowBlocks = () => {
+    let fail = null;
+    const pending = new Promise((resolve, reject) => { fail = reject; });
+    pending.then(() => { runSettled = true; }, () => { runSettled = true; });
+    abort = () => { fail(new Error("aborted by the test")); };
+    return pending;
+  };
   const hook = registerReportsHook(db, hookDeps(report, { runBlocks: slowBlocks }));
 
-  const startedAt = Date.now();
-  await hook.tick(db);
-  const took = Date.now() - startedAt;
+  let waited = null;
+  const tooSlow = new Promise((_, reject) => {
+    waited = setTimeout(() => reject(new Error("the tick waited for the run")), 4000);
+    waited.unref?.();
+  });
+  try {
+    await Promise.race([hook.tick(db), tooSlow]);
+  } finally {
+    clearTimeout(waited);
+  }
 
-  assert.ok(took < 100, `the tick took ${took} ms`);
+  assert.equal(runSettled, false, "the tick returned while the run was still in progress");
   const runs = await rows(db, "SELECT * FROM report_runs");
   assert.equal(runs.length, 1, "the run was queued");
   for (let i = 0; i < 40 && !abort; i += 1) await new Promise((r) => setTimeout(r, 5));
