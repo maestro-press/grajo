@@ -21,10 +21,16 @@ import { RELAY_SOURCE_V4 } from "../servers/shared/bot-doors.js";
 const FULL = "test-full-local-token";
 const BOARD = "test-board-token";
 const SECRETS = "test-secrets-token";
+const SHARING_BOT = "test-sharing-bot-token";
 const sha256 = (t) => createHash("sha256").update(t).digest("hex");
 
 /** The settings registry reads `{rows:[{value}]}`; a known key answers with its hash. */
-const HASHES = { mcp_local_token_hash: sha256(FULL), mcp_board_token_hash: sha256(BOARD), mcp_secrets_token_hash: sha256(SECRETS) };
+const HASHES = {
+  mcp_local_token_hash: sha256(FULL),
+  mcp_board_token_hash: sha256(BOARD),
+  mcp_secrets_token_hash: sha256(SECRETS),
+  mcp_sharing_bot_token_hash: sha256(SHARING_BOT),
+};
 const db = {
   execute: async ({ sql, args }) => {
     const key = args && args[0];
@@ -83,4 +89,17 @@ test("the path-scoped secrets token authenticates a relayed /secrets/mcp socket,
   assert.equal(full.localTokenAuth, undefined, "crow.db is bot-writable: the full local token is never the operator on a relayed socket");
   const off = await run(fakeReq({ remoteAddress: RELAY, path: "/memory/mcp", token: SECRETS }));
   assert.equal(off.localTokenAuth, undefined, "the secrets token opens nothing but its own mount");
+});
+
+test("the path-scoped sharing-bot token authenticates a relayed /sharing-bot/mcp socket, and nothing else", async () => {
+  // The bot sharing door is called FROM a contained bot, so a relayed socket must be able to present
+  // its own token — and only on its own mount.
+  const req = await run(fakeReq({ remoteAddress: RELAY, path: "/sharing-bot/mcp", token: SHARING_BOT }));
+  assert.deepEqual(req.localTokenAuth, { token: "local-mcp", scope: "sharing-bot" });
+  const full = await run(fakeReq({ remoteAddress: RELAY, path: "/sharing-bot/mcp", token: FULL }));
+  assert.equal(full.localTokenAuth, undefined, "the full local token is never the operator on a relayed socket");
+  for (const path of ["/sharing/mcp", "/memory/mcp", "/board/mcp"]) {
+    const elsewhere = await run(fakeReq({ remoteAddress: RELAY, path, token: SHARING_BOT }));
+    assert.equal(elsewhere.localTokenAuth, undefined, `the sharing-bot token opens nothing but its own mount (${path})`);
+  }
 });

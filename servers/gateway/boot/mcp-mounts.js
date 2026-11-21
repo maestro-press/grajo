@@ -22,11 +22,11 @@ import { mountMcpServer } from "../routes/mcp.js";
 import { enforcePeerExposure } from "../peer-exposure.js";
 import { connectedServers } from "../proxy.js";
 import { createBoardMcpServer } from "../board-mcp.js";
-import { ensureBoardToken, ensurePhoneToken, ensureModelsToken, ensureArtifactsToken, ensurePeerRelayToken, rotateLlmCloudToken, SERVICES_TOKEN, SATELLITE_TOOLS_TOKEN, SECRETS_TOKEN } from "../local-token.js";
+import { ensureBoardToken, ensurePhoneToken, ensureModelsToken, ensureArtifactsToken, ensurePeerRelayToken, rotateLlmCloudToken, SERVICES_TOKEN, SATELLITE_TOOLS_TOKEN, SECRETS_TOKEN, SHARING_BOT_TOKEN } from "../local-token.js";
 import { peerRelayRouter } from "../routes/peer-relay.js";
 import { addonDoorsRouter } from "../routes/addon-doors.js";
 import { actorSignRouter } from "../routes/actor-sign.js";
-import { initGatewayActorKey, verifyActorSig, verifyBoardActorSig, verifyArtifactsActorSig, verifyBoardThreadActorSig, verifySecretsActorSig } from "../../../scripts/pi-bots/actor-sig.mjs";
+import { initGatewayActorKey, verifyActorSig, verifyBoardActorSig, verifyArtifactsActorSig, verifyBoardThreadActorSig, verifySecretsActorSig, verifySharingActorSig } from "../../../scripts/pi-bots/actor-sig.mjs";
 import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -97,7 +97,7 @@ export async function rotateCloudDoorTokenAtBoot({
  */
 export async function rotateFamilyTokensAtBoot({
   createDb = createDbClient, log = console,
-  tokens = [[SERVICES_TOKEN, "services-tools"], [SATELLITE_TOOLS_TOKEN, "satellite-tools"], [SECRETS_TOKEN, "secrets"]],
+  tokens = [[SERVICES_TOKEN, "services-tools"], [SATELLITE_TOOLS_TOKEN, "satellite-tools"], [SECRETS_TOKEN, "secrets"], [SHARING_BOT_TOKEN, "sharing-bot"]],
 } = {}) {
   for (const [tok, label] of tokens) {
     try {
@@ -459,6 +459,27 @@ export async function mountMcpServers(app, deps) {
     console.log("[gateway] secrets MCP mounted at /secrets/mcp");
   } catch (err) {
     console.warn(`[gateway] secrets mount skipped: ${err.message}`);
+  }
+  // Bot sharing door (bot door + saved message drafts, PR B part 1): /sharing-bot/mcp, the bots' narrow
+  // mounting for drafting a message the owner reviews and sends. Mounted HERE (core, like /board and
+  // /secrets) behind its own guard: the path-scoped SHARING_BOT_TOKEN (rotated above with the families)
+  // AND a signed `sharing` actor, or 401 before any handler. It is NOT /sharing — that mount stays the
+  // owner's and is never a door. A failure never blocks boot.
+  //
+  // THIS MOUNT IS SIGNED, AND IT SAYS SO WHERE IT IS WRITTEN DOWN. The guard and the server factory are
+  // handed the same two deps, `verifyActor: verifySharingActorSig` among them: the guard is what runs
+  // the signature check (sharingBotMountAuth), and naming the verifier on the mount factory here is
+  // what makes a SIGNED bot door readable from this file — a source-level audit of every mount McpServer
+  // publishes (scripts/pi-bots/mcp_writer.mjs's owner-mount rule, pinned by
+  // tests/mcp-writer-owner-mounts.test.js) reads a factory that names a verifier as signed, so it must
+  // stay allowed for a bot and never be classed as an owner-capable mount.
+  try {
+    const { createSharingBotServer, sharingBotMountAuth } = await import("../sharing-bot-mcp.js");
+    app.use("/sharing-bot", sharingBotMountAuth({ createDb: createDbClient, verifyActor: verifySharingActorSig }));
+    mountMcpServer(app, "/sharing-bot", () => createSharingBotServer({ createDb: createDbClient, verifyActor: verifySharingActorSig }), sessionManager, authMiddleware, peerExposureGate);
+    console.log("[gateway] bot sharing door mounted at /sharing-bot/mcp");
+  } catch (err) {
+    console.warn(`[gateway] sharing-bot mount skipped: ${err.message}`);
   }
   // Phone bundle (plan A): core-mounted like /board, but only when the bundle
   // is installed. The server factory is imported by PATH from the installed

@@ -14,10 +14,11 @@
  *    second row. The partial unique index in the DDL is the enforcement under it — an INSERT that
  *    races another writer collides, and the collision is retried as the update it should have been.
  *
- *  - EVERY EDIT IS A COMPARE-AND-SET. `updateBody` and `beginSend` take the version the person's
- *    screen was drawn from and write through `WHERE version = ? AND state = 'open'`; of two racing
- *    writers exactly one wins, and the loser is told `changed` WITH the row as it now is, so a card
- *    can redraw instead of guessing. `discardDraft` takes the same version when the caller has one.
+ *  - EVERY EDIT IS A COMPARE-AND-SET. `updateBody`, `beginSend` and the revise path of
+ *    `createDraft` take the version the person's screen was drawn from and write through
+ *    `WHERE version = ? AND state = 'open'`; of two racing writers exactly one wins, and the loser is
+ *    told `changed` WITH the row as it now is, so a card can redraw instead of guessing.
+ *    `discardDraft` takes the same version when the caller has one.
  *
  *  - THE RECIPIENTS ARE SEALED. The caller derives the audience from the live conversation
  *    (servers/gateway/messages/conversations.js); the store writes it as canonical JSON — one entry
@@ -356,7 +357,9 @@ export async function listAudit(db, draftId) {
  *     answer is `{refused: "changed", draft: <the row already there>}`, which the client ADOPTS. The
  *     words somebody else saved are never replaced by words typed in ignorance of them.
  *   - `expectVersion: n` (n >= 1) — a compare-and-set against the row the caller was looking at; a
- *     stale n is the same `changed` refusal with the row as it now is.
+ *     stale n is the same `changed` refusal with the row as it now is. The version is in the
+ *     UPDATE's own WHERE, not only in the read above it: a bot revising the draft it read loses to
+ *     an owner autosave that landed in between, instead of quietly replacing the owner's words.
  *   - no `expectVersion` — the store's own upsert (a bot revising its draft, part 2's door). It is
  *     only reachable from code that already holds the row or has decided an overwrite is the point.
  *
@@ -404,19 +407,29 @@ export async function createDraft(db, input, opts = {}) {
       sealFieldsFor({ ...existing, origin, botId, botName }, recipients),
       seed,
     );
+    // THE VERSION IS IN THE WHERE, not only in the read above. A caller that names the version it
+    // read (a bot revising its own draft) is writing over words somebody else may have saved in
+    // between — the owner's autosave, a card, another gateway on this crow.db. Without the version in
+    // the predicate that owner edit would be silently replaced: the autosave bumps `version` and
+    // leaves the row `open`, so `state = 'open'` alone still matches. A lost race here is a `changed`
+    // refusal WITH the row as it now is, exactly like `updateBody`'s and `beginSend`'s.
+    const compareAndSet = expectVersion != null;
     const res = await db.execute({
       sql: `UPDATE message_drafts
                SET body = ?, body_hash = ?, recipients_json = ?, recipients_seal = ?,
                    origin = ?, bot_id = ?, bot_name = ?, project_id = COALESCE(?, project_id),
                    fail_reason = NULL, version = version + 1, updated_at = ?
-             WHERE id = ? AND state = 'open'`,
+             WHERE id = ? AND state = 'open'${compareAndSet ? " AND version = ?" : ""}`,
       args: [
         body, bodyHash(body), json, seal,
         origin, botId, botName, projectId, at, existing.id,
+        ...(compareAndSet ? [existing.version] : []),
       ],
     });
     if (!res.rowsAffected) {
-      // The row left `open` between the read and the write (a send started): ask again.
+      // The row left `open` (a send started) or moved to a newer version (an owner edit) between the
+      // read and the write: ask again, and answer with what is there rather than what this caller
+      // was about to overwrite.
       const after = await getDraft(db, existing.id);
       return { ok: false, refused: "changed", draft: after ?? existing };
     }

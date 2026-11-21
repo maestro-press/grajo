@@ -88,7 +88,7 @@ export const MESSAGE_DRAFT_TABLES = Object.freeze(["message_drafts", "message_dr
 
 /**
  * `message_drafts.bot_name`: the display name of the bot that wrote the draft, snapshotted when the
- * draft was written and covered by the seal (the "Sent by <bot>" line reads from it). It is its own
+ * draft was written and covered by the seal (the "Sent by <bot> (bot)" line reads from it). It is its own
  * constant because a store created from an earlier build of this branch has the table already and
  * `CREATE TABLE IF NOT EXISTS` would leave the column out — both rails add it with this exact ALTER.
  */

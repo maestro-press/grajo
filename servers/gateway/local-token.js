@@ -618,6 +618,17 @@ export const SATELLITE_TOOLS_TOKEN = pathScopedToken({ name: "satellite-tools", 
 export const SECRETS_TOKEN = pathScopedToken({ name: "secrets", hashKey: "mcp_secrets_token_hash", createdKey: "mcp_secrets_token_created" });
 const SECRETS_PATH_RE = /^\/secrets\/(?:mcp|sse|messages)$/;
 
+// Bot sharing door (bot door + saved drafts, PR B part 1): the bots' token for the narrow
+// /sharing-bot/(mcp|sse|messages) mount ONLY (servers/gateway/sharing-bot-mcp.js). Same family shape
+// as the secrets token: <crowHome>/secrets/sharing-bot-token, 0600 in the 0700 dir the pi sandbox
+// masks, rotated at every boot (a bot's config is rebuilt every turn). It opens nothing else, and on
+// that mount it proves only "a bot's config", never who: the mount guard also requires a signed
+// `sharing` actor, so a token alone (a leaked config, a replayed header) drafts nothing. The raw
+// value is read by the bot catalog (scripts/pi-bots/crow-server-catalog.mjs) when it mints the door
+// block, exactly as the board token is.
+export const SHARING_BOT_TOKEN = pathScopedToken({ name: "sharing-bot", hashKey: "mcp_sharing_bot_token_hash", createdKey: "mcp_sharing_bot_token_created" });
+const SHARING_BOT_PATH_RE = /^\/sharing-bot\/(?:mcp|sse|messages)$/;
+
 // MCP transport paths are `/mcp`, `/sse`, `/messages`, optionally under ONE
 // server-prefix segment (e.g. /router/mcp, /memory/sse, /tools-x/messages,
 // /blog-mcp/mcp; see mcp.js:194-196 and the single-segment mountMcpServer
@@ -700,6 +711,13 @@ export function localTokenAuthMiddleware(db) {
       }
       if (!req.localTokenAuth && SECRETS_PATH_RE.test(req.path) && await SECRETS_TOKEN.validate(db, token)) {
         req.localTokenAuth = { token: "local-mcp", scope: "secrets" };
+      }
+      // The bot sharing door's token (PR B part 1): same path-scoped rule as the families above, so
+      // it authenticates on /sharing-bot/(mcp|sse|messages) and nowhere else. The mount's own guard
+      // (servers/gateway/sharing-bot-mcp.js) re-validates it AND requires a signed `sharing` actor, so
+      // this branch is the transport-level half, not the decision.
+      if (!req.localTokenAuth && SHARING_BOT_PATH_RE.test(req.path) && await SHARING_BOT_TOKEN.validate(db, token)) {
+        req.localTokenAuth = { token: "local-mcp", scope: "sharing-bot" };
       }
     } catch (err) {
       // Treat a DB/read error as non-fatal: log and fall through to the other

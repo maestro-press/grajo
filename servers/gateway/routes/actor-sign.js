@@ -100,8 +100,13 @@ export const ACTOR_SIGN_PATH = "/internal/actor-sign";
  * has no such turn. Because the tuple's thread slot is just text (`<draftId>:<turnId>`), a caller
  * that names the kind anyway would otherwise get a signature over whatever thread the checks above
  * resolved — so it is refused outright below (RELAY_REFUSED_KINDS), never signed.
+ *
+ * "sharing" (the bot sharing door, /sharing-bot/mcp) IS here: a key-less bot host runs channel and
+ * job turns whose bots may draft messages, and it holds no key of its own, so the relay is its only
+ * way to sign the (bot, thread, gateway) the door requires. Step 6 already binds the tuple to a live
+ * session (or a job) of that bot on this host.
  */
-export const ACTOR_SIGN_KINDS = Object.freeze(["bot", "board", "artifacts", "board-thread", ...SESSION_ACTOR_KINDS, ...SCOPE_ACTOR_KINDS]);
+export const ACTOR_SIGN_KINDS = Object.freeze(["bot", "board", "artifacts", "board-thread", "sharing", ...SESSION_ACTOR_KINDS, ...SCOPE_ACTOR_KINDS]);
 
 /**
  * Kinds a caller may name that this relay must never sign, whatever tuple it presents: 403 for the

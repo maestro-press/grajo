@@ -15,6 +15,7 @@ import { SATELLITE_DDL } from "../servers/shared/satellite-schema.js";
 import { MAIL_DDL, MAIL_ACCOUNT_SEND_COLUMNS, MAIL_DRAFTS_DDL } from "../servers/shared/mail-schema.js";
 import { REPORTS_DDL, REPORTS_RUNS_DDL, REPORTS_VERSIONS_DDL, REPORTS_SEND_DDL, REPORTS_STEPS_DDL } from "../servers/shared/reports-schema.js";
 import { MESSAGE_DRAFTS_BOT_NAME_COLUMN, MESSAGE_DRAFTS_DDL } from "../servers/shared/message-drafts-schema.js";
+import { BOT_SHARING_AUDIT_DDL } from "../servers/shared/bot-sharing-schema.js";
 import { PROVENANCE_COLUMNS, PROVENANCE_INDEX_SQL, NOTE_WITHDRAWAL_COLUMNS } from "../servers/research/provenance-schema.js";
 
 // Ensure data directory exists
@@ -3169,7 +3170,7 @@ await initTable("reports steps tables", REPORTS_STEPS_DDL);
 // SCHEMA_GENERATION bump. (0034 and 0035 belong to the reports stack, so this migration is numbered
 // past them; the runner applies by id and does not need contiguous numbers.)
 await initTable("message draft tables", MESSAGE_DRAFTS_DDL);
-// message_drafts.bot_name (the "Sent by <bot>" snapshot, sealed with the rest of the draft): in the
+// message_drafts.bot_name (the "Sent by <bot> (bot)" snapshot, sealed with the rest of the draft): in the
 // DDL above for a fresh table, added here for one created by an earlier build of this branch —
 // CREATE TABLE IF NOT EXISTS never adds a column. Same ALTER as the migration rail's, one constant.
 await ensureSchemaColumn(MESSAGE_DRAFTS_BOT_NAME_COLUMN);
@@ -3469,6 +3470,14 @@ try {
 } catch (err) {
   console.warn("Nav migration W3-6 skipped:", err.message);
 }
+
+// --- Bot sharing door (bot door + saved drafts, PR B part 1) ---
+// bot_sharing_audit: one row per call to the narrow /sharing-bot/mcp door — which bot, which tool,
+// who it aimed at, whether it was allowed, and the draft (or read ids+cursor) it left behind. It
+// carries ids only, never message text. LOCAL ONLY (instance-sync LOCAL_ONLY_TABLES). Additive, no
+// SCHEMA_GENERATION bump: the migration rail's 0037 executes the same constant
+// (servers/shared/bot-sharing-schema.js), so fresh and upgraded stores converge.
+await initTable("bot_sharing_audit table", BOT_SHARING_AUDIT_DDL);
 
 // --- Late schema migrations (2026-06-12) ---
 // These ALTERs target tables whose CREATE statements appear ABOVE but after

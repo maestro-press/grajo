@@ -29,7 +29,7 @@ import {
   resolveEnvValue,
 } from "../server-registry.js";
 import { botsDbPath, resolveSqlitePath } from "./instance-paths.mjs";
-import { signActor, signBoardActor, signArtifactsActor, signBoardThreadActor, signSecretsActor } from "./actor-sig.mjs";
+import { signActor, signBoardActor, signArtifactsActor, signBoardThreadActor, signSecretsActor, signSharingActor } from "./actor-sig.mjs";
 // Leaf module (registry read only): no path back to ext_registry.mjs or mcp_writer.mjs.
 import { isLegacyConfiguredAddon, addonDerivedEnv } from "../../servers/gateway/services/legacy-sources.js";
 // Leaf module (no imports): loader/injection names a child must never inherit from the
@@ -205,19 +205,60 @@ function artifactsBlock(crowHome, { botId, threadId, gatewayType, port } = {}) {
 export const SECRETS_SERVER = "crow-secrets";
 
 /**
- * Crow servers that exist on this instance but are NEVER handed to a bot.
+ * Crow servers that exist on this instance but are NEVER handed to a bot as a STDIO server.
  *
- * `crow-sharing` is the operator's own sharing door: since servers/shared/
- * bot-owner-only refuses every sharing tool to a bot (all but
- * crow_list_crosspost_transforms), a bot config that names it can only fail
- * calls — and the stdio server still reads the instance's identity material to
- * start. So it is not catalogued for bots at all (mcp_writer disables it even
- * when the operator's own canonical ~/.pi/agent/mcp.json carries it), while the
- * REGISTRY entry stays exactly as it is for the operator's own MCP config
- * (`npm run mcp-config`, unchanged). A narrow bot messaging door comes
- * separately.
+ * `crow-sharing` is the operator's own sharing surface: since servers/shared/bot-owner-only refuses
+ * every sharing tool to a bot (all but crow_list_crosspost_transforms), a bot config that named it
+ * could only fail calls — and the stdio server still reads the instance's identity material to start.
+ * So the STDIO entry is never catalogued for bots (mcp_writer disables it even when the operator's own
+ * canonical ~/.pi/agent/mcp.json carries it), while the REGISTRY entry stays exactly as it is for the
+ * operator's own MCP config (`npm run mcp-config`, unchanged).
+ *
+ * A bot instead gets `sharingBotBlock()` below — an HTTP `{url, headers}` entry under the SAME catalog
+ * name, pointing at this instance's own narrow door `/sharing-bot/mcp` (a new mount, never /sharing).
+ * It is the one exception to this list, and `isSharingDoorBlock()` is how mcp_writer tells the two
+ * apart: a name in this list may be handed to a bot only as that block.
  */
 export const BOT_EXCLUDED_SERVERS = Object.freeze(["crow-sharing"]);
+
+/** The catalog name the bot's sharing entry carries: the operator's own server name, so a def that
+ *  already selected `crow-sharing/*` resolves its tools against the door. */
+export const BOT_SHARING_SERVER = "crow-sharing";
+
+/** The one path a bot's sharing entry may point at (the door, never the owner surface). */
+export const SHARING_BOT_DOOR_PATH = "/sharing-bot/mcp";
+
+/**
+ * The hosts a bot's door block may name: this instance's own gateway, on the loopback interface. The
+ * catalog always mints `127.0.0.1` (boardBlock's convention); `[::1]`/`localhost` are the same machine
+ * and only the spelling differs, so both are accepted for a block somebody wrote by hand.
+ */
+const SHARING_DOOR_HOSTS = Object.freeze(["127.0.0.1", "::1", "[::1]", "localhost"]);
+
+/**
+ * Is this catalog block the sharing DOOR (an HTTP block at this instance's /sharing-bot/mcp)? That is
+ * the only shape a bot may receive under a BOT_EXCLUDED_SERVERS name; a stdio block under the same
+ * name is the owner's server and never a bot's.
+ *
+ * TWO HALVES, and the second is not decoration. The PATH is the door's address, and the HOST must be
+ * THIS machine's loopback interface: a block whose path is /sharing-bot/mcp but whose url names another
+ * host is not this instance's door — it is somebody else's server wearing the door's path, and handing
+ * it to a bot would send the door's bearer and actor headers to that host. So a remote url is refused
+ * here exactly like a stdio block, and the caller treats the result as "not the door".
+ */
+export function isSharingDoorBlock(block) {
+  if (!block || typeof block !== "object" || typeof block.url !== "string" || block.command) return false;
+  let url;
+  try {
+    url = new URL(block.url);
+  } catch {
+    return false;
+  }
+  // A door is a loopback HTTP(s) mount; anything else (a unix path, a `file:`, a bare host) is not one.
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  if (!SHARING_DOOR_HOSTS.includes(url.hostname.toLowerCase())) return false;
+  return url.pathname.replace(/\/+$/, "") === SHARING_BOT_DOOR_PATH;
+}
 
 /**
  * True for a Crow server a bot's MCP config must never contain. Both spellings
@@ -249,6 +290,47 @@ function secretsBlock(crowHome, { botId, threadId, gatewayType, port } = {}) {
   const sig = signSecretsActor({ botId, threadId, gatewayType });
   if (sig) headers["X-Crow-Actor-Sig"] = sig;
   return { url: `http://127.0.0.1:${gatewayPort}/secrets/mcp`, headers };
+}
+
+/** The sharing door's token file: <crowHome>/secrets, the 0700 dir the pi sandbox masks for bots. */
+function sharingBotTokenPath(crowHome) { return join(crowHome, "secrets", "sharing-bot-token"); }
+
+/**
+ * The bot sharing door: `{url, headers}` for /sharing-bot/mcp, signed with kind "sharing"
+ * (actor-sig.mjs) so the mount can attribute every call and refuse an unsigned one.
+ *
+ * It is returned only when this build can mint a COMPLETE block: the token file exists, the caller
+ * named a bot, and this process holds the per-boot actor key (or a presigned tuple for it). A door
+ * block missing any of those would be refused at the mount after a spawn, so it is not emitted at all
+ * — the caller surfaces the reason through `unconfigured`, exactly as the board entry's missing token
+ * is surfaced.
+ *
+ * SELECTION IS UNCHANGED: like every catalog entry, this block reaches a bot's config only when the
+ * bot's def selects `crow-sharing` (`buildBotMcp`'s closed-world pass); the operator's stdio
+ * `crow-sharing` is a BOT_EXCLUDED_SERVERS entry and is never emitted under this name.
+ */
+function sharingBotBlock(crowHome, { botId, threadId, gatewayType, port } = {}) {
+  let token;
+  try {
+    token = readFileSync(sharingBotTokenPath(crowHome), "utf8").trim();
+  } catch {
+    return null;
+  }
+  if (!token || botId == null || String(botId).trim() === "") return null;
+  const sig = signSharingActor({ botId, threadId, gatewayType });
+  // No key in this process (a GUI/CLI build for a validation, or a host that signs over the relay):
+  // an unsigned door block would be refused at the mount, so it is not emitted at all.
+  if (!sig) return null;
+  const gatewayPort = port || process.env.CROW_GATEWAY_PORT || 3001;
+  const headers = {
+    Authorization: "Bearer " + token,
+    "X-Crow-Actor-Kind": "sharing",
+    "X-Crow-Actor-Id": String(botId),
+    "X-Crow-Actor-Sig": sig,
+  };
+  if (threadId) headers["X-Crow-Actor-Thread"] = String(threadId);
+  if (gatewayType) headers["X-Crow-Actor-Gateway"] = String(gatewayType);
+  return { url: `http://127.0.0.1:${gatewayPort}${SHARING_BOT_DOOR_PATH}`, headers };
 }
 
 function applyJournalGuard(env) {
@@ -483,6 +565,13 @@ export function crowServerCatalog(crowHome = process.env.CROW_HOME || join(homed
   if (artifacts) { servers.artifacts = artifacts; coreNames.push("artifacts"); }
   const secrets = secretsBlock(crowHome, { botId: opts.botId, threadId: opts.threadId, gatewayType: opts.gatewayType, port: opts.gatewayPort });
   if (secrets) { servers[SECRETS_SERVER] = secrets; coreNames.push(SECRETS_SERVER); }
+  // The bot sharing door (bot door + saved message drafts): an http block under the SAME catalog name
+  // the operator's stdio server has, so a def that already selected `crow-sharing/*` resolves to the
+  // door's tools and never to the identity-reading stdio spawn. Emitted only when it can be complete
+  // (token + a signed actor); see sharingBotBlock. A bot that never selects it never sees it.
+  const sharing = sharingBotBlock(crowHome, { botId: opts.botId, threadId: opts.threadId, gatewayType: opts.gatewayType, port: opts.gatewayPort });
+  if (sharing) { servers[BOT_SHARING_SERVER] = sharing; coreNames.push(BOT_SHARING_SERVER); }
+  else unconfigured[BOT_SHARING_SERVER] = "is not available to bots yet: the sharing door has no token, or this build holds no signed actor for the bot";
 
   for (const spec of CORE_SERVERS) {
     if (isBotExcludedServer(spec.name)) continue; // never in a bot's config (BOT_EXCLUDED_SERVERS)

@@ -1403,3 +1403,74 @@ test("B12: every data-dir name the gateway itself uses is a reserved entry", () 
   }
   assert.deepEqual(offenders, [], "a name join()ed or resolve()d onto a data dir must be reserved");
 });
+
+// ---- The bot sharing door in the contain tier (bot door + saved drafts, part 1) ----
+
+// A def that lists `crow-sharing/*` must spawn CONTAINED with the bot messaging DOOR in its config —
+// an http block at this instance's `/sharing-bot/mcp` — and never the stdio `crow-sharing` server,
+// which reads the instance's identity. The config the plan sees is the spawner-built one (bridge.mjs's
+// containInputs collects the ACTIVE blocks of `opts.mcpConfig`), so this test builds that config with
+// the real catalog/writer and hands its active blocks to the real plan builder. No bwrap runs: the
+// question is what the argv says.
+test("a def listing crow-sharing/* gets the door block and identity.json masked, never a stdio sharing server", async () => {
+  const { crowServerCatalog, BOT_SHARING_SERVER, SHARING_BOT_DOOR_PATH, instanceBinding, isSharingDoorBlock } =
+    await import("../scripts/pi-bots/crow-server-catalog.mjs");
+  const { buildBotMcp } = await import("../scripts/pi-bots/mcp_writer.mjs");
+  const { initGatewayActorKey, _resetActorKeyForTest } = await import("../scripts/pi-bots/actor-sig.mjs");
+
+  _resetActorKeyForTest();
+  initGatewayActorKey();
+  try {
+    // A scratch instance home: the catalog reads the sharing token from `<crowHome>/secrets/`.
+    const ch = mk(T, "botdoor", "crow");
+    const dd = mk(ch, "data");
+    writeFileSync(join(dd, "crow.db"), "");
+    writeFileSync(join(dd, "identity.json"), "{}");
+    const secrets = mk(ch, "secrets");
+    chmodSync(secrets, 0o700);
+    writeFileSync(join(secrets, "sharing-bot-token"), "f".repeat(64) + "\n", { mode: 0o600 });
+
+    const def = {
+      bot_id: "hank",
+      session_dir: mk(T, "botdoor", "session"),
+      // Both spellings pi accepts for a sharing tool selection.
+      tools: { pi_builtin: ["read"], crow_mcp: ["crow-sharing/crow_send_message", "crow-sharing__crow_bot_inbox"] },
+      permission_policy: { bash: "deny", write_paths: [], read_paths: [] },
+    };
+    const binding = instanceBinding(ch);
+    const { servers: catalog, unconfigured } = crowServerCatalog(ch, {
+      binding, botId: "hank", threadId: "perch-1", gatewayType: "perch", gatewayPort: 3999,
+    });
+
+    // The operator's own canonical config still carries the stdio sharing server; the closed-world
+    // pass must refuse to activate it for a bot.
+    const canonical = {
+      mcpServers: { "crow-sharing": { command: "node", args: [join(app, "servers", "sharing", "index.js")], cwd: app } },
+    };
+    const built = buildBotMcp(def, canonical, { catalog, unconfigured, binding, crowHome: ch, interactive: true });
+    const shareBlock = built.json.mcpServers[BOT_SHARING_SERVER];
+    assert.equal(isSharingDoorBlock(shareBlock), true, "the config holds the door, not a spawned server");
+    assert.equal(SHARING_BOT_DOOR_PATH, "/sharing-bot/mcp");
+    assert.equal(shareBlock.url, "http://127.0.0.1:3999/sharing-bot/mcp");
+    assert.equal(shareBlock.command, undefined, "never a stdio block");
+    assert.equal(shareBlock.headers["X-Crow-Actor-Kind"], "sharing");
+    assert.ok(built.servers.includes(BOT_SHARING_SERVER), "and the spawner counts it as active");
+
+    // Exactly what bridge.mjs's containInputs hands the plan: the ACTIVE blocks of that config.
+    const active = Object.values(built.json.mcpServers).filter((b) => b && typeof b === "object" && !b.disabled);
+    assert.deepEqual(active.map((b) => b.url || b.command), [shareBlock.url], "only the door is active");
+    assert.equal(active.some((b) => [b.command, ...(b.args || []), b.cwd]
+      .some((v) => /servers[/\\]sharing\b/.test(String(v || "")))), false, "no stdio sharing spawn reaches the plan");
+
+    const { args } = buildContainPlan(base({
+      crowHome: ch, dataDir: dd, botCacheDir: mk(ch, "bot-cache"), mcpServers: active,
+    }));
+    assert.ok(has(args, "--ro-bind", "/dev/null", join(dd, "identity.json")), "identity.json is masked");
+    assert.equal(pairs(args).some((p) => (p[0] === "--bind" || p[0] === "--ro-bind")
+      && String(p[1]).startsWith(join(app, "servers", "sharing"))), false, "the sharing server's files are never bound");
+    assert.equal(args.some((a) => /servers[/\\]sharing[/\\]index\.js/.test(a)), false,
+      "nothing in the argv names the stdio sharing server");
+  } finally {
+    _resetActorKeyForTest();
+  }
+});

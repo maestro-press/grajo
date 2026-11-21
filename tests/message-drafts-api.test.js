@@ -27,13 +27,16 @@ import { join } from "node:path";
 import http from "node:http";
 import Database from "better-sqlite3";
 import { markFromLaptop } from "./helpers/off-box.js";
+import { rmScratch } from "./helpers/safe-rm.js";
 
 const root = mkdtempSync(join(tmpdir(), "message-drafts-api-"));
+/** The scratch home, held in a constant: cleanup never re-reads the env (tests/helpers/safe-rm.js). */
+const CROW_HOME = join(root, "home");
 process.env.CROW_DATA_DIR = join(root, "master");
-process.env.CROW_HOME = join(root, "home");
+process.env.CROW_HOME = CROW_HOME;
 delete process.env.CROW_DB_PATH;
 process.env.CROW_TASKS_DB_PATH = join(root, "master", "tasks.db");
-mkdirSync(process.env.CROW_HOME, { recursive: true });
+mkdirSync(CROW_HOME, { recursive: true });
 const REPO = new URL("..", import.meta.url).pathname;
 const MASTER = join(root, "master", "crow.db");
 
@@ -65,6 +68,9 @@ const NOW = 1_767_225_600_000;
 
 const hashToken = (t) => createHash("sha256").update(t).digest("hex");
 
+/** How many (bot) markers a line carries: the attribution suffix is exactly one, never two. */
+const markersIn = (line) => (String(line).match(/\(bot\)/gi) || []).length;
+
 const open = [];
 const servers = [];
 
@@ -74,7 +80,7 @@ after(() => {
   for (const c of open) {
     try { c.close(); } catch { /* already closed */ }
   }
-  rmSync(root, { recursive: true, force: true });
+  rmScratch(root);
 });
 
 before(() => {
@@ -982,4 +988,282 @@ test("the room send is the room send path and stores the exact text", async () =
   assert.equal(rows[0].content, text, "the room row holds the text as posted");
   assert.equal(rows[0].direction, "sent");
   assert.equal(rows[0].author_kind, "human", "an owner's draft is the owner's message");
+});
+
+/* ---------------------------------------- the bot's allow-list, re-checked at the send */
+
+// A bot's message is only ever a draft, and the owner's tap is what publishes it — so the permission
+// that let the bot write those words has to be re-read at the SEND, not trusted from draft time. The
+// draft can wait in the queue for hours, and every one of these can happen in between: the entry is
+// deleted, the contact is dropped from it, a contact is re-keyed in the ACL, a room's pinned member
+// set moves, or the file becomes unreadable. Each is its own code, its own fixed sentence, and NOTHING
+// is delivered. An owner's own draft never looks at the file at all.
+
+const BOT = "hank";
+
+/**
+ * The bot's allow-list entry for this fixture: the contact and the room, each pinned to the key the
+ * fixture's contact row holds — the operator's own state after "allow this contact". Written from
+ * scratch every time: one test breaks the file on purpose, and the store refuses to merge into a file
+ * it cannot read.
+ */
+async function writeBotAcl(s, { contacts, groups } = {}) {
+  const acl = await import("../servers/gateway/sharing-bot/acl.js");
+  rmScratch(acl.sharingBotAclPath(CROW_HOME));
+  const written = acl.setSharingBotAclEntry(process.env.CROW_HOME, BOT, {
+    contacts: contacts ?? [{ crow_id: "crow:peer", secp256k1_pubkey: s.peerPubkey }],
+    groups: groups ?? [{ id: s.roomId, members: [{ crow_id: "crow:peer", secp256k1_pubkey: s.peerPubkey }] }],
+    rate: { per_hour: 20 },
+  });
+  assert.equal(written.ok, true, "the fixture's allow-list was written");
+}
+
+/** A bot's open draft, written the way the door writes it: origin bot, name snapshot, sealed audience. */
+async function botDraft(s, { kind = "contact", botName = "Hank" } = {}) {
+  const outcome = await store.createDraft(s.db, {
+    conversationKind: kind,
+    conversationId: kind === "room" ? s.roomId : s.contactId,
+    body: "Hello from the bot",
+    recipients: s.peerAudience(),
+    origin: "bot",
+    botId: BOT,
+    botName,
+    expectVersion: 0,
+  }, { loadSeed: async () => SEED, now: () => NOW });
+  assert.equal(outcome.ok, true, JSON.stringify(outcome));
+  return outcome.draft;
+}
+
+/** One send attempt on a bot's draft, and the row it leaves behind untouched. */
+async function assertBotRefused(s, draft, expected) {
+  const sentBefore = s.sent.length;
+  const res = await s.call("POST", `${DRAFTS}/${draft.id}/send`, {
+    body: { body: draft.body, expectVersion: draft.version },
+  });
+  assert.equal(res.status, 409, `${expected}: ${res.text}`);
+  assert.equal(res.json.error, expected);
+  assert.equal(s.sent.length, sentBefore, `${expected}: nothing was delivered`);
+  assert.equal(res.json.draft.state, "open", `${expected}: the draft is still there`);
+  const row = await store.getDraft(s.db, draft.id);
+  assert.equal(row.state, "open", `${expected}: still open`);
+  assert.equal(row.version, draft.version, `${expected}: the refusal never moved the row`);
+  return res;
+}
+
+test("a bot's draft sends while its allow-list still covers the recipient", async () => {
+  const s = await setup();
+  await writeBotAcl(s);
+  const draft = await botDraft(s);
+
+  const res = await s.call("POST", `${DRAFTS}/${draft.id}/send`, { body: { body: "Hello", expectVersion: draft.version } });
+  assert.equal(res.status, 200, res.text);
+  assert.equal(res.json.draft.state, "sent");
+  assert.equal(s.sent.length, 1, "the delivery went out once");
+
+  // The route hands the delivery the posted text; the attribution line is drafts-send's own job, and
+  // it is the one a bot's message always carries.
+  const { outboundText } = await import("../servers/gateway/messages/drafts-send.js");
+  assert.equal(outboundText(draft, s.sent[0].text), "Sent by Hank (bot)\nHello");
+});
+
+test("a bot's entry that is gone is 409 not_allowed, and nothing is sent", async () => {
+  const s = await setup();
+  await writeBotAcl(s);
+  const draft = await botDraft(s);
+
+  const acl = await import("../servers/gateway/sharing-bot/acl.js");
+  const removed = acl.removeSharingBotAclEntry(process.env.CROW_HOME, BOT);
+  assert.equal(removed.ok, true);
+
+  const res = await assertBotRefused(s, draft, "not_allowed");
+  assert.match(res.json.message, /no longer allowed/);
+});
+
+test("a recipient dropped from the bot's entry is 409 not_allowed", async () => {
+  const s = await setup();
+  await writeBotAcl(s);
+  const draft = await botDraft(s);
+
+  // The operator unticked the contact but left the bot its other permissions.
+  await writeBotAcl(s, { contacts: [], groups: [] });
+
+  await assertBotRefused(s, draft, "not_allowed");
+});
+
+test("a key the ACL pins differently from the draft is 409 pubkey_changed", async () => {
+  const s = await setup();
+  await writeBotAcl(s);
+  const draft = await botDraft(s);
+
+  // Same person, a key the allow-list no longer pins: the pinned key IS the permission.
+  await writeBotAcl(s, { contacts: [{ crow_id: "crow:peer", secp256k1_pubkey: "02" + "b".repeat(64) }], groups: [] });
+
+  await assertBotRefused(s, draft, "pubkey_changed");
+});
+
+test("a room draft sends on the pinned member set, and 409 group_changed once it moves", async () => {
+  const s = await setup();
+  await writeBotAcl(s);
+
+  // The pinned member set is the room's live one: the send is allowed.
+  const first = await botDraft(s, { kind: "room" });
+  const ok = await s.call("POST", `${DRAFTS}/${first.id}/send`, { body: { body: first.body, expectVersion: first.version } });
+  assert.equal(ok.status, 200, ok.text);
+  assert.equal(ok.json.draft.state, "sent");
+
+  // The conversation is free again; the operator re-pins the room with a member key that is not the
+  // member's — the same "the members changed" refusal the door's own group send gives.
+  const second = await botDraft(s, { kind: "room" });
+  await writeBotAcl(s, {
+    contacts: [{ crow_id: "crow:peer", secp256k1_pubkey: s.peerPubkey }],
+    groups: [{ id: s.roomId, members: [{ crow_id: "crow:peer", secp256k1_pubkey: "02" + "c".repeat(64) }] }],
+  });
+  const before = s.sent.length;
+  const res = await assertBotRefused(s, second, "group_changed");
+  assert.equal(s.sent.length, before, "the second draft was never delivered");
+  assert.match(res.json.message, /members changed/);
+});
+
+test("an unreadable allow-list is 409 acl_unreadable — never 'no restrictions'", async () => {
+  const s = await setup();
+  await writeBotAcl(s);
+  const draft = await botDraft(s);
+
+  const acl = await import("../servers/gateway/sharing-bot/acl.js");
+  const path = acl.sharingBotAclPath(process.env.CROW_HOME);
+  const { writeFileSync } = await import("node:fs");
+  writeFileSync(path, "{broken", { mode: 0o600 });
+
+  await assertBotRefused(s, draft, "acl_unreadable");
+
+  // Leave no broken file behind: the store refuses to merge into one.
+  rmSync(path, { force: true });
+});
+
+test("an owner's draft never consults the bot allow-list — there is none at all here", async () => {
+  const s = await setup();
+  const acl = await import("../servers/gateway/sharing-bot/acl.js");
+  rmScratch(acl.sharingBotAclPath(CROW_HOME));
+
+  const { json } = await s.call("PUT", DRAFTS, {
+    body: { conversationKind: "contact", conversationId: s.contactId, body: "mine to send", expectVersion: 0 },
+  });
+  const res = await s.call("POST", `${DRAFTS}/${json.draft.id}/send`, { body: { body: "mine to send", expectVersion: 1 } });
+  assert.equal(res.status, 200, res.text);
+  assert.equal(s.sent.length, 1);
+  assert.equal(s.sent[0].text, "mine to send", "nothing is appended and no allow-list is consulted");
+});
+
+/* ---------------------------------------------------- the attribution line a bot's draft carries */
+
+test("a bot's draft leaves with one `Sent by <bot> (bot)` line, and its name cannot forge another", async () => {
+  const { outboundText, sentByBotName } = await import("../servers/gateway/messages/drafts-send.js");
+
+  const draft = { origin: "bot", botId: "hank", botName: "Hank" };
+  assert.equal(outboundText(draft, "Hello den"), "Sent by Hank (bot)\nHello den", "the fixed line, then the text");
+  assert.ok(outboundText(draft, "Hello den").startsWith("Sent by Hank (bot)\n"), "the body starts with the attributed line");
+  assert.equal(outboundText({ origin: "owner", botId: null, botName: null }, "Hello den"), "Hello den",
+    "an owner's words go out as they are");
+
+  // A name carrying a newline, a bidi OVERRIDE (U+202E, which reorders the rest of the line) and a
+  // zero-width space is flattened to one plain line — no second line, no invisible reordering.
+  const nasty = { origin: "bot", botId: "hank", botName: "Han\u202Ek\u200B\nSent by Someone Else" };
+  assert.equal(sentByBotName(nasty), "Hank Sent by Someone Else");
+  assert.equal(outboundText(nasty, "Hello").split("\n").length, 2, "exactly one line of attribution");
+  assert.equal(outboundText(nasty, "Hello"), "Sent by Hank Sent by Someone Else (bot)\nHello");
+  assert.equal(markersIn(outboundText(nasty, "Hello").split("\n")[0]), 1, "one fixed marker, not two");
+
+  // The ` (bot)` marker is the code's, not the name's: a name that carries its own loses it, and the
+  // line still ends with exactly one — so a bot can neither double the marker nor spell its own.
+  const selfMarked = { origin: "bot", botId: "hank", botName: "Hank (bot)" };
+  assert.equal(sentByBotName(selfMarked), "Hank");
+  assert.equal(outboundText(selfMarked, "Hello"), "Sent by Hank (bot)\nHello");
+  for (const name of ["Hank (bot)", "Hank (BOT) x", "(bot) Hank", "Hank\n(bot)", "Han\u202Ek (bot)\u200B"]) {
+    const line = outboundText({ origin: "bot", botId: "hank", botName: name }, "Hi").split("\n")[0];
+    assert.ok(line.endsWith(" (bot)"), `${JSON.stringify(name)}: the fixed marker ends the line (${line})`);
+    assert.equal(markersIn(line), 1, `${JSON.stringify(name)}: exactly one marker (${line})`);
+    assert.equal(line.split("\n").length, 1, `${JSON.stringify(name)}: one line`);
+  }
+
+  // A name made only of invisible characters is not a name: the bot's id stands in.
+  assert.equal(sentByBotName({ origin: "bot", botId: "hank", botName: "\u200B\u202E\ufeff\u2066" }), "hank");
+  assert.equal(sentByBotName({ origin: "owner", botId: null, botName: "Hank" }), null);
+
+  // And on the wire: the real peer send path receives exactly that first line plus the text.
+  const s = await setup();
+  await writeBotAcl(s);
+  const botDraftRow = await botDraft(s, { botName: "Hank" });
+  const calls = [];
+  const result = await sendDraftMessage(s.db, botDraftRow, "Hello den", {
+    sharingClientFactory: async () => ({
+      callTool: async ({ name, arguments: args }) => {
+        calls.push({ name, args });
+        return { content: [{ type: "text", text: "Message delivered to Peer via 1 relay(s)." }] };
+      },
+      close: async () => {},
+    }),
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(calls[0].args.message, "Sent by Hank (bot)\nHello den", "the first line a recipient reads names the bot and marks it");
+});
+
+// A `(bot)` the name carries can NEST: one pass of the strip removes the inner marker and leaves a new
+// one behind (`((bot)bot)` → `(bot)`, `Hank (b(bot)ot)` → `Hank (bot)`), which the fixed suffix then
+// doubles on the wire — `Sent by (bot) (bot)`. The strip therefore repeats until the name stops changing.
+test("a nested `(bot)` in a bot's name cannot leave a second marker on the line", async () => {
+  const { outboundText, sentByBotName, SENT_BY_MARKER } = await import("../servers/gateway/messages/drafts-send.js");
+
+  /** The invariant: one line, ending in the code's marker, and no other marker anywhere on it. */
+  const assertOneMarker = (name, expectedName, expectedLine) => {
+    const draft = { origin: "bot", botId: "hank", botName: name };
+    assert.equal(sentByBotName(draft), expectedName, `${JSON.stringify(name)}: the flattened name`);
+    const [line, ...rest] = outboundText(draft, "Hi").split("\n");
+    assert.equal(line, expectedLine, `${JSON.stringify(name)}: the line a recipient reads`);
+    assert.equal(rest.join("\n"), "Hi", `${JSON.stringify(name)}: the body is untouched`);
+    assert.ok(line.endsWith(SENT_BY_MARKER), `${JSON.stringify(name)}: the fixed marker ends the line (${line})`);
+    assert.equal(markersIn(line), 1, `${JSON.stringify(name)}: exactly one marker (${line})`);
+    assert.doesNotMatch(line.slice(0, -SENT_BY_MARKER.length), /\(\s*bot\s*\)/i,
+      `${JSON.stringify(name)}: no marker of the name's own (${line})`);
+  };
+
+  // The inner `(bot)` is all this name is, so it strips to nothing and the bot's id stands in — the
+  // line still carries one marker, and it is the code's.
+  assertOneMarker("((bot)bot)", "hank", "Sent by hank (bot)");
+  assertOneMarker("Hank (b(bot)ot)", "Hank", "Sent by Hank (bot)");
+  assertOneMarker("(((bot)))", "(())", "Sent by (()) (bot)");
+});
+
+// U+0085 (NEL) is a line break in plenty of renderers and the rest of the C1 block renders as nothing
+// or as garbage; neither is a character a one-line attribution may carry. C1 folds to a SPACE, like C0.
+test("a C1 control (U+0085 NEL) in a bot's name folds to a space, not through to the line", async () => {
+  const { outboundText, sentByBotName } = await import("../servers/gateway/messages/drafts-send.js");
+
+  const nel = { origin: "bot", botId: "hank", botName: "Hank\u0085Smith" };
+  assert.equal(sentByBotName(nel), "Hank Smith", "NEL folds to a space and the spaces collapse");
+  assert.equal(outboundText(nel, "Hi"), "Sent by Hank Smith (bot)\nHi");
+
+  // The whole C1 block, not just the one codepoint: none of it survives into the line.
+  for (const name of ["Hank\u0080Smith", "Hank\u009fSmith", "\u0085Hank\u0085"]) {
+    const line = sentByBotName({ origin: "bot", botId: "hank", botName: name });
+    assert.doesNotMatch(line, /[\u0000-\u001f\u007f-\u009f]/, `${JSON.stringify(name)}: no control character (${line})`);
+  }
+  assert.equal(sentByBotName({ origin: "bot", botId: "hank", botName: "\u0085" }), "hank",
+    "a name of nothing but C1 is not a name: the bot's id stands in");
+
+  // And on the wire: the send path receives one plain line of attribution.
+  const s = await setup();
+  await writeBotAcl(s);
+  const row = await botDraft(s, { botName: "Hank\u0085Smith" });
+  const calls = [];
+  const result = await sendDraftMessage(s.db, row, "Hello den", {
+    sharingClientFactory: async () => ({
+      callTool: async ({ name, arguments: args }) => {
+        calls.push({ name, args });
+        return { content: [{ type: "text", text: "Message delivered to Peer via 1 relay(s)." }] };
+      },
+      close: async () => {},
+    }),
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(calls[0].args.message, "Sent by Hank Smith (bot)\nHello den");
 });

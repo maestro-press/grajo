@@ -739,10 +739,13 @@ export const translations = {
   // leaves, and these are the approved sentences for those refusals (errPubkey's wording talks about
   // Bot Builder because that is where a bot's own allow-list is fixed; an owner's draft with a changed
   // contact key reads the same sentence, and the contact itself is what needs checking).
+  // The sent line's `(bot)` marker is FIXED text, not a {placeholder}: it reads the same in both
+  // languages, and the server appends it itself (drafts-send.js SENT_BY_MARKER), so a banner that
+  // promises it and the line that goes out cannot drift.
   "messages.draft.draftsHeading": { en: "Drafts ({n})", es: "Borradores ({n})" },
   "messages.draft.draftsEmpty": { en: "No saved drafts", es: "No hay borradores guardados" },
   "messages.draft.draftBy": { en: "by {bot}", es: "de {bot}" },
-  "messages.draft.draftBanner": { en: "Draft by {bot}. The first line will read: Sent by {bot}", es: "Borrador de {bot}. La primera línea dirá: Enviado por {bot}" },
+  "messages.draft.draftBanner": { en: "Draft by {bot}. The first line will read: Sent by {bot} (bot)", es: "Borrador de {bot}. La primera línea dirá: Enviado por {bot} (bot)" },
   "messages.draft.send": { en: "Send", es: "Enviar" },
   "messages.draft.discard": { en: "Discard", es: "Descartar" },
   "messages.draft.discardConfirm": { en: "Discard this draft? It cannot be recovered.", es: "¿Descartar este borrador? No se puede recuperar." },

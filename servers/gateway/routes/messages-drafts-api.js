@@ -60,8 +60,12 @@
  *                              version, so the client can try again rather than collide with the row.
  *   - `POST /:id/discard`    — throw it away (`open` -> `discarded`; the row stays for the audit).
  *
- * The text is sent as posted. Nothing appends a "Sent by …" line — an owner's draft goes out as the
- * owner's words, and a bot's part in it lives on the row (`origin`, `bot_id`) and in the audit trail.
+ * The text is sent as posted. An OWNER's draft goes out as the owner's own words and nothing is
+ * appended; a BOT's draft (origin `bot`, written through the sharing door) goes out with one fixed
+ * first line read from the row's sealed name snapshot — `Sent by <bot> (bot)` — so the recipient can
+ * always tell a bot's suggestion the owner sent from the owner's own words (drafts-send.js
+ * outboundText; the ` (bot)` marker is fixed text the name cannot add, drop or change). A
+ * bot's part is also recorded on the row (`origin`, `bot_id`) and in the audit trail.
  *
  * Every write pokes the gateway's event bus with `message-drafts:changed` (ids only) from the store,
  * which is what part 2's SSE route and the panel's client listen for.
@@ -77,10 +81,12 @@
  */
 import { Router, json as jsonParserOf } from "express";
 import { createDbClient } from "../../db.js";
+import { resolveCrowHome } from "../../shared/crow-home.js";
 import { isLocalPasswordSessionOn } from "../dashboard/local-session.js";
 import { isSameOriginRequest } from "../dashboard/same-origin.js";
 import { CONVERSATION_KINDS, audienceKeyChanges, resolveConversation, sameAudience } from "../messages/conversations.js";
 import { draftsWithBotNames } from "../messages/drafts-bots.js";
+import { botAudienceRefusal, readDraftBotAcl } from "../messages/drafts-bot-acl.js";
 import { draftRowViews } from "../messages/drafts-rows.js";
 import { loadDraftSealSeed, verifyRecipients } from "../messages/drafts-seal.js";
 import {
@@ -116,6 +122,9 @@ const FIXED_TEXT = Object.freeze({
   seal_invalid: "This draft's recipients could not be verified, so nothing was sent.",
   recipients_changed: "Who this message would reach has changed. Open the draft again before sending.",
   pubkey_changed: "One of the recipients' keys changed since this draft was written, so nothing was sent.",
+  not_allowed: "This bot is no longer allowed to message one of this draft's recipients, so nothing was sent.",
+  group_changed: "This group's members changed since this bot was allowed to message it, so nothing was sent.",
+  acl_unreadable: "This Crow could not read the bot allow-list, so nothing was sent.",
   blocked: "One of the recipients is blocked, so nothing was sent.",
   conversation_gone: "That conversation is gone.",
   delivery_failed: "The message could not be delivered. The draft is still here to try again.",
@@ -135,7 +144,7 @@ const DISCARD_KEYS = Object.freeze(["expectVersion"]);
 
 /* ------------------------------------------------------------------- runtime */
 
-const EMPTY_RUNTIME = Object.freeze({ loadSeed: null, now: null, send: null, managers: null });
+const EMPTY_RUNTIME = Object.freeze({ loadSeed: null, now: null, send: null, managers: null, crowHome: null });
 
 let runtime = EMPTY_RUNTIME;
 
@@ -143,7 +152,8 @@ let runtime = EMPTY_RUNTIME;
  * Replace the injectable half of the routes' seam: the seal seed loader, the clock, the delivery
  * function and the room send's `managers` (boot sets none of them; a test sets all four).
  *
- * @param {{loadSeed?: Function, now?: Function|number, send?: Function, managers?: object|Function|null}} [next]
+ * @param {{loadSeed?: Function, now?: Function|number, send?: Function, managers?: object|Function|null,
+ *   crowHome?: string|Function}} [next]
  */
 export function setMessagesDraftsRuntime(next = {}) {
   runtime = {
@@ -152,6 +162,9 @@ export function setMessagesDraftsRuntime(next = {}) {
     send: typeof next?.send === "function" ? next.send : null,
     managers: typeof next?.managers === "function" || (next?.managers != null && typeof next.managers === "object")
       ? next.managers
+      : null,
+    crowHome: typeof next?.crowHome === "function" || (typeof next?.crowHome === "string" && next.crowHome !== "")
+      ? next.crowHome
       : null,
   };
 }
@@ -185,6 +198,16 @@ async function managersFor() {
 async function seedFor() {
   if (typeof runtime.loadSeed === "function") return await runtime.loadSeed();
   return loadDraftSealSeed();
+}
+
+/**
+ * This instance's home, for the bot allow-list file: the seam's value (a test's scratch home), else the
+ * resolved CROW_HOME. Read per call, like every other per-instance path.
+ */
+async function crowHomeFor() {
+  if (typeof runtime.crowHome === "function") return await runtime.crowHome();
+  if (typeof runtime.crowHome === "string" && runtime.crowHome !== "") return runtime.crowHome;
+  return resolveCrowHome();
 }
 
 /* ------------------------------------------------------------------ answers */
@@ -478,7 +501,8 @@ export function messagesDraftsRouter(dashboardAuth, deps = {}) {
     res.json({ draft: await viewOne(db, outcome.draft) });
   }));
 
-  // POST /:id/send — the tap. The posted text is what is sent, exactly, through the send path this
+  // POST /:id/send — the tap. The posted text is what is sent, exactly (an owner's), or preceded by the
+  // sealed `Sent by <bot> (bot)` line (a bot's; drafts-send.js outboundText), through the send path this
   // conversation kind already has. Before anything moves, and in this order:
   //   1. the row must still be `open`;
   //   2. its seal must verify under this instance's key — a row somebody edited by hand (a bot
@@ -486,7 +510,11 @@ export function messagesDraftsRouter(dashboardAuth, deps = {}) {
   //   3. the audience is re-derived from the LIVE conversation: the same PEOPLE (`recipients_changed`
   //      when a room's membership moved), none of them blocked (`blocked`), and each one still holding
   //      the KEY the draft sealed (`pubkey_changed`);
-  //   4. the conversation must still exist (`conversation_gone`).
+  //   4. the conversation must still exist (`conversation_gone`);
+  //   5. for a BOT draft, the bot must still be allowed to write to this audience: its allow-list entry
+  //      still names the contact with the same pinned key, or the group with the same member set
+  //      (`not_allowed`, `pubkey_changed`, `group_changed`, `acl_unreadable`) — a revoked permission is
+  //      enforced at the send, never only at the moment the bot drafted.
   // Every refusal answers with the row and its version, so the client never retries against a stale
   // version. Then the compare-and-set (`beginSend`) takes the row into `sending`; a delivery that
   // lands is `sent`, one that does not is put back to `open` with a reason code and answered 502 WITH
@@ -527,6 +555,17 @@ export function messagesDraftsRouter(dashboardAuth, deps = {}) {
     }
     const changedKeys = audienceKeyChanges(draft.recipients, conversation.recipients);
     if (!changedKeys.ok) return sendRefusal(db, res, 409, changedKeys.reason, id);
+
+    // A BOT's draft is still that bot's to write. The seal proves the audience was not rewritten
+    // under the owner; this proves the bot may STILL reach it — the allow-list is re-read here, at the
+    // moment the words would leave, so a permission revoked (or a contact re-keyed in the ACL, or a
+    // room's pinned member set moved) while the draft waited stops it. Codes: `not_allowed`,
+    // `pubkey_changed`, `group_changed`, `acl_unreadable`; an owner's draft never takes this branch.
+    if (draft.origin === "bot") {
+      const acl = readDraftBotAcl(draft, await crowHomeFor());
+      const refusal = acl.ok ? botAudienceRefusal(draft, acl.entry) : acl.code;
+      if (refusal) return sendRefusal(db, res, 409, refusal, id);
+    }
 
     const begun = await beginSend(db, id, input, storeOpts());
     if (!begun.ok) return sendRefused(db, res, begun);

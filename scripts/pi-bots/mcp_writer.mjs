@@ -42,7 +42,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { botsDbPath } from "./instance-paths.mjs";
 import { mintRemoteBlocks } from "./remote-blocks.mjs";
-import { crowServerCatalog, instanceBinding, rebindBlock, SECRETS_SERVER, addonKeychainNeeds, manifestNeeds, SHARED_STORAGE_NEED, withoutKeychainValues, isBotExcludedServer } from "./crow-server-catalog.mjs";
+import { crowServerCatalog, instanceBinding, rebindBlock, SECRETS_SERVER, addonKeychainNeeds, manifestNeeds, SHARED_STORAGE_NEED, withoutKeychainValues, isBotExcludedServer, isSharingDoorBlock } from "./crow-server-catalog.mjs";
 // The reviewed, code-held storage-consumer table (STORAGE_ENV_CONSUMERS): a bundle manifest's
 // `needs` only ASKS — the grant also needs the id on this list, so a store add-on can never
 // take this instance's storage credentials by declaring a need in its (operator-writable)
@@ -313,7 +313,9 @@ export function draftingTurnMcpConfig(block, { canonical, canonicalPath } = {}) 
 // for the first group, boot/feature-mounts.js for /storage and /blog-mcp). These paths exist
 // only on Crow gateways (any host, any scheme: loopback, LAN, a Serve HTTPS front); legitimate peer
 // access goes through stdio crow-remote-proxy blocks. Board/secrets/phone/artifacts mounts carry
-// signed actor headers instead, so they are deliberately absent here. /memory and /storage too: a
+// signed actor headers instead, so they are deliberately absent here. /sharing-bot is the same kind of
+// mount (a path-scoped token plus a signed `sharing` actor, boot/mcp-mounts.js), so it is absent too:
+// a bot that selects the sharing door gets its catalog block, never the owner's /sharing. /memory and /storage too: a
 // bot reaching them with the gateway token would run as an unknown caller (e.g. able to change the
 // operator's writing rules, or read every project's files). /sharing reaches the operator's
 // contacts the same way. The gateway's root /mcp is matched only on a
@@ -594,20 +596,23 @@ export function buildBotMcp(def, canonical, opts = {}) {
   const noteGuard = (name, block) => { if (touchesCrowDb(block)) journalGuarded.push(name); };
 
   for (const name of want) {
-    // A Crow server a bot may never hold (BOT_EXCLUDED_SERVERS in
-    // crow-server-catalog.mjs): the catalog does not emit it, and the operator's
-    // own canonical mcp.json must not hand it to a bot either. A def that still
-    // names its tools does not break the spawn — the block is simply absent, so
-    // the tools are simply absent.
-    if (isBotExcludedServer(name)) {
-      disable(name, "is not available to bots");
+    // A Crow server a bot may never hold as a STDIO block (BOT_EXCLUDED_SERVERS in
+    // crow-server-catalog.mjs): the catalog does not emit the stdio shape, and the operator's own
+    // canonical mcp.json must not hand it to a bot either. ONE exception — the bot sharing door: the
+    // catalog emits `crow-sharing` as an http `{url, headers}` block at this instance's
+    // /sharing-bot/mcp, and that block IS what a def selecting `crow-sharing/*` should get. A stdio
+    // block under the same name (from canonical, or from a catalog a caller built itself) is still
+    // refused; isSharingDoorBlock is the only discriminator.
+    const catalogBlock = catalog[name];
+    if (isBotExcludedServer(name) && !isSharingDoorBlock(catalogBlock)) {
+      disable(name, unconfigured[name] || "is not available to bots");
       continue;
     }
-    if (catalog[name]) {
-      out.mcpServers[name] = catalog[name];
+    if (catalogBlock) {
+      out.mcpServers[name] = catalogBlock;
       active.push(name);
       noteMinted(name);
-      noteGuard(name, catalog[name]);
+      noteGuard(name, catalogBlock);
       continue;
     }
     if (unconfigured[name]) {

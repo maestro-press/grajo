@@ -121,6 +121,7 @@ import voiceHandoffsRouter from "../routes/voice-handoffs.js";
 import stagedPageRouter from "../routes/staged-page.js";
 import mailApiRouter from "../routes/mail-api.js";
 import messagesDraftsRouter from "../routes/messages-drafts-api.js";
+import sharingBotAclRouter from "../routes/sharing-bot-acl-api.js";
 import reportsApiRouter from "../routes/reports-api.js";
 import widgetsRouter from "../routes/widgets.js";
 import { shellRouter, resolveRequestMode, resolveShellPage, nestIsExplicit } from "./shell/request.js";
@@ -1001,6 +1002,13 @@ export default function dashboardRouter(mcpAuthMiddleware, { renderLayout: rende
   // Mounted HERE and not in boot/feature-mounts.js: a feature-mounts router runs at app root, BEFORE
   // this file's csrfMiddleware, so an autosave or a send there would skip the CSRF rail entirely.
   router.use(messagesDraftsRouter(dashboardAuth));
+
+  // The bot sharing allow-list (bot door + saved drafts, PR B part 1): who each bot may draft a message
+  // to, pinned to the secp256k1 key the operator allowed, plus the per-bot draft cap. Same slot and
+  // rails as the drafts API above (session + CSRF, Funnel refused upstream); owner-only on its own
+  // prefix, no-store on every answer, and it parses its own 32kb body (index.js `_hasOwnParser`).
+  // Part 2's Bot Builder "Sharing" section is the UI over these routes.
+  router.use(sharingBotAclRouter(dashboardAuth));
 
   // Crow Recurring Reports' private JSON API: the same slot and rails as the mail API above
   // (session + CSRF, Funnel refused upstream), owner-only on its own prefix, and no-store on every

@@ -31,6 +31,11 @@ export async function recordSessionStart({ sessionId, serverName, transport, cli
     // Start periodic flush if not already running
     if (!_flushTimer) {
       _flushTimer = setInterval(flushAllSessions, 30000);
+      // A periodic flush of tool counts must never be the reason a process stays alive. The
+      // gateway is kept alive by its listener; a test (or a short-lived process) that recorded a
+      // session and never saw a DELETE — the Streamable HTTP client's close() does NOT send one —
+      // would otherwise hang forever on this interval alone, with every test already reported.
+      _flushTimer.unref?.();
     }
   } catch (err) {
     console.warn("[session-logger] Failed to record session start:", err.message);
