@@ -36,6 +36,7 @@ import {
 } from "./private-address.js";
 import { closePagesBeforeRestart } from "./safe-restart.js";
 import { filterLinks, parseUrlFilter, urlContainsFilter } from "./safe-filter.js";
+import { withDownloadsAllowed, resetDownloadsOnNewSession } from "./download-behavior.js";
 
 /** Browser contexts this process already guards: the guard is installed once per context. */
 const GUARDED_CONTEXTS = new WeakSet();
@@ -170,6 +171,11 @@ export function createBrowserServer(options = {}) {
   };
 
   const sessionDir = options.sessionDir || stateDir("browser-sessions");
+  // The download leases live under the SHARED state root (the same stateDir the
+  // downloads themselves use), not in this process: the download behavior is
+  // browser-wide while its callers are not, so every MCP child of this instance
+  // must see the same lease directory (download-behavior.js).
+  const downloadLeaseDir = stateDir("browser-download-leases");
   // The viewer's address on the Crow dashboard (same origin, signed in). The
   // container's own noVNC port listens on 127.0.0.1 only, so a raw
   // http://localhost:<port> URL never works from the operator's device.
@@ -289,6 +295,11 @@ export function createBrowserServer(options = {}) {
     }
     page = firstIsBlankTab ? first : await ownership.newPage(context);
     cdpSession = await page.context().newCDPSession(page);
+    // A session made here can inherit a browser-wide "allow" left behind by a
+    // previous connection (a restart inside a download, a dropped session), so the
+    // default is put back before anything uses this one. No-op while a download of
+    // this process is still waiting for its file.
+    await resetDownloadsOnNewSession(cdpSession, { leaseDir: downloadLeaseDir });
     // Blocked hosts, enforced in the page too (links, scripts, redirects).
     try {
       await cdpSession.send("Network.enable");
@@ -1797,29 +1808,36 @@ export function createBrowserServer(options = {}) {
         const hostDir = stateDir("browser-downloads");
         if (!existsSync(hostDir)) mkdirSync(hostDir, { recursive: true });
 
-        // Container writes to /downloads, bind-mounted to hostDir.
-        await cdpSession.send("Browser.setDownloadBehavior", { behavior: "allow", downloadPath: "/downloads" });
+        // Container writes to /downloads, bind-mounted to hostDir. The download
+        // behavior is BROWSER-WIDE, so it is switched on only around this wait and
+        // back to "default" after (download-behavior.js) — never left allowing
+        // downloads for every later turn. The session is read through a getter, so a
+        // reconnect mid-download resets the session that is current when it ends.
+        // The lease's deadline outlives this call's own wait by 30 s: a lease that
+        // expired before the wait ended would let another process put the default
+        // back under a download that is still running.
+        return await withDownloadsAllowed(() => cdpSession, "/downloads", async () => {
+          const before = new Set(existsSync(hostDir) ? readdirSync(hostDir) : []);
+          const el = await p.$(selector);
+          if (!el) return { content: [{ type: "text", text: `Selector not found: ${selector}` }], isError: true };
+          await el.click().catch(() => {});
 
-        const before = new Set(existsSync(hostDir) ? readdirSync(hostDir) : []);
-        const el = await p.$(selector);
-        if (!el) return { content: [{ type: "text", text: `Selector not found: ${selector}` }], isError: true };
-        await el.click().catch(() => {});
-
-        const deadline = Date.now() + (timeout_ms || 30000);
-        let found = null;
-        while (Date.now() < deadline) {
-          const now = readdirSync(hostDir).filter((f) => !before.has(f) && !f.endsWith(".crdownload") && !f.endsWith(".part") && !f.endsWith(".tmp"));
-          if (now.length) {
-            const newest = now.map((f) => ({ f, m: statSync(join(hostDir, f)).mtimeMs })).sort((a, b) => b.m - a.m)[0];
-            found = newest.f;
-            break;
+          const deadline = Date.now() + (timeout_ms || 30000);
+          let found = null;
+          while (Date.now() < deadline) {
+            const now = readdirSync(hostDir).filter((f) => !before.has(f) && !f.endsWith(".crdownload") && !f.endsWith(".part") && !f.endsWith(".tmp"));
+            if (now.length) {
+              const newest = now.map((f) => ({ f, m: statSync(join(hostDir, f)).mtimeMs })).sort((a, b) => b.m - a.m)[0];
+              found = newest.f;
+              break;
+            }
+            await delay(500, 700);
           }
-          await delay(500, 700);
-        }
-        if (!found) return { content: [{ type: "text", text: "Download triggered but no completed file appeared (timeout). Check the bind mount and that the click started a download." }], isError: true };
+          if (!found) return { content: [{ type: "text", text: "Download triggered but no completed file appeared (timeout). Check the bind mount and that the click started a download." }], isError: true };
 
-        const full = join(hostDir, found);
-        return { content: [{ type: "text", text: JSON.stringify({ downloaded: true, file: found, path: full, bytes: statSync(full).size }) }] };
+          const full = join(hostDir, found);
+          return { content: [{ type: "text", text: JSON.stringify({ downloaded: true, file: found, path: full, bytes: statSync(full).size }) }] };
+        }, { leaseDir: downloadLeaseDir, deadlineMs: (timeout_ms || 30000) + 30000 });
       } catch (err) {
         return { content: [{ type: "text", text: `download failed: ${err.message}` }], isError: true };
       }
