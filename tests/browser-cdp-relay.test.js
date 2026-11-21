@@ -1297,18 +1297,38 @@ test("live (opt-in: CROW_TEST_BROWSER_IMAGE=<built image>, as the invoking non-r
     try { run.kill("SIGKILL"); } catch { /* gone */ }
   });
   try {
+    // The host-side `docker run --name <marker>` CLI carries the marker in its own argv as
+    // well, under a LOWER pid, and its cgroup is this user's session scope — so picking it
+    // would make containerIdFromCgroup answer null. The container's node process is the one
+    // to read: the CLI is excluded by pid, and what is left must be the in-container node
+    // whose cgroup names a docker container.
     const deadline = Date.now() + 60000;
     let pid = null;
+    let candidates = [];
     while (Date.now() < deadline && !pid) {
+      candidates = [];
       for (const name of readdirSync("/proc")) {
         if (!/^\d+$/.test(name)) continue;
-        if (!(readText(`/proc/${name}/cmdline`) || "").includes(marker)) continue;
-        pid = Number(name);
+        const p = Number(name);
+        const raw = readText(`/proc/${p}/cmdline`);
+        if (!raw || !raw.includes(marker)) continue;
+        const cmdline = raw.split("\0").join(" ").trim();
+        const cgroup = (readText(`/proc/${p}/cgroup`) || "").split("\n")[0];
+        candidates.push({ pid: p, cmdline, cgroup });
+        if (p === run.pid) continue;
+        if (raw.split("\0")[0] !== "/usr/bin/node") continue;
+        if (!/docker-|\/docker\//.test(cgroup)) continue;
+        pid = p;
         break;
       }
       if (!pid) await sleep(250);
     }
-    assert.ok(pid, "the throwaway container's node process is visible in the host's /proc: " + logs);
+    assert.ok(
+      pid,
+      "the throwaway container's node process is visible in the host's /proc (candidates seen: "
+        + (candidates.map((c) => `${c.pid} ${c.cmdline.slice(0, 120)} [${c.cgroup}]`).join("; ") || "none")
+        + "): " + logs,
+    );
     const ready = Date.now() + 30000;
     while (Date.now() < ready && listenInodes(port).length === 0) await sleep(250);
     assert.ok(listenInodes(port).length, "the container's relay is listening on the host's loopback: " + logs);
