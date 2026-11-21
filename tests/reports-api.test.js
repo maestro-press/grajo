@@ -36,6 +36,8 @@ const { SETTINGS_CHANGED_PAUSE_REASON } = await import("../servers/gateway/repor
 const { createReport, getReport, getState, saveRecipe, updateReportColumns } = await import("../servers/gateway/reports/store.js");
 const { createAccount } = await import("../servers/gateway/mail/store/accounts.js");
 const { createMailCredentials } = await import("../servers/gateway/mail/credentials.js");
+const { startRun } = await import("../servers/gateway/reports/run.js");
+const { _setReportsHookForTest } = await import("../servers/gateway/reports/schedule-hook.js");
 
 const OWNER = "owner-local-password-session";
 const SSO = "peer-sso-session";
@@ -781,4 +783,41 @@ test("the owner deletes a report, and the delete is logged on the gateway's audi
   assert.deepEqual(again.json, { error: "not_found", message: "Not found." });
   const malformed = await call("DELETE", `${REPORTS_API_PREFIX}/rpt-xyz`);
   assert.equal(malformed.status, 404, malformed.text);
+});
+
+/* ---------------------------------------------------------------- send to the rest */
+
+test("send to the rest writes rows, sends nothing, and wakes the reports hook", async () => {
+  const world = await setup();
+  const report = await prepareReport(world.db);
+  // A finished run of this report, and one approved recipient: what the tap needs.
+  const { runId } = await startRun(world.db, { now: () => 1_700_000_000_000 }, {
+    reportId: report.id, trigger: "manual", requestedBy: "owner",
+  });
+  await world.db.execute({
+    sql: "UPDATE report_runs SET status = 'ok', ended_at = ? WHERE id = ?",
+    args: [1_700_000_000_000, runId],
+  });
+  const added = await post(`${reportPath(report.id)}/recipients`, { address: "alex@example.com" });
+  assert.equal(added.status, 201, added.text);
+
+  let passes = 0;
+  _setReportsHookForTest({ kick: () => { passes += 1; } });
+  let r;
+  try {
+    r = await post(`${reportPath(report.id)}/runs/${runId}/send-rest`, {});
+  } finally {
+    _setReportsHookForTest(null);
+  }
+
+  assert.equal(r.status, 201, r.text);
+  assert.equal(r.json.created.length, 1, "one recipient was left to send to");
+  assert.equal(passes, 1, "the route wakes the hook, which is what sends the rows");
+  const { rows } = await world.db.execute({
+    sql: "SELECT status, claim_token, message_id FROM report_sends WHERE run_id = ?", args: [runId],
+  });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].status, "pending", "only a row: the route sends nothing");
+  assert.equal(rows[0].claim_token, null);
+  assert.equal(rows[0].message_id, null);
 });

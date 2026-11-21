@@ -19,7 +19,8 @@
  *      storage-nearly-full failure, whose error text the run engine recorded, reaches the owner even in
  *      `crow_only` mode and even with no recipients at all, and a notification type the owner switched
  *      off cannot swallow it.
- *   3. `crow_only` stops here: no email, and the counts are zero.
+ *   3. `crow_only` stops here: no email, and the counts are zero. (`deliverPending` settles the run's
+ *      `pending` rows `refused` for the same reason; see below.)
  *   4. The VERSION to pin is the run's own when it is one a recipient may be shown, else the newest
  *      version that is (`latestRecipientVersion`), and NEVER the artifact's `current_version`: a preview
  *      or an owner edit can sit at current, and a mail link is a promise about one version. The pin may
@@ -57,11 +58,14 @@
  * report's send log writes `pending` rows for the recipients that run did not mail (`send-log.js`), and
  * `deliverPending(db, deps, {reportId, runId})` is the one function that sends exactly those rows. It
  * reads the run, the report and the version the run wrote (its stored document, its allowed links) and
- * makes NO row of its own; a recipient this run already `sent`, is `sending` or left `unknown` is
- * skipped. It writes no run-level notice, because the run was announced when it happened, and it still
- * writes the counts notice when a row did not go. NO TRIGGER CALLS IT IN THIS PR: a later PR wires it to
- * whatever asks for those rows to go. A custom step's own email template is not replayed there, because
- * the run-to-version row keeps the document and the links and no template.
+ * makes NO row of its own; a recipient this run already `sent`, is `sending` or left `unknown` has its
+ * `pending` row settled `refused` / `not_pending` instead. A row it cannot send at all settles too (see
+ * `settlePendingRow`), so no row is left `pending` for ever by a tap. It writes no run-level notice,
+ * because the run was announced when it happened, and it still writes the counts notice when a row did
+ * not go. THE TRIGGER IS THE REPORTS SCHEDULER HOOK'S TICK
+ * (`reports/schedule-hook.js`), which calls it for the pairs those rows name once they are past its
+ * grace. A custom step's own email template is not replayed there, because the run-to-version row keeps
+ * the document and the links and no template.
  *
  * NOTHING HERE THROWS OUT for a per-recipient problem, and every string this module stores or shows is
  * passed through `redactSecrets` first. The deps are the whole seam, and each falls back to the real thing
@@ -640,6 +644,38 @@ async function alreadySpokenFor(db, runId, recipientId) {
   return rows.length > 0;
 }
 
+/**
+ * Settle one `pending` row that this pass cannot send, terminally: ONE guarded statement, so only a row
+ * that is still `pending` moves. A row another pass claimed (`sending`), sent, or settled some other way
+ * is never rewritten by this, and nothing here touches a status other than `pending`.
+ *
+ * The statuses and reasons are the send door's own vocabulary: `refused` with `recipient_not_approved`
+ * (the words the door uses for the same refusal) or `not_pending` (the mail is already spoken for), and
+ * `failed` with `no_link` (this instance cannot make a link for that recipient, so nothing was mailed).
+ * All three are internal codes; a person reads the notice, never the row.
+ *
+ * A write that fails leaves the row exactly as it is: the next pass offers it again.
+ *
+ * @param {object} db a libsql-shaped client
+ * @param {string} id the `report_sends` row id
+ * @param {"failed"|"refused"} status the terminal status to settle it as
+ * @param {string} reason the short internal reason code
+ * @param {number} now one clock for the row's own timestamp
+ * @returns {Promise<void>}
+ */
+async function settlePendingRow(db, id, status, reason, now) {
+  if (typeof id !== "string" || !id) return;
+  try {
+    await db.execute({
+      sql: `UPDATE report_sends SET status = ?, reason = ?, updated_at = ?
+             WHERE id = ? AND status = 'pending'`,
+      args: [status, reason, now, id],
+    });
+  } catch {
+    // A row that could not be settled stays `pending`, and a later pass tries again.
+  }
+}
+
 /** One run's `pending` rows, oldest first: exactly the rows "Send to the rest" wrote. */
 async function pendingSendRows(db, reportId, runId) {
   const { rows } = await db.execute({
@@ -658,21 +694,31 @@ async function pendingSendRows(db, reportId, runId) {
  * recorded links), and then hands every `pending` row of the run to the SAME per-recipient path `deliver`
  * uses: the link, the mail, and the hold on the version that was sent. Nothing here makes a row, so a
  * recipient with no `pending` row is never written to (a run's own delivery owns that write), and a
- * recipient whose row is beside a `sent`, `sending` or `unknown` one is skipped, never mailed twice.
+ * recipient whose row is beside a `sent`, `sending` or `unknown` one is never mailed twice: its row
+ * settles `refused` / `not_pending`. Every other row this pass cannot send settles too, by
+ * `settlePendingRow`: `refused` / `recipient_not_approved` for a recipient that is no longer approved or
+ * whose seal no longer verifies, and `failed` / `no_link` for one this instance has no link for, which
+ * still counts as a skip and still rings the one skipped-emails notice. A row settles only from
+ * `pending`, so nothing a door or another pass moved is ever rewritten here.
  *
  * A preview run and a run that has not finished send nothing. `crow_only` sends nothing either: that
- * report has no mail. A failed run's body is the honest line and nothing else, exactly as in `deliver`.
+ * report has no mail, so every `pending` row of its run settles `refused` / `not_live` (nothing will
+ * ever claim one) and no notice is written. A failed run's body is the honest line and nothing else,
+ * exactly as in `deliver`.
  *
- * NOTHING CALLS THIS IN THIS PR: the rows are written by `send-log.js` today and a later PR wires a
- * trigger to this function. The run's own notice was written when the run happened, so none is written
- * here; the "some emails were not sent" notice still is, because a row that failed now is news.
+ * The reports scheduler hook's tick calls this (`reports/schedule-hook.js`), for the pairs the rows
+ * `send-log.js` wrote; a caller may also drive it directly. The run's own notice was written when the
+ * run happened, so none is written here; the "some emails were not sent" notice still is, because a row
+ * that failed now is news.
  *
  * @param {object} db a libsql-shaped client
  * @param {object} [deps] the seam (see the module comment)
  * @param {{reportId: string, runId: string}} input
  * @returns {Promise<{sent: number, refused: number, failed: number, unknown: number, skipped: number}>}
  *   never rejects for a per-recipient problem
- * @throws {Error} `bad_input` for a missing id, `not_found` when the run or the report is not there
+ * @throws {Error} `bad_input` for a missing id, `not_found` when the run or the report is not there,
+ *   and `read_failed` when the recipient list could not be read: no row is settled then, because a
+ *   question that could not be answered says nothing about who may be mailed
  */
 export async function deliverPending(db, deps, { reportId, runId } = {}) {
   const d = resolveDeps(db, deps);
@@ -688,7 +734,16 @@ export async function deliverPending(db, deps, { reportId, runId } = {}) {
   // A preview is never approved mail, and a run that has not finished has nothing to send to the rest of.
   if (text(run.trigger) === "preview") return counts;
   if (!SENDABLE_RUN_STATUSES.includes(text(run.status))) return counts;
-  if (text(report.delivery_mode) === "crow_only") return counts;
+  if (text(report.delivery_mode) === "crow_only") {
+    // A report with no mail has no row that can ever go: each `pending` row of this run settles
+    // `refused` / `not_live` (the door's word for a row nothing will ever claim) instead of sitting in
+    // the hook's scan for the life of the log. Nothing is mailed and nothing is rung.
+    const at = Number(d.now());
+    for (const row of await pendingSendRows(db, reportId, runId)) {
+      await settlePendingRow(db, text(row.id), "refused", "not_live", at);
+    }
+    return counts;
+  }
 
   const status = text(run.status);
   const title = noticeTitleOf(report);
@@ -701,7 +756,9 @@ export async function deliverPending(db, deps, { reportId, runId } = {}) {
   try {
     recipients = await listRecipients(db, reportId, d.approvals);
   } catch {
-    recipients = [];
+    // A recipient list that could not be read says nothing about any row: every `pending` row of this
+    // run is still owed its send. This throws before a row is touched, so the caller retries.
+    throw fail("read_failed", "recipients");
   }
   const byId = new Map();
   for (const recipient of recipients) {
@@ -711,23 +768,33 @@ export async function deliverPending(db, deps, { reportId, runId } = {}) {
 
   let linkSkips = 0;
   for (const row of await pendingSendRows(db, reportId, runId)) {
+    const rowId = text(row.id);
     const recipient = byId.get(text(row.recipient_id)) ?? null;
-    // A pending row whose recipient is not approved (or whose seal no longer verifies) is not mail: its
-    // row is left exactly as it is, because only the door settles a row and this never reached one.
+    // A pending row whose recipient is not approved (or whose seal no longer verifies) is not mail and
+    // never will be: it settles `refused` / `recipient_not_approved`, the door's own word for exactly
+    // that refusal, so it leaves `pending` instead of being offered again for the life of the log.
     if (!recipient || recipient.state !== "approved" || recipient.verified !== true) {
+      await settlePendingRow(db, rowId, "refused", "recipient_not_approved", now);
       counts.skipped += 1;
       continue;
     }
+    // A `sent`, `sending` or `unknown` row already answers for this recipient: this row can never go,
+    // so it settles `refused` / `not_pending` (the door's word for a row that lost its turn) rather
+    // than sitting in the scan for ever.
     if (await alreadySpokenFor(db, runId, recipient.id)) {
+      await settlePendingRow(db, rowId, "refused", "not_pending", now);
       counts.skipped += 1;
       continue;
     }
 
     const outcome = await deliverToRecipient(db, d, {
       report, run, status, recipient, document, allowedLinks, override: null, artifactId, pinned,
-      now, linkDays, sendId: text(row.id),
+      now, linkDays, sendId: rowId,
     });
     if (outcome === "nolink") {
+      // Nothing was claimed and nothing was mailed: the row settles `failed` / `no_link`, so it stops
+      // being offered (and stops blocking the owner's next tap) and the notice below stays its record.
+      await settlePendingRow(db, rowId, "failed", "no_link", now);
       counts.skipped += 1;
       linkSkips += 1;
       continue;
@@ -754,8 +821,9 @@ export async function deliverPending(db, deps, { reportId, runId } = {}) {
     });
   }
 
-  // The same rule as `deliver`: a recipient with no link owns no row, so this notice is the only record
-  // that its mail did not go.
+  // The same rule as `deliver`: a recipient this instance has no link for is a mail that did not go.
+  // Its row settles `failed` / `no_link` above (or it owns no row at all, in `deliver`), so this notice
+  // is the one thing that says so, and it is counted as a skip rather than as a failed send.
   if (linkSkips > 0) {
     await ring(db, d, {
       title: emailsSkippedNotice(title),
@@ -780,6 +848,20 @@ export function makeDeliver(baseDeps = {}) {
   const base = baseDeps == null ? {} : baseDeps;
   return function deliverRun(db, payload) {
     return deliver(db, base, payload);
+  };
+}
+
+/**
+ * The `(db, {reportId, runId})` seam a caller with boot's deps calls to send the `pending` rows one run
+ * already holds (the owner's "Send to the rest").
+ *
+ * @param {object} [baseDeps] anything `deliverPending` takes (`sendMail`, `adapterFor`, `approvals`, ...)
+ * @returns {(db: object, input: {reportId: string, runId: string}) => Promise<object>}
+ */
+export function makeDeliverPending(baseDeps = {}) {
+  const base = baseDeps == null ? {} : baseDeps;
+  return function deliverPendingRun(db, { reportId, runId } = {}) {
+    return deliverPending(db, base, { reportId, runId });
   };
 }
 

@@ -989,9 +989,10 @@ export async function runPostListenSetup(server, app, deps) {
   // gateway is a loopback companion sharing crow.db, so it registers nothing, sweeps nothing and
   // takes no lease (startReportsAtBoot refuses on `noAuth` alone, not on any sync setting).
   //
-  // The hook's one outgoing seam is the real delivery: `makeDeliver` builds `reports/delivery.js`'s
+  // The hook's outgoing seams are the real delivery: `makeDeliver` builds `reports/delivery.js`'s
   // deliver with boot's own mail adapter source (`reportsAdapterFor`, the running mail supervisor's
-  // borrowed connection), the approvals deps and this instance's id. The approvals deps come from
+  // borrowed connection), the approvals deps and this instance's id, and `makeDeliverPending` is the
+  // same seam for the rows "Send to the rest" wrote. The approvals deps come from
   // `buildApprovalsDeps`, so the hook's model-change sentence resolves the bot's real model instead of
   // saying "unavailable", and reports' failed and empty notices reach the owner whatever their
   // notification type settings say.
@@ -1006,7 +1007,7 @@ export async function runPostListenSetup(server, app, deps) {
           { startReportsAtBoot },
           { buildApprovalsDeps },
           { makeWriteVersion },
-          { makeDeliver },
+          { makeDeliver, makeDeliverPending },
           { reportsAdapterFor },
           { getOrCreateLocalInstanceId },
         ] = await Promise.all([
@@ -1028,6 +1029,7 @@ export async function runPostListenSetup(server, app, deps) {
           db,
           deps: {
             deliver: makeDeliver({ adapterFor: reportsAdapterFor, approvals, localInstanceId }),
+            deliverPending: makeDeliverPending({ adapterFor: reportsAdapterFor, approvals, localInstanceId }),
             approvals,
             // The artifact bridge loads the Artifacts bundle lazily (it is installed at runtime), so a
             // gateway without that bundle still boots: a run that needs it fails honestly with

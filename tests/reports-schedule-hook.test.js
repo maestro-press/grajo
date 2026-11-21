@@ -26,11 +26,14 @@ const {
   SETTINGS_CHANGED_TEXT, deliverNotWired, kickReportsHook, registerReportsHook,
   startReportsAtBoot, _setReportsHookForTest,
 } = await import("../servers/gateway/reports/schedule-hook.js");
-const { approveGoLive, pauseReport } = await import("../servers/gateway/reports/approvals.js");
+const { approveGoLive, approveRecipient, pauseReport, proposeRecipient } =
+  await import("../servers/gateway/reports/approvals.js");
 const { NOT_LIVE_TEXT, RESTARTED_TEXT, startRun } = await import("../servers/gateway/reports/run.js");
 const {
   createReport, getReport, saveRecipe, updateReportColumns,
 } = await import("../servers/gateway/reports/store.js");
+const { makeDeliverPending } = await import("../servers/gateway/reports/delivery.js");
+const { emailsSkippedNotice } = await import("../servers/gateway/reports/email/copy.js");
 const { gatewayRunId } = await import("../servers/gateway/run-id.js");
 const { LEASE_KEY } = await import("../servers/gateway/reports/lease.js");
 const {
@@ -1103,6 +1106,804 @@ test("kick drains the queue in a process with a hook and does nothing without on
   assert.equal(kickReportsHook(), false);
 });
 
+/* ---------------------------------------------------------------- the pending sends */
+
+/** One `report_sends` row, the way "Send to the rest" writes it (a row only, never a send). */
+async function pendingSendRow(db, {
+  id, reportId, runId, recipientId = "rrc-0000000000000001", createdAt, status = "pending",
+}) {
+  await db.execute({
+    sql: `INSERT INTO report_sends
+            (id, run_id, report_id, recipient_id, attempt, status, created_at, updated_at)
+          VALUES (?, ?, ?, ?, 1, ?, ?, ?)`,
+    args: [id, runId, reportId, recipientId, status, createdAt, createdAt],
+  });
+}
+
+/**
+ * A run row the hook's join accepts as finished, owned by this process so the boot sweep leaves it alone.
+ * "Send to the rest" only writes rows for a finished run, so a pending row names one.
+ */
+async function finishedRun(db, report, id, { status = "ok" } = {}) {
+  await insertRun(db, report, { id, status, gateway: gatewayRunId(), endedAt: NOW });
+}
+
+/** A recipient of the report that is approved now, with a seal that verifies. */
+async function approvedRecipient(db, report, { address = "outside@example.com", tier = null }) {
+  const proposed = await proposeRecipient(db, approvalsDeps(report), {
+    reportId: report.id, address, displayName: "Outside", commentTier: tier, proposedBy: "owner",
+  });
+  return approveRecipient(db, approvalsDeps(report), { recipientId: proposed.id, actor: OWNER });
+}
+
+const oneSend = async (db, id) => (await rows(db, "SELECT * FROM report_sends WHERE id = ?", [id]))[0] ?? null;
+
+test("a pending row past the grace is sent by a tick through the injected deliverPending", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  const calls = [];
+  const hook = registerReportsHook(db, hookDeps(report, {
+    deliverPending: async (_db, input) => { calls.push(input); },
+  }));
+  await finishedRun(db, report, "rrn-0000000000000101");
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000101", reportId: report.id, runId: "rrn-0000000000000101",
+    createdAt: NOW - 60_000,
+  });
+
+  await hook.tick(db);
+
+  assert.deepEqual(calls, [{ reportId: report.id, runId: "rrn-0000000000000101" }],
+    "one call for the run those rows name");
+  assert.equal((await oneSend(db, "rsd-0000000000000101")).status, "pending",
+    "the hook itself writes no row");
+});
+
+test("a pending row younger than the grace is left for the next pass", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  const calls = [];
+  const hook = registerReportsHook(db, hookDeps(report, {
+    deliverPending: async (_db, input) => { calls.push(input); },
+  }));
+  await finishedRun(db, report, "rrn-0000000000000102");
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000102", reportId: report.id, runId: "rrn-0000000000000102",
+    createdAt: NOW - 1_000,
+  });
+
+  await hook.tick(db);
+  assert.deepEqual(calls, [], "a row written just now may be a delivery still writing its own");
+
+  clock = NOW + 60_000;
+  await hook.tick(db);
+  assert.deepEqual(calls, [{ reportId: report.id, runId: "rrn-0000000000000102" }],
+    "the same row is sent once it is past the grace");
+});
+
+test("a pass with no pending rows calls the seam not at all", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  let calls = 0;
+  const hook = registerReportsHook(db, hookDeps(report, {
+    deliverPending: async () => { calls += 1; },
+  }));
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000103", reportId: report.id, runId: "rrn-0000000000000103",
+    createdAt: NOW - 60_000, status: "sent",
+  });
+
+  await hook.tick(db);
+  assert.equal(calls, 0, "a settled row is never handed to the seam");
+});
+
+test("a throwing deliverPending is said once, and its row set is offered again next pass", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  const calls = [];
+  const hook = registerReportsHook(db, hookDeps(report, {
+    deliverPending: async (_db, input) => {
+      calls.push(input.runId);
+      if (input.runId === "rrn-0000000000000104") throw Object.assign(new Error("not_found: report"), { code: "not_found" });
+    },
+  }));
+  await finishedRun(db, report, "rrn-0000000000000104");
+  await finishedRun(db, report, "rrn-0000000000000105");
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000104", reportId: report.id, runId: "rrn-0000000000000104",
+    createdAt: NOW - 90_000,
+  });
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000105", reportId: report.id, runId: "rrn-0000000000000105",
+    createdAt: NOW - 60_000,
+  });
+
+  const warnings = [];
+  const original = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  try {
+    await hook.tick(db);
+    assert.deepEqual(calls, ["rrn-0000000000000104", "rrn-0000000000000105"],
+      "the older pair threw and the next one was still tried");
+    await hook.tick(db);
+  } finally {
+    console.warn = original;
+  }
+
+  assert.deepEqual(calls, ["rrn-0000000000000104", "rrn-0000000000000105", "rrn-0000000000000104"],
+    "the set whose seam threw is offered again on the next pass; the one already offered is not");
+  assert.equal(warnings.filter((line) => /pending sends could not be sent/.test(line)).length, 1,
+    "said once for that run id, not once per pass");
+});
+
+test("a pending set whose seam threw once is offered again and sent by the next pass", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  const RUN = "rrn-0000000000000153";
+  const ROW = "rsd-0000000000000153";
+  await finishedRun(db, report, RUN);
+  await pendingSendRow(db, { id: ROW, reportId: report.id, runId: RUN, createdAt: NOW - 60_000 });
+
+  let attempts = 0;
+  const hook = registerReportsHook(db, hookDeps(report, {
+    deliverPending: async () => {
+      attempts += 1;
+      if (attempts === 1) throw Object.assign(new Error("read_failed: recipients"), { code: "read_failed" });
+      await db.execute({
+        sql: "UPDATE report_sends SET status = 'sent', updated_at = ? WHERE id = ?",
+        args: [clock, ROW],
+      });
+    },
+  }));
+
+  const warnings = [];
+  const original = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  try {
+    await hook.tick(db);
+    assert.equal(attempts, 1, "the first pass offered the pair, and the seam threw");
+    assert.equal((await oneSend(db, ROW)).status, "pending", "a fault settles nothing");
+
+    clock += 60_000;
+    await hook.tick(db);
+  } finally {
+    console.warn = original;
+  }
+
+  assert.equal(attempts, 2, "the next pass offered the same set again");
+  assert.equal((await oneSend(db, ROW)).status, "sent", "and the seam sent it that time");
+  assert.equal(warnings.filter((line) => /pending sends could not be sent/.test(line)).length, 1,
+    "one warning for that run id, however many passes it takes");
+});
+
+test("a settled pair's key is forgotten by an uncapped pass, so the same row id is offered again", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  const RUN = "rrn-0000000000000154";
+  const ROW = "rsd-0000000000000154";
+  await finishedRun(db, report, RUN);
+  await pendingSendRow(db, { id: ROW, reportId: report.id, runId: RUN, createdAt: NOW - 60_000 });
+
+  const calls = [];
+  const hook = registerReportsHook(db, hookDeps(report, {
+    // The seam settles the row it is handed, the way the real one does.
+    deliverPending: async (_db, input) => {
+      calls.push(input.runId);
+      await db.execute({
+        sql: "UPDATE report_sends SET status = 'sent', updated_at = ? WHERE status = 'pending' AND run_id = ?",
+        args: [clock, input.runId],
+      });
+    },
+  }));
+
+  for (let cycle = 0; cycle < 3; cycle += 1) {
+    await hook.tick(db);
+    assert.equal(calls.length, cycle + 1, `cycle ${cycle}: the pending row is offered`);
+    assert.equal((await oneSend(db, ROW)).status, "sent", `cycle ${cycle}: and the seam settled it`);
+
+    // Nothing is pending now and the scan is below its cap, so this pass forgets the offered key.
+    clock += 60_000;
+    await hook.tick(db);
+    assert.equal(calls.length, cycle + 1, `cycle ${cycle}: nothing pending, nothing offered`);
+
+    // The same row (same run, same recipient, same id) is pending again: only a forgotten key lets a
+    // later pass offer it, so a set that kept every key it ever held would stall here.
+    await db.execute({
+      sql: "UPDATE report_sends SET status = 'pending', updated_at = ? WHERE id = ?",
+      args: [clock, ROW],
+    });
+    clock += 60_000;
+  }
+
+  assert.equal(calls.length, 3, "three cycles, three offers: the memory never held a stale key");
+});
+
+test("a hook with no deliverPending dep sends nothing and says nothing", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  const hook = registerReportsHook(db, hookDeps(report));
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000106", reportId: report.id, runId: "rrn-0000000000000106",
+    createdAt: NOW - 60_000,
+  });
+
+  const warnings = [];
+  const original = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  try {
+    await hook.tick(db);
+  } finally {
+    console.warn = original;
+  }
+
+  assert.deepEqual(warnings.filter((line) => /pending send/.test(line)), []);
+  assert.equal((await oneSend(db, "rsd-0000000000000106")).status, "pending", "the row waits");
+});
+
+test("the real deliverPending sends nothing for a preview run's pending rows", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  const preview = await startRun(db, { now: () => clock }, {
+    reportId: report.id, trigger: "preview", requestedBy: "owner",
+  });
+  await db.execute({
+    sql: "UPDATE report_runs SET status = 'ok', ended_at = ? WHERE id = ?",
+    args: [clock, preview.runId],
+  });
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000107", reportId: report.id, runId: preview.runId,
+    createdAt: NOW - 60_000,
+  });
+  const mails = [];
+  const hook = registerReportsHook(db, hookDeps(report, {
+    deliverPending: makeDeliverPending({
+      sendMail: async (_db, _deps, input) => { mails.push(input); return { status: "sent" }; },
+      notify: async () => null,
+      holdVersion: async () => ({}),
+      getSecrets: () => [],
+      now: () => clock,
+      baseUrl: "https://crow.example.ts.net",
+    }),
+  }));
+
+  await hook.tick(db);
+
+  assert.deepEqual(mails, [], "a preview is never approved mail");
+  assert.equal((await oneSend(db, "rsd-0000000000000107")).status, "pending",
+    "and its row is left as it was");
+});
+
+test("a pending row set is handed to the seam once, however many ticks select it", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  const calls = [];
+  const hook = registerReportsHook(db, hookDeps(report, {
+    deliverPending: async (_db, input) => { calls.push(input); },
+  }));
+  await finishedRun(db, report, "rrn-0000000000000108");
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000108", reportId: report.id, runId: "rrn-0000000000000108",
+    createdAt: NOW - 60_000,
+  });
+
+  await hook.tick(db);
+  clock += 60_000;
+  await hook.tick(db);
+  clock += 60_000;
+  await hook.tick(db);
+
+  assert.deepEqual(calls, [{ reportId: report.id, runId: "rrn-0000000000000108" }],
+    "one attempt for one set of pending row ids, not one per tick");
+});
+
+test("the real deliverPending rings the skipped-emails notice once and settles the row failed", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  // A recipient approved after go-live with a tier this instance cannot make a link for: delivery
+  // claims no row for it, so its one record is the notice, and that notice must not repeat every minute.
+  const recipient = await approvedRecipient(db, report, { tier: "a" });
+  await finishedRun(db, report, "rrn-0000000000000112");
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000112", reportId: report.id, runId: "rrn-0000000000000112",
+    recipientId: recipient.id, createdAt: NOW - 60_000,
+  });
+
+  const told = [];
+  const mails = [];
+  const hook = registerReportsHook(db, hookDeps(report, {
+    deliverPending: makeDeliverPending({
+      approvals: approvalsDeps(report),
+      sendMail: async (_db, _deps, input) => { mails.push(input); return { status: "sent" }; },
+      notify: async (_db, note) => { told.push(note); },
+      holdVersion: async () => ({}),
+      getSecrets: () => [],
+      now: () => clock,
+      baseUrl: "https://crow.example.ts.net",
+    }),
+  }));
+
+  await hook.tick(db);
+  clock += 60_000;
+  await hook.tick(db);
+  clock += 60_000;
+  await hook.tick(db);
+
+  const skipped = told.filter((note) => note.title === emailsSkippedNotice("Weekly listings"));
+  assert.equal(skipped.length, 1, "one notice for the skipped emails, not one every minute");
+  assert.deepEqual(mails, [], "a recipient with no link gets no mail");
+  const settled = await oneSend(db, "rsd-0000000000000112");
+  assert.equal(settled.status, "failed", "the row settles, so it is never offered again");
+  assert.equal(settled.reason, "no_link", "the internal code for a recipient this instance cannot link");
+  assert.equal(told.length, 1, "a settled skip is not a failed send: no counts notice");
+  assert.deepEqual(notes, [], "and the hook itself writes no notice about it");
+});
+
+test("a second Send to the rest tap (new row ids) for the same run is attempted again", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  const calls = [];
+  const hook = registerReportsHook(db, hookDeps(report, {
+    deliverPending: async (_db, input) => { calls.push(input); },
+  }));
+  await finishedRun(db, report, "rrn-0000000000000110");
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000110", reportId: report.id, runId: "rrn-0000000000000110",
+    createdAt: NOW - 60_000,
+  });
+
+  await hook.tick(db);
+  assert.equal(calls.length, 1, "the first set went out");
+
+  // The owner taps "Send to the rest" again: new row ids for the same run, so a new set.
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000111", reportId: report.id, runId: "rrn-0000000000000110",
+    recipientId: "rrc-0000000000000002", createdAt: NOW - 30_000,
+  });
+  clock += 60_000;
+  await hook.tick(db);
+
+  assert.equal(calls.length, 2, "the rows a later tap wrote are attempted, not held back by the first set");
+  assert.deepEqual(calls[1], { reportId: report.id, runId: "rrn-0000000000000110" });
+});
+
+test("a pending row on a run that has not finished is attempted once that run has", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  const calls = [];
+  const hook = registerReportsHook(db, hookDeps(report, {
+    deliverPending: async (_db, input) => { calls.push(input); },
+  }));
+  // This process's own run, so the boot sweep leaves it `running`.
+  await finishedRun(db, report, "rrn-0000000000000113", { status: "running" });
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000113", reportId: report.id, runId: "rrn-0000000000000113",
+    createdAt: NOW - 60_000,
+  });
+
+  await hook.tick(db);
+  assert.deepEqual(calls, [], "a run that has not finished has nothing to send to the rest of");
+
+  await db.execute({
+    sql: "UPDATE report_runs SET status = 'ok', ended_at = ? WHERE id = ?",
+    args: [clock, "rrn-0000000000000113"],
+  });
+  clock += 60_000;
+  await hook.tick(db);
+
+  assert.deepEqual(calls, [{ reportId: report.id, runId: "rrn-0000000000000113" }],
+    "the finished run's rows are attempted on the next tick");
+});
+
+test("a report paused after Send to the rest queued rows sends nothing and settles them refused", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  const calls = [];
+  const hook = registerReportsHook(db, hookDeps(report, {
+    deliverPending: async (_db, input) => { calls.push(input); },
+  }));
+  await finishedRun(db, report, "rrn-0000000000000121");
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000121", reportId: report.id, runId: "rrn-0000000000000121",
+    createdAt: NOW - 60_000,
+  });
+  // A row of another status on the same report: settling the pending ones leaves it exactly as it is.
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000122", reportId: report.id, runId: "rrn-0000000000000121",
+    recipientId: "rrc-0000000000000002", createdAt: NOW - 60_000, status: "sent",
+  });
+  await pauseReport(db, report.approvals, { reportId: report.id, actor: OWNER });
+
+  await hook.tick(db);
+
+  assert.deepEqual(calls, [], "a paused report's pending rows are never handed to the seam");
+  const refused = await oneSend(db, "rsd-0000000000000121");
+  assert.equal(refused.status, "refused", "no mail went out, so the row settles terminally");
+  assert.equal(refused.reason, "not_live", "the send door's own word for that refusal");
+  assert.equal(Number(refused.updated_at), clock);
+  assert.equal((await oneSend(db, "rsd-0000000000000122")).status, "sent",
+    "a row of another status is never rewritten");
+  assert.deepEqual(notes, [], "no notice: the owner already knows the report is paused");
+});
+
+test("a live report whose seal no longer verifies sends nothing: its pending rows settle refused", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  const calls = [];
+  const hook = registerReportsHook(db, hookDeps(report, {
+    deliverPending: async (_db, input) => { calls.push(input); },
+  }));
+  await finishedRun(db, report, "rrn-0000000000000123");
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000123", reportId: report.id, runId: "rrn-0000000000000123",
+    createdAt: NOW - 60_000,
+  });
+  // The way the guard tests break a seal: a direct UPDATE of a live-set column.
+  await db.execute({ sql: "UPDATE reports SET delivery_mode = 'both' WHERE id = ?", args: [report.id] });
+
+  // A light pass, what a route's kick runs: no guard runs, so the drain's own gate is what stands
+  // between this still-`live` row and the seam.
+  hook.kick();
+  await settle(200);
+
+  assert.deepEqual(calls, [], "a seal that no longer verifies means nothing is sent");
+  const refused = await oneSend(db, "rsd-0000000000000123");
+  assert.equal(refused.status, "refused");
+  assert.equal(refused.reason, "not_live");
+  assert.equal((await getReport(db, report.id)).status, "live", "the light pass ran no guard");
+});
+
+test("a report deleted after its pending rows were queued: the rows settle refused and nothing throws", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  const calls = [];
+  const hook = registerReportsHook(db, hookDeps(report, {
+    deliverPending: async (_db, input) => { calls.push(input); },
+  }));
+  await finishedRun(db, report, "rrn-0000000000000124");
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000124", reportId: report.id, runId: "rrn-0000000000000124",
+    createdAt: NOW - 60_000,
+  });
+  await db.execute({ sql: "DELETE FROM reports WHERE id = ?", args: [report.id] });
+
+  await hook.tick(db);
+
+  assert.deepEqual(calls, [], "a report that is gone has nothing to send");
+  // The rows are refused rather than left pending forever: nothing can ever send them.
+  const refused = await oneSend(db, "rsd-0000000000000124");
+  assert.equal(refused.status, "refused");
+  assert.equal(refused.reason, "not_live");
+});
+
+test("stuck pairs do not starve the pairs queued behind them", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  const calls = new Map();
+  const hook = registerReportsHook(db, hookDeps(report, {
+    // A pair this seam cannot move: it leaves its rows pending, like a recipient with no link.
+    deliverPending: async (_db, input) => {
+      calls.set(input.runId, (calls.get(input.runId) ?? 0) + 1);
+    },
+  }));
+  const STUCK = 25;
+  const stuckRun = (i) => `rrn-00000000000002${String(i).padStart(2, "0")}`;
+  for (let i = 0; i < STUCK; i += 1) {
+    await finishedRun(db, report, stuckRun(i));
+    await pendingSendRow(db, {
+      id: `rsd-00000000000002${String(i).padStart(2, "0")}`,
+      reportId: report.id, runId: stuckRun(i),
+      recipientId: `rrc-00000000000002${String(i).padStart(2, "0")}`,
+      createdAt: NOW - 120_000 + i * 1000,
+    });
+  }
+  const GOOD = "rrn-0000000000000299";
+  await finishedRun(db, report, GOOD);
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000299", reportId: report.id, runId: GOOD,
+    recipientId: "rrc-0000000000000299", createdAt: NOW - 60_000,
+  });
+
+  for (let pass = 0; pass < 3 && !calls.has(GOOD); pass += 1) await hook.tick(db);
+
+  assert.equal(calls.get(GOOD), 1, "the good pair queued behind 25 stuck ones was offered");
+  for (let i = 0; i < STUCK; i += 1) {
+    assert.equal(calls.get(stuckRun(i)), 1,
+      `${stuckRun(i)} was offered once, not once per pass`);
+  }
+});
+
+/* ------------------------------------------------------- a stuck pair settles and stays settled */
+
+test("a restart after the stuck pairs settled rings no notice and offers nothing", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  // A recipient this instance cannot make a link for, and one nobody ever approved: the two rows a
+  // pair used to leave `pending` for ever.
+  const noLink = await approvedRecipient(db, report, { tier: "a" });
+  const proposed = await proposeRecipient(db, approvalsDeps(report), {
+    reportId: report.id, address: "unapproved@example.com", displayName: "Nim",
+    commentTier: null, proposedBy: "owner",
+  });
+  await finishedRun(db, report, "rrn-0000000000000131");
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000131", reportId: report.id, runId: "rrn-0000000000000131",
+    recipientId: noLink.id, createdAt: NOW - 60_000,
+  });
+  await finishedRun(db, report, "rrn-0000000000000132");
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000132", reportId: report.id, runId: "rrn-0000000000000132",
+    recipientId: proposed.id, createdAt: NOW - 60_000,
+  });
+
+  const told = [];
+  const mails = [];
+  const first = registerReportsHook(db, hookDeps(report, {
+    deliverPending: makeDeliverPending({
+      approvals: approvalsDeps(report),
+      sendMail: async (_db, _deps, input) => { mails.push(input); return { status: "sent" }; },
+      notify: async (_db, note) => { told.push(note); },
+      holdVersion: async () => ({}),
+      getSecrets: () => [],
+      now: () => clock,
+      baseUrl: "https://crow.example.ts.net",
+    }),
+  }));
+
+  await first.tick(db);
+
+  assert.deepEqual(mails, [], "neither row could be mailed");
+  const settledNoLink = await oneSend(db, "rsd-0000000000000131");
+  assert.equal(settledNoLink.status, "failed");
+  assert.equal(settledNoLink.reason, "no_link");
+  const settledUnapproved = await oneSend(db, "rsd-0000000000000132");
+  assert.equal(settledUnapproved.status, "refused");
+  assert.equal(settledUnapproved.reason, "recipient_not_approved", "the words the send door uses");
+  assert.equal(told.length, 1, "the one notice is the no-link one: a refusal is not a failed send");
+
+  // The restart: a NEW hook over the same log. The rows are no longer pending, so nothing is offered
+  // and nothing is said, however many passes the new process makes.
+  const calls = [];
+  const second = registerReportsHook(db, hookDeps(report, {
+    deliverPending: async (_db, input) => { calls.push(input); },
+  }));
+  for (let pass = 0; pass < 3; pass += 1) {
+    clock += 60_000;
+    await second.tick(db);
+  }
+  assert.deepEqual(calls, [], "the settled rows are never offered again");
+  assert.equal(told.length, 1, "and the new process rings no second notice");
+  assert.equal((await getReport(db, report.id)).status, "live", "the report was never anything but live");
+});
+
+test("2100 stuck pending rows do not hide the good pair behind them", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  // A project row, so the good recipient's tier `c` link is an absolute URL a mail can carry.
+  await db.execute({
+    sql: "INSERT INTO project_spaces (id, slug, name) VALUES (?, ?, ?)",
+    args: [PROJECT, "weekly-listings", "Weekly listings"],
+  });
+  const STUCK_RUN = "rrn-0000000000000301";
+  await finishedRun(db, report, STUCK_RUN);
+  // 2100 pending rows of ONE finished run, each for a recipient that was never approved: the rows a
+  // pass settles instead of leaving `pending` for ever. Written in chunks, because this is a scan test
+  // and not a row-by-row insert test.
+  const stuckId = (i) => `rsd-stuck-${String(i).padStart(6, "0")}`;
+  const CHUNK = 300;
+  for (let start = 0; start < 2100; start += CHUNK) {
+    const size = Math.min(CHUNK, 2100 - start);
+    const values = [];
+    const args = [];
+    for (let i = 0; i < size; i += 1) {
+      const index = start + i;
+      const at = NOW - 200_000 + index;
+      values.push("(?, ?, ?, ?, 1, 'pending', ?, ?)");
+      args.push(stuckId(index), STUCK_RUN, report.id, `rrc-stuck-${String(index).padStart(6, "0")}`, at, at);
+    }
+    await db.execute({
+      sql: `INSERT INTO report_sends
+              (id, run_id, report_id, recipient_id, attempt, status, created_at, updated_at)
+            VALUES ${values.join(", ")}`,
+      args,
+    });
+  }
+  const good = await approvedRecipient(db, report, {});
+  const GOOD_RUN = "rrn-0000000000000399";
+  await finishedRun(db, report, GOOD_RUN);
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000399", reportId: report.id, runId: GOOD_RUN,
+    recipientId: good.id, createdAt: NOW - 60_000,
+  });
+
+  const mails = [];
+  const hook = registerReportsHook(db, hookDeps(report, {
+    deliverPending: makeDeliverPending({
+      approvals: approvalsDeps(report),
+      sendMail: async (_db, _deps, input) => {
+        mails.push(input);
+        // The door settles its row before it answers, exactly as the real one does.
+        await db.execute({
+          sql: "UPDATE report_sends SET status = 'sent', updated_at = ? WHERE id = ?",
+          args: [clock, input.sendId],
+        });
+        return { status: "sent" };
+      },
+      notify: async () => null,
+      holdVersion: async () => ({}),
+      getSecrets: () => [],
+      now: () => clock,
+      baseUrl: "https://crow.example.ts.net",
+    }),
+  }));
+
+  let passes = 0;
+  const warnings = [];
+  const original = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  try {
+    for (; passes < 6 && mails.length === 0; passes += 1) {
+      clock += 60_000;
+      await hook.tick(db);
+    }
+  } finally {
+    console.warn = original;
+  }
+
+  assert.equal((await oneSend(db, stuckId(0))).status, "refused", "the stuck rows settled");
+  assert.deepEqual(warnings.filter((line) => /could not be sent|could not be refused|tick failed/.test(line)), [],
+    "no pass threw");
+  assert.equal(mails.length, 1, `the good pair was reached in ${passes} passes`);
+  assert.equal(mails[0].sendId, "rsd-0000000000000399");
+  assert.equal((await oneSend(db, "rsd-0000000000000399")).status, "sent");
+});
+
+/* ------------------------------------------------------- a fault is not a refusal (F2) */
+
+test("a report read that throws settles nothing, and the next healthy pass sends", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  const recipient = await approvedRecipient(db, report, {});
+  await finishedRun(db, report, "rrn-0000000000000141");
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000141", reportId: report.id, runId: "rrn-0000000000000141",
+    recipientId: recipient.id, createdAt: NOW - 60_000,
+  });
+
+  const calls = [];
+  const hook = registerReportsHook(db, hookDeps(report, {
+    deliverPending: async (_db, input) => {
+      calls.push(input);
+      await db.execute({
+        sql: "UPDATE report_sends SET status = 'sent', updated_at = ? WHERE id = 'rsd-0000000000000141'",
+        args: [clock],
+      });
+    },
+  }));
+
+  // A database whose report read fails: the liveness question has no answer, so nothing may settle.
+  let broken = true;
+  const flakyDb = {
+    async execute(arg) {
+      const sql = typeof arg === "string" ? arg : String(arg?.sql ?? "");
+      if (broken && /FROM reports WHERE id = \?/.test(sql)) throw new Error("reports is busy");
+      return db.execute(arg);
+    },
+  };
+  const warnings = [];
+  const original = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  try {
+    await hook.tick(flakyDb);
+  } finally {
+    console.warn = original;
+  }
+
+  assert.deepEqual(calls, [], "an unreadable report is not a refusal: the pair is not offered");
+  const waiting = await oneSend(db, "rsd-0000000000000141");
+  assert.equal(waiting.status, "pending", "nothing was settled on a question that could not be answered");
+  assert.equal(waiting.reason, null);
+  assert.equal((await getReport(db, report.id)).status, "live", "and the report was never paused");
+  assert.equal(warnings.filter((line) => /could not be refused/.test(line)).length, 0,
+    "a fault is not logged as a refusal");
+
+  broken = false;
+  clock += 60_000;
+  await hook.tick(db);
+
+  assert.deepEqual(calls, [{ reportId: report.id, runId: "rrn-0000000000000141" }],
+    "the next pass with a healthy answer offered the pair");
+  assert.equal((await oneSend(db, "rsd-0000000000000141")).status, "sent");
+});
+
+test("a hook with no approvals deps settles nothing: the seal question is unknown, not refused", async () => {
+  const db = await freshDb();
+  const report = await liveReport(db);
+  await finishedRun(db, report, "rrn-0000000000000142");
+  await finishedRun(db, report, "rrn-0000000000000143");
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000142", reportId: report.id, runId: "rrn-0000000000000142",
+    recipientId: "rrc-0000000000000142", createdAt: NOW - 120_000,
+  });
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000143", reportId: report.id, runId: "rrn-0000000000000143",
+    recipientId: "rrc-0000000000000143", createdAt: NOW - 60_000,
+  });
+
+  for (const approvals of [null, {}]) {
+    let calls = 0;
+    const hook = registerReportsHook(db, hookDeps(report, {
+      approvals,
+      deliverPending: async () => { calls += 1; },
+    }));
+    // A light pass, so no guard runs: the drain's own gate is the only thing between the row and the seam.
+    hook.kick();
+    await settle(300);
+    assert.equal(calls, 0, `${JSON.stringify(approvals)}: nothing is offered`);
+  }
+
+  for (const id of ["rsd-0000000000000142", "rsd-0000000000000143"]) {
+    const waiting = await oneSend(db, id);
+    assert.equal(waiting.status, "pending", `${id}: nothing settled on a question nothing could answer`);
+    assert.equal(waiting.reason, null);
+  }
+});
+
+/* --------------------------------------- a refusal does not use up the batch (F4) */
+
+test("a refusal that throws does not use up the pass's batch", async () => {
+  const db = await freshDb();
+  const paused = await liveReport(db);
+  await pauseReport(db, paused.approvals, { reportId: paused.id, actor: OWNER });
+  const good = await liveReport(db);
+  const calls = [];
+  const hook = registerReportsHook(db, hookDeps(good, {
+    deliverPending: async (_db, input) => { calls.push(input); },
+  }));
+
+  // 25 pairs of a paused report, all older than the good pair. Their refusal write fails every time, so
+  // their rows stay pending and the next pass reads exactly the same pairs first again.
+  const STUCK = 25;
+  const stuckRun = (i) => `rrn-00000000000004${String(i).padStart(2, "0")}`;
+  for (let i = 0; i < STUCK; i += 1) {
+    await finishedRun(db, paused, stuckRun(i));
+    await pendingSendRow(db, {
+      id: `rsd-00000000000004${String(i).padStart(2, "0")}`,
+      reportId: paused.id, runId: stuckRun(i),
+      recipientId: `rrc-00000000000004${String(i).padStart(2, "0")}`,
+      createdAt: NOW - 300_000 + i * 1000,
+    });
+  }
+  const GOOD_RUN = "rrn-0000000000000499";
+  await finishedRun(db, good, GOOD_RUN);
+  await pendingSendRow(db, {
+    id: "rsd-0000000000000499", reportId: good.id, runId: GOOD_RUN,
+    recipientId: "rrc-0000000000000499", createdAt: NOW - 60_000,
+  });
+
+  const failing = {
+    async execute(arg) {
+      const sql = typeof arg === "string" ? arg : String(arg?.sql ?? "");
+      if (/UPDATE report_sends SET status = 'refused'/.test(sql)) throw new Error("report_sends is busy");
+      return db.execute(arg);
+    },
+  };
+  const warnings = [];
+  const original = console.warn;
+  console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
+  try {
+    await hook.tick(failing);
+  } finally {
+    console.warn = original;
+  }
+
+  assert.deepEqual(calls, [{ reportId: good.id, runId: GOOD_RUN }],
+    "25 refusals that could not be written did not take the pass's batch");
+  assert.equal(warnings.filter((line) => /could not be refused/.test(line)).length, 1,
+    "one refusal write per report per pass, said once");
+  assert.equal((await oneSend(db, "rsd-0000000000000499")).status, "pending",
+    "the seam the test injected writes no row");
+});
+
 /* -------------------------------------------------------------------- the seam */
 
 test("the hook and its boot helper are wired the way post-listen wires them", () => {
@@ -1124,6 +1925,8 @@ test("the hook and its boot helper are wired the way post-listen wires them", ()
   // approvals deps, so a live run's mail goes through the reports-only send door and no other path.
   assert.match(boot, /import\("\.\.\/reports\/delivery\.js"\)/);
   assert.match(boot, /deliver: makeDeliver\(\{ adapterFor: reportsAdapterFor/);
+  assert.match(boot, /deliverPending: makeDeliverPending\(\{ adapterFor: reportsAdapterFor/);
+  assert.match(boot, /\{ makeDeliver, makeDeliverPending \}/, "both seams come out of the one import");
   assert.doesNotMatch(boot, /deliverNotWired/);
 });
 

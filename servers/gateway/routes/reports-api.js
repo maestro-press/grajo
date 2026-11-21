@@ -47,7 +47,7 @@ import { deleteReport } from "../reports/delete.js";
 import { listRuns } from "../reports/run.js";
 import { approveSource, listDraftSources, revokeSource } from "../reports/source-approvals.js";
 import { requestRun } from "../reports/run-requests.js";
-import { kickReportsHook } from "../reports/schedule-hook.js";
+import { DEFAULT_PENDING_GRACE_MS, kickReportsHook } from "../reports/schedule-hook.js";
 import { createSendToRest, listSends } from "../reports/send-log.js";
 import {
   ASSET_NAME_RE, ASSET_MAX_BYTES, STEP_KEY_RE, approveCredential, approveHost, approveStep,
@@ -611,8 +611,11 @@ export function reportsApiRouter(dashboardAuth, deps = {}) {
 
   // POST /:id/runs/:runId/send-rest — the owner's "Send to the rest": a `pending` row for every
   // approved recipient this run has not sent to, is not sending to, and holds no row for. It SENDS
-  // nothing: those rows are sent by `deliverPending` (reports/delivery.js), which a later PR wires to a
-  // trigger. A malformed run id is a 404, like every other path id here.
+  // nothing: the rows are sent by the reports hook's tick, which calls `deliverPending`
+  // (reports/delivery.js) for them once they are past its grace. A row this tap just wrote is INSIDE
+  // that grace (a delivery may be writing its own pending rows right now), so the immediate kick only
+  // drains what was already due; a second, delayed kick just past the grace is what reaches the new rows
+  // soon instead of up to a minute later. A malformed run id is a 404, like every other path id here.
   router.post(`${REPORTS_API_PREFIX}/:id/runs/:runId/send-rest`, route(
     "POST /:id/runs/:runId/send-rest",
     async (db, req, res) => {
@@ -626,6 +629,11 @@ export function reportsApiRouter(dashboardAuth, deps = {}) {
         runId,
         actor: { kind: "owner" },
       });
+      kickReportsHook();
+      // The rows are younger than the hook's pending grace, so this second kick is the one that sends
+      // them. Unreferenced: a timer must never keep a process (or a test) alive for half a minute.
+      const later = setTimeout(() => kickReportsHook(), DEFAULT_PENDING_GRACE_MS + 1000);
+      later.unref?.();
       res.status(201).json(out);
     },
   ));

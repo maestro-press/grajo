@@ -34,6 +34,25 @@
  *      said once.
  *   4. The run requests (report_run_requests): a preview runs as a preview, a run now runs only for a
  *      live report whose seal verifies. A request for a report that is gone is dropped.
+ *   5. The pending sends (`deliverPending`): the `pending` `report_sends` rows the owner's "Send to the
+ *      rest" wrote (`send-log.js`) go out here, at most one pair of (report, run) per row of a bounded
+ *      batch, oldest first, and only for a run that has FINISHED in a sendable status
+ *      (`SENDABLE_RUN_STATUSES`) and once a row is older than `pendingGraceMs` (so this never races a
+ *      delivery that is writing its own pending rows right now). A pair whose report is gone, not live,
+ *      or whose seal no longer verifies is never handed over: its rows settle `refused` / `not_live`
+ *      (`refusePendingSends` in send-sweep.js), exactly as the send door refuses a row for that reason.
+ *      A report that cannot be read at all is a third answer (`unknown`): that pair is skipped, nothing
+ *      is settled and nothing is remembered, because a database that burped is not a report that
+ *      stopped. The command's guarded pending -> sending claim is what makes a row go at most once,
+ *      whatever overlaps, and this pass remembers the (report, run, pending row ids) set it OFFERED to
+ *      the seam so the same set is not offered again while its rows are still pending: the rows the
+ *      seam SETTLES (no link, a recipient no longer approved, a recipient already spoken for) leave
+ *      `pending` and are never offered again at all, and a set the seam THREW on is forgotten so the
+ *      next pass offers it again (those rows are still owed a send). That memory is also what keeps a
+ *      set the seam cannot move from blocking the pairs behind it: the query takes the oldest eligible
+ *      ROWS (a generous cap, `PENDING_ROW_SCAN`), the pass skips every pair it already offered, and it
+ *      offers at most `PENDING_SEND_BATCH` new ones, so the next pass reaches the rest. This step is in
+ *      BOTH the full and the light pass and sits under the lease the pass already holds.
  *
  * A report that is queued or running is not queued again for the same schedule window: the run table's
  * unique (report_id, scheduled_for) index refuses the duplicate and `startRun` answers
@@ -65,13 +84,17 @@
  * never both sweep.
  *
  * NOTHING HERE SENDS ANYTHING BY ITSELF. This module imports no delivery module and nothing under
- * `mail/`: `deps.deliver` is injected by the caller and passed through to `executeRun`. Boot wires it to
- * `reports/delivery.js`'s `makeDeliver` (the real seam, which is the reports-only send door's one caller),
- * so the one path from a run to a mail is the caller's injection and never a bot door's.
+ * `mail/`: `deps.deliver` and `deps.deliverPending` are injected by the caller. Boot wires the first to
+ * `reports/delivery.js`'s `makeDeliver` and the second to its `makeDeliverPending` (the real seam, which
+ * is the reports-only send door's one caller), so the one path from a run or from a "Send to the rest"
+ * row to a mail is the caller's injection and never a bot door's.
  *
  * `deps`:
  *   - `deliver(db, payload)`: the one outgoing seam, passed to `executeRun`. Absent, a live run is
  *     recorded `failed` with "Delivery is not wired." and its blocks do not run.
+ *   - `deliverPending(db, {reportId, runId})`: sends the `pending` rows one run already holds. Absent,
+ *     this hook sends none of them and says nothing about it.
+ *   - `pendingGraceMs`: how old a `pending` row has to be before this pass sends it (default 30 s).
  *   - `runBlocks`, `writeVersion`: passed through to `executeRun`.
  *   - `approvals`: the approvals deps (`verifyLive` reads them, and the model-change sentence resolves
  *     the new model through `approvals.resolveModelRef`). In production they come from
@@ -96,7 +119,10 @@ import { modelRoleOfRecipe, verifyLive, REPORT_LIVE } from "./approvals.js";
 import { releaseLease, takeLease } from "./lease.js";
 import { executeRun, getRun, getScheduledRun, NOT_LIVE_TEXT, RESTARTED_TEXT, startRun, statusAuditOk } from "./run.js";
 import { claimRunRequests, pruneRunRequests } from "./run-requests.js";
-import { sweepStaleSends } from "./send-sweep.js";
+// The run statuses a send may start from. `send-log.js` owns the list and imports no mail module, so the
+// hook takes it from there rather than keeping a second copy of it.
+import { SENDABLE_RUN_STATUSES } from "./send-log.js";
+import { sweepStaleSends, refusePendingSends } from "./send-sweep.js";
 import { getReport, getRevision, recordAudit } from "./store.js";
 
 /** The hook id the gateway's scheduler knows this by. */
@@ -110,6 +136,33 @@ const REQUEST_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 /** The `dashboard_settings` key that caps how many runs this process works on at once. */
 const CONCURRENCY_KEY = "reports.max_concurrent_runs";
+
+/** How old a `pending` send row has to be before a pass sends it, unless the caller says otherwise. */
+export const DEFAULT_PENDING_GRACE_MS = 30_000;
+
+/** How many distinct (report, run) pairs one pass hands to `deliverPending` at most. */
+export const PENDING_SEND_BATCH = 20;
+
+/**
+ * How many pending ROWS one pass reads at most. The batch above bounds how many pairs are offered;
+ * this only bounds the read, so a pass sees the pairs behind the ones it already offered.
+ */
+export const PENDING_ROW_SCAN = 2000;
+
+/**
+ * How many run ids the "its pending sends could not be sent" warning remembers before it is cleared. The
+ * set exists to say a failure once, not to grow for the life of the process.
+ */
+const PENDING_WARNED_MAX = 1000;
+
+/**
+ * What a report's liveness question may answer. `not_live` is a certainty (the row is gone, its status is
+ * not live, or its seal or audit says no); `unknown` is a fault (a read threw, or there are no approvals
+ * deps to read the seal with). Only a certainty may settle a row.
+ */
+const MAY_SEND_LIVE = "live";
+const MAY_SEND_NOT_LIVE = "not_live";
+const MAY_SEND_UNKNOWN = "unknown";
 
 /** The pause reason when a live-set column (or the status) moved outside the report page. */
 export const SETTINGS_CHANGED_TEXT = "Settings changed outside Crow. Check and go live again.";
@@ -132,6 +185,10 @@ function resolveDeps(deps) {
   const fn = (key, fallback) => (typeof given[key] === "function" ? given[key] : fallback);
   return {
     deliver: typeof given.deliver === "function" ? given.deliver : null,
+    deliverPending: typeof given.deliverPending === "function" ? given.deliverPending : null,
+    pendingGraceMs: Number.isFinite(given.pendingGraceMs) && given.pendingGraceMs >= 0
+      ? given.pendingGraceMs
+      : DEFAULT_PENDING_GRACE_MS,
     runBlocks: fn("runBlocks", undefined),
     writeVersion: fn("writeVersion", undefined),
     approvals: given.approvals ?? null,
@@ -226,6 +283,8 @@ export function registerReportsHook(database, deps = {}) {
     queue: [],
     inFlight: new Set(),
     strays: new Set(),
+    pendingWarned: new Set(),
+    pendingAttempted: new Set(),
     warnedNotPrimary: false,
     warnedSweepSkipped: false,
     swept: false,
@@ -648,6 +707,173 @@ export function registerReportsHook(database, deps = {}) {
     }
   }
 
+  /* ------------------------------------------------------------- the pending sends */
+
+  /**
+   * Whether one report may still send, as one of three answers:
+   *   - `live`: the row exists, its status is live, and the same two checks a run now makes hold — its
+   *     seal verifies and its newest live-kind decision is an approval;
+   *   - `not_live`: the report row is certainly gone, or its status is not live, or `verifyLive` or
+   *     `statusAuditOk` answered false. Its pending rows may settle;
+   *   - `unknown`: the question could not be answered — a read threw, or there are no approvals deps to
+   *     read the seal with. A caller must settle NOTHING on this answer and must not remember the pair:
+   *     a database that burped is not a report that stopped, and its rows are still owed a send.
+   */
+  async function reportMaySend(db, reportId) {
+    // No approvals deps (or none that could read anything) means no way to read the seal at all: that is
+    // not a report that stopped, so nothing may settle on it.
+    const approvals = d.approvals;
+    const readable = approvals != null && typeof approvals === "object"
+      && Object.values(approvals).some((member) => typeof member === "function");
+    if (!readable) return MAY_SEND_UNKNOWN;
+    let report = null;
+    try {
+      report = await getReport(db, reportId);
+    } catch {
+      return MAY_SEND_UNKNOWN;
+    }
+    if (!report || report.status !== REPORT_LIVE) return MAY_SEND_NOT_LIVE;
+    try {
+      if (!(await verifyLive(db, approvals, report))) return MAY_SEND_NOT_LIVE;
+      return (await statusAuditOk(db, report.id)) ? MAY_SEND_LIVE : MAY_SEND_NOT_LIVE;
+    } catch {
+      return MAY_SEND_UNKNOWN;
+    }
+  }
+
+  /**
+   * Send the `pending` rows "Send to the rest" wrote: the distinct (report, run) pairs whose run has
+   * FINISHED in a sendable status and whose oldest pending row is past the grace, oldest first, at most
+   * one batch per pass, and the same set of pending row ids at most ONCE per process.
+   *
+   * A pair whose report is gone, not live, or whose seal no longer verifies is NEVER handed to the seam:
+   * its pending rows settle `refused` / `not_live` (`refusePendingSends`, the twin of the send door's own
+   * refusal) and write no notice. Those rows leave `pending`, so the pair is gone for good. A pair whose
+   * report cannot be read at all is skipped instead: nothing settles and nothing is remembered, so the
+   * next pass asks again (see `reportMaySend`).
+   *
+   * The query reads the oldest eligible ROWS, not the oldest pairs, and the pass skips the pairs it has
+   * already offered: a set the seam could not move while its rows are still pending is remembered (see
+   * `state.pendingAttempted`) instead of being re-read as one of the batch every tick, so the pairs
+   * behind it are reached by a later pass.
+   *
+   * It writes no row of its own and never touches a `sending` or `unknown` one: each pair is handed to
+   * the injected `deliverPending`, whose door claim makes a row go at most once however many passes
+   * overlap. The pair's key (report, run and the sorted ids of the rows it would send) is remembered
+   * BEFORE the seam is called, so a row set the seam could not move is not offered again on every tick.
+   * A seam that THREW has its key deleted again (`read_failed` on a recipient list is a fault, not an
+   * answer about the rows): those rows are still owed a send, so the next pass offers the set again,
+   * while the warning about that run id stays one per process. The rows the seam itself SETTLES leave
+   * `pending`, so their key is pruned from that memory by the next uncapped pass, and a new "Send to the
+   * rest" tap writes new row ids and so a new key. A pair that throws (a report deleted between the row
+   * and the pass, say) is logged once per run id in this process and never breaks the pass.
+   */
+  async function drainPendingSends(db) {
+    if (typeof d.deliverPending !== "function") return;
+    const now = clock(d);
+    const cutoff = now - d.pendingGraceMs;
+    const sendable = SENDABLE_RUN_STATUSES.map(() => "?").join(", ");
+    let pending = [];
+    try {
+      // One statement: every pending row a pair may still send, oldest first, bounded by a row cap so
+      // the pairs a previous pass already offered cannot hide the ones behind them (the batch below is
+      // what limits how many pairs one pass OFFERS).
+      ({ rows: pending } = await db.execute({
+        sql: `SELECT s.report_id AS report_id, s.run_id AS run_id, s.id AS id
+                FROM report_sends s
+               WHERE s.status = 'pending' AND s.created_at <= ?
+                 AND EXISTS (SELECT 1 FROM report_runs r
+                              WHERE r.id = s.run_id AND r.status IN (${sendable}))
+               ORDER BY s.created_at ASC, s.id ASC
+               LIMIT ?`,
+        args: [cutoff, ...SENDABLE_RUN_STATUSES, PENDING_ROW_SCAN],
+      }));
+    } catch (err) {
+      console.warn(`[reports] the pending sends could not be read: ${err?.message || err}`);
+      return;
+    }
+
+    // The rows arrive oldest first, so the pairs come out in the order of their oldest row.
+    const pairs = new Map();
+    for (const row of pending) {
+      const reportId = text(row.report_id);
+      const runId = text(row.run_id);
+      const rowId = text(row.id);
+      if (!reportId || !runId || !rowId) continue;
+      const groupKey = `${reportId}|${runId}`;
+      const pair = pairs.get(groupKey) ?? { reportId, runId, ids: [] };
+      pair.ids.push(rowId);
+      pairs.set(groupKey, pair);
+    }
+
+    // Every pair's key for this pass, computed before the loop: the pass's memory of offered sets is
+    // pruned against ALL of them, not only against the ones it got to before its batch was full.
+    const pairKeys = new Set();
+    for (const pair of pairs.values()) {
+      pair.key = `${pair.reportId}:${pair.runId}:${[...pair.ids].sort().join(",")}`;
+      pairKeys.add(pair.key);
+    }
+
+    // One liveness answer per report per pass, however many runs its rows name.
+    const liveByReport = new Map();
+    // One refusal per report per pass: `refusePendingSends` settles every pending row of the report in
+    // ONE statement, so a report with a thousand pairs costs one write, not a thousand.
+    const refusedReports = new Set();
+    let offered = 0;
+    for (const pair of pairs.values()) {
+      if (offered >= PENDING_SEND_BATCH) break;
+      if (state.pendingAttempted.has(pair.key)) continue;
+      if (!liveByReport.has(pair.reportId)) {
+        liveByReport.set(pair.reportId, reportMaySend(db, pair.reportId));
+      }
+      const answer = await liveByReport.get(pair.reportId);
+      if (answer === MAY_SEND_UNKNOWN) {
+        // The report could not be read at all: this is a fault, not a refusal. Nothing settles, nothing
+        // is remembered and nothing is counted, so the next pass asks again and finds the rows pending.
+        continue;
+      }
+      if (answer !== MAY_SEND_LIVE) {
+        // Nothing goes out for a report that is not live now. Its rows settle terminally, and it is
+        // not remembered as offered (the rows are gone from `pending`, or the write failed and the
+        // next pass tries again). A refusal counts for nothing in this pass's batch: it sends nothing.
+        if (refusedReports.has(pair.reportId)) continue;
+        refusedReports.add(pair.reportId);
+        try {
+          await refusePendingSends(db, { reportId: pair.reportId, now });
+        } catch (err) {
+          console.warn(`[reports] ${pair.reportId}: its pending sends could not be refused: ${err?.code || err?.message || err}`);
+        }
+        continue;
+      }
+      // Only a pair actually handed to the seam is one of this pass's batch, and it is remembered
+      // BEFORE the call: a concurrent pass cannot offer this set again while the call is in hand.
+      offered += 1;
+      state.pendingAttempted.add(pair.key);
+      try {
+        await d.deliverPending(db, { reportId: pair.reportId, runId: pair.runId });
+      } catch (err) {
+        // The seam could not do its work for this pair (a recipient list it could not read, a run that
+        // moved underneath it): its rows are still owed a send, so the key is forgotten and the next
+        // pass offers this very set again. The warning stays one per run id.
+        state.pendingAttempted.delete(pair.key);
+        if (state.pendingWarned.has(pair.runId)) continue;
+        state.pendingWarned.add(pair.runId);
+        if (state.pendingWarned.size > PENDING_WARNED_MAX) state.pendingWarned.clear();
+        console.warn(`[reports] run ${pair.runId}: its pending sends could not be sent: ${err?.code || err?.message || err}`);
+      }
+    }
+
+    // An UNCAPPED scan read every pending row there is, so a remembered key that is not among this
+    // pass's pairs names rows that are no longer pending (settled, or deleted): it is forgotten, and the
+    // set cannot grow into a list of every pair this process ever offered. A capped scan says nothing
+    // about the rows it did not read, so it prunes nothing.
+    if (pending.length < PENDING_ROW_SCAN) {
+      for (const key of state.pendingAttempted) {
+        if (!pairKeys.has(key)) state.pendingAttempted.delete(key);
+      }
+    }
+  }
+
   /* -------------------------------------------------------------------- the sweep */
 
   /** The run rows a restart cut off, marked once. Its flag is set only by the pass that marked them. */
@@ -757,6 +983,7 @@ export function registerReportsHook(database, deps = {}) {
     }
     await dispatchDue(db);
     await drainRequests(db);
+    await drainPendingSends(db);
   }
 
   async function tick(database2) {
@@ -811,7 +1038,8 @@ export function registerReportsHook(database, deps = {}) {
     });
   }
 
-  /** A run route just wrote a request: drain it now instead of at the next tick. */
+  /** A route just wrote something for the next pass (a run request, a set of pending sends): run one
+   *  now, light, instead of waiting for the next tick. */
   function kick() {
     try {
       serialized(() => runTick(database, { light: true })).catch((err) => {
@@ -840,8 +1068,9 @@ export function registerReportsHook(database, deps = {}) {
 }
 
 /**
- * Wake the registered hook in this process, if there is one: drain the request queue and the due rows
- * now, fire-and-forget. A process with no hook (a `--no-auth` companion, a test harness) does nothing.
+ * Wake the registered hook in this process, if there is one: drain the request queue, the due rows and
+ * the pending sends now, fire-and-forget. A process with no hook (a `--no-auth` companion, a test
+ * harness) does nothing.
  *
  * @returns {boolean} whether a hook was woken
  */

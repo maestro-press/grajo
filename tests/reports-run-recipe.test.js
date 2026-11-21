@@ -32,12 +32,16 @@ const { REPORTS_BUNDLE, saveServiceSecret } = await import("../servers/gateway/k
 const {
   approveCredential, approveHost, injectHashOf, proposeCredential, proposeHost,
 } = await import("../servers/gateway/reports/steps.js");
-const { approveGoLive } = await import("../servers/gateway/reports/approvals.js");
+const { approveGoLive, approveRecipient, proposeRecipient } =
+  await import("../servers/gateway/reports/approvals.js");
+const { deliver } = await import("../servers/gateway/reports/delivery.js");
 const { executeRun, getRun, startRun } = await import("../servers/gateway/reports/run.js");
 const { makeStateAccess, runRecipe } = await import(
   "../servers/gateway/reports/blocks/run-recipe.js"
 );
-const { customBlock } = await import("../servers/gateway/reports/blocks/custom.js");
+const { customBlock, MAX_EMAIL_TEXT_BYTES } = await import(
+  "../servers/gateway/reports/blocks/custom.js"
+);
 const { approveSource, settingsHashOf } = await import(
   "../servers/gateway/reports/source-approvals.js"
 );
@@ -707,7 +711,7 @@ async function runCustom(db, reportId, deps) {
   });
 }
 
-test("a custom step's section is custom: its type, files, specs, links and email are not trusted", async () => {
+test("a custom step's section is custom: its type, files, specs and links are not trusted", async () => {
   const db = await freshDb();
   const report = await prepare(db);
   await approveStepFor(db, report.id);
@@ -719,7 +723,9 @@ test("a custom step's section is custom: its type, files, specs, links and email
       specs: -5,
       assets: [{ path: "plot.svg", contentType: "image/svg+xml", base64: SVG_BASE64 }],
     }],
-    email: { to: "sam@example.com" },
+    email: {
+      to: "sam@example.com", cc: "boss@example.com", subject: "Mine", html: "<p>hi</p>", text: "hi",
+    },
   };
   const deps = blockDeps({ runStep: stepAnswer(output) });
   const out = await runCustom(db, report.id, deps);
@@ -738,7 +744,7 @@ test("a custom step's section is custom: its type, files, specs, links and email
   assert.ok(!JSON.stringify(out.document).includes(SVG_BASE64));
   assert.ok(out.document.markdown.includes("Mine."), "the step's words are in the body");
 
-  // The block's own answer carries no `email`: a step cannot hand the send path its own recipients.
+  // The block's own answer carries the BODY only: the two string halves, and nothing else.
   const answer = await customBlock.run({
     db,
     deps,
@@ -747,7 +753,129 @@ test("a custom step's section is custom: its type, files, specs, links and email
     block: CUSTOM_RECIPE.blocks[0],
     blockId: "fetch",
   }, { items: [], sections: [] });
-  assert.ok(!Object.hasOwn(answer, "email"), "a step's own mail fields are dropped");
+  assert.deepEqual(answer.email, { html: "<p>hi</p>", text: "hi" },
+    "a step's own mail fields are dropped, and its body alone is carried");
+  assert.ok(!Object.hasOwn(answer.email, "to"), "a step cannot hand the send path its own recipients");
+});
+
+test("a custom step's email body rides the run result out to delivery", async () => {
+  const { db, report, deps } = await liveReport();
+  const seen = [];
+  const runId = await queueRun(db, report.id);
+  const out = await executeRun(db, runDeps({
+    approvals: deps,
+    runStep: stepAnswer({ items: ITEMS, email: { html: "<p>ours</p>", text: "ours" } }),
+    deliver: async (_db, payload) => { seen.push(payload); },
+  }), runId);
+  assert.equal(out.status, "ok");
+  assert.deepEqual(seen.length, 1, "the run delivered once");
+  assert.deepEqual(seen[0].result.email, { html: "<p>ours</p>", text: "ours" },
+    "the step's own body reaches delivery in the run's result");
+});
+
+test("a custom step's own links are not live in what reaches the door, and the footer is still there", async () => {
+  const { db, report } = await liveReport();
+  const slug = "listings";
+  // A project row, so the mail's own link is an absolute URL this instance can build.
+  await db.execute({
+    sql: "INSERT INTO project_spaces (id, slug, name) VALUES (?, ?, ?)",
+    args: [PROJECT, slug, "Listings"],
+  });
+  const proposed = await proposeRecipient(db, approvalsDeps(report), {
+    reportId: report.id, address: "alex@example.com", displayName: "Alex",
+    commentTier: "c", proposedBy: "owner",
+  });
+  await approveRecipient(db, approvalsDeps(report), { recipientId: proposed.id, actor: OWNER });
+
+  // The step answers items carrying X, and an email body that links X and Y. X is the step's OWN item's
+  // URL (so it approves nothing), and Y is a URL no item carries at all.
+  const X = "https://evil.example/x";
+  const Y = "https://other.example/y";
+  const out = await runCustom(db, report.id, blockDeps({
+    runStep: stepAnswer({
+      items: [{ id: "a", link: X }, { id: "b", title: "Two" }],
+      email: {
+        html: `<p><a href="${X}">first</a> and <a href="${Y}">second</a></p>`,
+        text: `first ${X} second ${Y}`,
+      },
+    }),
+  }));
+  assert.deepEqual(out.sourceErrors, []);
+  assert.ok(out.email != null, "the step's own body is what the run carries out");
+  assert.ok(!out.allowedLinks.includes(X), "a step's own item approves no link");
+  assert.ok(!out.allowedLinks.includes(Y));
+
+  // A finished run row to name, and the mail that run's delivery builds from that result.
+  const { runId } = await startRun(db, { now: () => T0 }, {
+    reportId: report.id, trigger: "manual", requestedBy: "owner",
+  });
+  await db.execute({
+    sql: "UPDATE report_runs SET status = 'ok', ended_at = ? WHERE id = ?",
+    args: [T0, runId],
+  });
+  const sent = [];
+  const counts = await deliver(db, {
+    approvals: approvalsDeps(report),
+    now: () => T0,
+    getSecrets: () => [],
+    baseUrl: "https://crow.example.ts.net",
+    notify: async () => null,
+    holdVersion: async () => ({}),
+    sendMail: async (_db, _deps, input) => { sent.push(input); return { status: "sent" }; },
+  }, {
+    report: { ...(await getReport(db, report.id)), delivery_mode: "email_full" },
+    run: { id: runId, reportId: report.id, trigger: "manual", requestedBy: "owner", status: "ok" },
+    live: null,
+    status: "ok",
+    artifactVersion: null,
+    result: { document: out.document, allowedLinks: out.allowedLinks, email: out.email },
+  });
+
+  assert.equal(counts.sent, 1, "the mail reached the door once");
+  const { html, text } = sent[0];
+  assert.ok(!html.includes(`href="${X}"`), `the step's own item URL is not a live href: ${html}`);
+  assert.ok(!html.includes(`href="${Y}"`), "and neither is a URL no item carries");
+  assert.ok(!html.includes(X) && !html.includes(Y), "neither is written out as a URL either");
+  assert.match(html, /\[link removed\]/, `the refused links become the plain marker: ${html}`);
+  assert.equal((html.match(/\[link removed\]/g) || []).length, 2,
+    `one marker per refused URL: ${html}`);
+  const url = `https://crow.example.ts.net/dashboard/project/${slug}/reports/${report.id}/runs/${runId}`;
+  assert.ok(html.includes(`<p>Open this report: <a href="${url}">${url}</a></p>`),
+    "the footer is still there, after the sanitised body");
+  assert.ok(text.trimEnd().endsWith(`Open this report: ${url}`), "and it ends the text half");
+  assert.ok(!text.includes(X) && !text.includes(Y), "the text half refuses them too");
+});
+
+test("a custom step's email output that is not a body is a warning, and the run still builds", async () => {
+  const db = await freshDb();
+  const report = await prepare(db);
+  await approveStepFor(db, report.id);
+  const shapes = [
+    ["a non-string half", { html: 42, text: "hi" }],
+    ["a text over the cap", { text: "x".repeat(MAX_EMAIL_TEXT_BYTES + 1) }],
+    ["an array", ["hi"]],
+    ["an empty object", {}],
+  ];
+  for (const [name, email] of shapes) {
+    const out = await runCustom(db, report.id, blockDeps({
+      runStep: stepAnswer({ items: ITEMS, sections: [{ markdown: "still here" }], email }),
+    }));
+    assert.equal(out.email, null, `${name}: no body is carried`);
+    assert.deepEqual(out.warnings, [{ source: "fetch", message: "custom_email_invalid" }], name);
+    assert.deepEqual(out.sourceErrors, [], `${name}: the block did not fail`);
+    assert.ok(out.document && out.document.markdown, `${name}: the document is still built`);
+  }
+
+  // The executor records the advisory note beside the run and fails nothing.
+  const live = await liveReport();
+  const runId = await queueRun(live.db, live.report.id);
+  const executed = await executeRun(live.db, runDeps({
+    approvals: live.deps,
+    runStep: stepAnswer({ items: ITEMS, email: { html: 42 } }),
+  }), runId);
+  assert.equal(executed.status, "ok", "an invalid body does not fail the run");
+  assert.deepEqual((await getRun(live.db, runId)).blockLog.warnings,
+    [{ source: "fetch", message: "custom_email_invalid" }]);
 });
 
 test("a custom step's section cannot add a heading of its own", async () => {

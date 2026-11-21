@@ -15,9 +15,14 @@
  * `unknown` is the honest answer: nobody knows whether the provider took the message, so it is never
  * resent automatically. The owner gets ONE notice per affected run, with plain counts for that run:
  * how many went, how many nobody can confirm, and how many are still waiting. A `pending` row stays
- * pending: the rows written by "Send to the rest" are sent by `deliverPending` (delivery.js), which a
- * later PR wires to a trigger, so this sweep never picks one up itself. The report title is untrusted
+ * pending: the rows written by "Send to the rest" are sent by `deliverPending` (delivery.js), which the
+ * reports hook's tick calls, so this sweep never picks one up itself. The report title is untrusted
  * text, so it loses its control characters and is bounded before it reaches a bell.
+ *
+ * The same send log carries the rows the owner's "Send to the rest" wrote (`pending`, send-log.js). A
+ * report that is paused, gone, or whose seal no longer verifies must send none of them, so the hook
+ * settles them through `refusePendingSends` below — the twin of the reports-only send door's own
+ * refusal — before it ever reaches the delivery seam.
  *
  * This module imports nothing under `mail/`: the notification comes in as a callback, and the caller
  * (reports/schedule-hook.js) already holds the owner's notice channel and the reports lease.
@@ -32,6 +37,29 @@ export const RESTARTED_SENDING_TITLE = "Crow restarted while sending";
 
 /** The longest report title a bell carries. */
 const TITLE_MAX = 80;
+
+/**
+ * Settle every `pending` row of ONE report as `refused` / `not_live`: the twin of the reports-only send
+ * door's own refusal, which writes that same status and reason for a pending row whose report is gone or
+ * no longer live. Only `pending` rows move, so a row that is `sending`, `sent`, `unknown`, `failed` or
+ * already `refused` is never rewritten by this.
+ *
+ * It writes no notice: the owner already knows the report was paused or taken off live.
+ *
+ * @param {object} db a libsql-shaped client
+ * @param {{reportId?: string, now?: number}} [input]
+ * @returns {Promise<number>} how many rows settled
+ */
+export async function refusePendingSends(db, { reportId, now } = {}) {
+  if (reportId == null || reportId === "") return 0;
+  const at = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  const result = await db.execute({
+    sql: `UPDATE report_sends SET status = 'refused', reason = 'not_live', updated_at = ?
+           WHERE report_id = ? AND status = 'pending'`,
+    args: [at, reportId],
+  });
+  return Number(result?.rowsAffected ?? 0);
+}
 
 /** The shortest count sentence there is, in the words the plan's own example uses. */
 export function countsText({ sent, unknown, notSent }) {

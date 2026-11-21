@@ -33,7 +33,7 @@ const { registerReportsHook, _setReportsHookForTest } = await import(
   "../servers/gateway/reports/schedule-hook.js"
 );
 const {
-  RESTARTED_SEND_REASON, RESTARTED_SENDING_TITLE, restartSendNotice, sweepStaleSends,
+  RESTARTED_SEND_REASON, RESTARTED_SENDING_TITLE, refusePendingSends, restartSendNotice, sweepStaleSends,
 } = await import("../servers/gateway/reports/send-sweep.js");
 const {
   createReport, saveRecipe, updateReportColumns,
@@ -264,6 +264,48 @@ test("the sweep's notice strips a title's control characters and bounds it", asy
   assert.deepEqual(restartSendNotice({}), {
     title: `This report: ${RESTARTED_SENDING_TITLE}`, body: "0 sent, 0 unknown, 0 not sent.",
   });
+});
+
+/* ------------------------------------------------- the pending rows of one report */
+
+test("refusePendingSends settles one report's pending rows as refused/not_live, and nothing else", async () => {
+  const { db, reportId, runId, recipient } = await world();
+  const other = await createReport(db, { projectId: 7, owner: "owner", botId: "bot-1", title: "Other" });
+  const pending = await sendRow(db, { runId, reportId, recipientId: recipient.id, status: "pending" });
+  const second = await sendRow(db, {
+    runId, reportId, recipientId: recipient.id, attempt: 2, status: "pending",
+  });
+  const sent = await sendRow(db, {
+    runId, reportId, recipientId: recipient.id, attempt: 3, status: "sent", gateway: RUN_ID,
+  });
+  const sending = await sendRow(db, {
+    runId, reportId, recipientId: recipient.id, attempt: 4, status: "sending", gateway: RUN_ID,
+  });
+  const unknown = await sendRow(db, {
+    runId, reportId, recipientId: recipient.id, attempt: 5, status: "unknown", gateway: "run-old",
+  });
+  const elsewhere = await sendRow(db, {
+    runId, reportId: other.id, recipientId: recipient.id, attempt: 6, status: "pending",
+  });
+
+  const settled = await refusePendingSends(db, { reportId, now: T0 + 1234 });
+
+  assert.equal(settled, 2, "both pending rows of the one report");
+  for (const id of [pending, second]) {
+    const row = await rowOf(db, id);
+    assert.equal(row.status, "refused");
+    assert.equal(row.reason, "not_live", "the send door's own word for a row whose report is not live");
+    assert.equal(Number(row.updated_at), T0 + 1234);
+    assert.equal(row.claim_token, null, "no claim was made for a row that never went out");
+  }
+  assert.equal((await rowOf(db, sent)).status, "sent", "a sent row is untouched");
+  assert.equal((await rowOf(db, sending)).status, "sending", "an in-flight row is untouched");
+  assert.equal((await rowOf(db, unknown)).status, "unknown", "an unknown row is untouched");
+  assert.equal((await rowOf(db, elsewhere)).status, "pending", "another report's rows are untouched");
+
+  // A second call has nothing left to do for this report, and no report id is a no-op.
+  assert.equal(await refusePendingSends(db, { reportId, now: T0 + 5678 }), 0);
+  assert.equal(await refusePendingSends(db, {}), 0);
 });
 
 /* --------------------------------------------------------------- the door's own half */

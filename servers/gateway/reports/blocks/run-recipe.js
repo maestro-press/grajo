@@ -3,7 +3,7 @@
  *
  * `runRecipe(db, deps, {report, recipe, run, live, state})` flows `{items, sections}` from block to
  * block and answers `{items, sections, warnings, sourceErrors, stateWrites, document, allowedLinks,
- * summary}`:
+ * summary, email}`:
  *   - `items` is what the last block left (a source block's items, filtered and sorted by the shape
  *     blocks after it); the run engine counts it for the run's status and the block log.
  *   - `sourceErrors` is one `{source: <block id>, message: <code word>}` per source or custom block that
@@ -12,13 +12,19 @@
  *   - `warnings` is the same shape for a shape block that failed. A shape block only arranges data the
  *     sources already produced, so its failure is recorded and the run goes on. A block may also answer
  *     an advisory `warnings: [{message}]` list beside its own section (the chart block's
- *     `chart_rows_dropped`), and those are recorded here too: an advisory note never fails a run.
+ *     `chart_rows_dropped`, a custom block's `custom_email_invalid`), and those are recorded here too:
+ *     an advisory note never fails a run.
  *   - `stateWrites` is `[{key, value}]` in the order the blocks buffered them, and it is NOT applied
  *     here: the run engine applies it after the version write, only for a run that ends not-failed and
  *     never for a preview.
  *   - `document` is the assembled source the artifact bridge writes (`{markdown, assets?}`),
  *     `allowedLinks` the run's own item URLs and `summary` its counts; see the header's THE DOCUMENT
  *     paragraph.
+ *   - `email` is a custom step's own mail body (`{html?, text?}`), or null when no step answered one, and
+ *     the LAST valid one wins. Only the `custom` kind may set it: `blocks/custom.js` narrows it to those
+ *     two string halves (no recipient, no subject, each within its cap) and the send path sanitises and
+ *     neutralises it against the run's own items. It travels to delivery in this result and is never part
+ *     of the document, the block log or the version.
  *
  * `ctx` is what one block gets: `{db, deps, report, run, live, block, blockId, getState, setState,
  * fetch, mail, workspaceDir, log, extraStepClaim, extraStepClaimToken, sources}`.
@@ -307,7 +313,7 @@ async function workspaceDirFor(db, report, seam, testSeams) {
  * @param {{report: object, recipe: object, run: object, live?: object|null, state?: object}} input
  * @returns {Promise<{items: object[], sections: object[], warnings: object[],
  *   sourceErrors: object[], stateWrites: {key: string, value: *}[], document: object|null,
- *   allowedLinks: string[], summary: object|null}>}
+ *   allowedLinks: string[], summary: object|null, email: {html?: string, text?: string}|null}>}
  */
 export async function runRecipe(db, deps, { report, recipe, run, live = null, state = null } = {}) {
   const seam = isPlainObject(deps) ? deps : {};
@@ -360,6 +366,8 @@ export async function runRecipe(db, deps, { report, recipe, run, live = null, st
   const sourceErrors = [];
   let items = [];
   let sections = [];
+  // A custom step's own mail body for this run: null until one answers a valid one, the last one wins.
+  let email = null;
   const blocks = Array.isArray(recipe?.blocks) ? recipe.blocks : [];
 
   // The owner-history answers of this run's gate: ONE read of the report's revisions, asked for on the
@@ -447,6 +455,9 @@ export async function runRecipe(db, deps, { report, recipe, run, live = null, st
     }
 
     if (Array.isArray(output?.items)) items = output.items.slice(0, MAX_ITEMS);
+    // Only a custom block may name the run's email body, and its own block has already narrowed it to the
+    // two string halves (blocks/custom.js): anything that is not a plain object is not a body.
+    if (entry.kind === "custom" && isPlainObject(output?.email)) email = { ...output.email };
     if (Array.isArray(output?.sections) && output.sections.length) {
       // A present block answers the list it was handed plus its own section (the block contract), so its
       // answer replaces the list; every other kind answers only its own new sections, which are appended.
@@ -479,7 +490,9 @@ export async function runRecipe(db, deps, { report, recipe, run, live = null, st
     summary = assembled.summary;
   }
 
-  return { items, sections, warnings, sourceErrors, stateWrites, document, allowedLinks, summary };
+  return {
+    items, sections, warnings, sourceErrors, stateWrites, document, allowedLinks, summary, email,
+  };
 }
 
 /**

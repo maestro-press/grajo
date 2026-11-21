@@ -24,7 +24,7 @@ const MASTER = join(root, "master", "crow.db");
 
 const { createDbClient } = await import("../servers/db.js");
 const {
-  DEFAULT_LINK_DAYS, LINK_DAYS_KEY, deliver, deliverPending, makeDeliver,
+  DEFAULT_LINK_DAYS, LINK_DAYS_KEY, deliver, deliverPending, makeDeliver, makeDeliverPending,
 } = await import("../servers/gateway/reports/delivery.js");
 const { DEFAULT_EMPTY_TEXT } = await import("../servers/gateway/reports/document.js");
 const { STORAGE_NEARLY_FULL_TEXT } = await import("../servers/gateway/reports/artifact-bridge.js");
@@ -37,6 +37,7 @@ const {
 } = await import("../servers/gateway/reports/store.js");
 const { startRun } = await import("../servers/gateway/reports/run.js");
 const { createSendToRest, listSends } = await import("../servers/gateway/reports/send-log.js");
+const { registerReportsHook } = await import("../servers/gateway/reports/schedule-hook.js");
 const { createAccount } = await import("../servers/gateway/mail/store/accounts.js");
 const { MailError } = await import("../servers/gateway/mail/errors.js");
 const { initArtifactsTables } = await import("../bundles/artifacts/server/init-tables.js");
@@ -386,6 +387,32 @@ test("crow_only sends no email but still notifies the owner", async () => {
   assert.equal((await sendRows(w.db, w.runId)).length, 0, "and no send row");
 });
 
+test("crow_only has no mail: its pending rows settle refused and nothing is sent", async () => {
+  const w = await world();
+  await recipientFor(w.db, w.reportId);
+  await updateReportColumns(w.db, w.reportId, { delivery_mode: "crow_only" });
+  await finishRun(w.db, w.runId);
+  const made = await createSendToRest(w.db, { approvals: approvalsDeps(), now: () => T0 }, {
+    reportId: w.reportId, runId: w.runId, actor: OWNER,
+  });
+  assert.equal(made.created.length, 1, "the tap writes the row it would write for any report");
+
+  const mail = recorder();
+  const bell = notes();
+  const counts = await deliverPending(w.db, deliveryDeps({ sendMail: mail.sendMail, notify: bell.notify }), {
+    reportId: w.reportId, runId: w.runId,
+  });
+  assert.deepEqual(counts, { sent: 0, refused: 0, failed: 0, unknown: 0, skipped: 0 });
+  assert.deepEqual(mail.calls, [], "a crow_only report sends no email at all");
+  assert.deepEqual(bell.list, [], "and rings nothing about it");
+  // Nothing will ever claim a row for a report with no mail, so it settles terminally instead of
+  // sitting in the hook's scan for the life of the log.
+  const row = (await sendRows(w.db, w.runId)).find((entry) => entry.id === made.created[0]);
+  assert.equal(row.status, "refused");
+  assert.equal(row.reason, "not_live");
+  assert.equal(Number(row.updated_at), T0);
+});
+
 /* --------------------------------------------------------------- the pinned version */
 
 /** A live world with an artifact whose newest recipient-safe version (3) is not the current one (7). */
@@ -712,6 +739,96 @@ test("a custom template's links that the items do not carry are neutralised", as
   assert.ok(!text.includes("https://other.example.com/page"), "and not in the text either");
 });
 
+test("a run's own email body is sanitised, and the footer still ends both halves", async () => {
+  const w = await world();
+  await recipientFor(w.db, w.reportId);
+  const mail = recorder();
+  await deliver(w.db, deliveryDeps({ sendMail: mail.sendMail }), {
+    report: { ...w.report, delivery_mode: "email_full" },
+    run: w.run,
+    live: null,
+    status: "ok",
+    artifactVersion: null,
+    result: {
+      document: { markdown: "# The report body" },
+      email: {
+        html: [
+          "<p>Our own words</p>",
+          '<script>alert("x")</script>',
+          '<p onclick="steal()">tap here</p>',
+          '<form action="https://evil.example/post"><input name="q"></form>',
+          '<iframe src="https://evil.example/frame"></iframe>',
+          '<p><a href="javascript:alert(1)">bad link</a></p>',
+        ].join(""),
+        text: "Our own words",
+      },
+    },
+  });
+  const { html, text } = mail.calls[0];
+  assert.ok(html.includes("<p>Our own words</p>"), "the step's own body is the mail body");
+  assert.ok(!html.includes("The report body"), "and it replaces the document");
+  for (const raw of ["<script", "onclick", "<form", "<iframe", "javascript:"]) {
+    assert.ok(!html.toLowerCase().includes(raw), `${raw} does not survive: ${html}`);
+  }
+  assert.ok(html.includes("tap here"), "the words of the stripped element stay");
+  const url = `${BASE}/dashboard/project/weekly-listings/reports/${w.reportId}/runs/${w.runId}`;
+  assert.ok(html.endsWith(`<p>${FOOTER}<a href="${url}">${url}</a></p>`),
+    "the footer is the last thing in the html");
+  assert.ok(text.includes("Our own words"));
+  assert.ok(text.endsWith(`${FOOTER}${url}`), "the footer is the last thing in the text");
+});
+
+test("a link in a run's own email body is live only when the run's items carry it", async () => {
+  const w = await world();
+  await recipientFor(w.db, w.reportId);
+  const kept = "https://listings.example.com/a";
+  const mail = recorder();
+  await deliver(w.db, deliveryDeps({ sendMail: mail.sendMail }), {
+    report: { ...w.report, delivery_mode: "email_full" },
+    run: w.run,
+    live: null,
+    status: "ok",
+    artifactVersion: null,
+    result: {
+      document: { markdown: "# Body" },
+      allowedLinks: [kept],
+      email: {
+        html: '<p><a href="https://other.example.com/page">other</a> and '
+          + `<a href="${kept}">ours</a></p>`,
+        text: `other https://other.example.com/page ours ${kept}`,
+      },
+    },
+  });
+  const { html, text } = mail.calls[0];
+  assert.ok(html.includes(`href="${kept}"`), "the run's own URL is a live link");
+  assert.ok(!html.includes('href="https://other.example.com/page"'), "a URL it does not carry is not");
+  assert.match(html, /\[link removed\]/, "the refused link becomes the plain marker");
+  assert.ok(text.includes(kept), "the run's own URL stays in the text");
+  assert.ok(!text.includes("https://other.example.com/page"), "the other one is not in the text either");
+  assert.match(text, /\[link removed\]/);
+});
+
+test("an empty or invalid run email falls back to the document body", async () => {
+  const w = await world();
+  await recipientFor(w.db, w.reportId);
+  const url = `${BASE}/dashboard/project/weekly-listings/reports/${w.reportId}/runs/${w.runId}`;
+  for (const email of [null, {}, { html: "", text: "" }, "not a body"]) {
+    const mail = recorder();
+    await deliver(w.db, deliveryDeps({ sendMail: mail.sendMail }), {
+      report: { ...w.report, delivery_mode: "email_full" },
+      run: w.run,
+      live: null,
+      status: "ok",
+      artifactVersion: null,
+      result: { document: { markdown: "# The report body" }, allowedLinks: [], email },
+    });
+    const { html, text } = mail.calls[0];
+    assert.ok(html.includes("The report body"), `${JSON.stringify(email)}: the default layout is used`);
+    assert.ok(text.includes("The report body"), `${JSON.stringify(email)}: in the text too`);
+    assert.ok(text.endsWith(`${FOOTER}${url}`), `${JSON.stringify(email)}: and the footer still ends it`);
+  }
+});
+
 /* ----------------------------------------------------------------- the real door */
 
 test("an app-password Crow Mail account can be the sender", async () => {
@@ -935,8 +1052,86 @@ test("deliverPending never sends beside a row that already went", async () => {
   assert.deepEqual(counts, { sent: 0, refused: 0, failed: 0, unknown: 0, skipped: 1 });
   assert.equal(mail.calls.length, 0, "a sent row is the answer never again");
   const rows = await sendRows(w.db, w.runId);
-  assert.equal(rows.find((row) => row.id === "rsd-pending-0000001").status, "pending",
-    "the pending row is left exactly as it was");
+  const beside = rows.find((row) => row.id === "rsd-pending-0000001");
+  assert.equal(beside.status, "refused", "the row can never go, so it settles instead of waiting");
+  assert.equal(beside.reason, "not_pending", "the door's own word for a row that lost its turn");
+  assert.equal(rows.find((row) => row.id === "rsd-sent-0000000001").status, "sent",
+    "and the row that went is never rewritten");
+});
+
+test("a no-link pending row settles failed, and the owner's next tap is not blocked by it", async () => {
+  const w = await world();
+  // A tier `a` recipient has no link kind yet, so nothing can be claimed or mailed for it.
+  await recipientFor(w.db, w.reportId, { tier: "a" });
+  await finishRun(w.db, w.runId);
+  const tap = { approvals: approvalsDeps(), now: () => T0 };
+  const made = await createSendToRest(w.db, tap, { reportId: w.reportId, runId: w.runId, actor: OWNER });
+  assert.equal(made.created.length, 1);
+
+  const mail = recorder();
+  const bell = notes();
+  const counts = await deliverPending(w.db, deliveryDeps({ sendMail: mail.sendMail, notify: bell.notify }), {
+    reportId: w.reportId, runId: w.runId,
+  });
+  assert.deepEqual(counts, { sent: 0, refused: 0, failed: 0, unknown: 0, skipped: 1 },
+    "a row with no link is a skip, not a failed send");
+  assert.equal(mail.calls.length, 0, "nothing was mailed");
+  const settled = (await sendRows(w.db, w.runId)).find((row) => row.id === made.created[0]);
+  assert.equal(settled.status, "failed");
+  assert.equal(settled.reason, "no_link");
+  assert.equal(bell.list.length, 1, "and still exactly one notice");
+  assert.match(bell.list[0].title, /no link$/);
+
+  // The settled row no longer reads as "pending", so the owner's next tap writes a new attempt.
+  const again = await createSendToRest(w.db, tap, { reportId: w.reportId, runId: w.runId, actor: OWNER });
+  assert.equal(again.created.length, 1, "a settled row no longer blocks the next tap");
+  assert.notEqual(again.created[0], made.created[0]);
+  assert.deepEqual((await sendRows(w.db, w.runId)).map((row) => row.attempt), [1, 2],
+    "a new attempt beside the settled one");
+});
+
+/* --------------------------------------------------- a recipient read that fails */
+
+test("a recipient read that throws settles nothing and rejects read_failed", async () => {
+  const w = await world();
+  const recipient = await recipientFor(w.db, w.reportId);
+  await finishRun(w.db, w.runId);
+  const pendingId = await addSendRow(w.db, {
+    id: "rsd-readfail-0000001", runId: w.runId, reportId: w.reportId, recipientId: recipient.id,
+    attempt: 1, accountId: w.account.id, status: "pending",
+  });
+
+  const mail = recorder();
+  const bell = notes();
+  // The recipients table is the read `listRecipients` goes through: a database that cannot answer it
+  // knows nothing about who may be mailed, so no row may be settled on that answer.
+  const broken = {
+    async execute(arg) {
+      const sql = typeof arg === "string" ? arg : String(arg?.sql ?? "");
+      if (/FROM report_recipients/.test(sql)) throw new Error("report_recipients is busy");
+      return w.db.execute(arg);
+    },
+  };
+
+  await assert.rejects(
+    deliverPending(broken, deliveryDeps({ sendMail: mail.sendMail, notify: bell.notify }), {
+      reportId: w.reportId, runId: w.runId,
+    }),
+    (err) => err.code === "read_failed",
+  );
+  assert.deepEqual(mail.calls, [], "nothing was mailed");
+  assert.deepEqual(bell.list, [], "and nothing was said about a question nobody could answer");
+  const row = (await sendRows(w.db, w.runId)).find((entry) => entry.id === pendingId);
+  assert.equal(row.status, "pending", "no row is settled on a read that failed");
+  assert.equal(row.reason, null);
+
+  // The next call, with a database that answers, sends the row: it was never given up.
+  const counts = await deliverPending(w.db, deliveryDeps({ sendMail: mail.sendMail, notify: bell.notify }), {
+    reportId: w.reportId, runId: w.runId,
+  });
+  assert.deepEqual(counts, { sent: 1, refused: 0, failed: 0, unknown: 0, skipped: 0 });
+  assert.equal(mail.calls.length, 1);
+  assert.equal(mail.calls[0].sendId, pendingId);
 });
 
 test("a preview run is never sent by deliverPending", async () => {
@@ -959,4 +1154,79 @@ test("a preview run is never sent by deliverPending", async () => {
   assert.equal(mail.calls.length, 0, "a preview is never approved mail");
   const [row] = await sendRows(w.db, preview.runId);
   assert.equal(row.status, "pending", "and its row is left as it was");
+});
+
+/* --------------------------------------------------- one row goes at most once */
+
+test("concurrent deliverPending calls and hook passes send one pending row exactly once", async () => {
+  const w = await world();
+  const recipient = await recipientFor(w.db, w.reportId);
+  await finishRun(w.db, w.runId);
+  // The report's schedule row names the report, so the hook's row guard leaves the report live.
+  await w.db.execute({
+    sql: "UPDATE schedules SET task = ? WHERE id = (SELECT schedule_id FROM reports WHERE id = ?)",
+    args: [`report:${w.reportId}`, w.reportId],
+  });
+  const pendingId = await addSendRow(w.db, {
+    id: "rsd-once-0000000001", runId: w.runId, reportId: w.reportId, recipientId: recipient.id,
+    attempt: 1, accountId: w.account.id, status: "pending",
+  });
+
+  // The real door, behind a fake adapter: the door's own pending -> sending claim is what can make the
+  // row go once, so the adapter is the only thing that counts what left.
+  const messages = [];
+  const seam = makeDeliverPending(deliveryDeps({
+    sendMail: undefined,
+    now: () => T0,
+    adapterFor: async (account, fn) => {
+      assert.equal(account.id, w.account.id, "the report's own sender");
+      return fn({
+        send: async (message) => {
+          messages.push(message);
+          return {
+            messageId: "<provider-once@example.com>",
+            accepted: [{ address: recipient.address }],
+            rejected: [],
+          };
+        },
+      });
+    },
+  }));
+  // The pending row was written at T0: the hook reads it well past its 30 s grace.
+  const later = T0 + 60_000;
+  const hook = registerReportsHook(w.db, {
+    approvals: approvalsDeps(),
+    now: () => later,
+    notify: async () => null,
+    instanceZone: async () => "UTC",
+    getSecrets: () => [],
+    lease: {
+      now: () => later, pid: 4331, isPidAlive: () => true,
+      kernelBootId: () => "boot-delivery", runId: "run-delivery",
+    },
+    deliverPending: seam,
+  });
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 200));
+  try {
+    await Promise.all([
+      seam(w.db, { reportId: w.reportId, runId: w.runId }),
+      seam(w.db, { reportId: w.reportId, runId: w.runId }),
+    ]);
+    await hook.tick(w.db);
+    hook.kick();
+    await settle();
+
+    assert.equal(messages.length, 1, "one row, one message, whatever overlapped");
+    const rows = await sendRows(w.db, w.runId);
+    assert.equal(rows.length, 1, "no second row was written");
+    assert.equal(rows[0].id, pendingId);
+    assert.equal(rows[0].status, "sent", "the one row ends sent");
+
+    await hook.tick(w.db);
+    await settle();
+    assert.equal(messages.length, 1, "a later pass sends nothing beside it");
+    assert.equal((await sendRows(w.db, w.runId))[0].status, "sent");
+  } finally {
+    await hook.stop();
+  }
 });

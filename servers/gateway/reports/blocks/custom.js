@@ -4,8 +4,9 @@
  * The block carries `{step: <step key>, params?: object}` and hands the flow's `{items, sections}` to the
  * step as its input. The step's answer decides what this block adds to the flow:
  *   - `{ok: true, output}`: `items` (when present) replaces the flow's items, `sections` is appended, and
- *     an `email` field is NOT carried in this round (see A STEP'S SECTIONS, AND ITS `email`). Output items
- *     must be an array of plain objects, capped so one step cannot make a run the size of a database.
+ *     `email` (when present) is carried as the run's own mail BODY, narrowed to `{html, text}` (see
+ *     A STEP'S SECTIONS, AND ITS `email`). Output items must be an array of plain objects, capped so one
+ *     step cannot make a run the size of a database.
  *   - `{ok: false, code, error}`: a source error carrying the step's own `error` text. That text is
  *     already redacted by custom-step.js, and for `step_waiting` it is the one sentence the owner reads.
  *     This block does not throw for it: a throw would replace the sentence with a code word.
@@ -25,9 +26,13 @@
  *     items this step returns are its own claim, so they are marked untrusted (untrusted-items.js) and
  *     contribute to no allow-list at all: not this block's, not a later present block's, not the
  *     assembly's. They still flow on and are still shown as data.
- *   - `output.email` is DROPPED here. The send path does not take a step's own mail fields in this round;
- *     PR 5 must apply this same rule to whatever it wires there (a step may not hand the send path its
- *     own recipients).
+ *   - `output.email` is carried as a BODY ONLY: `{html?, text?}`, each (when present) a string within its
+ *     own 64 KB cap, and at least one of them non-empty. Every other key (`to`, `subject`, `cc`, ...) is
+ *     DROPPED, so a step may never hand the send path its own recipients or its own subject. What this
+ *     block carries is not sanitised here: the send path puts it through the same sanitiser and link
+ *     neutraliser as any outgoing body, against the run's own items, and the fixed footer goes on after
+ *     that. A body that is not that shape is not carried at all: the block answers the advisory note
+ *     `custom_email_invalid`, and the run goes on without it.
  *
  * THE TRIGGER IS THE RUN ROW'S (M8, security): `custom-step.js` spends the day's `extra_step_runs` on
  * anything that is not the schedule, so a caller that could name the trigger could spend nothing. The
@@ -64,6 +69,11 @@ export const MAX_CUSTOM_ITEMS = 5000;
 export const MAX_CUSTOM_SECTIONS = 20;
 export const MAX_SECTION_BYTES = 64 * 1024;
 
+/** How many bytes of a step's own email html and text may carry. Over the cap the body is refused, never
+ *  cut: a cut tag is worse than none. */
+export const MAX_EMAIL_HTML_BYTES = 64 * 1024;
+export const MAX_EMAIL_TEXT_BYTES = 64 * 1024;
+
 function isPlainObject(value) {
   return value != null && typeof value === "object" && !Array.isArray(value);
 }
@@ -88,6 +98,35 @@ function validate(settings) {
   if (typeof settings.step !== "string" || !STEP_KEY_RE.test(settings.step)) errors.push("step");
   if (settings.params !== undefined && !isPlainObject(settings.params)) errors.push("params");
   return errors;
+}
+
+/** Is this a string of at most `max` utf8 bytes? */
+function withinBytes(value, max) {
+  return typeof value === "string" && Buffer.byteLength(value, "utf8") <= max;
+}
+
+/**
+ * A step's own email as the run may carry it: `{html?, text?}` and NOTHING else.
+ *
+ * A step is bot-approved code, so its mail fields are untrusted the same way its sections are. The body
+ * halves are carried as written (the send path sanitises and neutralises them); every other key is
+ * dropped, so a step cannot name its own recipients or its own subject. Each half present must be a
+ * string within its cap, and at least one of them must be non-empty: a body over the cap is refused
+ * rather than truncated, because a cut tag is worse than none.
+ *
+ * @param {*} value the step's `output.email`
+ * @returns {{html?: string, text?: string}|null} the body, or null when it is not one this may carry
+ */
+function emailOf(value) {
+  if (!isPlainObject(value)) return null;
+  if (value.html !== undefined && !withinBytes(value.html, MAX_EMAIL_HTML_BYTES)) return null;
+  if (value.text !== undefined && !withinBytes(value.text, MAX_EMAIL_TEXT_BYTES)) return null;
+  const out = {};
+  if (value.html !== undefined) out.html = value.html;
+  if (value.text !== undefined) out.text = value.text;
+  const carries = (out.html !== undefined && out.html !== "")
+    || (out.text !== undefined && out.text !== "");
+  return carries ? out : null;
 }
 
 /** A string cut to at most `max` utf8 bytes, never in the middle of a character. */
@@ -161,8 +200,13 @@ async function run(ctx, input) {
     const carried = Array.isArray(input?.items) ? input.items : [];
     out.sections = sanitizeSections(output.sections, carried, ctx.blockId);
   }
-  // `output.email` is deliberately not carried in this round: see the header. PR 5 must apply the same
-  // rule (a step's own mail fields never reach the send path).
+  if (output.email !== undefined) {
+    // A body only, and never a recipient or a subject: see emailOf and the header. A body this refuses
+    // is not a failed run: the block says so in one advisory note and the run goes on without it.
+    const email = emailOf(output.email);
+    if (email) out.email = email;
+    else out.warnings = [{ message: "custom_email_invalid" }];
+  }
   // `output.state` is deliberately not carried: see the header.
   return out;
 }
