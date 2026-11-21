@@ -19,6 +19,7 @@
  */
 import { createHash } from "node:crypto";
 import { canonicalJson } from "../../recipe-hash.js";
+import { carryUntrusted } from "../../untrusted-items.js";
 
 /** How many keys one report's `seen` map may hold. */
 export const MAX_SEEN_KEYS = 5000;
@@ -95,7 +96,9 @@ async function run(ctx, input) {
     }));
     const known = Object.hasOwn(seen, id);
     if (known && seen[id] === hash) continue;
-    kept.push(known ? { ...item, _resurfaced: true } : item);
+    // A re-surfaced item is a rebuilt one: it carries the mark of the item it was built from
+    // (untrusted-items.js).
+    kept.push(known ? carryUntrusted(item, { ...item, _resurfaced: true }) : item);
     seen[id] = hash;
   }
   ctx.setState(stateKey, capped(seen, MAX_SEEN_KEYS));

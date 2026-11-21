@@ -12,6 +12,7 @@
  * in this recipe throws `source_not_found`, which the executor records as a warning: an enrich block is
  * a shape block, and its failure does not fail the run.
  */
+import { carryUntrusted } from "../../untrusted-items.js";
 
 function isPlainObject(value) {
   return value != null && typeof value === "object" && !Array.isArray(value);
@@ -71,7 +72,12 @@ async function run(ctx, input) {
         const value = readField(row, field);
         if (value !== undefined) extra[prefix + field] = value;
       }
-      return { ...item, ...extra };
+      // A joined item is never more trusted than what it was joined from: the item itself, and the
+      // retained row (a custom block's own items when `source` names one). untrusted-items.js.
+      const joined = { ...item, ...extra };
+      carryUntrusted(item, joined);
+      carryUntrusted(row, joined);
+      return joined;
     }),
   };
 }

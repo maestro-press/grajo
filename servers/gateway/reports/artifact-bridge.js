@@ -507,14 +507,20 @@ export async function writeRunVersion(db, deps, { report, run, source, allowedLi
 
 /* ------------------------------------------------------------------------ the seam */
 
-/** The document a run's result carries: `{markdown, title}`, a markdown string, or nothing. */
+/**
+ * The document a run's result carries: `{markdown, title?, assets?}`, a markdown string, or nothing. A
+ * document that brings its own assets (a map block's SVG plot) keeps them, so the version carries the
+ * files its markdown refers to; nothing else about the document is touched here.
+ */
 function sourceFromResult(report, result) {
   const fallbackTitle = titleOf(report);
   const doc = result == null ? null : result.document;
   const titleOfDoc = (value) => text(value).replace(/\s+/g, " ").trim();
   if (typeof doc === "string" && doc.trim()) return { markdown: doc, title: fallbackTitle };
   if (doc && typeof doc === "object" && typeof doc.markdown === "string" && doc.markdown.trim()) {
-    return { markdown: doc.markdown, title: titleOfDoc(doc.title) || fallbackTitle };
+    const source = { markdown: doc.markdown, title: titleOfDoc(doc.title) || fallbackTitle };
+    if (Array.isArray(doc.assets) && doc.assets.length) source.assets = doc.assets;
+    return source;
   }
   return { markdown: `# ${fallbackTitle}\n\nNo new items this run.`, title: fallbackTitle };
 }

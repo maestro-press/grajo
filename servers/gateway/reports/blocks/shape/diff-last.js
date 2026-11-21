@@ -9,6 +9,9 @@
  *   - `same`: the key was, and the item is unchanged.
  * An item whose key was in the last map and is not in this one is appended as `{<keyField>: <key>,
  * _diff: "gone"}`: the key is all a "gone" line needs, and the last run's item is not kept around.
+ * Such an item is built from the STORED state and not from an item, so there is nothing to carry a mark
+ * from: every gone item is marked untrusted itself (untrusted-items.js). A key field that is a URL
+ * (`link`) is then only data here, and approves no link in a later block or in the assembly.
  *
  * The map is capped at 5000 keys (the newest are kept) so a report whose keys grow every run cannot grow
  * `report_state` without bound.
@@ -19,6 +22,7 @@
  */
 import { createHash } from "node:crypto";
 import { canonicalJson } from "../../recipe-hash.js";
+import { carryUntrusted, markUntrusted } from "../../untrusted-items.js";
 
 /** How many keys one report's `last` map may hold. */
 export const MAX_LAST_KEYS = 5000;
@@ -89,13 +93,20 @@ async function run(ctx, input) {
       else if (known) diff = "changed";
       next[id] = hash;
     }
-    out.push({ ...item, _diff: diff });
+    // A rebuilt item carries the mark of the item it was built from: a step's own item stays untrusted
+    // through this block (untrusted-items.js).
+    out.push(carryUntrusted(item, { ...item, _diff: diff }));
   }
   const kept = capped(next, MAX_LAST_KEYS);
+  const gone = [];
   for (const id of Object.keys(last)) {
     if (present.has(id)) continue;
-    out.push({ [keyField]: id, _diff: "gone" });
+    gone.push({ [keyField]: id, _diff: "gone" });
   }
+  // A gone item has no item to inherit a mark from: it is built from the previous run's stored key, and
+  // that key may be a URL. Marked here, so an unmarked URL cannot come back into the run as approved.
+  markUntrusted(gone);
+  out.push(...gone);
   ctx.setState(stateKey, kept);
   return { items: out };
 }

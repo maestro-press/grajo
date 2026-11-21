@@ -86,6 +86,99 @@ function clockOf(now) {
   return Number.isFinite(now) ? Number(now) : Date.now();
 }
 
+/* -------------------------------------------------------------- the authoredBy stamp */
+
+/** One block without its `authoredBy` key, so a caller-sent stamp can never survive a save. */
+function withoutStamp(block) {
+  if (block == null || typeof block !== "object" || Array.isArray(block)) return block;
+  if (!Object.hasOwn(block, "authoredBy")) return block;
+  const { authoredBy, ...rest } = block;
+  return rest;
+}
+
+/** The markdown a `text` block writes, for comparison: "" when it has none, null for anything but `text`. */
+function textOfBlock(block) {
+  if (block == null || typeof block !== "object" || block.type !== "text") return null;
+  const settings = block.settings;
+  if (settings == null || typeof settings !== "object" || Array.isArray(settings)) return "";
+  const heading = typeof settings.heading === "string" ? settings.heading : "";
+  const body = typeof settings.content === "string"
+    ? settings.content
+    : (typeof settings.text === "string" ? settings.text : "");
+  return `${comparableText(heading)}\u0000${comparableText(body)}`;
+}
+
+/**
+ * Text as the stamp compares it: CRLF and lone CR are one line break, and trailing whitespace on a line
+ * (or a trailing blank line) counts for nothing. A save that round-trips a recipe through a form must not
+ * look like an edit, because an edit re-stamps the block with the writer's own kind.
+ */
+function comparableText(value) {
+  return String(value == null ? "" : value)
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/[ \t]+$/, "")
+    .replace(/\n+$/, "");
+}
+
+/** The previous revision's recipe as an object, or null when there is no readable one. */
+function previousRecipeOf(revision) {
+  if (revision == null) return null;
+  try {
+    const recipe = JSON.parse(revision.recipe_json);
+    return recipe != null && typeof recipe === "object" && Array.isArray(recipe.blocks) ? recipe : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A block's own `authoredBy` stamp when it is one this module writes, else null. */
+function stampOf(block) {
+  const value = block == null ? null : block.authoredBy;
+  return value === "owner" || value === "bot" ? value : null;
+}
+
+/**
+ * Stamp `authoredBy` on every `text` block whose own words changed in this save, and strip a stamp the
+ * caller sent from every block. See `saveRecipe`'s header for the rule.
+ *
+ * An UNCHANGED block keeps the stamp it already carries. A block that carries none (a recipe written
+ * before the stamp existed, or a row inserted straight into the database) is always `"bot"`: it has not
+ * proved that an owner wrote it, and the run neutralises its links. The previous revision's own
+ * `author_kind` says who last saved the RECIPE, which is not the same as who wrote THIS block (an owner
+ * who fixes block B has not become the author of block A), so it is never inherited.
+ *
+ * An edited block takes this save's `authorKind`, and only an owner save can stamp `"owner"`.
+ *
+ * @param {object} recipe the recipe the caller handed over
+ * @param {object|null} previous the head revision's recipe, or null for the first save
+ * @param {"owner"|"bot"} authorKind who is saving
+ * @returns {object} the recipe to validate, hash and store
+ */
+export function stampAuthoredBy(recipe, previous, authorKind) {
+  if (recipe == null || typeof recipe !== "object" || Array.isArray(recipe)) return recipe;
+  const blocks = Array.isArray(recipe.blocks) ? recipe.blocks : null;
+  if (!blocks) return recipe;
+  const previousBlocks = new Map();
+  if (previous != null && Array.isArray(previous.blocks)) {
+    for (const block of previous.blocks) {
+      if (block != null && typeof block === "object" && typeof block.id === "string") {
+        previousBlocks.set(block.id, block);
+      }
+    }
+  }
+  const stamped = blocks.map((block) => {
+    const clean = withoutStamp(block);
+    const text = textOfBlock(clean);
+    if (text == null) return clean;
+    const before = previousBlocks.get(clean.id);
+    const changed = before == null || textOfBlock(withoutStamp(before)) !== text;
+    const keptStamp = stampOf(before) ?? "bot";
+    return { ...clean, authoredBy: changed ? authorKind : keptStamp };
+  });
+  return { ...recipe, blocks: stamped };
+}
+
 /* ------------------------------------------------------------------------- the report */
 
 /**
@@ -153,6 +246,20 @@ export async function listReports(db, { projectId } = {}) {
  * Save a recipe: validate it, hash it, then move the report's head and insert its revision in ONE
  * transaction.
  *
+ * THE `authoredBy` STAMP (server-side, never the caller's): every `text` block whose own words (its
+ * `content`/`text` setting OR its `heading`) changed in this save is stamped with this save's
+ * `authorKind`, and a block that did not change keeps the stamp it already carried. A block that carries
+ * NO stamp (`authoredBy` missing, or a value this module never writes) is `"bot"`: a recipe written
+ * before the stamp existed, or a row inserted straight into the database, is therefore never treated as
+ * owner-written, and the PREVIOUS revision's `author_kind` is not inherited either (an owner who edits
+ * one block has not become the author of another). A new block counts as changed. The comparison
+ * normalises line endings and trailing whitespace, so a save that round-trips a recipe cannot flip a
+ * stamp. The stamp is part of the block object, so it is inside both recipe hashes, and it is what lets
+ * the run decide whether a bot-written text block still goes through link neutralising. A caller may not
+ * set it: any `authoredBy` a recipe arrives with is stripped first, from every block, so the stamp always
+ * names the writer the server knows. The head revision the stamp is compared against is the SAME read the
+ * compare-and-set below uses (`headRev`), never a second read inside the transaction.
+ *
  * The block registry the recipe is VALIDATED against is always the server's own (`blocks/index.js`'s
  * `BLOCKS`): a caller's `registry` never decides what a save accepts, so a caller that declares its own
  * types or skips the real settings checks cannot write a recipe the server could not run. `registry`
@@ -174,28 +281,39 @@ export async function listReports(db, { projectId } = {}) {
 export async function saveRecipe(db, { reportId, recipe, authorKind, registry = blockRegistry, now } = {}) {
   idOf(reportId);
   if (!REPORT_AUTHOR_KINDS.includes(authorKind)) throw fail("bad_author_kind", "authorKind");
+  // The stamp is read from the head revision's own recipe, so it needs that row before the transaction.
+  // `headRev` is also what the compare-and-set below compares against: ONE read of the head decides both
+  // what this save stamps and whether it is still the head it read, so a concurrent save can only lose
+  // the race (`conflict`), never have its revision stamped from another revision's recipe.
+  const headRow = await db.execute({
+    sql: "SELECT recipe_rev FROM reports WHERE id = ?",
+    args: [reportId],
+  });
+  if (!headRow.rows[0]) throw fail("not_found", "report");
+  const headRev = Number(headRow.rows[0].recipe_rev) || 0;
+  const previousRevision = headRev > 0 ? await getRevision(db, reportId, headRev) : null;
+  const stamped = stampAuthoredBy(recipe, previousRecipeOf(previousRevision), authorKind);
   // Before the transaction: a refused recipe leaves the row and the revision table exactly as they
   // were, with no transaction ever opened. The REAL registry is the one that validates, whatever a
   // caller passed: `registry` only narrows the sources hash below.
-  const errors = validateRecipe(recipe, BLOCKS);
+  const errors = validateRecipe(stamped, BLOCKS);
   if (errors.length) throw fail("bad_recipe", errors[0]);
-  if (recipe.blocks.length > MAX_RECIPE_BLOCKS) throw fail("bad_recipe", "too_many_blocks");
-  const hash = recipeHash(recipe);
-  const srcHash = sourcesHash(recipe, registry);
-  const recipeJson = canonicalJson(recipe);
+  if (stamped.blocks.length > MAX_RECIPE_BLOCKS) throw fail("bad_recipe", "too_many_blocks");
+  const hash = recipeHash(stamped);
+  const srcHash = sourcesHash(stamped, registry);
+  const recipeJson = canonicalJson(stamped);
   const at = clockOf(now);
 
   return db.runTransaction((run) => {
     const head = run({ sql: "SELECT recipe_rev FROM reports WHERE id = ?", args: [reportId] }).rows[0];
     if (!head) throw fail("not_found", "report");
-    const previous = Number(head.recipe_rev) || 0;
-    const rev = previous + 1;
+    const rev = headRev + 1;
 
     const moved = run({
       sql: `UPDATE reports
                SET recipe_json = ?, recipe_rev = ?, recipe_hash = ?, sources_hash = ?, updated_at = ?
              WHERE id = ? AND recipe_rev = ?`,
-      args: [recipeJson, rev, hash, srcHash, at, reportId, previous],
+      args: [recipeJson, rev, hash, srcHash, at, reportId, headRev],
     });
     if (moved.rowsAffected !== 1) throw fail("conflict", "recipe_rev");
 

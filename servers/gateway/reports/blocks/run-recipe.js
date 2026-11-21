@@ -2,17 +2,23 @@
  * The recipe executor: one recipe, walked block by block, answering what the run has to record.
  *
  * `runRecipe(db, deps, {report, recipe, run, live, state})` flows `{items, sections}` from block to
- * block and answers `{items, sections, warnings, sourceErrors, stateWrites}`:
+ * block and answers `{items, sections, warnings, sourceErrors, stateWrites, document, allowedLinks,
+ * summary}`:
  *   - `items` is what the last block left (a source block's items, filtered and sorted by the shape
  *     blocks after it); the run engine counts it for the run's status and the block log.
  *   - `sourceErrors` is one `{source: <block id>, message: <code word>}` per source or custom block that
  *     could not read. The run engine's own rule turns any of them into a failed run; a source error does
  *     not stop the blocks after it, so one unreachable feed still records what the others gave.
  *   - `warnings` is the same shape for a shape block that failed. A shape block only arranges data the
- *     sources already produced, so its failure is recorded and the run goes on.
+ *     sources already produced, so its failure is recorded and the run goes on. A block may also answer
+ *     an advisory `warnings: [{message}]` list beside its own section (the chart block's
+ *     `chart_rows_dropped`), and those are recorded here too: an advisory note never fails a run.
  *   - `stateWrites` is `[{key, value}]` in the order the blocks buffered them, and it is NOT applied
  *     here: the run engine applies it after the version write, only for a run that ends not-failed and
  *     never for a preview.
+ *   - `document` is the assembled source the artifact bridge writes (`{markdown, assets?}`),
+ *     `allowedLinks` the run's own item URLs and `summary` its counts; see the header's THE DOCUMENT
+ *     paragraph.
  *
  * `ctx` is what one block gets: `{db, deps, report, run, live, block, blockId, getState, setState,
  * fetch, mail, workspaceDir, log, extraStepClaim, extraStepClaimToken, sources}`.
@@ -46,12 +52,22 @@
  *   - `sources` keeps each source (and custom) block's own output by block id, which is what
  *     `enrich_lookup` joins against. It is deleted with the run: nothing here writes it anywhere.
  *
- * A present block has no `run` in this round: the executor skips it, because rendering is a later round's
- * job. A SOURCE block with no `run` yet is not skipped: it is the named source error
- * `source_not_available`, so a recipe that names a source this build cannot read fails honestly instead
- * of quietly reporting an empty run. An unknown block type is the same kind of honesty
- * (`unknown_block_type`): a revision stored under a registry that knew it still fails closed when the
- * registry no longer does.
+ * A present block has a `run` now: it turns the items into a document section (and, for a model block,
+ * adds one section of the model's writing). Its failures are the SHAPE kind of failure (a warning), with
+ * these exceptions that stop the run instead: `model_changed`, `model_unresolved` and `model_not_local`
+ * (the model is not the one the live seal names, or a preview resolved no local model, so nothing may be
+ * sent), and `too_large` (from the document assembly at the end). A SOURCE block with no
+ * `run` yet is not skipped: it is the named source error `source_not_available`, so a recipe that names a
+ * source this build cannot read fails honestly instead of quietly reporting an empty run. An unknown block
+ * type is the same kind of honesty (`unknown_block_type`): a revision stored under a registry that knew it
+ * still fails closed when the registry no longer does.
+ *
+ * THE DOCUMENT IS ASSEMBLED LAST (reports/document.js): every present block's section, in recipe order,
+ * becomes one run document under the artifact renderer's two limits, and the answer carries it as
+ * `document` (the source `makeWriteVersion` writes), `allowedLinks` (the run's own item URLs, which is
+ * what a version may show) and `summary`. A document over a limit throws `too_large` out of this
+ * function, which the run engine records as a failed run with that sentence; a run that already has a
+ * source error assembles nothing, because its version is never written.
  *
  * A GATED PREVIEW READS ONLY APPROVED CONTENT: a recipe is bot-authorable, and a preview is the one
  * trigger that runs a revision the owner has not sealed, so every source-shaped block (`kind: "source"`
@@ -87,6 +103,7 @@
 import { isReservedStateKey } from "../artifact-bridge.js";
 import { claimExtraStepRun, dayInTz, getCaps } from "../caps.js";
 import { CLAIMED_BY_EXECUTOR } from "../claim-token.js";
+import { assembleDocument, isAiSection } from "../document.js";
 import { getState as readState } from "../store.js";
 import { isSourceApprovedForBot, ownerChainAnswers, waitingForOkText } from "../source-approvals.js";
 import { ACTIVE_PROJECT_WHERE } from "../../../shared/shell-items.js";
@@ -97,6 +114,15 @@ const MAX_ITEMS = 5000;
 
 /** How long one source error's message may be. */
 const MESSAGE_MAX = 300;
+
+/**
+ * The failure codes a present block may throw to stop the whole run: a model that is not the sealed one
+ * (or, on a preview, no model / not a local one), and a document over a limit. Every other present-block
+ * failure is a warning.
+ */
+const HARD_PRESENT_CODES = Object.freeze([
+  "model_changed", "model_unresolved", "model_not_local", "too_large",
+]);
 
 function fail(code) {
   const err = new Error(code);
@@ -154,6 +180,31 @@ function message(value) {
 
 function isPlainObject(value) {
   return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * The report's bot display name, for the document's AI heading. A missing bot row (or no database) leaves
+ * the heading with the generic word; a name that cannot be read never fails a run.
+ */
+async function botNameFor(db, report) {
+  const botId = typeof report?.bot_id === "string" ? report.bot_id : "";
+  if (!botId || !db) return "";
+  try {
+    const { rows } = await db.execute({
+      sql: "SELECT display_name FROM pi_bot_defs WHERE bot_id = ?",
+      args: [botId],
+    });
+    const name = rows[0]?.display_name;
+    return typeof name === "string" && name.trim() ? name.trim() : botId;
+  } catch {
+    return botId;
+  }
+}
+
+/** The recipe's own words for a run that found nothing, when it set any. A presentational setting. */
+function emptyTextOf(recipe) {
+  const value = isPlainObject(recipe) ? recipe.emptyText : null;
+  return typeof value === "string" && value.trim() ? value : undefined;
 }
 
 /** Is this run a preview, the one trigger that reads a revision the owner has not sealed? */
@@ -249,7 +300,8 @@ async function workspaceDirFor(db, report, seam, testSeams) {
  *   only under `testSeams: true`; `fetch` and `workspaceDir` are never read.
  * @param {{report: object, recipe: object, run: object, live?: object|null, state?: object}} input
  * @returns {Promise<{items: object[], sections: object[], warnings: object[],
- *   sourceErrors: object[], stateWrites: {key: string, value: *}[]}>}
+ *   sourceErrors: object[], stateWrites: {key: string, value: *}[], document: object|null,
+ *   allowedLinks: string[], summary: object|null}>}
  */
 export async function runRecipe(db, deps, { report, recipe, run, live = null, state = null } = {}) {
   const seam = isPlainObject(deps) ? deps : {};
@@ -325,7 +377,7 @@ export async function runRecipe(db, deps, { report, recipe, run, live = null, st
       sourceErrors.push({ source: blockId, message: "unknown_block_type" });
       continue;
     }
-    if (entry.kind === "present") continue;
+    if (entry.kind === "present" && typeof entry.run !== "function") continue;
     if (typeof entry.run !== "function") {
       // A source block this build cannot read yet: named, never skipped silently.
       sourceErrors.push({ source: blockId, message: "source_not_available" });
@@ -351,8 +403,10 @@ export async function runRecipe(db, deps, { report, recipe, run, live = null, st
     try {
       output = await entry.run(blockCtx, input);
     } catch (err) {
-      const failure = { source: blockId, message: message(err && err.code ? err.code : "block_failed") };
-      if (entry.kind === "shape") warnings.push(failure);
+      const code = message(err && err.code ? err.code : "block_failed");
+      if (entry.kind === "present" && HARD_PRESENT_CODES.includes(err && err.code)) throw err;
+      const failure = { source: blockId, message: code };
+      if (entry.kind === "shape" || entry.kind === "present") warnings.push(failure);
       else sourceErrors.push(failure);
       continue;
     }
@@ -361,19 +415,56 @@ export async function runRecipe(db, deps, { report, recipe, run, live = null, st
         source: blockId,
         message: message(output.sourceError.message || output.sourceError.code || "block_failed"),
       };
-      if (entry.kind === "shape") warnings.push(failure);
+      if (entry.kind === "shape" || entry.kind === "present") warnings.push(failure);
       else sourceErrors.push(failure);
       continue;
     }
 
+    // A block's own advisory notes, beside the section it adds (`chart_rows_dropped`): recorded, and
+    // never a reason to fail a run.
+    if (output != null && Array.isArray(output.warnings)) {
+      for (const note of output.warnings) {
+        const code = message(
+          note != null && typeof note === "object" ? (note.message ?? note.code) : note,
+        );
+        if (code) warnings.push({ source: blockId, message: code });
+      }
+    }
+
     if (Array.isArray(output?.items)) items = output.items.slice(0, MAX_ITEMS);
     if (Array.isArray(output?.sections) && output.sections.length) {
-      sections = [...sections, ...output.sections];
+      // A present block answers the list it was handed plus its own section (the block contract), so its
+      // answer replaces the list; every other kind answers only its own new sections, which are appended.
+      sections = entry.kind === "present"
+        ? output.sections.slice()
+        : [...sections, ...output.sections];
     }
     if (entry.kind === "source" || entry.kind === "custom") ctx.sources.set(blockId, items);
   }
 
-  return { items, sections, warnings, sourceErrors, stateWrites };
+  let document = null;
+  let allowedLinks = [];
+  let summary = null;
+  if (!sourceErrors.length) {
+    // A failed run writes no version, so there is nothing to assemble for one: a source error's own text
+    // stays the run's sentence rather than being replaced by a size refusal.
+    const assembled = assembleDocument({
+      report,
+      run,
+      sections,
+      items,
+      allowedLinks: [],
+      // The AI heading names the bot; nothing else in the document needs its row, so it is read only when
+      // a model block wrote a section.
+      botName: sections.some(isAiSection) ? await botNameFor(db, report) : "",
+      emptyText: emptyTextOf(recipe),
+    });
+    document = assembled.source;
+    allowedLinks = assembled.allowedLinks;
+    summary = assembled.summary;
+  }
+
+  return { items, sections, warnings, sourceErrors, stateWrites, document, allowedLinks, summary };
 }
 
 /**

@@ -218,6 +218,30 @@ export function modelRefText(value) {
   }
 }
 
+/**
+ * The locality word a resolved model reference carries: `local` or `cloud`.
+ *
+ * This is the same rule `defaultResolveModelRef` applies at go-live, read from the ref it answered
+ * (`{providerId, model, locality, baseUrlHost}`), or recomputed from a `baseUrl` with
+ * `isLocallyOrchestratable` when the ref carries none. A ref that carries neither is `cloud`: a model
+ * nobody can place on this machine is not one a report may send its items to.
+ */
+export function modelRefLocality(value) {
+  if (value == null) return "cloud";
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return "cloud";
+    try {
+      return modelRefLocality(JSON.parse(trimmed));
+    } catch {
+      return "cloud";
+    }
+  }
+  if (typeof value !== "object") return "cloud";
+  if (typeof value.locality === "string" && value.locality) return value.locality;
+  return isLocallyOrchestratable({ baseUrl: value.baseUrl }) ? "local" : "cloud";
+}
+
 /* ------------------------------------------------------------------------ the defaults */
 
 function defaultLoadSeed() {

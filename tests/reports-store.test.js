@@ -214,6 +214,31 @@ test("a second save is revision 2 and keeps revision 1 as it was", async () => {
   assert.equal(await countRows(db, "report_recipe_revisions"), 2);
 });
 
+test("the stamp comes from the head the compare-and-set uses, so a racing save conflicts", async () => {
+  const db = await freshDb();
+  const id = await makeReport(db);
+  const text = (content) => ({ id: "t1", type: "text", settings: { content } });
+  await saveRecipe(db, { reportId: id, recipe: recipe(text("first")), authorKind: "owner", now: T0 });
+
+  // A client whose transaction moves the head behind the writer's back: the save read rev 1, and by the
+  // time it opens its transaction the report is at rev 2. The stamp was compared against rev 1, so the
+  // compare-and-set has to lose rather than stamp rev 2 from rev 1's recipe.
+  const racing = {
+    execute: (query) => db.execute(query),
+    runTransaction: (fn) => db.runTransaction((run) => {
+      run({ sql: "UPDATE reports SET recipe_rev = recipe_rev + 1 WHERE id = ?", args: [id] });
+      return fn(run);
+    }),
+  };
+  await assert.rejects(
+    () => saveRecipe(racing, { reportId: id, recipe: recipe(text("second")), authorKind: "bot" }),
+    { code: "conflict" },
+  );
+  assert.equal(await countRows(db, "report_recipe_revisions"), 1, "the losing save wrote no revision");
+  const stored = JSON.parse((await getReport(db, id)).recipe_json);
+  assert.equal(stored.blocks[0].authoredBy, "owner", "and it did not re-stamp the head's text");
+});
+
 test("the saved recipe is stored canonically, so key order cannot fork a revision", async () => {
   const db = await freshDb();
   const id = await makeReport(db);

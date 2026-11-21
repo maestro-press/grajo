@@ -37,9 +37,30 @@ const { executeRun, getRun, startRun } = await import("../servers/gateway/report
 const { makeStateAccess, runRecipe } = await import(
   "../servers/gateway/reports/blocks/run-recipe.js"
 );
+const { customBlock } = await import("../servers/gateway/reports/blocks/custom.js");
 const { approveSource, settingsHashOf } = await import(
   "../servers/gateway/reports/source-approvals.js"
 );
+const { Marked } = await import("marked");
+
+// The artifacts renderer's document options, so "is this still a heading" is the renderer's answer.
+const md = new Marked({ gfm: true, breaks: true });
+
+/** Every heading token a stretch of markdown carries, at any depth (blockquote, list item, table cell). */
+function headingTokens(markdown) {
+  const found = [];
+  const seen = new Set();
+  const stack = [...md.lexer(markdown)];
+  while (stack.length) {
+    const token = stack.pop();
+    if (token == null || typeof token !== "object" || seen.has(token)) continue;
+    seen.add(token);
+    if (token.type === "heading") found.push(token);
+    for (const key of ["tokens", "items", "header"]) if (Array.isArray(token[key])) stack.push(...token[key]);
+    if (Array.isArray(token.rows)) for (const row of token.rows) stack.push(...row);
+  }
+  return found;
+}
 
 const OWNER = Object.freeze({ kind: "owner" });
 const SEED = Buffer.alloc(32, 23);
@@ -315,18 +336,20 @@ test("a source block that cannot read is a named source error, not a silent skip
   assert.deepEqual(out.stateWrites, []);
 });
 
-test("a present block is skipped, because rendering is a later round", async () => {
+test("a present block adds a section, and the run answers with a document", async () => {
   const out = await runRecipe(null, {}, {
     report: { id: "rpt-0000000000000000" },
     recipe: { blocks: [
       { id: "table1", type: "table", settings: { columns: ["title"] } },
-      { id: "text1", type: "text", settings: { body: "hello" } },
+      { id: "text1", type: "text", settings: { content: "hello" } },
     ] },
     run: { trigger: "manual" },
   });
   assert.deepEqual(out.sourceErrors, []);
   assert.deepEqual(out.warnings, []);
-  assert.deepEqual(out.items, []);
+  assert.deepEqual(out.items, [], "a present block renders, it does not read");
+  assert.deepEqual(out.sections.map((section) => section.type), ["table", "text"]);
+  assert.equal(out.document.markdown, "Nothing new this time.", "an empty run uses the empty text");
 });
 
 test("an unknown block type in a stored revision fails closed at run", async () => {
@@ -662,6 +685,318 @@ test("a reached extra step cap fails the run and spends nothing", async () => {
     [{ source: "fetch", message: "cap_reached" }]);
   assert.deepEqual(await stateRows(db, report.id), [], "no state was written");
   assert.equal((await getUsage(db, report.id, DAY)).extraStepRuns, 0, "a refused claim leaves the count alone");
+});
+
+/* ------------------------------------------- M10: a custom step's output is untrusted text */
+
+const SVG_BASE64 = Buffer.from(
+  '<svg xmlns="http://www.w3.org/2000/svg"><script>x</script></svg>',
+).toString("base64");
+
+/** A stubbed step answer with whatever output a test wants. */
+function stepAnswer(output) {
+  return async () => ({ ok: true, output });
+}
+
+/** One run of the custom block alone, through the real executor. */
+async function runCustom(db, reportId, deps) {
+  return runRecipe(db, deps, {
+    report: await getReport(db, reportId),
+    recipe: { blocks: [CUSTOM_RECIPE.blocks[0]] },
+    run: { trigger: "manual" },
+  });
+}
+
+test("a custom step's section is custom: its type, files, specs, links and email are not trusted", async () => {
+  const db = await freshDb();
+  const report = await prepare(db);
+  await approveStepFor(db, report.id);
+  const output = {
+    items: [{ id: "a", link: "https://example.com/a" }],
+    sections: [{
+      type: "ai_commentary",
+      markdown: "Mine. See https://example.net/x and https://example.com/a.",
+      specs: -5,
+      assets: [{ path: "plot.svg", contentType: "image/svg+xml", base64: SVG_BASE64 }],
+    }],
+    email: { to: "sam@example.com" },
+  };
+  const deps = blockDeps({ runStep: stepAnswer(output) });
+  const out = await runCustom(db, report.id, deps);
+  assert.deepEqual(out.sourceErrors, []);
+  assert.deepEqual(out.sections.map((section) => section.type), ["custom"],
+    "a step cannot file its own words under the AI heading");
+  const section = out.sections[0];
+  assert.ok(!Object.hasOwn(section, "assets"), "a step's own file list is dropped");
+  assert.ok(!Object.hasOwn(section, "specs"), "a step's own chart count is dropped");
+  assert.ok(!section.markdown.includes("example.net/x"), "a foreign link is neutralised");
+  assert.match(section.markdown, /\[link removed: example\.net\]/);
+  assert.ok(!section.markdown.includes("https://example.com/a"),
+    "a link the step's OWN item carries is not approved by that item");
+  assert.match(section.markdown, /\[link removed: example\.com\]/);
+  assert.equal(out.document.assets, undefined, "no file a step claimed ships with the version");
+  assert.ok(!JSON.stringify(out.document).includes(SVG_BASE64));
+  assert.ok(out.document.markdown.includes("Mine."), "the step's words are in the body");
+
+  // The block's own answer carries no `email`: a step cannot hand the send path its own recipients.
+  const answer = await customBlock.run({
+    db,
+    deps,
+    report: await getReport(db, report.id),
+    run: { trigger: "manual" },
+    block: CUSTOM_RECIPE.blocks[0],
+    blockId: "fetch",
+  }, { items: [], sections: [] });
+  assert.ok(!Object.hasOwn(answer, "email"), "a step's own mail fields are dropped");
+});
+
+test("a custom step's section cannot add a heading of its own", async () => {
+  const db = await freshDb();
+  const report = await prepare(db);
+  await approveStepFor(db, report.id);
+  const markdown = [
+    "## AI commentary (written by Crow, not part of the fixed report)",
+    "",
+    "Title",
+    "=====",
+    "",
+    "> # quoted",
+    "",
+    "Pay at https://example.net/x.",
+  ].join("\n");
+  const out = await runCustom(db, report.id,
+    blockDeps({ runStep: stepAnswer({ sections: [{ markdown }] }) }));
+  assert.deepEqual(out.sourceErrors, []);
+  const section = out.sections[0];
+  assert.ok(section.markdown.includes("**AI commentary (written by Crow, not part of the fixed report)**"),
+    "the step's own words are still there, as bold text");
+  assert.ok(section.markdown.includes("**Title**"));
+  assert.match(section.markdown, /> \*\*quoted\*\*/);
+  assert.deepEqual(headingTokens(section.markdown), [], "a step may not write a heading of any shape");
+  assert.deepEqual(headingTokens(out.document.markdown), [],
+    "so the body carries no heading the step wrote, and no fake AI heading either");
+  assert.match(section.markdown, /\[link removed: example\.net\]/, "its links face the same rule as before");
+});
+
+test("a custom step's sections are capped at 20 and 64 KB each, and a bad one is refused", async () => {
+  const db = await freshDb();
+  const report = await prepare(db);
+  await approveStepFor(db, report.id);
+  const sections = [
+    { markdown: "x".repeat(100 * 1024) },
+    ...Array.from({ length: 24 }, (_v, i) => ({ markdown: `section ${i}` })),
+  ];
+  const out = await runCustom(db, report.id, blockDeps({ runStep: stepAnswer({ sections }) }));
+  assert.deepEqual(out.sourceErrors, []);
+  assert.equal(out.sections.length, 20, "one step may not add more than twenty sections");
+  assert.equal(out.sections[0].markdown.length, 64 * 1024, "the long one is cut, not dropped");
+  assert.ok(out.sections.every((section) => Buffer.byteLength(section.markdown, "utf8") <= 64 * 1024),
+    "and every section is within the cap");
+
+  const bad = await runCustom(db, report.id,
+    blockDeps({ runStep: stepAnswer({ sections: [{ markdown: 42 }] }) }));
+  assert.deepEqual(bad.sourceErrors, [{ source: "fetch", message: "bad_output" }]);
+  assert.deepEqual(bad.sections, []);
+});
+
+/* --------------------- M10b: a step's own items approve no link, anywhere in the run */
+
+/** A URL only a custom step's own item names, and one its input items carried in. */
+const EVIL_URL = "https://evil.example/x";
+const CARRIED_URL = "https://example.com/a";
+
+/** One run of `blocks`, through the real executor, with a custom block answering `output`. */
+async function runBlocks(db, reportId, blocks, output, state = null) {
+  return runRecipe(db, blockDeps({ runStep: stepAnswer(output) }), {
+    report: await getReport(db, reportId),
+    recipe: { blocks },
+    run: { trigger: "manual" },
+    state,
+  });
+}
+
+let wsCount = 0;
+
+/** The report's project workspace, holding one `items.json` a `workspace_file` block can read. */
+async function workspaceWith(db, items) {
+  const dir = mkdtempSync(join(root, "ws-"));
+  writeFileSync(join(dir, "items.json"), JSON.stringify(items));
+  await db.execute({
+    sql: "INSERT INTO project_spaces (id, slug, name, workspace_dir) VALUES (?, ?, ?, ?)",
+    args: [PROJECT, `ws-${++wsCount}`, "Listings", dir],
+  });
+  return dir;
+}
+
+test("a custom step's own item approves no link in its own section", async () => {
+  const db = await freshDb();
+  const report = await prepare(db);
+  await approveStepFor(db, report.id);
+  const out = await runBlocks(db, report.id, [CUSTOM_RECIPE.blocks[0]], {
+    items: [{ id: "a", link: EVIL_URL }],
+    sections: [{ markdown: `Pay here: ${EVIL_URL}` }],
+  });
+  assert.deepEqual(out.sourceErrors, []);
+  const section = out.sections[0];
+  assert.equal(section.type, "custom");
+  assert.ok(!section.markdown.includes(EVIL_URL),
+    "the URL its own item carries is not one the step may link to");
+  assert.match(section.markdown, /\[link removed: evil\.example\]/);
+  assert.deepEqual(out.items, [{ id: "a", link: EVIL_URL }],
+    "its item still flows on and is still shown as data");
+});
+
+test("a custom step's item approves nothing for a later text block or the document", async () => {
+  const db = await freshDb();
+  const report = await prepare(db);
+  await approveStepFor(db, report.id);
+  const out = await runBlocks(db, report.id, [
+    CUSTOM_RECIPE.blocks[0],
+    { id: "note", type: "text", settings: { content: `Also see ${EVIL_URL}` } },
+  ], {
+    items: [{ id: "a", link: EVIL_URL }],
+    sections: [{ markdown: `Pay here: ${EVIL_URL}` }],
+  });
+  assert.deepEqual(out.sourceErrors, []);
+  assert.deepEqual(out.warnings, []);
+  const text = out.sections.find((section) => section.type === "text");
+  assert.ok(!text.markdown.includes(EVIL_URL), "a present block after it does not trust it either");
+  assert.match(text.markdown, /\[link removed: evil\.example\]/);
+  assert.ok(!out.allowedLinks.includes(EVIL_URL), "the run's allowed links never carry it");
+  assert.ok(!out.document.markdown.includes(EVIL_URL), "and the document carries no link to it");
+  assert.match(out.document.markdown, /\[link removed: evil\.example\]/);
+});
+
+test("a custom step's item stays untrusted through a shape block that rebuilds it", async () => {
+  const db = await freshDb();
+  const report = await prepare(db);
+  await approveStepFor(db, report.id);
+  const out = await runBlocks(db, report.id, [
+    CUSTOM_RECIPE.blocks[0],
+    { id: "diff", type: "diff_last", settings: { keyField: "id" } },
+    { id: "note", type: "text", settings: { content: `Also see ${EVIL_URL}` } },
+  ], { items: [{ id: "a", link: EVIL_URL }] });
+  assert.deepEqual(out.sourceErrors, []);
+  assert.equal(out.items[0]._diff, "new", "the shape block rebuilt the item");
+  const text = out.sections.find((section) => section.type === "text");
+  assert.ok(!text.markdown.includes(EVIL_URL), "the rebuilt item's URL is still not approved");
+  assert.ok(!out.allowedLinks.includes(EVIL_URL));
+});
+
+test("a link an approved source item carried into a custom step still survives", async () => {
+  const db = await freshDb();
+  const report = await prepare(db);
+  await approveStepFor(db, report.id);
+  const dir = mkdtempSync(join(root, "ws-carried-"));
+  writeFileSync(join(dir, "items.json"), JSON.stringify([{ id: "a", link: CARRIED_URL }]));
+  await db.execute({
+    sql: "INSERT INTO project_spaces (id, slug, name, workspace_dir) VALUES (?, ?, ?, ?)",
+    args: [PROJECT, "carried", "Carried", dir],
+  });
+  const out = await runBlocks(db, report.id, [
+    { id: "file", type: "workspace_file", settings: { path: "items.json" } },
+    CUSTOM_RECIPE.blocks[0],
+    { id: "note", type: "text", settings: { content: `Source ${CARRIED_URL} and ${EVIL_URL}` } },
+  ], { sections: [{ markdown: `Source: ${CARRIED_URL}. Other: ${EVIL_URL}.` }] });
+  assert.deepEqual(out.sourceErrors, []);
+  const section = out.sections[0];
+  assert.equal(section.type, "custom");
+  assert.ok(section.markdown.includes(CARRIED_URL), "a carried item's link is kept in its section");
+  assert.ok(!section.markdown.includes(EVIL_URL), "the step's own URL is not");
+  const text = out.sections.find((entry) => entry.type === "text");
+  assert.ok(text.markdown.includes(CARRIED_URL), "and a later present block keeps it too");
+  assert.ok(!text.markdown.includes(EVIL_URL));
+  assert.ok(out.allowedLinks.includes(CARRIED_URL));
+  assert.ok(!out.allowedLinks.includes(EVIL_URL));
+  assert.ok(out.document.markdown.includes(CARRIED_URL));
+  assert.ok(!out.document.markdown.includes(EVIL_URL));
+  assert.deepEqual(out.items, [{ id: "a", link: CARRIED_URL }],
+    "a step that answers no items leaves the flow's own items in place");
+});
+
+test("a gone item diff_last rebuilds from the stored key is untrusted, key URL and all", async () => {
+  const db = await freshDb();
+  const report = await prepare(db);
+  await approveStepFor(db, report.id);
+  // The previous run's `last` map held the URL as a key: the gone line below is built from that stored
+  // state and from no item at all.
+  const out = await runBlocks(db, report.id, [
+    CUSTOM_RECIPE.blocks[0],
+    { id: "diff", type: "diff_last", settings: { keyField: "link" } },
+    { id: "note", type: "text", settings: { content: `Also see ${EVIL_URL}` } },
+  ], { items: [{ id: "a", title: "One" }] }, { "last:diff": { [EVIL_URL]: "a".repeat(64) } });
+  assert.deepEqual(out.sourceErrors, []);
+  assert.deepEqual(out.warnings, []);
+  const gone = out.items.find((item) => item._diff === "gone");
+  assert.equal(gone.link, EVIL_URL, "the gone line still carries its key, as data");
+  const text = out.sections.find((section) => section.type === "text");
+  assert.ok(!text.markdown.includes(EVIL_URL), "a key the stored state held approves no link");
+  assert.match(text.markdown, /\[link removed: evil\.example\]/);
+  assert.ok(!out.allowedLinks.includes(EVIL_URL), "and it is not in the run's allowed links");
+  assert.ok(!out.document.markdown.includes(EVIL_URL), "nor a link in the document");
+});
+
+test("a re-surfaced item carries its mark through dedupe_seen", async () => {
+  const db = await freshDb();
+  const report = await prepare(db);
+  await approveStepFor(db, report.id);
+  // The key is known with a hash of its own, so the item is rebuilt with `_resurfaced`.
+  const out = await runBlocks(db, report.id, [
+    CUSTOM_RECIPE.blocks[0],
+    CUSTOM_RECIPE.blocks[1],
+    { id: "note", type: "text", settings: { content: `Also see ${EVIL_URL}` } },
+  ], { items: [{ id: "a", title: "One", link: EVIL_URL }] },
+  { "seen:seen": { a: "0".repeat(64) } });
+  assert.deepEqual(out.sourceErrors, []);
+  assert.equal(out.items[0]._resurfaced, true, "the clone was built by the shape block");
+  assert.equal(out.items[0].link, EVIL_URL, "its URL is still shown as data");
+  const text = out.sections.find((section) => section.type === "text");
+  assert.ok(!text.markdown.includes(EVIL_URL), "the resurfaced clone's URL is still not approved");
+  assert.ok(!out.allowedLinks.includes(EVIL_URL));
+  assert.ok(!out.document.markdown.includes(EVIL_URL));
+});
+
+test("an item keeps its mark when enrich_lookup joins a retained row into it", async () => {
+  const db = await freshDb();
+  const report = await prepare(db);
+  await approveStepFor(db, report.id);
+  // The retained row is an approved file's (unmarked): only the item's own mark can save this join.
+  await workspaceWith(db, [{ id: "a", score: 9 }]);
+  const out = await runBlocks(db, report.id, [
+    { id: "file", type: "workspace_file", settings: { path: "items.json" } },
+    CUSTOM_RECIPE.blocks[0],
+    { id: "join", type: "enrich_lookup", settings: { source: "file", joinField: "id", lookupKey: "id", fields: ["score"] } },
+    { id: "note", type: "text", settings: { content: `Also see ${EVIL_URL}` } },
+  ], { items: [{ id: "a", link: EVIL_URL }] });
+  assert.deepEqual(out.sourceErrors, []);
+  assert.deepEqual(out.warnings, []);
+  assert.equal(out.items[0].score, 9, "the join happened");
+  assert.equal(out.items[0].link, EVIL_URL, "and the step's URL is still shown as data");
+  const text = out.sections.find((section) => section.type === "text");
+  assert.ok(!text.markdown.includes(EVIL_URL), "the joined item's URL is not approved by the join");
+  assert.ok(!out.allowedLinks.includes(EVIL_URL));
+});
+
+test("an item joined from a custom block's retained row is untrusted too", async () => {
+  const db = await freshDb();
+  const report = await prepare(db);
+  await approveStepFor(db, report.id);
+  // Here the joining item is an approved file's (unmarked) and the retained row is the step's own, so
+  // only the row's mark can save this join.
+  await workspaceWith(db, [{ id: "a", title: "One" }]);
+  const out = await runBlocks(db, report.id, [
+    CUSTOM_RECIPE.blocks[0],
+    { id: "file", type: "workspace_file", settings: { path: "items.json" } },
+    { id: "join", type: "enrich_lookup", settings: { source: "fetch", joinField: "id", lookupKey: "id", fields: ["link"] } },
+    { id: "note", type: "text", settings: { content: `Also see ${EVIL_URL}` } },
+  ], { items: [{ id: "a", link: EVIL_URL }] });
+  assert.deepEqual(out.sourceErrors, []);
+  assert.deepEqual(out.warnings, []);
+  assert.equal(out.items[0].link, EVIL_URL, "the field came from the step's own row");
+  const text = out.sections.find((section) => section.type === "text");
+  assert.ok(!text.markdown.includes(EVIL_URL), "the step's URL is not approved by the row it came from");
+  assert.ok(!out.allowedLinks.includes(EVIL_URL));
+  assert.ok(!out.document.markdown.includes(EVIL_URL));
 });
 
 test("a preview gate stays shut on settings a bot put back after the owner removed them", async () => {

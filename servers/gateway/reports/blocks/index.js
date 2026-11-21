@@ -19,8 +19,10 @@
  *     source error at run time (`source_not_available`), never a silent skip.
  *   - `shape`: filters, sorts or annotates the items a source produced. Never reads anything new, so a
  *     failure is a warning, not a source error.
- *   - `present`: turns items into a document section. Has no `run` in this round: the executor skips it.
- *     `ai_commentary` and `annotate` send items to a model, so they are `sourceBearing: true`.
+ *   - `present`: turns items into a document section. It reads nothing, so its settings are free and
+ *     a failure is a warning. `ai_commentary` and `annotate` send items to a model, so they are
+ *     `sourceBearing: true`, and their own gates (the report's `ai_commentary` column, and the model the
+ *     live seal names) are in the block.
  *   - `custom`: runs the report's own approved step. `sourceBearing: true`.
  *
  * `validate(settings)` answers a list of error tokens (field names, never prose), and `validateRecipe`
@@ -30,6 +32,12 @@
  */
 import { MODEL_BLOCK_TYPES } from "../recipe-hash.js";
 import { customBlock } from "./custom.js";
+import { aiCommentaryBlock, annotateBlock } from "./present/ai-commentary.js";
+import { cardsBlock } from "./present/cards.js";
+import { chartBlock } from "./present/chart.js";
+import { mapBlock } from "./present/map.js";
+import { tableBlock } from "./present/table.js";
+import { textBlock } from "./present/text.js";
 import { httpJsonBlock } from "./sources/http-json.js";
 import { mailAlertsBlock } from "./sources/mail-alerts.js";
 import { rssBlock } from "./sources/rss.js";
@@ -65,6 +73,15 @@ function presentEntry(type, sourceBearing) {
   });
 }
 
+/** Every model-calling block type has a real module; a type added to MODEL_BLOCK_TYPES needs one. */
+const MODEL_BLOCKS = Object.freeze([aiCommentaryBlock, annotateBlock]);
+const MODEL_BLOCK_NAMES = Object.freeze(MODEL_BLOCKS.map((block) => block.type));
+
+/** A model-calling type this build has no module for: metadata only, so it renders nothing. */
+const MISSING_MODEL_BLOCKS = MODEL_BLOCK_TYPES
+  .filter((type) => !MODEL_BLOCK_NAMES.includes(type))
+  .map((type) => presentEntry(type, true));
+
 const REGISTERED = [
   // Sources: each one reads something the owner approved, and each one refuses on its own terms.
   httpJsonBlock,
@@ -79,13 +96,14 @@ const REGISTERED = [
   enrichLookupBlock,
   // The report's own approved step.
   customBlock,
-  // Present blocks: the document assembly that calls them arrives in a later round.
-  presentEntry("table", false),
-  presentEntry("cards", false),
-  presentEntry("chart", false),
-  presentEntry("map", false),
-  presentEntry("text", false),
-  ...MODEL_BLOCK_TYPES.map((type) => presentEntry(type, true)),
+  // Present blocks: the document assembly that calls them is blocks/run-recipe.js and reports/document.js.
+  tableBlock,
+  cardsBlock,
+  chartBlock,
+  mapBlock,
+  textBlock,
+  ...MODEL_BLOCKS,
+  ...MISSING_MODEL_BLOCKS,
 ];
 
 function buildRegistry(entries) {
