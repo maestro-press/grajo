@@ -1916,17 +1916,22 @@ test("5c-6: a sessionless (browser-level) Target.detachFromTarget ends coverage 
     await guard.call("Fetch.continueRequest", { requestId: first.requestId }, sessionId);
     assert.equal((await first.reply).result?.outcome, "passed", "control: the covered page passes");
 
-    // Control (ii): a sessionless detach naming ANOTHER client's session changes nothing here.
-    const otherPage = await observer.call("Target.createTarget", { url: "about:blank" });
-    const otherAttach = await observer.call("Target.attachToTarget", { targetId: otherPage.result.targetId, flatten: true });
+    // Control (ii): a sessionless detach naming ANOTHER session — one the guard OWNS, because
+    // Chromium looks a session up for `Target.detachFromTarget` only in the session that created
+    // it, so a detach of somebody else's session would be refused and prove nothing — changes
+    // nothing for THIS page. This guard is `attach: false`, so the other session is one it
+    // attached itself (created on its own `S_c` envelope by `forwardToPipe`).
+    const otherPage = await guard.call("Target.createTarget", { url: "about:blank" });
+    const otherAttach = await guard.call("Target.attachToTarget", { targetId: otherPage.result.targetId, flatten: true });
     const otherSession = otherAttach.result?.sessionId;
-    assert.ok(otherSession, "the observer holds a session of its own");
+    assert.ok(otherSession, "the guard holds a session of its own on another page");
     const elsewhere = await guard.call("Target.detachFromTarget", { sessionId: otherSession });
     assert.equal(elsewhere.error, undefined, `the sessionless detach is forwarded: ${JSON.stringify(elsewhere)}`);
-    await waitTrace(ctx, (r) => r.t === "detached" && r.sessionId === otherSession, 4000, "the fixture detaching the other client's session");
+    const elsewhereDetached = await waitTrace(ctx, (r) => r.t === "detached" && r.sessionId === otherSession, 4000, "the fixture detaching the guard's own other session");
+    assert.equal(elsewhereDetached.refused, undefined, "the detach named a session this client OWNS, so the browser accepted it");
     const second = await pausedAtGuard("https://bot.example/still-covered");
     await guard.call("Fetch.continueRequest", { requestId: second.requestId }, sessionId);
-    assert.equal((await second.reply).result?.outcome, "passed", "control: another client's session is not this page's coverage");
+    assert.equal((await second.reply).result?.outcome, "passed", "control: another session of the same client is not this page's coverage");
 
     // The negative: the guard holds a request and detaches that very session with a
     // sessionless (browser-level) Target.detachFromTarget that names it in params.

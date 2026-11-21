@@ -596,7 +596,13 @@ test("on disconnect the relay detaches every child session, then S_c", async (t)
       await sleep(50);
     }
     assert.deepEqual(detaches.map((r) => r.params.sessionId), [child, sc], "children first, then the browser session");
-    assert.equal(detaches.every((r) => r.sessionId === null), true, "detaches are relay-internal: no client session rides on them");
+    // Chromium looks a session up for `Target.detachFromTarget` only in the session that OWNS
+    // it, so the envelope is not cosmetic: the child was attached by this client's own `S_c`
+    // (a sessionless attach is stamped with it), so its detach rides on `S_c`; `S_c` itself was
+    // created by a sessionless `Target.attachToBrowserTarget` and so detaches at the root.
+    assert.deepEqual(detaches.map((r) => r.sessionId), [sc, null], "the child's detach names its owner (the client's S_c); S_c detaches at the root");
+    const refusedDetaches = ctx.records("detached").filter((r) => r.refused);
+    assert.deepEqual(refusedDetaches, [], `an ownership-honouring Chromium accepted every detach: ${JSON.stringify(refusedDetaches)}`);
   });
 });
 

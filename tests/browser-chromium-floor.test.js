@@ -17,7 +17,8 @@
  *       after the playwright install line;
  *   (e) entrypoint.sh carries the downgrade guard, after the instance marker and before
  *       Xvfb starts, with the sleep before the exit;
- *   (f) manifest.json is the release that shipped this (1.9.1).
+ *   (f) manifest.json is the release that shipped the SIGTERM close-window gate fix
+ *       (1.9.2).
  *
  * Static + read-only: no docker, no build.
  */
@@ -164,6 +165,6 @@ test("(e) entrypoint.sh carries the downgrade guard, after the instance marker a
   assert.ok(xvfbAt > guardAt, "the downgrade guard runs before Xvfb starts");
 });
 
-test("(f) manifest.json is the release that shipped the lock move", () => {
-  assert.equal(readJson("manifest.json").version, "1.9.1");
+test("(f) manifest.json is the release that shipped the SIGTERM close-window gate fix", () => {
+  assert.equal(readJson("manifest.json").version, "1.9.2");
 });

@@ -665,6 +665,13 @@ export async function createRelay(config) {
   let stopping = false;
   /** True once `closing` went out on fd 5: a graceful close, and the exit hook owes no kill. */
   let closingReported = false;
+  /**
+   * True once a `Browser.close` has actually been WRITTEN to the pipe, by either path (the stop
+   * path's own write, or a client's close forwarded by `handleBrowserClose`). It is what tells a
+   * later `shutdown()` that the cleanup owed for that close has already run: what a joining stop
+   * owes then is the wait for Chromium's exit, never a second cleanup.
+   */
+  let closeForwarded = false;
   /** True once `kill` went out on fd 5: it is written once, never again by the exit hook. */
   let killReported = false;
 
@@ -808,6 +815,22 @@ export async function createRelay(config) {
   let cleanupRun = null;
   /** The replacement page of the cleanup on the move: resumed at once, never navigated. */
   let cleanupReplacementId = null;
+  /**
+   * How many asks for a `Browser.close` are outstanding. A COUNT, never one flag, because two
+   * different owners ask — the stop path (`shutdown()`, SIGTERM) and a client's `Browser.close`
+   * — and neither may undo the other's ask. Above zero, the cleanup that comes back clean must
+   * NOT re-open the gate: Chromium keeps running its pages between `Browser.close` and its own
+   * exit (pagehide beacons, image requests), so a gate that declared itself open in that window
+   * would pass them.
+   *
+   * `shutdown()` increments it and never decrements — a SIGTERM stop is terminal, so the count
+   * can only return to zero on the client path. `handleBrowserClose()` increments it before the
+   * cleanup and decrements it when no `Browser.close` goes out at all (its asker is gone, or the
+   * stop path owns the exit); only with the count back at zero, nothing stopping, and a clean
+   * scan does the gate re-open. Both increment BEFORE the cleanup runs, so a cleanup already in
+   * flight that they join honours them too (the counter is read when the run ends).
+   */
+  let closeIntents = 0;
   /** Resolvers waiting for the cleanup to reach IDLE (new upgrades, held client input). */
   const idleWaiters = [];
   /** gate sessionId → { seen: Set<loaderId>, waiters: [{ loaderIds, resolve }] } (commits). */
@@ -893,6 +916,13 @@ export async function createRelay(config) {
       held: false,
       resumed: false,
       closed: false,
+      /**
+       * True only when the GATE ITSELF closed this target (`closeGateTarget`, and the cleanup's
+       * own close paths). `closed` is also set by Chromium events the gate never chose — a
+       * crash, a destroy, a settle that finds the target gone — and those may not take the
+       * request rule with them: a page that CRASHED is not a page the gate closed.
+       */
+      gateClosed: false,
       exemptWorker: false,
       ownerTargetId: ownerTargetId || null,
       acks: Promise.resolve(true),
@@ -1103,6 +1133,7 @@ export async function createRelay(config) {
     for (const record of pages) {
       if (record.resumed) { livePages.push(record); continue; }
       record.closed = true;
+      record.gateClosed = true; // the GATE closed it: its requests fail in every state
       record.resumed = true;
       dropGateEvents(record);
       await gateRequest(gateBrowserSession, "Target.closeTarget", { targetId: record.targetId }, budget(1000));
@@ -1145,6 +1176,7 @@ export async function createRelay(config) {
     // in front of it (a detach can count as the resume that releases a held target).
     for (const record of committed) {
       record.closed = true;
+      record.gateClosed = true; // the GATE closed it: its requests fail in every state
       record.resumed = true;
       dropGateEvents(record);
       await gateRequest(gateBrowserSession, "Target.closeTarget", { targetId: record.targetId }, budget(1000));
@@ -1167,7 +1199,7 @@ export async function createRelay(config) {
       // A component-extension worker the gate only ever LISTED (no record, no close) is
       // Chromium's, exactly like the attached one: it is never closed.
       if (isExemptNonPageTarget(targetId)) continue;
-      if (record) { record.closed = true; record.resumed = true; dropGateEvents(record); }
+      if (record) { record.closed = true; record.gateClosed = true; record.resumed = true; dropGateEvents(record); }
       await gateRequest(gateBrowserSession, "Target.closeTarget", { targetId }, budget(1000));
     }
 
@@ -1244,7 +1276,31 @@ export async function createRelay(config) {
         if (gateReady && !gateLost) stopPath("the cleanup could not leave the pages clean");
         return false;
       }
-      if (gateReady && !gateLost) completeCleanup();
+      if (gateReady && !gateLost) {
+        if (closeIntents > 0 || stopping) {
+          // A close is still owed (or a stop owns the exit): the gate stays CLEANUP through the
+          // close window, so the IDLE reconcile that normally resumes the page the cleanup left
+          // never runs. Resume what is left HERE, without touching the state: this is what gives
+          // the close window a LIVE page whose traffic has to reach the gate, where CLEANUP fails
+          // it. It is NOT what makes the close safe — the gate staying in CLEANUP is, and this
+          // block never moves the state.
+          for (const record of gateTargets.values()) {
+            if (record.closed) continue;
+            resumeTarget(record);
+            // A connected client auto-attaches with `waitForDebuggerOnStart` too, so the same
+            // target is held by the client's own session as well — and that client's resume
+            // frame is still in the queue this path never flushes. Release the hold on the
+            // client's session here, so the page RUNS and only the gate is in front of it
+            // (its own Fetch.enable, if any, is in the same never-flushed queue).
+            for (const [sessionId, targetId] of clientSessionTarget) {
+              if (targetId !== record.targetId) continue;
+              void gateRequest(sessionId, "Runtime.runIfWaitingForDebugger", {});
+            }
+          }
+          return true;
+        }
+        completeCleanup();
+      }
       return true;
     })();
     return cleanupRun;
@@ -1256,8 +1312,33 @@ export async function createRelay(config) {
    */
   function enterCleanup() {
     if (!gateReady || gateLost || stopping) return;
+    // A close is owed (`closeIntents` above zero): the gate already sits in CLEANUP for it and
+    // the browser is already on its way out. A SECOND cleanup here would run against a closing
+    // browser — its replacement page and its closes would fail on a browser that is exiting,
+    // and the failure takes the kill path instead of the polite close the owner asked for. The
+    // close's own cleanup is the only one this window gets; return before anything moves.
+    if (closeIntents > 0) return;
     if (cleanupRun) return; // one at a time: a second trigger changes nothing
     setState("CLEANUP");
+    // NO CLIENT-HELD REQUEST MAY SURVIVE THIS CLEANUP'S `Target.closeTarget`. A PLAIN client (no
+    // intent header) can still hold its own `Fetch.enable {*}` session on a page, newer than the
+    // gate's, so a request of that page pauses at the CLIENT's session first. In CLEANUP the
+    // relay defers a client's answers, so that request would sit there while the cleanup's close
+    // takes every session of the page at once — and it would then advance past the sessions that
+    // vanished and PASS, with the gate never in front of it. A session that DETACHES releases
+    // what it held ONWARD to the gate's session instead, which fails it in CLEANUP. So every
+    // client still attached is released here, BEFORE the cleanup may close any target (the pipe
+    // is ordered, so these detaches are processed before its first `Target.closeTarget`), and
+    // `keepOwnSession` leaves each one its `S_c` — the reply channel the next turn uses. The gate
+    // is already CLEANUP above, so the released requests are FAILED, never passed.
+    //
+    // A GUARD-BEARING client cannot be attached here: this trigger runs only once the last
+    // intent-bearing client is gone (the scan in `dropClient`), so this loop touches plain
+    // clients only.
+    for (const client of [...clients]) {
+      if (client.closed) continue;
+      releaseClientSessions(client, { keepOwnSession: true });
+    }
     void startCleanup().then((clean) => {
       if (clean) return;
       stopPath("the pages a guard-bearing client left could not be made clean");
@@ -1514,6 +1595,7 @@ export async function createRelay(config) {
   function closeGateTarget(record) {
     if (!record || record.closed) return;
     record.closed = true;
+    record.gateClosed = true; // the GATE closed it: its requests fail in every state
     dropGateEvents(record);
     record.resumed = true; // never resumed again for any reason
     void gateRequest(gateBrowserSession, "Target.closeTarget", { targetId: record.targetId });
@@ -1810,6 +1892,9 @@ export async function createRelay(config) {
       // coverage was per client session, and the new client session has to re-earn it.
       record.covered.clear();
       record.closed = false;
+      // The record is live again, and only a close the GATE performs sets the flag back: the
+      // close that marked it belonged to the session that just went away (a swap).
+      record.gateClosed = false;
     }
     record.type = type;
     record.url = url;
@@ -1887,7 +1972,12 @@ export async function createRelay(config) {
   /**
    * Per request: continue when the gate is in idle or the page is covered, else fail it. A
    * CLEANUP fails every request, coverage or not: a page it has not closed yet is a document
-   * it is about to leave, so nothing it issues may reach the network.
+   * it is about to leave, so nothing it issues may reach the network. A target the GATE closed
+   * fails in EVERY state, IDLE included: its document can still answer `requestPaused` on a
+   * session that has not detached yet (pagehide beacons, a last image request), and that
+   * traffic may not pass through a gate that never resumed it. The flag is the GATE's own
+   * (`gateClosed`, set where the gate closes a target itself): a target that CRASHED is not
+   * one of those, and its requests are decided by the state and coverage rules like any other.
    */
   function onGateRequestPaused(sessionId, params) {
     const requestId = params && typeof params.requestId === "string" ? params.requestId : null;
@@ -1896,7 +1986,7 @@ export async function createRelay(config) {
     const meta = gateSessions.get(sessionId);
     const record = meta && meta.targetId ? gateTargets.get(meta.targetId) : null;
     const covered = !!(record && record.covered.size > 0);
-    const pass = gateState === "IDLE" || (gateState !== "CLEANUP" && covered);
+    const pass = !(record && record.gateClosed) && (gateState === "IDLE" || (gateState !== "CLEANUP" && covered));
     const method = pass ? "Fetch.continueRequest" : "Fetch.failRequest";
     const answer = pass ? { requestId } : { requestId, errorReason: "BlockedByClient" };
     void gateRequest(sessionId, method, answer, 10_000).then(() => gateRequestIds.delete(requestId));
@@ -1988,15 +2078,82 @@ export async function createRelay(config) {
    * cleanup first, and the browser is asked to close only when the scan after it is clean.
    * Anything else would run a live page's pagehide/unload with the guard already gone (S4 11).
    * A client's `Browser.crash` passes through untouched: it runs no unload.
+   *
+   * The close intent is counted BEFORE the cleanup so the gate stays CLEANUP through the close
+   * window: Chromium keeps running its pages' pagehide beacons and image requests between
+   * `Browser.close` and its own exit, and IDLE would pass them. It is this client's OWN intent
+   * that is withdrawn below, never the count as a whole: a stop path that joined the same
+   * cleanup keeps the gate in CLEANUP, because its ask is the one that will write the close.
    */
   function handleBrowserClose(client, msg) {
+    closeIntents++;
+    // NO REQUEST MAY REACH THE NETWORK THROUGH AN ADVANCING FETCH CHAIN. A live client has its
+    // own Fetch session on a page, NEWER than the gate's, so that page's request pauses at the
+    // CLIENT's session first. While the relay is in CLEANUP it defers a client's answers, so the
+    // request would stay held there — and the cleanup's `Target.closeTarget` takes every session
+    // of the page at once, after which the request advances past the sessions that vanished and
+    // PASSES, with the gate never having seen it. A session that DETACHES instead releases what
+    // it held ONWARD to the next session in the chain — the gate's — which fails it in CLEANUP.
+    // So, before `startCleanup()` can close any target: the gate goes CLEANUP first (a released
+    // request must be FAILED, never passed), and EVERY client — the asker and every other one —
+    // is released ONWARD here, its top-level sessions detached on the envelopes that own them
+    // (`releaseClientSessions`, the asker's included) and forgotten; a nested child goes with its
+    // parent page session. The asker's own `S_c` is the one thing that stays: it is the reply
+    // channel the forwarded close still needs, and the replies it holds behind dropping events
+    // are failed by the cleanup's own bookkeeping. The pipe to Chromium is ORDERED, so every
+    // detach written here is processed before the cleanup's first `Target.closeTarget`.
+    if (gateReady && !gateLost && gateState !== "CLEANUP") setState("CLEANUP");
+    for (const other of [...clients]) {
+      if (other === client) continue;
+      releaseClientSessions(other, { keepOwnSession: true });
+    }
+    releaseClientSessions(client, { keepOwnSession: true });
     startCleanup().then((clean) => {
-      if (!clean || gateLost || client.closed) return; // the stop path owns the outcome
+      if (!clean || gateLost || client.closed) {
+        // No `Browser.close` is going out — the stop path owns the exit, or the client that
+        // asked has gone — so this ask is withdrawn and the count drops by one. Only when that
+        // was the LAST ask, nothing is stopping, and the scan was clean does the cleanup get
+        // the re-open it owes; otherwise the gate stays CLEANUP, where the close window's
+        // traffic fails.
+        closeIntents = Math.max(0, closeIntents - 1);
+        if (closeIntents === 0 && !stopping && clean && gateReady && !gateLost) completeCleanup();
+        return;
+      }
+      // A forwarded close is not an exit: Chromium may answer `Browser.close` and not go. The
+      // graceful stop bounds that wait with `closeTimeoutMs` and kills the browser when it
+      // overruns, and this path takes the same budget to the same stop path — otherwise a close
+      // Chromium ignored would leave this relay waiting forever. `delay` unrefs its timer, so a
+      // browser that does exit leaves no timer behind to hold the process up.
+      //
+      // ARMED FIRST, before anything else in this branch can throw: the count above is what
+      // keeps the gate in CLEANUP, and a step that threw between it and a late arm would leave
+      // the count above zero with no timer to bring it back — every request failed for the rest
+      // of the relay's life.
+      void Promise.race([exited.then(() => "exited"), delay(closeTimeoutMs).then(() => "timeout")]).then((how) => {
+        if (how === "timeout" && !stopping) stopPath("Chromium did not exit after a client's Browser.close");
+      });
+      // The scan was clean and the browser IS going: every other client is dropped whole now
+      // (its sessions were already released before the cleanup above, so this is the socket and
+      // its bookkeeping only). NOT before the cleanup: an asker that has already gone by the time
+      // the scan ends withdraws the close (the branch above), the gate re-opens IDLE, and the
+      // clients still attached have to still be usable there — dropping them on the way in would
+      // close sockets for a close that is never written.
+      for (const other of [...clients]) {
+        if (other === client) continue;
+        dropClient(other, 1001, "the relay is closing the browser");
+      }
       // The scan was clean, so this is a graceful close: the supervisor hears about it before
       // the command that closes the browser goes out.
       reportClosing();
       forwardToPipe(client, msg);
-    }).catch(() => {});
+      // The close is on the wire: a later `shutdown()` owes a wait for the exit, no cleanup.
+      closeForwarded = true;
+    }).catch(() => {
+      // A throw anywhere in this handler is never swallowed: the close is owed, nothing else is
+      // going to end this browser, and a swallowed failure would leave the gate in CLEANUP with
+      // that count above zero forever. The stop path takes it.
+      if (!stopping) stopPath("a client's Browser.close handling threw");
+    });
   }
 
   // -----------------------------------------------------------------------------------
@@ -2239,10 +2396,49 @@ export async function createRelay(config) {
     client.sessions.add(sessionId);
   }
 
-  function detachSession(sessionId) {
+  /**
+   * Detach ONE session, on the envelope of the session that OWNS it.
+   *
+   * Chromium looks a session up for `Target.detachFromTarget` only in the session the
+   * `Target.attachToTarget` / `Target.setAutoAttach` that created it was issued on: sent on
+   * any other envelope — the root included — the command is answered "No session with given
+   * id" and NOTHING is detached. That matters here because the detach is what releases the
+   * session's held requests ONWARD to the next, older Fetch session — the gate's: a detach
+   * that silently does nothing leaves the request to be released by the cleanup's own
+   * `Target.closeTarget`, which advances it past the sessions that vanished and PASSES it
+   * with no gate in front of it.
+   *
+   * `ownerSessionId` is that owner wherever the relay knows one: `sessionParent.get(sid)` for
+   * a nested child (a session announced BY another session — an attach event, or the RESPONSE to
+   * an attach the client sent on that session's envelope), otherwise the client's own `S_c` —
+   * every session a client attached sessionless was stamped with `sessionId = S_c` by
+   * `forwardToPipe`. `S_c` itself has NO owner: `Target.attachToBrowserTarget` went out
+   * sessionless (the root), so it detaches at the root, exactly as before.
+   *
+   * A refusal is LOGGED, never swallowed: one line naming the session and Chromium's error. A
+   * detach that did nothing is the leak this whole path exists to prevent, so it must be visible
+   * to an operator instead of being a silent `() => {}` — except for the one refusal that is not
+   * a fault ("No session with given id": Chromium already took the session away), which goes to
+   * the debug log so a real wrong-owner refusal stands out.
+   */
+  function detachSession(sessionId, ownerSessionId = null) {
     const id = nextId++;
-    internal.set(id, () => {});
-    pipeSend({ id, method: "Target.detachFromTarget", params: { sessionId } });
+    const owner = typeof ownerSessionId === "string" && ownerSessionId ? ownerSessionId : null;
+    internal.set(id, (msg) => {
+      if (!msg || !msg.error) return;
+      const reason = String(msg.error.message || "");
+      const line = `detach of session ${sessionId} on its owner ${owner || "(root)"} was refused: ${msg.error.code} ${reason}`;
+      // "No session with given id" is the ONE refusal that is expected and harmless: Chromium
+      // has already taken the session away with the owner or the target that closed it, so there
+      // is nothing left to detach. Every OTHER reason — an owner the relay got wrong included —
+      // means a session stayed attached while the relay believed it was gone, which is how a
+      // request it held leaks past the gate: that one stays an operator-visible line.
+      if (reason === "No session with given id") debug(line);
+      else log(line);
+    });
+    const frame = { id, method: "Target.detachFromTarget", params: { sessionId } };
+    if (owner) frame.sessionId = owner;
+    if (!pipeSend(frame)) internal.delete(id);
   }
 
   function send(client, msg) {
@@ -2284,24 +2480,71 @@ export async function createRelay(config) {
     return send(client, out);
   }
 
+  /**
+   * Release a client's sessions to the browser — the ONE per-session release, shared by a whole
+   * client's drop, the partial release a `Browser.close` does for its asker, and the release
+   * every attached client gets before a turn-end cleanup closes anything.
+   *
+   * The order is load-bearing. Coverage goes FIRST, before any detach is written: a session that
+   * detaches (or disables Fetch) releases its paused requests ONWARD to the next session in the
+   * Fetch chain, and they can reach the gate's own session before any event says the session is
+   * going away. Clearing coverage afterwards would let the gate pass a request the dead guard
+   * never approved. Then the ownership bookkeeping, then the detach itself, the client's own
+   * browser session LAST — every child session goes before the session its replies come back on.
+   *
+   * ONLY TOP-LEVEL sessions are detached, and each on its OWNER's envelope (see
+   * `detachSession`). A client's top-level sessions are its `S_c` (ownerless: it detaches at the
+   * root) and the sessions `S_c` attached — children announced on `S_c`, and explicit attaches,
+   * which `forwardToPipe` stamps with `sessionId = S_c`. A session announced BY one of those — an
+   * iframe the client auto-attached under its own page session, or the child an attach RESPONSE
+   * announced for an attach the client sent on that session's envelope (`sessionParent` is set
+   * from the forwarded envelope in both paths) — is owned by that session, not by `S_c`:
+   * Chromium takes it silently when its parent goes, and a detach sent anywhere else is answered
+   * "No session with given id" and detaches nothing. So it is never detached separately — only
+   * its bookkeeping goes, so a later release does not try to detach a session whose owner has
+   * already gone.
+   *
+   * `keepOwnSession` leaves `S_c`, the client's own browser session, attached and owned: a
+   * client that asked for `Browser.close` still owns its reply channel, so the close the relay
+   * forwards can be answered to it. That client is not closed and its socket stays open.
+   */
+  function releaseClientSessions(client, { keepOwnSession = false } = {}) {
+    if (!client) return;
+    for (const sid of client.sessions) clearSessionCoverage(sid);
+    const victims = [];
+    for (const sid of client.sessions) {
+      if (sid === client.sc) continue;
+      const parent = sessionParent.get(sid);
+      if (typeof parent === "string" && parent && parent !== client.sc) {
+        // A nested child: its parent page session owns it, so it dies with that session.
+        forgetSession(sid);
+        client.sessions.delete(sid);
+        continue;
+      }
+      victims.push(sid);
+    }
+    if (!keepOwnSession && client.sc) victims.push(client.sc);
+    for (const sid of victims) {
+      const parent = sessionParent.get(sid);
+      const owner = sid === client.sc ? null : typeof parent === "string" && parent ? parent : client.sc;
+      sessionOwner.delete(sid);
+      clientSessionTarget.delete(sid);
+      client.sessions.delete(sid);
+      sessionParent.delete(sid);
+      detachSession(sid, owner);
+    }
+  }
+
   function dropClient(client, code, why) {
     if (!client || client.closed) return;
     const wasIntent = client.intent === true;
     client.closed = true;
     stats.closed++;
     if (client.deadline) { clearTimeout(client.deadline); client.deadline = null; }
-    // Coverage goes FIRST, before any detach is written: a session that detaches or disables
-    // Fetch releases its paused requests onward to the gate, and they can reach the gate's
-    // own session before any event says the session is going away. Clearing afterwards would
-    // let the gate pass a request the dead guard never approved.
-    for (const sid of client.sessions) clearSessionCoverage(sid);
     for (const [child, meta] of [...swallowedSessions]) if (meta.client === client) swallowedSessions.delete(child);
-    for (const sid of [...client.sessions]) {
-      sessionOwner.delete(sid);
-      clientSessionTarget.delete(sid);
-      if (sid !== client.sc) detachSession(sid);
-    }
-    if (client.sc) detachSession(client.sc);
+    // Coverage first, then the detaches (see releaseClientSessions): a session that detaches
+    // releases what it held onward, and the gate has to already see it uncovered.
+    releaseClientSessions(client);
     client.sessions.clear();
     // Its in-flight ids die with it: a late response then finds no owner and is discarded.
     for (const [id, entry] of [...pending]) if (entry.client === client) pending.delete(id);
@@ -2335,13 +2578,30 @@ export async function createRelay(config) {
     debug(`client ${client.id} dropped (${code}): ${why}`);
   }
 
+  /**
+   * Send a client's queued frames, in order — but only while doing so is still safe. The state
+   * is re-read for EVERY frame, never once before the loop: a `Browser.close` is relay-handled
+   * and starts its cleanup SYNCHRONOUSLY, so the frames queued behind it belong to that
+   * cleanup's window, not to the IDLE the flush began in. They are put back (re-deferred, ahead
+   * of anything that arrived meanwhile) instead of being forwarded into a closing browser.
+   */
   function flush(client) {
     if (!client.sc || client.closed) return;
     if (gateState === "CLEANUP") return; // held: the cleanup flushes every queue at IDLE
     const queued = client.queue;
     client.queue = [];
     client.queueBytes = 0;
-    for (const text of queued) forwardText(client, text);
+    for (let i = 0; i < queued.length; i++) {
+      if (client.closed) return; // the socket is gone: nothing is owed to it
+      if (gateState === "CLEANUP") {
+        // A frame in front of this batch started a cleanup: hold the rest of it.
+        const rest = queued.slice(i).concat(client.queue);
+        client.queue = rest;
+        client.queueBytes = rest.reduce((n, text) => n + text.length, 0);
+        return;
+      }
+      forwardText(client, queued[i]);
+    }
   }
 
   function attachBrowserSession(client) {
@@ -2393,6 +2653,12 @@ export async function createRelay(config) {
     if (msg.id === undefined) { pipeSend({ ...msg, sessionId }); stats.framesIn++; return; }
     const relayMsgId = nextId++;
     const entry = { client, originalId: msg.id, method: typeof msg.method === "string" ? msg.method : null };
+    // The ENVELOPE this frame goes out on: `S_c` for every browser-level command (that is what
+    // `sessionId` above defaults to), or the client's own session the frame named. A session an
+    // attach response announces is owned by THIS envelope in Chromium — the session whose
+    // `Target.attachToTarget` / `setAutoAttach` created it — so the response path books the child
+    // as nested under it (see `fromPipe`).
+    entry.envelope = sessionId;
     // A session can be announced by a response (Target.attachToTarget): the map from a session
     // to its target comes from Chromium's own reply, with the target id the client asked for.
     if (entry.method && entry.method.startsWith("Target.attach") && msg.params && typeof msg.params.targetId === "string") {
@@ -2415,7 +2681,19 @@ export async function createRelay(config) {
     if (typeof msg.method === "string" && msg.method.startsWith("Crow.")) { handleCrowCommand(client, msg); return; }
     // `Browser.close` is relay-handled too (cleanup first, close only on a clean scan);
     // `Browser.crash` is not: it runs no unload and passes straight through.
-    if (msg.method === "Browser.close") { handleBrowserClose(client, msg); return; }
+    if (msg.method === "Browser.close") {
+      // Only the browser may close the browser: a close that NAMES a session is one Chromium
+      // refuses, so it closes nothing. Refused here, BEFORE any cleanup and before a close is
+      // counted — otherwise the cleanup would run for a close that never happens and leave the
+      // gate in CLEANUP with a close owed for the rest of the relay's life, failing every
+      // request after one frame. The client's own id comes back, as with the refusals below.
+      if (typeof msg.sessionId === "string" && msg.sessionId !== "") {
+        replyTo(client, msg, { error: { code: -32602, message: "Browser.close takes no sessionId: the browser is closed by the relay, not by a session" } });
+        return;
+      }
+      handleBrowserClose(client, msg);
+      return;
+    }
     if (refusesInitialUrl(msg)) {
       // Refused before anything is forwarded: an initial-URL target would fetch its URL
       // before the guard could attach (see refusesInitialUrl). The client's own id comes
@@ -2522,6 +2800,14 @@ export async function createRelay(config) {
       // A session can be announced by a response (Target.attachToTarget) or by an event.
       if (announced && entry.method && entry.method.startsWith("Target.attach")) {
         registerSession(announced, client);
+        // …and it is owned by the ENVELOPE the command went out on, exactly as Chromium owns it:
+        // a client's own `Target.attachToTarget` is stamped with `S_c` by forwardToPipe, so the
+        // child is top-level as it always was — but a client may send it on the envelope of one
+        // of its OWN sessions (a page session), and then THAT session owns the child. Booking it
+        // as nested is what makes `releaseClientSessions` let it die with its parent instead of
+        // sending a detach on `S_c`, which Chromium refuses ("No session with given id") and
+        // which would leave the session — and any request held at it — unreleased.
+        if (typeof entry.envelope === "string" && entry.envelope) sessionParent.set(announced, entry.envelope);
         if (entry.targetId) {
           clientSessionTarget.set(announced, entry.targetId);
           // A target the client auto-attached earlier keeps that session as its current one (a
@@ -2834,34 +3120,11 @@ export async function createRelay(config) {
   }
 
   /**
-   * A graceful stop: the cleanup first, then `Browser.close` — and only on a clean scan. Resolves
-   * true when the browser was closed through the pipe, false when the stop path owns the exit
-   * (the browser is then being stopped, and this process must not exit 0).
+   * The tail of every graceful stop, whether this process wrote the close or a client's close
+   * had already gone out: the clients go, the listener closes, the pipe ends. Shared so the two
+   * stop shapes cannot drift apart.
    */
-  async function shutdown(exitCode = 0) {
-    if (stopping) return false;
-    stopping = true;
-    // The graceful path runs the cleanup FIRST, and `Browser.close` is written only when the scan
-    // after it came back clean: closing a page that is still live runs its pagehide and unload
-    // traffic with the guard already gone (S4 11). The budgets add up — the cleanup inside its
-    // own cap, then the browser's close inside `closeTimeoutMs`.
-    const clean = await startCleanup();
-    if (!clean || gateLost) {
-      stopPath("a graceful stop could not be preceded by a clean cleanup");
-      return false;
-    }
-    // The supervisor is told BEFORE the line that closes the browser: from here on fd 5's EOF
-    // and this process's exit are expected, and Chromium's own exit is what is waited for (a
-    // SIGKILL in the middle of a close loses the cookie commit).
-    reportClosing();
-    // Ask Chromium to close, which is what commits its cookie store.
-    pipeSend({ id: nextId++, method: "Browser.close", params: {} });
-    const how = await Promise.race([exited.then(() => "exited"), delay(closeTimeoutMs).then(() => "timeout")]);
-    if (how === "timeout") {
-      log(`Chromium did not close within ${Math.round(closeTimeoutMs / 1000)}s — killing it`);
-      killChromium();
-      await Promise.race([exited, delay(2000)]);
-    }
+  async function finishStop(exitCode) {
     for (const client of [...clients]) dropClient(client, 1001, "the relay is stopping");
     await new Promise((resolve) => {
       const t = setTimeout(resolve, 500);
@@ -2871,6 +3134,78 @@ export async function createRelay(config) {
     try { input.destroy(); } catch { /* gone */ }
     try { output.destroy(); } catch { /* gone */ }
     process.exitCode = exitCode;
+  }
+
+  /**
+   * A graceful stop: the cleanup first, then `Browser.close` — and only on a clean scan. Resolves
+   * true when the browser was closed through the pipe, false when the stop path owns the exit
+   * (the browser is then being stopped, and this process must not exit 0).
+   *
+   * A `Browser.close` that has ALREADY gone out (a client's, whose cleanup is the one that ran) is
+   * not this stop's to run again: a SECOND cleanup would create another replacement page and
+   * navigate and close against a browser that is on its way out. What a joining stop owes there
+   * is the wait — Chromium's own exit, bounded by `closeTimeoutMs` exactly as below — and then
+   * the same tail; the gate is already CLEANUP for that close and stays there.
+   */
+  async function shutdown(exitCode = 0) {
+    if (stopping) return false;
+    stopping = true;
+    // A close was already forwarded: by `handleBrowserClose` (`closeForwarded`), or — in
+    // `--attach` only — the supervisor was already told this is a graceful close
+    // (`closingReported`, written immediately before that same write). Either way the cleanup
+    // owed for the close has run.
+    const closeAlreadyForwarded = closeForwarded || closingReported;
+    // The graceful path runs the cleanup FIRST, and `Browser.close` is written only when the scan
+    // after it came back clean: closing a page that is still live runs its pagehide and unload
+    // traffic with the guard already gone (S4 11). The budgets add up — the cleanup inside its
+    // own cap, then the browser's close inside `closeTimeoutMs`.
+    //
+    // BEFORE the cleanup: a clean scan must NOT re-open the gate here. Chromium keeps running
+    // its pages between `Browser.close` and its own exit, and the gate stays CLEANUP (every
+    // request failed) until the browser is gone. Counted before the call and never decremented
+    // — a stop is terminal — so a cleanup already in flight that this shutdown joins reads it
+    // when it ends, and a client's withdrawn ask cannot take this one away.
+    closeIntents++;
+    if (!closeAlreadyForwarded) {
+      // NO REQUEST MAY REACH THE NETWORK THROUGH AN ADVANCING FETCH CHAIN — the same rule
+      // `handleBrowserClose` applies, for the stop path. A live client holds its own Fetch
+      // session on a page, newer than the gate's, so a request of that page pauses at the
+      // CLIENT's session first; the cleanup DEFERS the client's answers, so the request sits
+      // there until `Target.closeTarget` takes every session of the page at once, and then it
+      // advances past the sessions that vanished and PASSES without the gate ever seeing it. A
+      // session that DETACHES releases what it held ONWARD to the gate's session instead, which
+      // fails it in CLEANUP. So before the cleanup may close any target: the gate goes CLEANUP
+      // first (released requests are FAILED, not passed), then every connected client is dropped
+      // (coverage cleared, sessions detached, held requests released onward), and only then does
+      // the cleanup run. The pipe to Chromium is ORDERED, so those detaches are processed before
+      // the cleanup's first `Target.closeTarget`. The drop loop in `finishStop` stays as the
+      // belt for a client that arrives later; it is a no-op for these.
+      if (gateReady && !gateLost && gateState !== "CLEANUP") setState("CLEANUP");
+      for (const client of [...clients]) dropClient(client, 1001, "the relay is stopping");
+      const clean = await startCleanup();
+      if (!clean || gateLost) {
+        stopPath("a graceful stop could not be preceded by a clean cleanup");
+        return false;
+      }
+      // Nothing may have re-opened the gate between the clean scan and the close: re-assert
+      // CLEANUP here, before the supervisor is told and before `Browser.close` is written, so
+      // every request the closing Chromium's pages still make fails at the gate.
+      if (gateReady && !gateLost && gateState !== "CLEANUP") setState("CLEANUP");
+      // The supervisor is told BEFORE the line that closes the browser: from here on fd 5's EOF
+      // and this process's exit are expected, and Chromium's own exit is what is waited for (a
+      // SIGKILL in the middle of a close loses the cookie commit).
+      reportClosing();
+      // Ask Chromium to close, which is what commits its cookie store.
+      pipeSend({ id: nextId++, method: "Browser.close", params: {} });
+      closeForwarded = true;
+    }
+    const how = await Promise.race([exited.then(() => "exited"), delay(closeTimeoutMs).then(() => "timeout")]);
+    if (how === "timeout") {
+      log(`Chromium did not close within ${Math.round(closeTimeoutMs / 1000)}s — killing it`);
+      killChromium();
+      await Promise.race([exited, delay(2000)]);
+    }
+    await finishStop(exitCode);
     return true;
   }
 

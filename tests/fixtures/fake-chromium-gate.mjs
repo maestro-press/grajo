@@ -37,10 +37,29 @@
  * `FAKE_CHROME_START_CONTEXT`, `FAKE_CHROME_START_PAGE_NO_URL` and the method hooks
  * `FAKE_CHROME_DELAY_METHODS` / `FAKE_CHROME_FAIL_METHODS`.
  *
+ * The knob that shapes the CLOSE WINDOW is `FAKE_CHROME_CLOSE_HANDLE_DELAY_MS` (default 0, cap
+ * 2000): with it set, `Browser.close` is traced and answered as it always is, but the fixture
+ * does NOT exit and does NOT close fd 4 for that many ms — it keeps serving, so a page's own
+ * timers (`Test.armPageRequest`) keep firing and the relay's answers to the requests they make
+ * still arrive. After the delay it does exactly what it does today (exit per
+ * `FAKE_CHROME_CLOSE_EXIT_MS`). That is the window a real Chromium has between `Browser.close`
+ * and its exit, while its pages still run their pagehide beacons and image requests.
+ *
  * Session ids are prefix-distinguishable, as in the other fake: `S…` browser sessions,
  * `T…` `Target.attachToTarget`, `A…` auto-attached children. Target ids carry the type they
  * were created as (`P…` page, `FR…` iframe, `WK…` worker, `SW…` shared worker, `SV…` service
  * worker, `PR…` prerender, `OT…` other) so a trace reads without a lookup.
+ *
+ * SESSIONS BELONG TO WHOEVER ATTACHED THEM. Every session records the envelope `sessionId` of
+ * the command that created it (`owner`): the session that auto-attached it
+ * (`Target.setAutoAttach` on that session), the session `Target.attachToTarget` was issued on,
+ * or null (the root, the sessionless connection) for `Target.attachToBrowserTarget` and for an
+ * attach that came in on the root. A real Chromium looks a session up for
+ * `Target.detachFromTarget` ONLY in the session that owns it, so the command has to be sent on
+ * the owning session's envelope: sent anywhere else it is answered -32602
+ * "No session with given id" and NOTHING detaches. Detaching a session takes the sessions it
+ * owns with it (they die silently, with no `Target.detachedFromTarget` of their own), which is
+ * how detaching a browser session takes every session below it.
  */
 import { appendFileSync, closeSync, readFileSync, writeSync } from "node:fs";
 import net from "node:net";
@@ -58,6 +77,12 @@ const trace = (obj) => { if (LOG) { try { appendFileSync(LOG, JSON.stringify(obj
  */
 const CLOSE_EXIT_MS = Number(process.env.FAKE_CHROME_CLOSE_EXIT_MS || 0);
 const CLOSE_EXIT_CODE = Number(process.env.FAKE_CHROME_CLOSE_EXIT_CODE || 0);
+/**
+ * How long the browser keeps running (and serving) after `Browser.close` — the window in which
+ * a real Chromium still runs its pages' pagehide beacons and image requests. 0 (the default)
+ * keeps the old behaviour byte for byte: reply, then exit in the same command handler.
+ */
+const CLOSE_HANDLE_DELAY_MS = Math.max(0, Math.min(2000, Math.trunc(Number(process.env.FAKE_CHROME_CLOSE_HANDLE_DELAY_MS ?? 0)) || 0));
 
 // Deliberately identical to the other fake's version block: a relay cannot tell the two
 // fixtures apart, so one can stand in for the other without moving any other needle.
@@ -401,7 +426,12 @@ const sessionState = (s) => ({
   pageEnabled: s.pageEnabled,
 });
 
-function makeSession({ id, kind, targetId, parent = null }) {
+/**
+ * One session. `parent` is the session its attach event was sent to (null for an explicit
+ * attach); `owner` is the session whose ENVELOPE created it — the id `Target.detachFromTarget`
+ * has to be sent on, and null for a session created sessionless (the root).
+ */
+function makeSession({ id, kind, targetId, parent = null, owner = null }) {
   const session = {
     id,
     kind,
@@ -413,6 +443,7 @@ function makeSession({ id, kind, targetId, parent = null }) {
     pageEnabled: false,
     discover: false,
     parent,
+    owner,
   };
   sessions.set(id, session);
   return session;
@@ -449,7 +480,10 @@ function toTargetSessions(targetId, method, params, { onlyPageEnabled = false } 
 }
 
 function announce(target, attacher) {
-  const child = makeSession({ id: `A${++autoSessions}`, kind: "target", targetId: target.id, parent: attacher.id });
+  // Announced BY this attacher's session, so that session owns the child: a detach of the
+  // child has to be sent on `attacher.id`'s envelope, and a detach of `attacher.id` takes the
+  // child with it.
+  const child = makeSession({ id: `A${++autoSessions}`, kind: "target", targetId: target.id, parent: attacher.id, owner: attacher.id });
   const wait = attacher.autoAttach.waitForDebugger === true;
   if (wait) {
     // Held: nothing runs until every announcer-with-waiting has resumed it.
@@ -498,6 +532,22 @@ function dropSession(session, { detachEvent = false } = {}) {
     sendEvent(session.parent, "Target.detachedFromTarget", { sessionId: session.id, targetId: session.targetId });
   }
   releaseHeldBy(session);
+}
+
+/**
+ * Drop a session AND every session it owns, in that order — the shape a real Chromium has: a
+ * child session dies with the session that attached it. The children go silently (a session
+ * that goes away with its parent is never announced as detached on its own), and each one's
+ * held requests are released, so a request held below a detached session moves on instead of
+ * hanging.
+ */
+function dropSessionTree(sessionId, { detachEvent = false } = {}) {
+  const session = sessions.get(sessionId);
+  if (!session) return false;
+  const children = [...sessions.values()].filter((s) => s.owner === sessionId).map((s) => s.id);
+  dropSession(session, { detachEvent });
+  for (const child of children) dropSessionTree(child);
+  return true;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -592,6 +642,26 @@ function closeTarget(target) {
   return true;
 }
 
+/**
+ * What `Browser.close` does once its reply is out: the shape of a real browser's close, with
+ * `FAKE_CHROME_CLOSE_EXIT_MS` deciding whether the pipe goes first and the process a moment
+ * later, or the process goes at once.
+ */
+function closeAfterReply() {
+  if (CLOSE_EXIT_MS > 0) {
+    // The pipe goes first, the process a moment later: the shape a real Chromium has while
+    // it commits its cookie store.
+    outputClosed = true;
+    try { closeSync(4); } catch { /* gone */ }
+    setTimeout(() => {
+      trace({ t: "closed-by-itself", code: CLOSE_EXIT_CODE });
+      process.exit(CLOSE_EXIT_CODE);
+    }, CLOSE_EXIT_MS);
+    return;
+  }
+  process.exit(0);
+}
+
 function maybeExitOnNoPages() {
   if (process.env.FAKE_EXIT_ON_NO_PAGES !== "1") return;
   const livePages = [...targets.values()].filter((t) => !t.closed && t.type === "page");
@@ -678,18 +748,13 @@ function handle(msg) {
     case "Browser.close":
       trace({ t: "browser-close" });
       reply({});
-      if (CLOSE_EXIT_MS > 0) {
-        // The pipe goes first, the process a moment later: the shape a real Chromium has while
-        // it commits its cookie store.
-        outputClosed = true;
-        try { closeSync(4); } catch { /* gone */ }
-        setTimeout(() => {
-          trace({ t: "closed-by-itself", code: CLOSE_EXIT_CODE });
-          process.exit(CLOSE_EXIT_CODE);
-        }, CLOSE_EXIT_MS);
+      if (CLOSE_HANDLE_DELAY_MS > 0) {
+        // The window a real Chromium has after Browser.close: the browser keeps running, its
+        // pages keep making requests, and the relay's answers to them still arrive.
+        setTimeout(closeAfterReply, CLOSE_HANDLE_DELAY_MS);
         return;
       }
-      process.exit(0);
+      closeAfterReply();
       return;
     case "Browser.crash":
       // A crash answers NOTHING: the browser is gone the instant the command lands.
@@ -704,7 +769,9 @@ function handle(msg) {
     case "Target.attachToTarget": {
       const target = targets.get(msg.params?.targetId);
       if (!target || target.closed) { fail(-32602, "No target with given id found"); return; }
-      const created = makeSession({ id: `T${++targetSessions}`, kind: "target", targetId: target.id });
+      // Whoever's envelope carried the command owns the session it creates (`sid` is null for a
+      // sessionless attach, i.e. the root).
+      const created = makeSession({ id: `T${++targetSessions}`, kind: "target", targetId: target.id, owner: sid });
       reply({ sessionId: created.id });
       return;
     }
@@ -777,9 +844,19 @@ function handle(msg) {
       return;
     case "Target.detachFromTarget": {
       const victimId = msg.params?.sessionId;
-      trace({ t: "detached", sessionId: victimId ?? null, from: sid });
       const victim = typeof victimId === "string" ? sessions.get(victimId) || null : null;
-      if (victim) dropSession(victim, { detachEvent: true });
+      // Chromium looks a session up only in the session the command was sent on: the one that
+      // ATTACHED the victim. Sent on any other envelope (the root included) it finds nothing,
+      // answers "No session with given id" and detaches nothing — which is why the relay has to
+      // name the owner, and why detaching a client's child from the root used to do nothing.
+      if (victim && victim.owner !== sid) {
+        trace({ t: "detached", sessionId: victimId, from: sid, refused: "not-owner" });
+        fail(-32602, "No session with given id");
+        return;
+      }
+      trace({ t: "detached", sessionId: victimId ?? null, from: sid });
+      // A detach takes the detached session's own children with it.
+      if (victim) dropSessionTree(victim.id, { detachEvent: true });
       reply({});
       return;
     }
