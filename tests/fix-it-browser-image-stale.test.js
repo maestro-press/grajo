@@ -24,6 +24,13 @@
  * image and is not compared. A failed exec (non-zero/timeout/garbage) is QUIET, like
  * the existing docker-unreachable rule: no card, and a pending card is left as it is.
  *
+ * And a stale container does NOT get the card when the restart would go BACKWARDS: the
+ * remedy REBUILDS the image (Chromium 145, from the installed lock) and a profile the
+ * running container's newer Chromium wrote (159) crash-loops on it. The detector asks
+ * browser-chromium-guard.js, and fails closed: an unknown lock, an unreadable profile or
+ * no running container hides the card too (tests/fix-it-browser-chromium-guard.test.js
+ * pins the guard itself). The docker stub answers that read from `profileVersion`.
+ *
  * Docker is never real here (every call goes through the injected runner), the
  * restart is injected, and CROW_HOME is a scratch dir set BEFORE the dynamic imports,
  * so nothing reads the real ~/.crow or touches a container.
@@ -120,8 +127,27 @@ const RELAY_INSTALLED = "// the relay: the WebRTC launch flag, and no Target.cre
 const RELAY_OLD = "// the relay: no WebRTC flag yet\n";
 const ENTRYPOINT = "#!/bin/sh\nexec node /app/cdp-relay.mjs\n";
 const PACKAGE_JSON = '{"name":"crow-browser","version":"1.8.0"}\n';
-/** The committed lockfile the real Dockerfile COPYs alongside package.json (`npm ci`). */
-const LOCKFILE = '{"lockfileVersion":3}\n';
+/**
+ * The committed lockfile the real Dockerfile COPYs alongside package.json (`npm ci`).
+ * It pins playwright-core 1.58.2 — what the rebuilt image's Chromium (145) comes from,
+ * which is what the Chromium-downgrade guard reads (browser-chromium-guard.js).
+ */
+const LOCKFILE = `${JSON.stringify({
+  name: "crow-browser",
+  version: "0.1.3",
+  lockfileVersion: 3,
+  packages: {
+    "": { name: "crow-browser", version: "0.1.3", dependencies: { playwright: "^1.49.0" } },
+    "node_modules/playwright": { version: "1.58.2", dependencies: { "playwright-core": "1.58.2" } },
+    "node_modules/playwright-core": { version: "1.58.2" },
+  },
+}, null, 2)}\n`;
+/** The Chromium major fast-path stands for: what a container profile written by it says. */
+const PROFILE_145 = "145.0.7632.6";
+/** A profile written by a NEWER Chromium than the rebuild installs. */
+const PROFILE_159 = "159.0.8154.6";
+/** `profileVersion` for a container whose profile cannot be read at all (the exec fails). */
+const PROFILE_UNREADABLE = Symbol("profile-unreadable");
 
 /** What the installed bundle holds on disk. */
 const INSTALLED_FILES = {
@@ -129,8 +155,9 @@ const INSTALLED_FILES = {
   "entrypoint.sh": ENTRYPOINT,
   "cdp-relay.mjs": RELAY_INSTALLED,
   "package.json": PACKAGE_JSON,
+  "package-lock.json": LOCKFILE,
 };
-const BUNDLE_FILES = ["Dockerfile", "entrypoint.sh", "cdp-relay.mjs", "package.json"];
+const BUNDLE_FILES = ["Dockerfile", "entrypoint.sh", "cdp-relay.mjs", "package.json", "package-lock.json"];
 
 before(async () => {
   home = mkdtempSync(join(tmpdir(), "crowhome-browserstale-"));
@@ -176,14 +203,20 @@ function put(relPath, content) {
   writeFileSync(p, content);
 }
 
-/** The installed browser bundle; `files` overrides the content of a build input. */
-function installBrowser({ whenIso = FILES_OLD, files = {}, installed = [{ id: "browser", version: "1.8.0" }] } = {}) {
+/**
+ * The installed browser bundle; `files` overrides the content of a build input, and
+ * `lock` the lockfile (`null` omits it — an install whose lock cannot be read).
+ */
+function installBrowser({ whenIso = FILES_OLD, files = {}, lock = LOCKFILE, installed = [{ id: "browser", version: "1.8.0" }] } = {}) {
   put("bundles/browser/manifest.json", JSON.stringify({
     id: "browser", name: "Browser Automation", version: "1.8.0", type: "bundle",
     docker: { composefile: "docker-compose.yml" },
   }));
   put("bundles/browser/docker-compose.yml", COMPOSE);
-  for (const [rel, content] of Object.entries({ ...INSTALLED_FILES, ...files })) put(`bundles/browser/${rel}`, content);
+  const onDisk = { ...INSTALLED_FILES, ...files };
+  if (lock === null) delete onDisk["package-lock.json"];
+  else onDisk["package-lock.json"] = lock;
+  for (const [rel, content] of Object.entries(onDisk)) put(`bundles/browser/${rel}`, content);
   if (installed) put("installed.json", JSON.stringify(installed));
   touch(whenIso);
 }
@@ -231,7 +264,7 @@ function sha256sumOutput(files, lookup, dests) {
   };
 }
 
-/** Every absolute path an exec call names — the dest paths, however the command is spelled. */
+/** Every absolute path a sha256sum exec call names — the dest paths, however the command is spelled. */
 function execDestPaths(args) {
   const out = [];
   for (const arg of args.slice(2)) {
@@ -240,21 +273,27 @@ function execDestPaths(args) {
   return out;
 }
 
-const execCalls = (runner) => runner.calls.filter((c) => c.args[0] === "exec");
+/** The content-check exec calls (`sha256sum <dests…>`); the guard's profile reads are apart. */
+const execCalls = (runner) => runner.calls.filter((c) => c.args[0] === "exec" && c.args[2] === "sha256sum");
+/** The Chromium-downgrade guard's `cat …/Last Version` exec calls. */
+const profileCalls = (runner) => runner.calls.filter((c) => c.args[0] === "exec" && c.args[2] === "cat");
 const execDests = (runner) => new Set(execCalls(runner).flatMap((c) => execDestPaths(c.args)));
 /** The container an exec call names (the first argument that is one of the running ids). */
 const execContainer = (args, ids) => args.slice(1).find((a) => ids.includes(a)) || args[1];
 
 /**
  * A `docker` CLI stand-in: `ps` answers the running ids, `inspect` answers the image
- * fixture, and `exec <id> sha256sum <dests>` answers from the container's files.
+ * fixture, `exec <id> sha256sum <dests>` answers from the container's files, and
+ * `exec <id> cat …/Last Version` answers the Chromium profile fixture.
  *
  * `containerFiles`: container id (or "*") → { destPath: content }. With `basenameFiles`
  * a dest that has no exact entry falls back to its basename — used only where the
  * detector must pick the destination itself (the unreadable-Dockerfile fallback).
  * `execAnswer` forces one answer for every exec call (a throw, garbage, …).
+ * `profileVersion` is what `Last Version` holds; PROFILE_UNREADABLE makes that read
+ * fail (a container whose profile cannot be read).
  */
-function dockerStub({ ids = ["container1"], imageIds = ["sha256:cafe"], created = IMAGE_OLD, containerFiles = {}, basenameFiles = null, execAnswer = null } = {}) {
+function dockerStub({ ids = ["container1"], imageIds = ["sha256:cafe"], created = IMAGE_OLD, containerFiles = {}, basenameFiles = null, execAnswer = null, profileVersion = PROFILE_145 } = {}) {
   const lookup = (files, dest) => {
     if (dest in files) return files[dest];
     if (basenameFiles && basename(dest) in basenameFiles) return basenameFiles[basename(dest)];
@@ -267,6 +306,12 @@ function dockerStub({ ids = ["container1"], imageIds = ["sha256:cafe"], created 
     if (args[0] === "ps") return { stdout: ids.join("\n"), stderr: "" };
     if (args[0] === "exec") {
       if (execAnswer) return execAnswer({ args: [...args], opts });
+      if (args[2] === "cat") {
+        if (profileVersion === PROFILE_UNREADABLE) {
+          throw Object.assign(new Error("docker exec exited 1"), { code: 1, stdout: "", stderr: "cat: /root/.config/chromium-crow/Last Version: No such file or directory" });
+        }
+        return { stdout: `${profileVersion}\n`, stderr: "" };
+      }
       const container = execContainer(args, ids);
       const files = containerFiles[container] ?? containerFiles["*"] ?? {};
       const out = sha256sumOutput(files, lookup, execDestPaths(args));
@@ -682,6 +727,107 @@ describe("nothing to say", () => {
   });
 });
 
+describe("the Chromium-downgrade guard: no restart while the rebuild would go backwards", () => {
+  // The restart this card offers runs `up -d --build --force-recreate`, which installs
+  // the Chromium the installed lock pins (145). A container profile written by a NEWER
+  // Chromium (159) makes Chromium crash-loop, so the card must not be offered at all.
+  // Fail closed: an unknown lock, an unreadable profile or no container at all is a
+  // refusal too — the card is HIDDEN, and no new copy is written for it.
+
+  test("a stale relay and a profile written by Chromium 159 → NO card, and the pending card resolves", async () => {
+    installBrowser();
+    const s = fakeStore();
+    const runner = dockerStub({ containerFiles: { container1: inContainer({ relay: RELAY_OLD }) }, profileVersion: PROFILE_159 });
+    const lines = [];
+
+    await runCheck(s, { runner, log: { warn: (m) => lines.push(m) } });
+
+    assert.deepEqual(s.upserts, [], "the rebuild would install an older Chromium than the profile holds");
+    assert.ok(s.resolved.includes(resolvedKey()), "the card is hidden, not left dangling");
+    assert.equal(lines.length, 1, "one log line for the operator, and no user-facing copy");
+    assert.match(lines[0], /older Chromium than the profile holds/);
+    // It really read the profile before deciding.
+    assert.ok(profileCalls(runner).length > 0, "the profile was read inside the container");
+  });
+
+  test("CONTROL: the same stale relay with a profile written by Chromium 145 → card", async () => {
+    installBrowser();
+    const s = fakeStore();
+    const runner = dockerStub({ containerFiles: { container1: inContainer({ relay: RELAY_OLD }) }, profileVersion: PROFILE_145 });
+
+    await runCheck(s, { runner });
+
+    assert.equal(s.upserts.length, 1, "a rebuild that keeps the same Chromium is safe");
+    assert.deepEqual(s.resolved, []);
+  });
+
+  test("an OLDER profile (Chromium 140) → card (that rebuild is an upgrade)", async () => {
+    installBrowser();
+    const s = fakeStore();
+    const runner = dockerStub({ containerFiles: { container1: inContainer({ relay: RELAY_OLD }) }, profileVersion: "140.0.7000.1" });
+
+    await runCheck(s, { runner });
+
+    assert.equal(s.upserts.length, 1);
+  });
+
+  test("an unreadable profile → NO card and no upsert (fail closed)", async () => {
+    installBrowser();
+    const s = fakeStore();
+    const runner = dockerStub({ containerFiles: { container1: inContainer({ relay: RELAY_OLD }) }, profileVersion: PROFILE_UNREADABLE });
+
+    await assert.doesNotReject(runCheck(s, { runner }));
+
+    assert.deepEqual(s.upserts, [], "we cannot tell what the profile holds, so the restart is not offered");
+    assert.ok(s.resolved.includes(resolvedKey()));
+  });
+
+  test("the installed bundle has no lockfile → NO card (an unknown rebuild is never offered)", async () => {
+    installBrowser({ lock: null });
+    const s = fakeStore();
+    const runner = dockerStub({ containerFiles: { container1: inContainer({ relay: RELAY_OLD }) } });
+
+    await runCheck(s, { runner });
+
+    assert.deepEqual(s.upserts, [], "what Chromium the rebuild installs is unknown");
+    assert.ok(s.resolved.includes(resolvedKey()));
+  });
+
+  test("an unparseable lockfile → NO card either", async () => {
+    installBrowser({ lock: "{ not a lock at all" });
+    const s = fakeStore();
+    const runner = dockerStub({ containerFiles: { container1: inContainer({ relay: RELAY_OLD }) } });
+
+    await runCheck(s, { runner });
+
+    assert.deepEqual(s.upserts, []);
+    assert.ok(s.resolved.includes(resolvedKey()));
+  });
+
+  test("a lock pinning a playwright the table does not know → NO card", async () => {
+    installBrowser({ lock: LOCKFILE.replaceAll("1.58.2", "1.99.0") });
+    const s = fakeStore();
+    const runner = dockerStub({ containerFiles: { container1: inContainer({ relay: RELAY_OLD }) } });
+
+    await runCheck(s, { runner });
+
+    assert.deepEqual(s.upserts, []);
+    assert.ok(s.resolved.includes(resolvedKey()));
+  });
+
+  test("the guard is NOT consulted when the container already matches (nothing to offer)", async () => {
+    installBrowser();
+    const s = fakeStore();
+    const runner = dockerStub({ containerFiles: { container1: inContainer() }, profileVersion: PROFILE_159 });
+
+    await runCheck(s, { runner });
+
+    assert.deepEqual(s.upserts, []);
+    assert.ok(s.resolved.includes(resolvedKey()));
+    assert.deepEqual(profileCalls(runner), [], "no restart is offered, so the profile need not be read");
+  });
+});
+
 describe("the copy object", () => {
   test("every user-facing string is there in EN and ES, and none is empty", () => {
     for (const [key, value] of Object.entries(COPY)) {
@@ -764,7 +910,7 @@ describe("the restart action", () => {
   test("the owner's click restarts the add-on exactly once, through the Extensions path, and resolves the card", async () => {
     const item = await raiseCard();
     const calls = [];
-    setDeps({ owner: async () => true, restart: async (id) => { calls.push(id); return { ok: true }; } });
+    setDeps({ owner: async () => true, guard: async () => ({ blocked: false }), restart: async (id) => { calls.push(id); return { ok: true }; } });
 
     const redirected = await click(item, { headers: { cookie: "crow_session=x" }, csrfToken: "t" });
 
@@ -775,7 +921,7 @@ describe("the restart action", () => {
 
   test("a restart that did not run leaves the card open", async () => {
     const item = await raiseCard();
-    setDeps({ owner: async () => true, restart: async () => ({ ok: false, reason: "docker compose up failed" }) });
+    setDeps({ owner: async () => true, guard: async () => ({ blocked: false }), restart: async () => ({ ok: false, reason: "docker compose up failed" }) });
 
     const redirected = await click(item);
 
@@ -785,7 +931,7 @@ describe("the restart action", () => {
 
   test("refuses anyone but the owner, and restarts nothing", async () => {
     let called = 0;
-    setDeps({ owner: async () => false, restart: async () => { called += 1; return { ok: true }; } });
+    setDeps({ owner: async () => false, guard: async () => ({ blocked: false }), restart: async () => { called += 1; return { ok: true }; } });
 
     const out = await remedy.default({ bundle: "browser" }, { db: null, item: null, req: { headers: { cookie: "crow_session=x" } } });
 
@@ -799,7 +945,7 @@ describe("the restart action", () => {
   test("the action is registered, and a stored card cannot pick another bundle", async () => {
     const item = await raiseCard();
     const calls = [];
-    setDeps({ owner: async () => true, restart: async (id) => { calls.push(id); return { ok: true }; } });
+    setDeps({ owner: async () => true, guard: async () => ({ blocked: false }), restart: async (id) => { calls.push(id); return { ok: true }; } });
     // `args` is crow.db data: the remedy ignores it and restarts the bundle it holds.
     await db.execute({
       sql: "UPDATE fix_it_items SET remedies = ? WHERE id = ?",
@@ -814,7 +960,7 @@ describe("the restart action", () => {
   test("the default path never dials the Extensions route without a session to carry", async () => {
     // No injected restart: the real one runs, which refuses before any network call
     // when the request carries no dashboard session cookie (nothing to send).
-    setDeps({ owner: async () => true });
+    setDeps({ owner: async () => true, guard: async () => ({ blocked: false }) });
 
     const out = await remedy.default({}, { db: null, item: null, req: { headers: {} } });
 
@@ -825,7 +971,7 @@ describe("the restart action", () => {
   test('"Not now" changes nothing: the card is answered and nothing is restarted', async () => {
     const item = await raiseCard();
     let called = 0;
-    setDeps({ owner: async () => true, restart: async () => { called += 1; return { ok: true }; } });
+    setDeps({ owner: async () => true, guard: async () => ({ blocked: false }), restart: async () => { called += 1; return { ok: true }; } });
 
     let redirected = null;
     await idx.handleFixItAction(

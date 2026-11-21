@@ -30,15 +30,29 @@
  * "Not now" (the shared dismissal button every Fix-it card has) for the owner
  * who does not want to lose that page right now.
  *
+ * ── Why it can refuse ─────────────────────────────────────────────────────
+ * `up -d --build --force-recreate` REBUILDS the image, so it installs the Chromium the
+ * installed lock pins (playwright-core 1.58.2 → Chromium 145). A running container's
+ * persistent profile may have been written by a NEWER Chromium (159), and Chromium
+ * refuses, then crash-loops on, a profile written by a newer major version. So before
+ * restarting, this remedy asks browser-chromium-guard.js whether the rebuild would go
+ * BACKWARDS: an unknown account, an unreadable profile, or bundled < profile refuses
+ * (fail closed) with one console.warn and no user-facing copy — the owner keeps a
+ * working (old) add-on, and the card stays pending for a later attempt.
+ *
  * All user-facing strings for the card live in the detector's ONE copy object
  * (fix-it/detectors/browser-image-stale.js, COPY). Copy approved by the operator
  * 2026-11-19. This file adds none: a refusal reuses the compose restore's owner-only flash,
  * and a restart that did not run falls back to the Nest's generic "Couldn't
  * apply that fix" line rather than inventing a second sentence here.
  */
+import { join } from "node:path";
 import { gatewayBackendPort } from "../../instance-registry.js";
 import { gatewayListenHost } from "../../listen-host.js";
 import { isLocalPasswordSessionOn } from "../../dashboard/local-session.js";
+import { CROW_HOME } from "../../bundles-config.js";
+import { dockerRunner } from "../../bundle-core.js";
+import { restartWouldDowngrade, runningBrowserContainerIds } from "../browser-chromium-guard.js";
 import { OWNER_ONLY_FLASH, OWNER_ONLY_MESSAGE } from "./restore-bundle-compose.js";
 
 export const ACTION_ID = "restart-browser-addon";
@@ -53,14 +67,40 @@ export const START_ROUTE = "/dashboard/bundles/api/start";
  */
 export const RESTART_TIMEOUT_MS = 15 * 60 * 1000;
 
-// Test-only: replace the owner rule and the restart itself. Neither ever reaches
-// docker or the network in a test.
+// Test-only: replace the owner rule, the Chromium-downgrade guard and the restart itself.
+// None of them ever reaches docker or the network in a test.
 let _depsForTest = null;
 export function _setRestartDepsForTest(deps) { _depsForTest = deps || null; }
 
 async function isOwner(db, req) {
   if (typeof _depsForTest?.owner === "function") return (await _depsForTest.owner(db, req)) === true;
   return (await isLocalPasswordSessionOn(db, req)) === true;
+}
+
+/**
+ * The Chromium-downgrade guard, for the REAL path (browser-chromium-guard.js): the
+ * Restart rebuilds the image, and the rebuilt image installs the Chromium the installed
+ * lock pins. A running container whose profile was written by a NEWER Chromium would
+ * crash-loop on it, so that restart is never run. Resolves whatever the guard returns.
+ */
+async function downgradeGuard() {
+  const bundleDir = join(CROW_HOME, "bundles", BUNDLE_ID);
+  const runner = dockerRunner();
+  const ids = await runningBrowserContainerIds({ bundleDir, crowHome: CROW_HOME, runner });
+  return restartWouldDowngrade({ bundleDir, ids, runner });
+}
+
+/**
+ * True when the restart must NOT run. FAIL CLOSED: only an explicit `blocked: false`
+ * lets it through, so a guard that throws, or answers nothing usable, refuses.
+ */
+async function guardBlocksRestart() {
+  try {
+    const verdict = typeof _depsForTest?.guard === "function" ? await _depsForTest.guard() : await downgradeGuard();
+    return verdict?.blocked !== false;
+  } catch {
+    return true;
+  }
 }
 
 /** Where to dial this gateway's own HTTP listener: loopback for a wildcard bind. */
@@ -110,6 +150,14 @@ export default async function restartBrowserAddon(_args, ctx) {
   let owner = false;
   try { owner = await isOwner(ctx?.db, ctx?.req); } catch { owner = false; }
   if (!owner) return { resolved: false, flash: OWNER_ONLY_FLASH, message: OWNER_ONLY_MESSAGE };
+
+  // Never restart into an older Chromium than the profile holds: that would take the
+  // add-on down for good. No new copy — the Nest's generic "couldn't apply" line, and
+  // the card stays pending for a later attempt (after a bundle that catches up).
+  if (await guardBlocksRestart()) {
+    console.warn("[fix-it] browser add-on: the restart did not run — a rebuild could install an older Chromium than the profile holds");
+    return { resolved: false };
+  }
 
   let out;
   try {

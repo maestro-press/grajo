@@ -102,6 +102,16 @@ export const COPY = Object.freeze({
  * A path sha256sum reports as missing IS evidence — the file the image is built from
  * is not in the running container.
  *
+ * ── And a card is never offered for a restart that would go BACKWARDS ───────
+ * The remedy runs the Extensions restart: `up -d --build --force-recreate`, which
+ * REBUILDS the image and so installs the Chromium the installed lock pins
+ * (playwright-core 1.58.2 → Chromium 145). A container whose persistent profile was
+ * written by a NEWER Chromium (159) crash-loops on that older one, so a stale image
+ * with such a profile gets NO card: the restart would take the add-on down for good.
+ * browser-chromium-guard.js decides, and it fails closed (an unknown lock, an
+ * unreadable profile, or no running container is a refusal too). There is no new copy
+ * for that case — the card is simply hidden, with one log line.
+ *
  * No event fires for a container's content, so this is a BOOT check
  * (`runBootChecks()`), and it rides the Extensions Start/stop/install re-check the
  * bind-drift detector already gets (`recheckOnContainerChange`, fix-it/index.js) — so
@@ -121,6 +131,7 @@ import { dockerRunner, readInstalled } from "../../bundle-core.js";
 import { composeEnv, parseDotEnv } from "../../compose-guard.js";
 import { isSatelliteEntry } from "../../satellites/installs.js";
 import { ACTION_ID as RESTART_ACTION_ID } from "../remedies/restart-browser-addon.js";
+import { restartWouldDowngrade } from "../browser-chromium-guard.js";
 
 export const SOURCE = "browser-image-stale";
 /** The one bundle this detector watches. */
@@ -404,6 +415,17 @@ export default {
 
     // The running containers already hold exactly the installed bytes.
     if (differences.length === 0) { await resolveCard(); return { cards: [] }; }
+
+    // The restart this card offers REBUILDS the image, which installs the Chromium the
+    // installed lock pins. A profile the running container's newer Chromium wrote makes
+    // Chromium crash-loop on that older one, so the card is not offered at all then.
+    // The guard is asked only now: with nothing stale there is no restart to weigh.
+    const downgrade = await restartWouldDowngrade({ bundleDir: dir, ids, runner });
+    if (downgrade.blocked) {
+      await resolveCard();
+      log.warn("[fix-it] browser image check: the restart card was not offered: a rebuild could install an older Chromium than the profile holds");
+      return { cards: [] };
+    }
 
     await store.upsertItem({
       source: SOURCE,
