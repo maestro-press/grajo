@@ -18,11 +18,27 @@
  *
  * Per call: write `<pid>-<random>` (JSON {pid, pidns, start, deadline}) into the
  * lease directory, send `allow`, run `fn`, remove the lease, and send `default`
- * ONLY when no live lease remains. A lease is live iff its holder is alive and
- * `now < deadline`; dead, expired and unparseable leases are deleted while
- * checking and ignored. A lease that cannot be written is fail-closed: no
- * `allow`, `fn` never runs, and the error propagates — no lease means downloads
- * stay off.
+ * ONLY when no live lease remains. A lease is live iff it parses as an object, its
+ * `start` is a finite number no more than `CLOCK_SKEW_MS` ahead of the reader's
+ * clock, `now < min(lease.deadline, lease.start + MAX_LEASE_MS)` holds, and — only
+ * when it was written in THIS PID namespace — its pid is alive. Dead, expired,
+ * planted and unparseable leases are deleted while checking and ignored. A lease
+ * that cannot be written is fail-closed: no `allow`, `fn` never runs, and the error
+ * propagates — no lease means downloads stay off.
+ *
+ * THE LEASE IS CAPPED AT BOTH ENDS, by the same number. The longest wait anyone can
+ * ask the download tool for is `DOWNLOAD_TIMEOUT_CAP_MS` (the `timeout_ms` schema cap
+ * in server.js) and that tool's writer adds 30000 ms of its own margin on top of it,
+ * so `MAX_LEASE_MS` is that sum. The writer here clamps every deadline it writes to
+ * it, and the reader never lets a lease outlive `start + MAX_LEASE_MS` whatever the
+ * file claims. The reader therefore never trusts a planted deadline: a lease file is
+ * ordinary writable state in a directory other processes can reach, so a forged
+ * far-future `deadline` cannot withhold the browser-wide default for ever — while the
+ * clamping of the writer keeps the reader from cutting a legitimate download short,
+ * because a lease this module writes for the tool's longest allowed timeout is
+ * exactly `MAX_LEASE_MS` long and no longer. A `start` further ahead than
+ * `CLOCK_SKEW_MS` is another machine's clock (or a forged one) and is not a lease at
+ * all.
  *
  * A lease records the writer's PID NAMESPACE (`pidns`, `/proc/self/ns/pid`) next
  * to its pid. Bots run under `bwrap --unshare-pid`, so a pid is only meaningful
@@ -30,7 +46,7 @@
  * host (or the reverse) fails with a false ESRCH and would delete a LIVE lease.
  * The pid-liveness test therefore applies ONLY when the lease's `pidns` is a
  * string equal to this process's own; a lease from another (or an unknown)
- * namespace is judged by its deadline alone.
+ * namespace is judged by its deadline, capped at `MAX_LEASE_MS` after its start.
  *
  * A lease is written atomically — `<name>.tmp`, then rename to `<name>` — so a
  * reader never sees a half-written lease. The live check SKIPS (never deletes) a
@@ -60,12 +76,35 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { DEFAULT_MAX_TOOL_ACTION_MS } from "./page-ownership.js";
 
 /** How long the reset send may take before it is given up on, in ms. */
 export const RESET_TIMEOUT_MS = 2000;
 
 /** How long a lease may be held before it counts as abandoned, unless told otherwise. */
 export const DEFAULT_LEASE_DEADLINE_MS = 60000;
+
+/**
+ * How far a lease's `start` may sit ahead of this process's clock before the lease is
+ * not a lease at all, in ms: two processes' clocks are allowed to disagree a little, a
+ * clock that disagrees by more than this belongs to another machine (or to nobody).
+ */
+export const CLOCK_SKEW_MS = 5000;
+
+/**
+ * The longest `timeout_ms` the crow_browser_download schema accepts, in ms: the tool
+ * action limit minus the margin server.js writes out in the schema itself. Written as
+ * the same expression the schema uses, so the two cannot drift apart.
+ */
+export const DOWNLOAD_TIMEOUT_CAP_MS = DEFAULT_MAX_TOOL_ACTION_MS - 5000;
+
+/**
+ * The longest lease this module will ever honour, in ms: the longest timeout the tool
+ * accepts plus the 30000 ms of margin server.js adds when it writes a download's lease
+ * (so a lease made for the longest legitimate wait is never cut short), and never below
+ * `DEFAULT_LEASE_DEADLINE_MS` — the writer and the reader take their bound from here.
+ */
+export const MAX_LEASE_MS = Math.max(DEFAULT_LEASE_DEADLINE_MS, DOWNLOAD_TIMEOUT_CAP_MS + 30000);
 
 const RESET_TIMEOUT_MESSAGE = "[browser] restoring the default download behavior timed out";
 const RESET_FAILED_MESSAGE = "[browser] could not restore the default download behavior:";
@@ -166,20 +205,22 @@ function pidAlive(pid) {
 /**
  * Does anyone still hold downloads on in `leaseDir`?
  *
- * A lease is live iff it parses, its deadline is still in the future, and — only
- * when it was written in THIS PID namespace — its pid is alive. A lease from
- * another (or an unknown) namespace is judged by its deadline alone: its pid
- * means nothing here, and a false ESRCH would delete a live lease. Unparseable,
- * dead and expired leases are deleted while checking and ignored; a `.tmp` name
- * is skipped unless it is old enough to be an abandoned write. Any fs error
- * while checking is treated as "live" (fail safe: do not put the browser-wide
- * default back under a possible download) and reported in ONE console.error
- * line — this helper never throws.
+ * A lease is live iff it parses as an object, its `start` is finite and not more
+ * than `CLOCK_SKEW_MS` ahead of `now`, `now < min(lease.deadline, lease.start +
+ * MAX_LEASE_MS)`, and — only when it was written in THIS PID namespace — its pid is
+ * alive. A lease from another (or an unknown) namespace is judged by that window and
+ * not by its pid: its pid means nothing here, and a false ESRCH would delete a live
+ * lease. Unparseable, malformed, dead and expired leases are deleted while checking
+ * and ignored; a `.tmp` name is skipped unless it is old enough to be an abandoned
+ * write. Any fs error while checking is treated as "live" (fail safe: do not put the
+ * browser-wide default back under a possible download) and reported in ONE
+ * console.error line — this helper never throws.
  *
  * @param {string} [leaseDir]
+ * @param {number} [now] - the clock to judge deadlines by, in ms since the epoch
  * @returns {boolean} true when a live lease remains (or could not be ruled out)
  */
-function hasLiveLease(leaseDir) {
+function hasLiveLease(leaseDir, now = Date.now()) {
   if (!leaseDir) return false;
   let names;
   try {
@@ -190,7 +231,6 @@ function hasLiveLease(leaseDir) {
     console.error(LEASE_CHECK_FAILED_MESSAGE, err?.message || err);
     return true;
   }
-  const now = Date.now();
   for (const name of names) {
     const leaseFile = join(leaseDir, name);
     if (name.endsWith(".tmp")) {
@@ -223,7 +263,17 @@ function hasLiveLease(leaseDir) {
       removeLease(leaseFile);
       continue;
     }
-    if (!lease || !Number.isInteger(lease.pid) || typeof lease.deadline !== "number") {
+    // The file is writable state in a directory other processes reach, so nothing in it
+    // is trusted: a non-object, a pid that is not an integer, a `start` that is missing,
+    // non-numeric or from a clock further ahead than the skew, and a `deadline` that is
+    // missing or not a finite number are each "not a lease".
+    if (
+      !lease || typeof lease !== "object"
+      || !Number.isInteger(lease.pid)
+      || !Number.isFinite(lease.start)
+      || lease.start > now + CLOCK_SKEW_MS
+      || !Number.isFinite(lease.deadline)
+    ) {
       removeLease(leaseFile);
       continue;
     }
@@ -234,7 +284,9 @@ function hasLiveLease(leaseDir) {
       removeLease(leaseFile);
       continue;
     }
-    if (lease.deadline <= now) {
+    // Liveness is the EARLIER of the deadline the lease names and the longest lease this
+    // module can take: a planted deadline cannot outlive `start + MAX_LEASE_MS`.
+    if (!(now < Math.min(lease.deadline, lease.start + MAX_LEASE_MS))) {
       removeLease(leaseFile);
       continue;
     }
@@ -251,20 +303,26 @@ function hasLiveLease(leaseDir) {
  * Written atomically: `<name>.tmp` first, then renamed onto `<name>`, so a
  * concurrent reader sees either no lease or a whole one.
  *
+ * The asked-for hold is clamped to `MAX_LEASE_MS`, the bound the reader enforces: a
+ * lease written longer than that would be abandoned by the reader before its own
+ * deadline, so the two ends take the same number.
+ *
  * @param {string} leaseDir
- * @param {number} deadlineMs
+ * @param {number} deadlineMs - how long to hold downloads on, in ms (clamped)
  * @returns {string} the lease file's path
  */
 function takeLease(leaseDir, deadlineMs) {
   const leaseFile = join(leaseDir, `${process.pid}-${randomBytes(8).toString("hex")}`);
   const tmpFile = `${leaseFile}.tmp`;
+  const heldMs = Number.isFinite(deadlineMs) ? Math.min(deadlineMs, MAX_LEASE_MS) : DEFAULT_LEASE_DEADLINE_MS;
+  const start = Date.now();
   try {
     mkdirSync(leaseDir, { recursive: true });
     writeFileSync(tmpFile, JSON.stringify({
       pid: process.pid,
       pidns: OWN_PIDNS,
-      start: Date.now(),
-      deadline: Date.now() + deadlineMs,
+      start,
+      deadline: start + heldMs,
     }));
     renameSync(tmpFile, leaseFile);
   } catch (err) {
@@ -294,12 +352,16 @@ function takeLease(leaseDir, deadlineMs) {
  * @param {() => (object|null)} getSession - returns the CURRENT CDP session, or null
  * @param {string} downloadPath - the container-side directory downloads land in
  * @param {() => Promise<T>} fn
- * @param {{ leaseDir?: string, deadlineMs?: number }} [opts]
+ * @param {{ leaseDir?: string, deadlineMs?: number, now?: () => number }} [opts] - `deadlineMs`
+ *   is how long the lease is held (default `DEFAULT_LEASE_DEADLINE_MS`, clamped to
+ *   `MAX_LEASE_MS`, the bound the reader enforces); `now` is the clock the final live
+ *   check is judged by (default `Date.now`)
  * @returns {Promise<T>}
  */
 export async function withDownloadsAllowed(getSession, downloadPath, fn, opts = {}) {
   const leaseDir = opts.leaseDir;
   const deadlineMs = typeof opts.deadlineMs === "number" ? opts.deadlineMs : DEFAULT_LEASE_DEADLINE_MS;
+  const now = typeof opts.now === "function" ? opts.now : Date.now;
   const leaseFile = takeLease(leaseDir, deadlineMs);
   try {
     const session = getSession();
@@ -312,7 +374,7 @@ export async function withDownloadsAllowed(getSession, downloadPath, fn, opts = 
     // processes, so a download another MCP child is still waiting on is never
     // cancelled by this one finishing. An earlier caller would pull the setting
     // out from under a call that is still waiting for its file.
-    if (!hasLiveLease(leaseDir)) {
+    if (!hasLiveLease(leaseDir, now())) {
       const session = getSession();
       // Nothing current to reset: no log, no throw — a session that went away
       // took the browser-wide setting with it.
@@ -331,12 +393,14 @@ export async function withDownloadsAllowed(getSession, downloadPath, fn, opts = 
  * every other reset — this must never throw into the connect path.
  *
  * @param {object|null} session - the newly made CDP session, or null
- * @param {{ leaseDir?: string }} [opts]
+ * @param {{ leaseDir?: string, now?: () => number }} [opts] - `now` is the clock the live check
+ *   is judged by (default `Date.now`)
  */
 export async function resetDownloadsOnNewSession(session, opts = {}) {
+  const now = typeof opts.now === "function" ? opts.now : Date.now;
   if (!session) return;
   try {
-    if (hasLiveLease(opts.leaseDir)) return;
+    if (hasLiveLease(opts.leaseDir, now())) return;
     await resetDownloads(session);
   } catch (err) {
     console.error(LEASE_CHECK_FAILED_MESSAGE, err?.message || err);

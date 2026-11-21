@@ -33,8 +33,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const { withDownloadsAllowed, resetDownloadsOnNewSession, RESET_TIMEOUT_MS } =
-  await import("../bundles/browser/server/download-behavior.js");
+const {
+  withDownloadsAllowed, resetDownloadsOnNewSession, RESET_TIMEOUT_MS, DEFAULT_LEASE_DEADLINE_MS,
+  MAX_LEASE_MS, DOWNLOAD_TIMEOUT_CAP_MS,
+} = await import("../bundles/browser/server/download-behavior.js");
 
 const DOWNLOAD_PATH = "/tmp/crow-downloads";
 
@@ -117,6 +119,18 @@ function plantLease(leaseDir, {
   writeFileSync(join(leaseDir, fileName), JSON.stringify({ pid, pidns, start, deadline }));
   return fileName;
 }
+
+/** Write a lease file's TEXT by hand (for values JSON.stringify cannot express). Returns its name. */
+function plantRawLease(leaseDir, text, name) {
+  const fileName = name || `raw-${Math.random().toString(16).slice(2)}`;
+  writeFileSync(join(leaseDir, fileName), text);
+  return fileName;
+}
+
+/** Ten years in ms: a deadline no download could ever still need. */
+const TEN_YEARS_MS = 10 * 365 * 24 * 60 * 60 * 1000;
+/** A PID namespace that is certainly not this one, spelled as /proc spells it. */
+const FOREIGN_PIDNS = "pid:[999999999]";
 
 /** A pid that is certainly dead: a child that ran to completion and was reaped. */
 function deadPid() {
@@ -555,6 +569,204 @@ test("a leaseDir that cannot be written fails closed: fn never runs, the allow i
     assert.deepEqual(cdp.calls, [], "the allow send is never attempted without a lease");
     assert.equal(lines.length, 1, `expected one console.error line, got ${JSON.stringify(lines)}`);
   }));
+
+test("a planted far-future lease is honoured inside MAX_LEASE_MS and abandoned past it", () =>
+  withLeaseDir(async (leaseDir) => {
+    const T0 = 1_700_000_000_000;
+    const planted = plantLease(leaseDir, {
+      name: "planted-foreign", pid: process.pid, pidns: FOREIGN_PIDNS, start: T0, deadline: T0 + TEN_YEARS_MS,
+    });
+
+    // A second in: the lease is inside its window, so the default stays back.
+    const early = makeCdp();
+    await resetDownloadsOnNewSession(early, { leaseDir, now: () => T0 + 1000 });
+    assert.deepEqual(early.calls, [], "a lease inside its window keeps the default back");
+    assert.deepEqual(leaseFiles(leaseDir), [planted], "the honoured lease is kept");
+
+    // One ms past the longest lease this bundle can take: abandoned, deleted.
+    const late = makeCdp();
+    await resetDownloadsOnNewSession(late, { leaseDir, now: () => T0 + MAX_LEASE_MS + 1 });
+    assertAllSetDownloadBehavior(late);
+    assert.deepEqual(behaviors(late), ["default"], "a lease older than MAX_LEASE_MS is abandoned");
+    assertNoLeases(leaseDir);
+  }));
+
+test("the writer clamps an over-long deadline to MAX_LEASE_MS", () =>
+  withLeaseDir(async (leaseDir) => {
+    const cdp = makeCdp();
+    let lease;
+    const result = await withDownloadsAllowed(() => cdp, DOWNLOAD_PATH, async () => {
+      const [name] = leaseFiles(leaseDir).filter((fileName) => !fileName.endsWith(".tmp"));
+      assert.ok(name, "the call must have written a lease");
+      lease = JSON.parse(readFileSync(join(leaseDir, name), "utf8"));
+      return "done";
+    }, { leaseDir, deadlineMs: MAX_LEASE_MS * 10 });
+
+    assert.equal(result, "done");
+    assert.ok(lease, "fn must have read this call's lease");
+    assert.equal(
+      lease.deadline - lease.start,
+      MAX_LEASE_MS,
+      "an over-long ask is clamped to MAX_LEASE_MS",
+    );
+    assert.deepEqual(behaviors(cdp), ["allow", "default"]);
+    assertNoLeases(leaseDir);
+  }));
+
+test("a lease written for MAX_LEASE_MS is honoured inside it and abandoned at it", () =>
+  withLeaseDir(async (leaseDir) => {
+    const cdp = makeCdp();
+    const result = await withDownloadsAllowed(() => cdp, DOWNLOAD_PATH, async () => {
+      const [name] = leaseFiles(leaseDir).filter((fileName) => !fileName.endsWith(".tmp"));
+      assert.ok(name, "the call must have written a lease");
+      const lease = JSON.parse(readFileSync(join(leaseDir, name), "utf8"));
+      assert.equal(lease.deadline - lease.start, MAX_LEASE_MS, "a MAX_LEASE_MS ask is written whole");
+
+      // One ms inside the longest lease this module honours: still live.
+      const early = makeCdp();
+      await resetDownloadsOnNewSession(early, { leaseDir, now: () => lease.start + MAX_LEASE_MS - 1 });
+      assert.deepEqual(early.calls, [], "a lease inside MAX_LEASE_MS keeps the default back");
+      assert.equal(leaseFiles(leaseDir).includes(name), true, "the honoured lease is kept");
+
+      // At exactly MAX_LEASE_MS it is over, whatever the file's own deadline says.
+      const late = makeCdp();
+      await resetDownloadsOnNewSession(late, { leaseDir, now: () => lease.start + MAX_LEASE_MS });
+      assertAllSetDownloadBehavior(late);
+      assert.deepEqual(behaviors(late), ["default"], "a lease at MAX_LEASE_MS is abandoned");
+
+      return "done";
+    }, { leaseDir, deadlineMs: MAX_LEASE_MS });
+
+    assert.equal(result, "done");
+    assert.deepEqual(behaviors(cdp), ["allow", "default"]);
+    assertNoLeases(leaseDir);
+  }));
+
+test("a lease whose start is in the future is invalid: deleted at once, default sent", () =>
+  withLeaseDir(async (leaseDir) => {
+    const now = 1_700_000_000_000;
+    plantLease(leaseDir, {
+      name: "future-start", pid: process.pid, pidns: FOREIGN_PIDNS,
+      start: now + 60 * 60 * 1000, deadline: now + TEN_YEARS_MS,
+    });
+
+    const cdp = makeCdp();
+    await resetDownloadsOnNewSession(cdp, { leaseDir, now: () => now });
+    assert.deepEqual(behaviors(cdp), ["default"]);
+    assertNoLeases(leaseDir);
+  }));
+
+test("a start inside the clock skew is honoured, a start past it is invalid", () =>
+  withLeaseDir(async (leaseDir) => {
+    const now = 1_700_000_000_000;
+
+    const inside = plantLease(leaseDir, {
+      name: "skew-inside", pid: process.pid, pidns: FOREIGN_PIDNS,
+      start: now + 4000, deadline: now + TEN_YEARS_MS,
+    });
+    const skewed = makeCdp();
+    await resetDownloadsOnNewSession(skewed, { leaseDir, now: () => now });
+    assert.deepEqual(skewed.calls, [], "a start inside the 5000 ms skew is honoured");
+    assert.deepEqual(leaseFiles(leaseDir), [inside]);
+
+    rmSync(join(leaseDir, inside));
+    plantLease(leaseDir, {
+      name: "skew-outside", pid: process.pid, pidns: FOREIGN_PIDNS,
+      start: now + 6000, deadline: now + TEN_YEARS_MS,
+    });
+    const past = makeCdp();
+    await resetDownloadsOnNewSession(past, { leaseDir, now: () => now });
+    assert.deepEqual(behaviors(past), ["default"], "a start past the skew is invalid");
+    assertNoLeases(leaseDir);
+  }));
+
+test("a lease with an unrepresentable or non-numeric deadline is invalid: deleted, default sent", () =>
+  withLeaseDir(async (leaseDir) => {
+    const now = 1_700_000_000_000;
+    const head = `"pid":${process.pid},"pidns":${JSON.stringify(FOREIGN_PIDNS)},"start":${now}`;
+    const cases = [
+      // Infinity: JSON.stringify would write null, so the text is written by hand.
+      [`{${head},"deadline":Infinity}`, "deadline Infinity"],
+      [`{${head},"deadline":null}`, "deadline null"],
+      [`{${head},"deadline":"9999999999999"}`, "deadline as a string"],
+      // NaN is not JSON either: written through JSON.stringify it becomes null.
+      [JSON.stringify({ pid: process.pid, pidns: FOREIGN_PIDNS, start: now, deadline: NaN }), "deadline NaN"],
+    ];
+
+    for (const [text, label] of cases) {
+      const name = plantRawLease(leaseDir, text, `deadline-${label.replace(/\W+/g, "-")}`);
+      const cdp = makeCdp();
+      await resetDownloadsOnNewSession(cdp, { leaseDir, now: () => now });
+      assert.deepEqual(behaviors(cdp), ["default"], `expected a default for ${label}`);
+      assert.equal(leaseFiles(leaseDir).includes(name), false, `${label} must be deleted`);
+      assertNoLeases(leaseDir);
+    }
+  }));
+
+test("a lease whose start is a string is invalid: deleted, default sent", () =>
+  withLeaseDir(async (leaseDir) => {
+    const now = 1_700_000_000_000;
+    const name = plantLease(leaseDir, {
+      name: "string-start", pid: process.pid, pidns: FOREIGN_PIDNS,
+      start: String(now), deadline: now + TEN_YEARS_MS,
+    });
+
+    const cdp = makeCdp();
+    await resetDownloadsOnNewSession(cdp, { leaseDir, now: () => now });
+    assert.deepEqual(behaviors(cdp), ["default"]);
+    assert.equal(leaseFiles(leaseDir).includes(name), false, "a string start must be deleted");
+    assertNoLeases(leaseDir);
+  }));
+
+test("a normal live lease from this process is still honoured", () =>
+  withLeaseDir(async (leaseDir) => {
+    const now = 1_700_000_000_000;
+    const live = plantLease(leaseDir, {
+      name: "normal", pid: process.pid, pidns: OUR_PIDNS, start: now, deadline: now + 60_000,
+    });
+
+    const cdp = makeCdp();
+    await resetDownloadsOnNewSession(cdp, { leaseDir, now: () => now });
+    assert.deepEqual(cdp.calls, [], "a live lease keeps the default back");
+    assert.deepEqual(leaseFiles(leaseDir), [live], "the live lease is kept");
+  }));
+
+test("derivation: MAX_LEASE_MS sits 30000 ms above the download tool's timeout cap", () => {
+  assert.equal(
+    MAX_LEASE_MS,
+    DOWNLOAD_TIMEOUT_CAP_MS + 30000,
+    "the longest lease must outlive the longest wait by the same 30 s the tool's own lease uses",
+  );
+  assert.ok(
+    MAX_LEASE_MS >= DEFAULT_LEASE_DEADLINE_MS,
+    `MAX_LEASE_MS (${MAX_LEASE_MS}) must not be below DEFAULT_LEASE_DEADLINE_MS (${DEFAULT_LEASE_DEADLINE_MS})`,
+  );
+});
+
+test("derivation: DOWNLOAD_TIMEOUT_CAP_MS is the crow_browser_download timeout_ms .max()", async () => {
+  const { DEFAULT_MAX_TOOL_ACTION_MS } =
+    await import("../bundles/browser/server/page-ownership.js");
+  assert.equal(
+    DOWNLOAD_TIMEOUT_CAP_MS,
+    DEFAULT_MAX_TOOL_ACTION_MS - 5000,
+    "the cap is the tool action limit minus its written-out margin",
+  );
+
+  const serverPath = fileURLToPath(new URL("../bundles/browser/server/server.js", import.meta.url));
+  const source = readFileSync(serverPath, "utf8");
+  // The tool's registration line, so the block sliced out is THIS tool and nothing earlier.
+  const blockStart = source.indexOf('server.tool(\n    "crow_browser_download",');
+  assert.ok(blockStart !== -1, "server.js must define the crow_browser_download tool");
+  // The next two-space comment line closes the block (the handler's own comments are deeper).
+  const blockEnd = source.indexOf("\n  // ", blockStart);
+  const block = blockEnd > blockStart ? source.slice(blockStart, blockEnd) : source.slice(blockStart);
+
+  assert.ok(block.includes("timeout_ms:"), "the crow_browser_download block must declare timeout_ms");
+  assert.ok(
+    block.includes(".max(DEFAULT_MAX_TOOL_ACTION_MS - 5000)"),
+    "the timeout_ms schema must be capped by the written-out literal .max(DEFAULT_MAX_TOOL_ACTION_MS - 5000)",
+  );
+});
 
 test("static: server.js imports withDownloadsAllowed and sends no setDownloadBehavior itself", () => {
   const serverPath = fileURLToPath(new URL("../bundles/browser/server/server.js", import.meta.url));
