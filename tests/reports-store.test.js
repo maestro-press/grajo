@@ -173,6 +173,7 @@ test("saveRecipe writes revision 1 and moves the head in one step", async () => 
     rev: 1,
     hash: recipeHash(MAIL_RECIPE),
     sourcesHash: sourcesHash(MAIL_RECIPE, blockRegistry),
+    authorSealed: false,
   });
 
   const report = await getReport(db, id);

@@ -682,7 +682,7 @@ test("the owner's free change re-stamps the live seal at the new revision", asyn
   const saved = await ownerSaveRecipe(db, deps, { reportId: report.id, recipe: FREE_EDIT_RECIPE, actor: OWNER });
   assert.deepEqual(saved, {
     rev: before.recipe_rev + 1, hash: saved.hash, sourcesHash: before.sources_hash,
-    restamped: true, needsGoLive: false,
+    restamped: true, needsGoLive: false, authorSealed: true,
   });
   const after1 = await row(db, report.id);
   assert.equal(Number(after1.live_rev), saved.rev, "the seal names the new revision");

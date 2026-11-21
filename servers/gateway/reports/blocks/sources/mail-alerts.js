@@ -12,8 +12,8 @@
  * THE TWO MEMBERS THAT NAME IT, and never a row of this block's own: `ctx.live.senderAccountId` is the
  * VERIFIED live set, so a run of a live report reads the account the owner sealed; a preview has no live
  * set, and its fallback is `ctx.previewSender`, which the executor resolved through the approval rails
- * (source-approvals.js's `approvedSenderAccount`: the report row's own `sender_account_id` only when the
- * report's head revision carries an owner author seal). This block reads neither `reports` nor
+ * (source-approvals.js's `approvedSenderAccount`: the report row's own `sender_account_id` only behind
+ * the owner's sender seal, sender-seal.js). This block reads neither `reports` nor
  * `report_state` itself, so an unsealed column can never become the account it measures against: keep it
  * that way, and keep `sender_account_id` owner-only as well.
  *

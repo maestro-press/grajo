@@ -1,6 +1,5 @@
-// The revision author seal: proof that the OWNER saved one recipe revision, and the three places that
-// lean on it — the source gate's owner-history path, and the mail account a preview's `mail_alerts` block
-// is measured against.
+// The revision author seal: proof that the OWNER saved one recipe revision, and the source gate's
+// owner-history path, which is the one place that leans on it.
 //
 // Harness: a real init-db'd scratch crow.db copied per test (CROW_DATA_DIR and CROW_HOME under a temp
 // dir, so nothing reaches a real Crow), real report, revision, schedule and mail account rows, the
@@ -24,11 +23,14 @@ const MASTER = join(root, "master", "crow.db");
 
 const { createDbClient } = await import("../servers/db.js");
 const {
-  approveGoLive, botSaveRecipe, ownerSaveRecipe, verifyLive,
+  approveGoLive, botSaveRecipe, ownerSaveRecipe, updateSettings, verifyLive,
 } = await import("../servers/gateway/reports/approvals.js");
 const {
-  REVISION_AUTHOR_PREFIX, isHeadOwnerSealed, ownerSealedRevisions, sealAuthorRevision,
+  REVISION_AUTHOR_PREFIX, ownerSealedRevisions, sealAuthorRevision,
 } = await import("../servers/gateway/reports/revision-author.js");
+const { SENDER_SEAL_KEY, senderSealVerifies } = await import(
+  "../servers/gateway/reports/sender-seal.js"
+);
 const { verifyApprovalSeal } = await import("../servers/gateway/reports/seal.js");
 const {
   approveSource, approvedSenderAccount, isSourceApprovedForBot, ownerChainAnswers, settingsHashOf,
@@ -159,6 +161,16 @@ async function prepare(db, { recipe, sender = "ma-0011223344556677", authorKind 
   return { id, rev: saved.rev };
 }
 
+/**
+ * Seal one report's sender the way the owner's settings route does, so a draft's mail block has an
+ * account the approval rails will measure against (`updateSettings` is the only writer of that seal).
+ */
+async function sealSenderViaSettings(db, reportId, accountId) {
+  await updateSettings(db, approvalDeps({ id: reportId }), {
+    reportId, settings: { sender_account_id: accountId }, actor: OWNER,
+  });
+}
+
 async function queuePreview(db, reportId) {
   const { runId } = await startRun(db, { now: () => T0 }, {
     reportId, trigger: "preview", requestedBy: BOT,
@@ -209,7 +221,6 @@ test("an owner save writes a revision_author state row the author seal verifies 
   }, row.seal, Buffer.alloc(32, 54)), false, "another seed is another key");
 
   // The reader proves the head, and only up to the revision it was asked about.
-  assert.equal(await isHeadOwnerSealed(db, SEED, await getReport(db, report.id)), true);
   assert.deepEqual([...(await ownerSealedRevisions(db, SEED, report.id, report.rev))], [report.rev]);
   assert.deepEqual([...(await ownerSealedRevisions(db, SEED, report.id, report.rev - 1))], []);
 
@@ -218,7 +229,8 @@ test("an owner save writes a revision_author state row the author seal verifies 
     reportId: report.id, recipe: { blocks: [FEED_BLOCK, FILTER_BLOCK] },
   });
   assert.equal(await getState(db, report.id, `${REVISION_AUTHOR_PREFIX}${saved.rev}`), null);
-  assert.equal(await isHeadOwnerSealed(db, SEED, await getReport(db, report.id)), false);
+  assert.deepEqual([...(await ownerSealedRevisions(db, SEED, report.id, saved.rev))], [report.rev],
+    "the bot's head carries no seal of its own");
 });
 
 test("sealAuthorRevision binds the revision number and the author kind", () => {
@@ -333,7 +345,8 @@ test("a bot revision whose author_kind column was flipped to owner is not owner-
     args: [report.id, report.rev],
   });
   assert.equal((await getRevision(db, report.id, report.rev)).author_kind, "owner");
-  assert.equal(await isHeadOwnerSealed(db, SEED, await getReport(db, report.id)), false);
+  assert.deepEqual([...(await ownerSealedRevisions(db, SEED, report.id, report.rev))], [],
+    "a flipped column proves nothing");
   assert.deepEqual(
     await isSourceApprovedForBot(db, deps, await getReport(db, report.id), FEED_BLOCK),
     { ok: false, text: waitingForOkText("feed") },
@@ -358,7 +371,8 @@ test("a seal copied onto another revision is not owner-written evidence", async 
   // the seal, so it proves nothing here, and the owner history for the feed block starts nowhere.
   await setState(db, report.id, `${REVISION_AUTHOR_PREFIX}${second.rev}`,
     await getState(db, report.id, `${REVISION_AUTHOR_PREFIX}${report.rev}`));
-  assert.equal(await isHeadOwnerSealed(db, SEED, await getReport(db, report.id)), false);
+  assert.deepEqual([...(await ownerSealedRevisions(db, SEED, report.id, second.rev))], [report.rev],
+    "the copied seal proves no revision");
   assert.deepEqual(
     await isSourceApprovedForBot(db, deps, await getReport(db, report.id), FEED_BLOCK),
     { ok: false, text: waitingForOkText("feed") },
@@ -375,7 +389,8 @@ test("a seal with one character changed, and another report's seal, are not owne
   const flipped = `${genuine.seal[0] === "0" ? "1" : "0"}${genuine.seal.slice(1)}`;
   await setState(db, report.id, `${REVISION_AUTHOR_PREFIX}${head.recipe_rev}`,
     { nonce: genuine.nonce, seal: flipped });
-  assert.equal(await isHeadOwnerSealed(db, SEED, head), false);
+  assert.deepEqual([...(await ownerSealedRevisions(db, SEED, report.id, head.recipe_rev))], [],
+    "one changed character proves nothing");
   assert.deepEqual(await isSourceApprovedForBot(db, deps, head, FEED_BLOCK),
     { ok: false, text: waitingForOkText("feed") });
 
@@ -383,7 +398,8 @@ test("a seal with one character changed, and another report's seal, are not owne
   const other = await prepare(db, { recipe: { blocks: [FEED_BLOCK] } });
   const otherProof = await getState(db, other.id, `${REVISION_AUTHOR_PREFIX}${other.rev}`);
   await setState(db, report.id, `${REVISION_AUTHOR_PREFIX}${head.recipe_rev}`, otherProof);
-  assert.equal(await isHeadOwnerSealed(db, SEED, await getReport(db, report.id)), false);
+  assert.deepEqual([...(await ownerSealedRevisions(db, SEED, report.id, head.recipe_rev))], [],
+    "another report's seal proves nothing here");
   assert.deepEqual(await isSourceApprovedForBot(db, deps, await getReport(db, report.id), FEED_BLOCK),
     { ok: false, text: waitingForOkText("feed") });
 });
@@ -400,7 +416,8 @@ test("a recipe body tampered under an intact hash column is not owner-written ev
   });
   // The hash column still names the text that was saved there, which is no longer the body on the row.
   assert.equal((await getRevision(db, report.id, report.rev)).recipe_hash, savedRow.recipe_hash);
-  assert.equal(await isHeadOwnerSealed(db, SEED, await getReport(db, report.id)), false);
+  assert.deepEqual([...(await ownerSealedRevisions(db, SEED, report.id, report.rev))], [],
+    "a tampered body under an intact hash column proves nothing");
   assert.deepEqual(
     await isSourceApprovedForBot(db, deps, await getReport(db, report.id), moved.blocks[0]),
     { ok: false, text: waitingForOkText("feed") },
@@ -414,7 +431,6 @@ test("an owner revision saved without an author seal is not evidence, and approv
   assert.equal((await getRevision(db, report.id, report.rev)).author_kind, "owner",
     "the column still says the owner saved it");
   assert.equal(await getState(db, report.id, `${REVISION_AUTHOR_PREFIX}${report.rev}`), null);
-  assert.equal(await isHeadOwnerSealed(db, SEED, await getReport(db, report.id)), false);
   assert.deepEqual(
     await isSourceApprovedForBot(db, deps, await getReport(db, report.id), FEED_BLOCK),
     { ok: false, text: waitingForOkText("feed") },
@@ -443,7 +459,6 @@ test("with no keychain seed no revision is proved and nothing throws", async () 
   assert.equal([...answers.values()].some((answer) => answer === true), false,
     "no pair is answered as owned with no seed");
   assert.deepEqual([...(await ownerSealedRevisions(db, null, report.id, head.recipe_rev))], []);
-  assert.equal(await isHeadOwnerSealed(db, null, head), false);
   assert.equal(await approvedSenderAccount(db, seedless, null, head), "");
   assert.deepEqual(await isSourceApprovedForBot(db, seedless, head, FEED_BLOCK),
     { ok: false, text: waitingForOkText("feed") });
@@ -484,24 +499,31 @@ test("a live report's sealed sender wins, and a tampered row is never the accoun
   assert.equal(after.sender_account_id, otherAccount, "the column really moved");
   assert.equal(await verifyLive(db, deps, after), null, "and the live seal no longer verifies");
   assert.equal(await approvedSenderAccount(db, deps, null, after), "",
-    "the row column is not trusted without a sealed owner head");
+    "the row column is not trusted without a sender seal");
   assert.deepEqual(await isSourceApprovedForBot(db, deps, after, tampered),
     { ok: false, text: waitingForOkText("mail") },
     "a block naming the other account does not pass the gate");
 });
 
-test("a never-live report whose head revision is the owner's sealed save previews its mail block", async () => {
+test("a never-live report whose sender the owner saved in settings previews its mail block", async () => {
   const db = await freshDb();
   const accountId = await addMailAccount(db);
   const block = {
     id: "mail", type: "mail_alerts", settings: { accountId, label: "Alerts", sinceDays: 7 },
   };
-  const report = await prepare(db, { recipe: { blocks: [block] }, sender: accountId });
+  // The revision is saved by the bare store call, so it carries no author seal: the account a preview may
+  // read hangs on the owner's settings save, not on how the head revision was written.
+  const report = await prepare(db, { recipe: { blocks: [block] }, sender: accountId, sealed: false });
   const deps = approvalDeps(report);
+  await sealSenderViaSettings(db, report.id, accountId);
   const head = await getReport(db, report.id);
 
-  assert.equal(await isHeadOwnerSealed(db, SEED, head), true);
+  assert.equal(await senderSealVerifies(db, SEED, head), true, "the settings save sealed the sender");
   assert.equal(await approvedSenderAccount(db, deps, null, head), accountId);
+  // The block's content needs its own approval, because this revision is not owner-chain evidence.
+  await approveSource(db, deps, {
+    reportId: report.id, blockId: "mail", expectedSettingsHash: settingsHashOf(block), actor: OWNER,
+  });
   assert.deepEqual(await isSourceApprovedForBot(db, deps, head, block), { ok: true });
 
   const folders = [];
@@ -511,17 +533,18 @@ test("a never-live report whose head revision is the owner's sealed save preview
   assert.deepEqual(folders, ["seam", "INBOX/Alerts"], "the draft's mail block read the owner's account");
 });
 
-test("a never-live report whose head revision is a bot's (or an unsealed owner's) is refused, however the row reads", async () => {
+test("a never-live report whose sender was never sealed is refused, whatever its head revision is", async () => {
   const db = await freshDb();
   const accountId = await addMailAccount(db);
   const block = {
     id: "mail", type: "mail_alerts", settings: { accountId, label: "Alerts", sinceDays: 7 },
   };
 
-  // A bot's head revision, over a row that names the very account the block names.
+  // A bot's head revision, over a row that names the very account the block names, with no sender seal.
   const bot = await prepare(db, { recipe: { blocks: [block] }, sender: accountId, authorKind: "bot" });
   const deps = approvalDeps(bot);
   const botHead = await getReport(db, bot.id);
+  assert.equal(await senderSealVerifies(db, SEED, botHead), false);
   assert.equal(await approvedSenderAccount(db, deps, null, botHead), "");
   assert.deepEqual(await isSourceApprovedForBot(db, deps, botHead, block),
     { ok: false, text: waitingForOkText("mail") });
@@ -531,9 +554,11 @@ test("a never-live report whose head revision is a bot's (or an unsealed owner's
   assert.deepEqual(botOut, { status: "failed", artifactVersion: null });
   assert.deepEqual(botFolders, [], "no mailbox was read");
 
-  // An owner revision saved before the seal existed: the same refusal.
+  // An owner revision saved before the author seal existed, and a sender set by a column write: the same
+  // refusal. The owner's settings save is what seals the sender (the test above).
   const bare = await prepare(db, { recipe: { blocks: [block] }, sender: accountId, sealed: false });
   const bareHead = await getReport(db, bare.id);
+  assert.equal(await senderSealVerifies(db, SEED, bareHead), false);
   assert.equal(await approvedSenderAccount(db, deps, null, bareHead), "");
   assert.deepEqual(await isSourceApprovedForBot(db, deps, bareHead, block),
     { ok: false, text: waitingForOkText("mail") });
@@ -546,8 +571,9 @@ test("the mail block itself refuses account_not_approved when the row names an a
   const block = {
     id: "mail", type: "mail_alerts", settings: { accountId: otherAccount, label: "Alerts", sinceDays: 7 },
   };
-  // A bot's head revision, and a row moved to the account the block names: the content is approved as a
-  // draft source, so the account rule is the only thing left, and the block reads no row itself.
+  // A bot's head revision, and a row moved to the account the block names with no sender seal: the
+  // content is approved as a draft source, so the account rule is the only thing left, and the block
+  // reads no row itself.
   const report = await prepare(db, { recipe: { blocks: [block] }, sender: accountId, authorKind: "bot" });
   const deps = approvalDeps();
   await db.execute({
@@ -648,6 +674,7 @@ test("the revision_author prefix is reserved: a block's setState refuses it", as
   assert.equal(isReservedStateKey("revision_author:3"), true);
   assert.equal(isReservedStateKey(REVISION_AUTHOR_PREFIX), true);
   assert.equal(isReservedStateKey("revision_author"), false, "the bare word is not a key the rails use");
+  assert.equal(isReservedStateKey(SENDER_SEAL_KEY), true, "the sender seal is reserved for the owner's save");
   assert.equal(isReservedStateKey("dedupe_seen"), false);
 
   const stateWrites = [];

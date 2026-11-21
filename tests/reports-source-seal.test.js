@@ -491,10 +491,13 @@ test("an owner preview of a draft mail_alerts block they wrote reads the report'
   const accountId = await addMailAccount(db);
   const block = { id: "mail", type: "mail_alerts", settings: { accountId, label: "Alerts", sinceDays: 7 } };
   // A draft has no live set at all, so the account a mail block is measured against is the report row's
-  // own owner-only sender account. Without that fallback this block could never preview, and so the
-  // report could never go live.
+  // own sender behind the owner's sender seal (the settings save below). Without that fallback this block
+  // could never preview, and so the report could never go live.
   const report = await prepare(db, { recipe: { blocks: [block] }, sender: accountId });
   const deps = approvalDeps(report);
+  await updateSettings(db, deps, {
+    reportId: report.id, settings: { sender_account_id: accountId }, actor: OWNER,
+  });
   assert.deepEqual(await isSourceApprovedForBot(db, deps, await getReport(db, report.id), block), { ok: true });
 
   const folders = [];
@@ -538,6 +541,10 @@ test("a draft mail_alerts block naming another account than the report's sender 
   };
   const report = await prepare(db, { recipe: { blocks: [block] }, sender: accountId });
   const deps = approvalDeps(report);
+  // The owner's own sender is sealed, so the only thing refusing the block is the account it names.
+  await updateSettings(db, deps, {
+    reportId: report.id, settings: { sender_account_id: accountId }, actor: OWNER,
+  });
   assert.deepEqual(
     await isSourceApprovedForBot(db, deps, await getReport(db, report.id), block),
     { ok: false, text: waitingForOkText("mail") },

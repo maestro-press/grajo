@@ -42,16 +42,21 @@
  *
  * `mail_alerts` has one extra rule, in both cases: the block's `accountId` must be the account the
  * report is about. That account is the VERIFIED live set's sealed sender when the live set verifies, and
- * otherwise the report row's own `sender_account_id` ONLY when the report's head revision carries an
- * owner author seal (`isHeadOwnerSealed`, revision-author.js). A live set is read here for a caller that
- * hands none, which is what a PREVIEW does, so the row fallback is for a report with no live set at all.
- * The unsealed column is never trusted on its own: `updateSettings` is the owner's route, but a direct
- * UPDATE of `sender_account_id` would otherwise point a never-live report's mail block at another
- * mailbox. A report whose head revision is a bot's save (or an owner save from before the seal) and that
- * was never live therefore names no account, and its mail block waits like any other unapproved source. Crow Mail's anti-goal is that no bot reads
- * mail outside a drafting turn; a bot proposing a label is fine, a bot pointing the report at a mailbox
- * the owner never chose is not. Keep `sender_account_id` owner-only as well: it is the account a draft's
- * mail block is measured against once the head revision is the owner's own.
+ * otherwise the report row's own `sender_account_id` ONLY behind the report's own SENDER SEAL
+ * (`senderSealVerifies`, sender-seal.js), which the owner's settings save writes over the account it puts
+ * on the row. A live set is read here for a caller that hands none, which is what a PREVIEW does, so the
+ * row fallback is for a report with no live set at all. The unsealed column is never trusted on its own:
+ * `updateSettings` is the owner's route, and a direct UPDATE of `sender_account_id` would otherwise point
+ * a never-live report's mail block at another mailbox. A report that was never live and whose sender was
+ * set some other way therefore names no account, and its mail block waits like any other unapproved
+ * source, whatever its head revision is. Crow Mail's anti-goal is that no bot reads mail outside a
+ * drafting turn; a bot proposing a label is fine, a bot pointing the report at a mailbox the owner never
+ * chose is not. Keep `sender_account_id` owner-only as well: it is the account a draft's mail block is
+ * measured against.
+ *
+ * REPORTS WHOSE SENDER PREDATES THE SENDER SEAL have no `sender_seal` row, so a draft preview does not
+ * trust their row sender. The owner re-saves the sender in the report's settings (the same value is fine)
+ * and it is sealed. A live report is unaffected, because the live seal already covers the sender.
  *
  * There is no second account approval here either: the one account the report names is the only one, and
  * a report that names none (a draft with no sender, or a seal that no longer verifies over a row that
@@ -62,7 +67,8 @@
  * `setState` seam refuses it (`isReservedStateKey`, artifact-bridge.js), and only this module (the
  * gateway's own code, never a recipe) writes it. A revoke writes `null`, which drops the seal: an old
  * seal can never re-approve a row (the same rule as every other approval in this tree). The
- * `revision_author:` prefix is reserved for the same reason, and belongs to revision-author.js.
+ * `revision_author:` prefix is reserved for the same reason, and belongs to revision-author.js. So is
+ * the `sender_seal` key, which belongs to sender-seal.js.
  *
  * THE SEAL: an HMAC over `{reportId, blockId, settingsHash, nonce}` as seal.js's `source` kind, under the
  * reports seal domain (`seal.js`'s `approvalSealKey`, the subkey derived from the keychain seed) and in
@@ -87,8 +93,9 @@ import { createHash } from "node:crypto";
 import { approvalInternals, verifyLive } from "./approvals.js";
 import { BLOCK_ID_RE, BLOCKS } from "./blocks/index.js";
 import { canonicalJson } from "./recipe-hash.js";
-import { isHeadOwnerSealed, ownerSealedRevisions } from "./revision-author.js";
+import { ownerSealedRevisions } from "./revision-author.js";
 import { approvalSeal, newApprovalNonce, verifyApprovalSeal } from "./seal.js";
+import { senderSealVerifies } from "./sender-seal.js";
 import { getRevision, getState, recordAudit, setState } from "./store.js";
 
 const { fail, requireOwner, requireReport, resolveDeps, seedOf, text } = approvalInternals;
@@ -341,20 +348,20 @@ function sealedCovers(recipe, settingsHash) {
 /**
  * The mail account this report is about, as the approval rails see it: the VERIFIED live set's sealed
  * sender account when the live set verified, and otherwise the report row's own `sender_account_id` ONLY
- * when the head revision is provably the owner's own save (`isHeadOwnerSealed`).
+ * behind the owner's sender seal (`senderSealVerifies`, sender-seal.js).
  *
  * The row column is never trusted on its own. A never-live report has no live set, and a draft's mail
  * block is exactly what a preview is for, so there has to be a fallback; the fallback is allowed only
- * behind a seal on the head revision, so a direct UPDATE of the column (or a bot's save of a mail block)
- * cannot point a preview at a mailbox the owner never chose. "" when the report names no account, or
- * when nothing proves the account is the owner's choice.
+ * behind a seal the owner's settings save wrote over that account, so a direct UPDATE of the column (or a
+ * bot's save of a mail block) cannot point a preview at a mailbox the owner never chose. "" when the
+ * report names no account, or when nothing proves the account is the owner's choice.
  *
  * A `live` of null is not "this report has none": a PREVIEW is handed that by `run.js`, and a live
  * report whose head is a newer save (a bot's free change) still has its sealed revision. So null reads
  * the live set through `verifyLive` and uses its sealed sender when it resolves, and only a report with
  * no live set at all reaches the row fallback.
  *
- * The keychain seed is loaded here, through the approvals seam, and handed to revision-author.js, which
+ * The keychain seed is loaded here, through the approvals seam, and handed to sender-seal.js, which
  * imports nothing from this module or from approvals.js. Never throws: a missing seed, an unreadable
  * state row and a database error all answer "".
  *
@@ -375,7 +382,7 @@ export async function approvedSenderAccount(db, deps, live, report) {
     if (sealedLive) return sealedLive;
     const rowAccount = text(report?.sender_account_id);
     if (!rowAccount) return "";
-    if (!(await isHeadOwnerSealed(db, await seedOrNull(deps), report))) return "";
+    if (!(await senderSealVerifies(db, await seedOrNull(deps), report))) return "";
     return rowAccount;
   } catch {
     return "";
@@ -385,7 +392,8 @@ export async function approvedSenderAccount(db, deps, live, report) {
 /**
  * Is this block's `accountId` the mail account this report is about
  * (`approvedSenderAccount`)? A report that names no approved account answers no, so nothing approves a
- * mailbox the owner never chose. Never throws.
+ * mailbox the owner never chose, and the account only counts when the live seal or the owner's sender
+ * seal names it. Never throws.
  */
 async function accountCovers(db, deps, live, report, block) {
   const approved = await approvedSenderAccount(db, deps, live, report);
@@ -571,7 +579,7 @@ async function chainAnswersFor(db, reportId, headRev, gate, deps) {
  * unbroken owner-introduced history up to the head revision (`ownerChainAnswers`); otherwise
  * `{ok: false, text}` with the one sentence the owner reads. A `mail_alerts` block needs the report's
  * own approved mail account as well, in every case (`approvedSenderAccount`: the sealed live sender, or
- * the row's sender only behind an owner-sealed head revision).
+ * the row's sender only behind the owner's sender seal).
  *
  * `gate` is a caller's per-run continuity map (`{headRev, ownerChain}` from `ownerChainAnswers`), so a
  * run reads the report's revisions ONCE and asks this for every gated block in that run. A gate for

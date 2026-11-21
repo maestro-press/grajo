@@ -319,7 +319,8 @@ test("the owner saves a recipe, changes settings, goes live, pauses and resumes"
 
   const saved = await put(`${reportPath(report.id)}/recipe`, { recipe: FREE_EDIT });
   assert.equal(saved.status, 200, saved.text);
-  assert.deepEqual(Object.keys(saved.json).sort(), ["hash", "needsGoLive", "restamped", "rev", "sourcesHash"]);
+  assert.deepEqual(Object.keys(saved.json).sort(),
+    ["authorSealed", "hash", "needsGoLive", "restamped", "rev", "sourcesHash"]);
   assert.equal(saved.json.rev, report.rev + 1);
   assert.equal(saved.json.restamped, false, "a draft is never re-stamped");
   assert.equal(saved.json.needsGoLive, false);

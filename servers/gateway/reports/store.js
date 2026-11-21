@@ -297,7 +297,8 @@ export async function listReports(db, { projectId } = {}) {
  *   registry?: Record<string, {sourceBearing?: boolean}>|null, now?: number,
  *   authorSeal?: ((fields: {reportId: string, rev: number, recipeHash: string,
  *     authorKind: "owner"}) => Promise<{nonce: string, seal: string}|null>)|null}} fields
- * @returns {Promise<{rev: number, hash: string, sourcesHash: string}>}
+ * @returns {Promise<{rev: number, hash: string, sourcesHash: string, authorSealed: boolean}>} where
+ *   `authorSealed` is true only when this save wrote a revision author seal
  * @throws {Error} `bad_input`, `bad_author_kind`, `bad_recipe`, `not_found`, `conflict`
  */
 export async function saveRecipe(db, { reportId, recipe, authorKind, registry = blockRegistry, now, authorSeal } = {}) {
@@ -364,7 +365,7 @@ export async function saveRecipe(db, { reportId, recipe, authorKind, registry = 
         args: [reportId, `${REVISION_AUTHOR_STATE_PREFIX}${rev}`, canonicalJson(authorProof), at],
       });
     }
-    return { rev, hash, sourcesHash: srcHash };
+    return { rev, hash, sourcesHash: srcHash, authorSealed: authorProof != null };
   });
 }
 

@@ -54,7 +54,7 @@
  * artifact that no report claims as its primary one, titled as a preview, whose versions are all preview
  * runs of THIS report); anything else is ignored and replaced with a fresh artifact. The key is also
  * reserved (`RESERVED_STATE_KEYS`): a block's `setState` must refuse it, so the value the bridge reads is
- * one the bridge wrote.
+ * one the bridge wrote. The same list covers the approval rails' own keys (`sender_seal`).
  *
  * EVERY RUN RE-READS THE REPORT, AND A PREVIEW'S READ IS GUARDED IN THE BATCH: the engine reads the
  * report row once at run start, so `writeRunVersion` reads it again before it writes anything. That
@@ -80,6 +80,7 @@ import { pathToFileURL } from "node:url";
 import { createDbClient, resolveDataDir } from "../../db.js";
 import { resolveCrowHome } from "../../shared/crow-home.js";
 import { REPORT_LIVE } from "./approvals.js";
+import { SENDER_SEAL_KEY } from "./sender-seal.js";
 import { getReport, getState, setState, updateReportColumns } from "./store.js";
 
 /** The trigger words a run row may carry (the run engine's own closed set). */
@@ -108,14 +109,15 @@ export const PREVIEW_INTO_LIVE_TEXT = "A preview never writes into the report's 
 export const PREVIEW_ARTIFACT_STATE_KEY = "preview_artifact_id";
 
 /**
- * The `report_state` keys the bridge owns and writes itself.
+ * The `report_state` keys the bridge and the approval rails own and write themselves.
  *
  * A recipe block's `setState` (a bot-authored recipe) MUST refuse every key in this list: the bridge
- * trusts what it finds under them to decide where a run writes, so a bot must not be able to name it.
- * The block write path reads this list and `RESERVED_STATE_PREFIXES` (below); a new bridge key is added
- * here, once.
+ * trusts what it finds under `preview_artifact_id` to decide where a run writes, and the approval rails
+ * trust `sender_seal` to say which mail account the owner chose for the report, so a bot must not be able
+ * to name either. The block write path reads this list and `RESERVED_STATE_PREFIXES` (below); a new
+ * reserved key is added here, once.
  */
-export const RESERVED_STATE_KEYS = Object.freeze([PREVIEW_ARTIFACT_STATE_KEY]);
+export const RESERVED_STATE_KEYS = Object.freeze([PREVIEW_ARTIFACT_STATE_KEY, SENDER_SEAL_KEY]);
 
 /**
  * The `report_state` key prefixes the approval rails own, so no recipe block may write under them.

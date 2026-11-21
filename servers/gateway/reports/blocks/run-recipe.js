@@ -48,7 +48,7 @@
  *   - `getState(key)` reads `report_state` through the store, and sees a value this run has already
  *     buffered (so two blocks reading the same key in one run agree).
  *   - `setState(key, value)` BUFFERS only, and refuses (throws `reserved_state_key`) every key the
- *     artifact bridge owns: `preview_artifact_id` and anything under `source_approval:` or
+ *     artifact bridge owns: `preview_artifact_id`, `sender_seal` and anything under `source_approval:` or
  *     `revision_author:`. A recipe is bot-authorable, and the bridge trusts those keys to decide where a
  *     run writes while the approval rails trust theirs to say what the owner approved.
  *   - `extraStepClaim` is a function that takes this run's ONE `extra_step_runs` on the block's behalf
@@ -64,7 +64,7 @@
  *   - `previewSender` is the mail account the approval rails name for this report
  *     (`approvedSenderAccount`, source-approvals.js): the live set's sealed sender account (read there for
  *     a caller that hands no live set, which a preview always does), or the report row's own
- *     `sender_account_id` only when the head revision carries an owner author seal, and "" otherwise. It
+ *     `sender_account_id` only behind the owner's sender seal (sender-seal.js), and "" otherwise. It
  *     is computed for a `mail_alerts` block and for no other kind, so a preview of a never-live report
  *     has an account to measure its mail block against without this module ever reading the unsealed
  *     column itself. A read that fails leaves "".

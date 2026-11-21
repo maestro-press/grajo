@@ -81,6 +81,11 @@ function sample(kind, overrides = {}) {
       authorKind: "owner",
       nonce,
     },
+    sender: {
+      reportId: "rpt-0011223344556677",
+      accountId: "ma-0011223344556677",
+      nonce,
+    },
   }[kind];
   assert.ok(base, `no sample for kind ${kind}`);
   return { ...base, ...overrides };
@@ -95,7 +100,7 @@ function changed(value) {
 test("the domain, the kinds and each kind's field order are fixed", () => {
   assert.equal(APPROVAL_SEAL_DOMAIN, "crow-reports-approval-v1");
   assert.deepEqual([...APPROVAL_KINDS], [
-    "live", "recipient", "step", "host", "credential", "proposal", "source", "author",
+    "live", "recipient", "step", "host", "credential", "proposal", "source", "author", "sender",
   ]);
   assert.ok(Object.isFrozen(APPROVAL_KINDS));
   assert.deepEqual([...SEAL_FIELDS.live], [
@@ -115,6 +120,7 @@ test("the domain, the kinds and each kind's field order are fixed", () => {
     ["reportId", "proposalId", "baseRev", "diffHash", "nonce"]);
   assert.deepEqual([...SEAL_FIELDS.source], ["reportId", "blockId", "settingsHash", "nonce"]);
   assert.deepEqual([...SEAL_FIELDS.author], ["reportId", "rev", "recipeHash", "authorKind", "nonce"]);
+  assert.deepEqual([...SEAL_FIELDS.sender], ["reportId", "accountId", "nonce"]);
   for (const kind of APPROVAL_KINDS) {
     assert.equal(SEAL_FIELDS[kind].at(-1), "nonce", `${kind} binds its nonce last`);
   }

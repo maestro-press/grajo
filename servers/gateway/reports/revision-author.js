@@ -179,29 +179,3 @@ export async function ownerSealedRevisions(db, seed, reportId, upToRev) {
     return sealed;
   }
 }
-
-/**
- * Is the report's HEAD revision one that is provably owner-written? True only when the head revision
- * number is a revision `ownerSealedRevisions` proved for this report. A report nobody saved (revision 0)
- * has no head revision to prove, so it answers false. Never throws.
- *
- * This is what a never-live report's unsealed row columns are allowed to lean on: the head revision being
- * the owner's own save is the anchor, and it is the seal on that revision rather than any column.
- *
- * @param {object} db
- * @param {Buffer|Uint8Array|null} seed the keychain key's seed, loaded by the caller
- * @param {object|null} report a report row
- * @returns {Promise<boolean>}
- */
-export async function isHeadOwnerSealed(db, seed, report) {
-  try {
-    if (report == null || typeof report !== "object") return false;
-    if (typeof report.id !== "string" || !report.id) return false;
-    const headRev = Number(report.recipe_rev);
-    if (!Number.isInteger(headRev) || headRev < 1) return false;
-    const sealed = await ownerSealedRevisions(db, seed, report.id, headRev);
-    return sealed.has(headRev);
-  } catch {
-    return false;
-  }
-}

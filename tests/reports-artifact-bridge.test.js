@@ -750,11 +750,12 @@ test("a valid stored preview artifact id is reused, with no second artifact made
 });
 
 test("the preview state key is reserved for the bridge", () => {
-  assert.deepEqual([...RESERVED_STATE_KEYS], ["preview_artifact_id"]);
+  assert.deepEqual([...RESERVED_STATE_KEYS], ["preview_artifact_id", "sender_seal"]);
   assert.equal(Object.isFrozen(RESERVED_STATE_KEYS), true);
   assert.equal(PREVIEW_ARTIFACT_STATE_KEY, "preview_artifact_id");
   assert.equal(isReservedStateKey("preview_artifact_id"), true);
-  assert.equal(isReservedStateKey("preview_artifact_id "), false, "no trimming: a near miss is another key");
+  assert.equal(isReservedStateKey("sender_seal"), true, "the approval rails' own key is reserved too");
+  assert.equal(isReservedStateKey("sender_seal "), false, "no trimming: a near miss is another key");
   assert.equal(isReservedStateKey("preview_artifact"), false);
   assert.equal(isReservedStateKey("last_source_day"), false);
   assert.equal(isReservedStateKey(""), false);

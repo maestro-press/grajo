@@ -2,8 +2,8 @@
  * The reports approval seal.
  *
  * Every owner approval in Crow Recurring Reports (go-live, a recipient, a custom-step bundle, a host, a
- * credential binding, a proposal, a draft source's settings, and the author seal over one owner-written
- * recipe revision) is stored with an HMAC over the content the
+ * credential binding, a proposal, a draft source's settings, the author seal over one owner-written
+ * recipe revision, and the sender a report is about) is stored with an HMAC over the content the
  * owner approved plus a fresh approval nonce, under a subkey derived from the keychain's own seed:
  * `HMAC(keychain seed, "crow-reports-approval-v1")`. The keychain key is the one secret this Crow holds
  * that no bot can read through the database, so a seal is the run-time half of the rule that a bot
@@ -45,7 +45,7 @@ export const APPROVAL_SEAL_DOMAIN = "crow-reports-approval-v1";
 
 /** The approvals that carry a seal. */
 export const APPROVAL_KINDS = Object.freeze([
-  "live", "recipient", "step", "host", "credential", "proposal", "source", "author",
+  "live", "recipient", "step", "host", "credential", "proposal", "source", "author", "sender",
 ]);
 
 /**
@@ -80,6 +80,11 @@ export const SEAL_FIELDS = Object.freeze({
   // One saved revision, sealed as OWNER-written (revision-author.js): the revision number and the hash of
   // the recipe that revision holds, so a copied seal names neither another revision nor another recipe.
   author: Object.freeze(["reportId", "rev", "recipeHash", "authorKind", "nonce"]),
+  // The mail account a report is about, sealed by the OWNER's settings save (sender-seal.js): a draft's
+  // `mail_alerts` block is measured against it, so the account has to be the owner's choice and not a
+  // column a direct UPDATE can move. The report id is inside it, so a seal copied between reports names
+  // neither one's account.
+  sender: Object.freeze(["reportId", "accountId", "nonce"]),
 });
 
 /** The payload's own version, so a future shape is a different MAC input. */
@@ -156,7 +161,7 @@ function sealPayload(kind, fields) {
 /**
  * Seal one approval: the hex HMAC over the kind's fields under the keychain seed.
  *
- * @param {"live"|"recipient"|"step"|"host"|"credential"|"proposal"|"source"|"author"} kind
+ * @param {"live"|"recipient"|"step"|"host"|"credential"|"proposal"|"source"|"author"|"sender"} kind
  * @param {object} fields the kind's field list, `nonce` included
  * @param {Buffer|Uint8Array} seed the keychain key's seed
  * @returns {string} 64 lower-case hex characters
@@ -173,7 +178,7 @@ export function approvalSeal(kind, fields, seed) {
  * in constant time. Never throws: an unverifiable seal (a wrong length, an upper-case copy, a padded
  * one, a missing nonce, a string where a number was sealed, another kind) is a refusal, not an error.
  *
- * @param {"live"|"recipient"|"step"|"host"|"credential"|"proposal"|"source"|"author"} kind
+ * @param {"live"|"recipient"|"step"|"host"|"credential"|"proposal"|"source"|"author"|"sender"} kind
  * @param {object} fields the kind's field list
  * @param {string} seal the hex seal stored on the row
  * @param {Buffer|Uint8Array} seed the keychain key's seed

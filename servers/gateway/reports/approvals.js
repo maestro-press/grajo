@@ -101,7 +101,8 @@ import { MODEL_BLOCK_TYPES, canonicalJson, recipeCallsModel, recipeHash, sources
 import { blockRegistry } from "./blocks/index.js";
 import { approvalSeal, newApprovalNonce, verifyApprovalSeal } from "./seal.js";
 import { sealAuthorRevision } from "./revision-author.js";
-import { getReport, getRevision, recordAudit, saveRecipe, updateReportColumns } from "./store.js";
+import { SENDER_SEAL_KEY, sealSender } from "./sender-seal.js";
+import { getReport, getRevision, recordAudit, saveRecipe, setState, updateReportColumns } from "./store.js";
 import { linkFor } from "./links.js";
 import { loadKeychainKey } from "../keychain/key.js";
 import { resolveProviderConfig } from "../ai/resolve-profile.js";
@@ -1036,6 +1037,9 @@ function savedAnswer(saved, { restamped = false, needsGoLive = false } = {}) {
     sourcesHash: saved.sourcesHash,
     restamped,
     needsGoLive,
+    // Whether THIS save wrote the revision's author seal (revision-author.js): true on an owner save that
+    // had a keychain key to seal with, false on a bot save and on an owner save whose key was unreadable.
+    authorSealed: saved != null && saved.authorSealed === true,
   };
 }
 
@@ -1115,7 +1119,7 @@ function authorSealForSave(d) {
  * @param {object} deps
  * @param {{reportId: string, recipe: object, actor: {kind: "owner"}}} input
  * @returns {Promise<{rev: number, hash: string, sourcesHash: string, restamped: boolean,
- *   needsGoLive: boolean}>}
+ *   needsGoLive: boolean, authorSealed: boolean}>}
  */
 export async function ownerSaveRecipe(db, deps, { reportId, recipe, actor } = {}) {
   requireOwner(actor);
@@ -1158,7 +1162,7 @@ export async function ownerSaveRecipe(db, deps, { reportId, recipe, actor } = {}
  * @param {object} deps
  * @param {{reportId: string, recipe: object}} input
  * @returns {Promise<{rev: number, hash: string, sourcesHash: string, pendingFreeChange: boolean,
- *   needsGoLive: boolean}>}
+ *   needsGoLive: boolean, authorSealed: boolean}>}
  */
 export async function botSaveRecipe(db, deps, { reportId, recipe } = {}) {
   const d = resolveDeps(deps);
@@ -1227,6 +1231,47 @@ function readFlag(value) {
 }
 
 /**
+ * Clear a report's stored sender seal, best effort: it must never fail the settings write around it.
+ * The value written is the JSON `null`, which every reader of the key already reads as "no seal".
+ */
+async function clearSenderSealOnSettings(db, reportId) {
+  try {
+    await setState(db, reportId, SENDER_SEAL_KEY, null);
+  } catch {
+    // Best effort: the settings write already landed.
+  }
+}
+
+/**
+ * Seal the sender a settings write has just put on the row, and never fail the write over it.
+ *
+ * The account is the row's own value read back after the UPDATE, so the seal names what the row holds now
+ * rather than what the caller sent. A missing or unreadable keychain key (`keychain_key_missing`) writes
+ * no seal at all: the settings are still saved, and an unsealed sender is simply not one a draft preview
+ * may read (sender-seal.js, source-approvals.js). No other setting write reaches here.
+ *
+ * NO NEW SEAL CLEARS THE OLD ONE: when the sender moves from A to B and no seal for B can be made (a
+ * missing keychain key, or any failure making or writing it), the seal left over from A is removed. A
+ * stale row would otherwise sit there naming A, and a later direct UPDATE of the column back to A would
+ * verify again against a seal the owner made for a sender the report no longer had. The clearing write is
+ * best effort: a failure of it never makes the settings save (which already landed) throw.
+ */
+async function sealSenderOnSettings(db, d, report) {
+  if (report == null || typeof report !== "object") return;
+  const accountId = text(report.sender_account_id);
+  if (accountId) {
+    try {
+      const proof = sealSender(await seedOf(d), { reportId: report.id, accountId });
+      await setState(db, report.id, SENDER_SEAL_KEY, proof);
+      return;
+    } catch {
+      // Fail closed: no seal, no trusted row sender. The settings write itself already landed.
+    }
+  }
+  await clearSenderSealOnSettings(db, report.id);
+}
+
+/**
  * The owner's settings write (route `PUT /settings`): the sender, the delivery rule, the comment
  * defaults, the AI switch, the title and the notify switch.
  *
@@ -1238,6 +1283,17 @@ function readFlag(value) {
  * approval. Only a fresh preview and go-live re-approve it (`resumeReport` answers `go_live_needed`).
  * The same change on a PAUSED report that still carries a seal nulls the seal and nonce as well, and
  * leaves its status and pause reason exactly as they were.
+ *
+ * THE SENDER IS SEALED HERE: a save that carries `sender_account_id` (even the value the row already
+ * holds) writes the report's sender seal beside the column, in `report_state` under `sender_seal`
+ * (sender-seal.js), so the account a draft's `mail_alerts` block is measured against is provably the
+ * owner's choice rather than a column any writer could have set. This is the only writer of that seal: a
+ * recipe save, a proposal and the Apply path never touch it, and a settings write that names no sender
+ * leaves the seal row exactly as it is. A keychain key that cannot be read still saves the settings, with
+ * no seal written and the sender seal CLEARED (fail closed: an unsealed sender is not one a preview may
+ * read, and the seal the previous sender left behind must not survive to verify a column moved back). A
+ * sender changed by any other path therefore stops being trusted, because the seal names the account it
+ * was made over and the reader compares it with the row.
  *
  * @param {object} db
  * @param {object} deps
@@ -1324,6 +1380,9 @@ export async function updateSettings(db, deps, { reportId, settings, actor } = {
   }
 
   const updated = await updateReportColumns(db, report.id, patch);
+  if (Object.hasOwn(patch, "sender_account_id")) {
+    await sealSenderOnSettings(db, d, updated);
+  }
   if (liveChanged) {
     await recordAudit(db, {
       reportId: report.id,
