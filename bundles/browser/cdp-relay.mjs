@@ -123,16 +123,31 @@ const GUARD_MARKER = "crow-private-address-guard:v1";
  * Chromium's OWN component-extension ids the gate leaves alone — a fixed set pinned in code,
  * and nothing else.
  *
- * Seen as `service_worker chrome-extension://nkeimhogjdpnpccoofpliimaahmaaome/thunk.js` LISTED
- * (never attached) at start by Chromium 145.0.7632.6, i.e. Playwright 1.58.2's chromium-1208,
- * found by a live `Target.getTargets` in the built image over 16 starts. Because it is never
- * attached, the attach path can never grant it its exemption: the listing has to.
+ * Chromium 145.0.7632.6 (Playwright 1.58.2's chromium-1208) LISTS one as
+ * `service_worker chrome-extension://nkeimhogjdpnpccoofpliimaahmaaome/thunk.js` and never
+ * attaches it, found by a live `Target.getTargets` in the built image over 16 starts. Because
+ * it is never attached, the attach path can never grant it its exemption: the listing has to.
+ * That id stays on the list so a rollback, or an install still pinned to the older lock,
+ * keeps resolving.
+ *
+ * Chromium 159.0.8154.6 (since 1.9.1, Playwright 1.65.1's chromium-1255) has TWO of them, both
+ * `service_worker chrome-extension://<id>/background.js`, seen at start in 3 of 3 fresh-profile
+ * starts on the real image. Both are VERIFIED against Chromium's own source at tag 159.0.8154.6:
+ *   - admccjkmockfdflocgggjfgdacdodkdf is extension_misc::kGlicExtensionId, "the Gemini transition
+ *     extension" (chrome/common/extensions/extension_constants.h line 58);
+ *   - glbjnfimcajjenihimblfaponejbkoph is extension_misc::kContextualTasksExtensionId, "the
+ *     Contextual Tasks component extension" (extensions/common/constants.h lines 336-338);
+ * and both are members of IsComponentExtensionAllowlisted()'s kAllowed set
+ * (chrome/browser/extensions/component_extensions_allowlist/allowlist.cc lines 44-45): Chromium's
+ * own built-in component extensions — not a foreign or a guessed id.
  *
  * An allow-listed id that is absent is fine. Any OTHER extension worker before the gate is
  * ready is NOT exempt: the start fails closed, with one log line naming the id, so a Chromium
- * upgrade that changes these ids is visible to an operator instead of silently tolerated.
+ * upgrade that changes these ids is visible to an operator instead of silently tolerated. The
+ * exemption is PRE-READY ONLY, for both ids: it covers a service worker whose targetId was
+ * recorded before the gate was ready, and nothing that shows up after that.
  */
-const COMPONENT_EXTENSION_IDS = new Set(["nkeimhogjdpnpccoofpliimaahmaaome"]);
+const COMPONENT_EXTENSION_IDS = new Set(["nkeimhogjdpnpccoofpliimaahmaaome", "admccjkmockfdflocgggjfgdacdodkdf", "glbjnfimcajjenihimblfaponejbkoph"]);
 /** The token shape Crow mints (hex32 or base64url) — the same rule the entrypoint applies. */
 export const TOKEN_RE = /^[A-Za-z0-9_-]{32,256}$/;
 /** How long the supervisor waits for the relay's one "ready <json>" line (the entrypoint waits 60 s). */

@@ -1,0 +1,4 @@
+{
+  "chromiumMajor": 159,
+  "note": "This is the Chromium major the previous release's image ran on, on every install. The lock (bundles/browser/package-lock.json) may only resolve to this major or newer: an older one would move the image below what already wrote every existing profile, and Chromium cannot open a profile written by a newer major. Edit this only consciously — a deliberate rollback, together with the way back for those profiles."
+}

@@ -3,10 +3,11 @@
  *
  * The Fix-it card "Restart the browser add-on" runs `up -d --build --force-recreate`
  * (remedies/restart-browser-addon.js). The rebuild installs whatever
- * bundles/browser/package-lock.json pins — playwright-core 1.58.2, whose Chromium is
- * 145 — while the RUNNING container's persistent profile may have been written by a
- * NEWER Chromium (159). Chromium refuses, and crash-loops on, a profile written by a
- * newer version, so offering that restart would take the add-on down for good.
+ * bundles/browser/package-lock.json pins — since 1.9.1 playwright-core 1.65.1 (Chromium
+ * 159), before that 1.58.2 (Chromium 145) — while the RUNNING container's persistent
+ * profile may have been written by a NEWER Chromium. Chromium refuses, and crash-loops
+ * on, a profile written by a newer version, so offering that restart would take the
+ * add-on down for good.
  *
  * browsers.js of an installed bundle is not here: the installed bundle dir holds only
  * package-lock.json, and a host node_modules/playwright-core may be anything at all —
@@ -79,7 +80,14 @@ function runner(answer) {
 
 describe("bundledChromiumMajor: what the image's `npm ci` actually installs", () => {
   test("the repo bundle's own lock → the Chromium its playwright-core downloads", () => {
-    assert.equal(guard.bundledChromiumMajor(REPO_BUNDLE), 145);
+    const lock = JSON.parse(readFileSync(join(REPO_BUNDLE, "package-lock.json"), "utf8"));
+    const version = lock?.packages?.["node_modules/playwright-core"]?.version;
+
+    assert.equal(
+      guard.bundledChromiumMajor(REPO_BUNDLE),
+      guard.PLAYWRIGHT_CHROMIUM_MAJOR[version],
+      `bundledChromiumMajor must answer the table's major for the lock's playwright-core (${version}), not a value hard-coded here`,
+    );
   });
 
   test("no package-lock.json in the installed bundle dir → null (unknown)", () => {
@@ -295,6 +303,10 @@ describe("runningBrowserContainerIds: the bundle's own compose project", () => {
 describe("the version table", () => {
   test("it is frozen", () => {
     assert.ok(Object.isFrozen(guard.PLAYWRIGHT_CHROMIUM_MAJOR));
+  });
+
+  test("the current lock pin (playwright-core 1.65.1) maps to Chromium 159", () => {
+    assert.equal(guard.PLAYWRIGHT_CHROMIUM_MAJOR["1.65.1"], 159);
   });
 
   // The drift guard: a lock bump that forgets the table would silently make the

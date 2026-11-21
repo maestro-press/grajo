@@ -46,6 +46,25 @@ const INTENT_HEADER = "X-Crow-Guard-Client";
  * start (Playwright 1.58.2's chromium-1208) LISTS as `thunk.js` and never attaches.
  */
 const COMPONENT_EXTENSION_ID = "nkeimhogjdpnpccoofpliimaahmaaome";
+/**
+ * The two component-extension ids Chromium 159.0.8154.6 (Playwright 1.65.1's chromium-1255)
+ * carries, both `service_worker chrome-extension://<id>/background.js`, seen at start in 3 of 3
+ * fresh-profile starts on the real image. Both are VERIFIED against Chromium's own source at tag
+ * 159.0.8154.6: admccjkmockfdflocgggjfgdacdodkdf is extension_misc::kGlicExtensionId, "the Gemini
+ * transition extension" (chrome/common/extensions/extension_constants.h line 58), and
+ * glbjnfimcajjenihimblfaponejbkoph is extension_misc::kContextualTasksExtensionId, "the Contextual
+ * Tasks component extension" (extensions/common/constants.h lines 336-338). Both are in
+ * IsComponentExtensionAllowlisted()'s kAllowed set
+ * (chrome/browser/extensions/component_extensions_allowlist/allowlist.cc lines 44-45): Chromium's
+ * own built-in component extensions. The relay's exemption for them is pre-ready only — a service
+ * worker whose targetId was recorded before the gate was ready.
+ */
+const COMPONENT_EXTENSION_IDS_159 = [
+  "admccjkmockfdflocgggjfgdacdodkdf",
+  "glbjnfimcajjenihimblfaponejbkoph",
+];
+/** The relay's allow-list declaration: one source line, and every id above belongs on it. */
+const COMPONENT_ALLOW_LIST_DECL = "COMPONENT_EXTENSION_IDS = new Set(";
 /** An extension id nothing allow-lists: no exemption may ever be guessed from an origin. */
 const UNKNOWN_EXTENSION_ID = "evilextidnotonthelist";
 
@@ -2738,6 +2757,10 @@ test("T6-b: the relay's error replies carry the request's sessionId too — unkn
 // and never a `shared_worker`: S7-5 shows that a worker at an allow-listed id first seen after
 // ready is closed anyway, and S7-6 shows that a shared worker at that id is not exempt at all
 // (listed at start, or attached before ready).
+//
+// Chromium 159.0.8154.6 (Playwright 1.65.1's chromium-1255) carries two allow-listed ids of
+// its own — both `service_worker chrome-extension://<id>/background.js` — and S7-7/S7-8 run the
+// same two shapes for them; the 145 id stays on the list for an older install or a rollback.
 // ---------------------------------------------------------------------------------------
 
 /** The env a listed-only target needs: the attach-late default workers would only add noise. */
@@ -2989,5 +3012,132 @@ test("S7-6: a shared_worker at an allow-listed id is NOT exempt — listed at st
         "and it is gone from the listing",
       );
     },
+  );
+});
+
+// ---------------------------------------------------------------------------------------
+// S7 for Chromium 159's TWO component-extension ids
+//
+// Chromium 159.0.8154.6 (Playwright 1.65.1's chromium-1255) carries two component-extension
+// service workers, both `service_worker chrome-extension://<id>/background.js`, seen at start in
+// 3 of 3 fresh-profile starts on the real image (both ids are in that binary's own
+// component-extension id list; their human names are not verified). They are on the relay's
+// allow-list, so the SAME two shapes S7-1/S7-2b run for the 145 id have to hold for them — and
+// an id on no list must still fail the start.
+// ---------------------------------------------------------------------------------------
+
+/** The fixture's `type|url` entries for both Chromium 159 component workers, listed only. */
+const listedOnly159 = () => COMPONENT_EXTENSION_IDS_159
+  .map((id) => `service_worker|chrome-extension://${id}/background.js`)
+  .join(",");
+
+/** The `chrome-extension://` URLs the two 159 ids stand for, sorted for a set comparison. */
+const urls159 = () => COMPONENT_EXTENSION_IDS_159.map((id) => `chrome-extension://${id}/background.js`).sort();
+
+/** Neither 159 id may ever be named as an unknown extension worker. */
+function assertNoUnknown159(ctx) {
+  assert.doesNotMatch(ctx.logs(), /unknown extension worker/, `neither 159 id is unknown: ${ctx.logs()}`);
+  for (const id of COMPONENT_EXTENSION_IDS_159) {
+    assert.equal(ctx.logs().includes(id), false, `the relay never logs ${id} at all`);
+  }
+}
+
+test("S7-7: both Chromium 159 component workers, LISTED and never attached, leave the gate ready — neither id is unknown", async (t) => {
+  await withGate(t, listedOnly(listedOnly159()), async ({ ctx, wsUrl }) => {
+    const listed = ctx.records("listed-only-target");
+    assert.deepEqual(
+      listed.map((r) => r.url).sort(),
+      urls159(),
+      `the fixture listed both of the browser's component workers: ${JSON.stringify(listed)}`,
+    );
+    assert.equal(listed.every((r) => r.type === "service_worker"), true, "both are service workers");
+    await waitLog(ctx, /gate state IDLE/);
+    await sleep(300);
+
+    // The start did not fail, and never judged either id: they are on the component allow-list.
+    assertNoUnknown159(ctx);
+    assert.doesNotMatch(ctx.logs(), /the start sequence failed/, `the start reached ready: ${ctx.logs()}`);
+
+    // …it judged the state clean (no neutralisation) and left both where they were.
+    assert.equal(ctx.records("create-target").length, 0, "the start tolerated the two listings; it ran no neutralisation");
+    assert.equal(ctx.records("close-target").length, 0, "neither listed worker was closed");
+    const observer = plainClient(wsUrl, { attach: true, hook: false });
+    await observer.armed;
+    await sleep(200);
+    const live = await liveTargets(observer);
+    for (const worker of listed) {
+      assert.ok(live.some((info) => info.targetId === worker.targetId), `a component worker is still listed (${worker.url})`);
+      assert.equal(observer.attached.some((a) => a.targetId === worker.targetId), false, `a client is never handed it (${worker.url})`);
+    }
+  });
+});
+
+test("S7-8: both Chromium 159 component workers, ATTACHED just after the gate's first listing, leave the gate ready — neither id is unknown", async (t) => {
+  await withGate(t, { FAKE_CHROME_EXTENSION_WORKERS: COMPONENT_EXTENSION_IDS_159.join(",") }, async ({ ctx, wsUrl }) => {
+    const deadline = Date.now() + 6000;
+    while (Date.now() < deadline && ctx.records("extension-worker").length < COMPONENT_EXTENSION_IDS_159.length) await sleep(25);
+    const workers = ctx.records("extension-worker");
+    assert.deepEqual(
+      workers.map((r) => r.url).sort(),
+      urls159(),
+      `the fixture made both component workers: ${JSON.stringify(workers)}`,
+    );
+    assert.equal(workers.every((r) => r.type === "service_worker"), true, "both are service workers");
+    assert.equal(workers.every((r) => r.at !== "start"), true, "they attached after the gate's first listing, as the real browser does");
+    await sleep(400);
+
+    assertNoUnknown159(ctx);
+
+    // The attach path exempted each of them: resumed by the gate, never held, never closed —
+    // and no client is handed its attach event.
+    for (const worker of workers) {
+      assert.equal(ctx.records("close-target").some((r) => r.targetId === worker.targetId), false, `not closed (${worker.url})`);
+      assert.equal(ctx.records("resumed").some((r) => r.targetId === worker.targetId), true, `the gate resumed it as exempt (${worker.url})`);
+    }
+    const observer = plainClient(wsUrl, { attach: true, hook: false });
+    await observer.armed;
+    await sleep(200);
+    const live = await liveTargets(observer);
+    for (const worker of workers) {
+      assert.ok(live.some((info) => info.targetId === worker.targetId), `still listed (${worker.url})`);
+      assert.equal(observer.attached.some((a) => a.targetId === worker.targetId), false, `no client sees an attach event for it (${worker.url})`);
+    }
+  });
+});
+
+test("S7-9: the 159 ids do not widen the allow-list — a service worker at an id on NO list still fails the start", async (t) => {
+  const line = `unknown extension worker at start, not on the component allow-list: ${UNKNOWN_EXTENSION_ID}`;
+
+  // (i) LISTED beside both allow-listed 159 ids: the start must still fail on the third id,
+  // and must not name either allow-listed one.
+  const listedCtx = await startRelay(t, listedOnly(`${listedOnly159()},service_worker|chrome-extension://${UNKNOWN_EXTENSION_ID}/background.js`));
+  await startFailed(listedCtx);
+  assert.ok(listedCtx.logs().includes(line), `one line names the id, so a Chromium upgrade that changed it is visible: ${listedCtx.logs()}`);
+  assert.equal(listedCtx.logs().split("\n").filter((l) => l.includes(`component allow-list: ${UNKNOWN_EXTENSION_ID}`)).length, 1, "ONE distinct line for the unknown id");
+  for (const id of COMPONENT_EXTENSION_IDS_159) {
+    assert.equal(listedCtx.logs().includes(`component allow-list: ${id}`), false, `the allow-listed ${id} is not named as unknown`);
+  }
+  assert.equal(listedCtx.records("close-target").length, 0, "the start stops on the id instead of closing it and serving afterwards");
+
+  // (ii) the same third id arriving by an ATTACH event before ready, beside the two 159 ids.
+  const attachedCtx = await startRelay(t, { FAKE_CHROME_EXTENSION_WORKERS: [...COMPONENT_EXTENSION_IDS_159, UNKNOWN_EXTENSION_ID].join(",") });
+  await startFailed(attachedCtx);
+  assert.ok(attachedCtx.logs().includes(line), `the attach path logs the same line: ${attachedCtx.logs()}`);
+  for (const id of COMPONENT_EXTENSION_IDS_159) {
+    assert.equal(attachedCtx.logs().includes(`component allow-list: ${id}`), false, `the allow-listed ${id} is not named as unknown`);
+  }
+});
+
+test("S7-10: the relay's COMPONENT_EXTENSION_IDS line carries all three ids (145 and both 159)", () => {
+  const source = readFileSync(RELAY, "utf8");
+  const line = source.split("\n").find((l) => l.includes(COMPONENT_ALLOW_LIST_DECL));
+  assert.ok(line, `the relay declares the component allow-list (${COMPONENT_ALLOW_LIST_DECL})`);
+  for (const id of [COMPONENT_EXTENSION_ID, ...COMPONENT_EXTENSION_IDS_159]) {
+    assert.ok(line.includes(`"${id}"`), `the allow-list line carries ${id}: ${line}`);
+  }
+  assert.equal(
+    (line.match(/"[a-p]{32}"/g) || []).length,
+    3,
+    `and nothing else: exactly the three known component ids are allow-listed (${line})`,
   );
 });

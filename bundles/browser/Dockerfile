@@ -34,6 +34,12 @@ RUN npm ci
 # Install Playwright Chromium
 RUN npx playwright install chromium --with-deps
 
+# Record the Chromium this image holds. The entrypoint compares it with the version that
+# last wrote the persistent profile and refuses to start on a downgrade: Chromium cannot
+# open a profile written by a newer major, and would crash-loop. The build fails rather
+# than ship an image whose Chromium version cannot be read.
+RUN node -e 'const browsers = require("./node_modules/playwright-core/browsers.json").browsers; const chromium = browsers.find((b) => b.name === "chromium"); if (!chromium || !chromium.browserVersion) { console.error("playwright-core/browsers.json has no chromium browserVersion"); process.exit(1); } require("fs").writeFileSync("/opt/crow-chromium-version", chromium.browserVersion + "\n");'
+
 COPY entrypoint.sh ./
 COPY cdp-relay.mjs ./
 RUN chmod +x entrypoint.sh

@@ -4,12 +4,12 @@
  * Why this exists. The card's remedy runs the Extensions restart, which is
  * `up -d --build --force-recreate` (remedies/restart-browser-addon.js): it REBUILDS the
  * image from the files Crow just installed, and then re-creates the container on it.
- * The rebuild installs exactly what `bundles/browser/package-lock.json` pins —
- * playwright-core 1.58.2, whose bundled Chromium is 145 — while a container that has
- * been running since a newer bundle was installed may hold a profile written by a
- * NEWER Chromium (159). Chromium refuses, and then crash-loops on, a profile written by
- * a newer major version, so that restart takes the add-on down for good: the very card
- * that was meant to fix it is what breaks it.
+ * The rebuild installs exactly what `bundles/browser/package-lock.json` pins — since 1.9.1
+ * playwright-core 1.65.1, whose bundled Chromium is 159; before that 1.58.2 → Chromium 145 —
+ * while the RUNNING container's persistent profile may have been written by a NEWER Chromium.
+ * Chromium refuses, then crash-loops on, a profile written by a newer major than itself.
+ * So a restart that moves the image backwards takes the add-on down for good: the very
+ * card that was meant to fix it is what breaks it.
  *
  * So the restart is offered ONLY when it cannot move the profile backwards:
  *
@@ -28,7 +28,9 @@
  * simply a different version from the one the image's `npm ci` installs, so reading it
  * would answer a question nobody asked. The lock IS the authority for what the image
  * installs, and PLAYWRIGHT_CHROMIUM_MAJOR maps that pin to the Chromium major it
- * downloads (playwright-core 1.58.2 → chromium browserVersion 145.0.7632.6). A
+ * downloads. The table lists every lock pin a release has shipped: the newest is
+ * playwright-core 1.65.1 → chromium browserVersion 159.0.8154.6, and the older pins
+ * stay so a lock that has not moved (or a deliberate rollback) still resolves. A
  * playwright version the table does not know is UNKNOWN → blocked, and
  * tests/fix-it-browser-chromium-guard.test.js fails CI the moment
  * bundles/browser/package-lock.json moves to a version missing from the table — a lock
@@ -46,10 +48,13 @@ import { composeEnv, parseDotEnv } from "../compose-guard.js";
 
 /**
  * playwright-core version (as pinned in bundles/browser/package-lock.json) → the major
- * of the Chromium build it downloads. Verified: playwright-core 1.58.2's browsers.json
- * pins chromium 145.0.7632.6. One entry only, on purpose — see the header.
+ * of the Chromium build it downloads. The table lists every lock pin a release has
+ * shipped, newest first: playwright-core 1.65.1's browsers.json pins chromium
+ * 159.0.8154.6, and 1.58.2's pinned 145.0.7632.6. Keep older entries — a lock that has
+ * not moved yet, or a conscious rollback, must still resolve.
  */
 export const PLAYWRIGHT_CHROMIUM_MAJOR = Object.freeze({
+  "1.65.1": 159,
   "1.58.2": 145,
 });
 

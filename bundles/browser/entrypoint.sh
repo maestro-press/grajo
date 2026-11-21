@@ -32,6 +32,16 @@ SCREEN="1920x1080x24"
 
 log() { echo "[crow-browser] $*"; }
 die() { echo "[crow-browser] FATAL: $*" >&2; exit 1; }
+# die_after_sleep SECONDS MESSAGE — like die, but the line is printed at once and the exit
+# waits SECONDS: the downgrade guard is the one fatal where a restart policy would
+# otherwise spin the container against the same unusable profile. The line comes first so
+# it is in the log immediately; only the exit is delayed.
+die_after_sleep() {
+  local seconds="$1"; shift
+  echo "[crow-browser] FATAL: $*" >&2
+  sleep "$seconds"
+  exit 1
+}
 
 # require_id NAME VALUE — a decimal id 0..2147483647, or a fatal that says where the
 # value comes from. Never defaulted: a 0 or a 1000 would make the relay listen as a uid
@@ -181,6 +191,43 @@ if [ -f "$INSTANCE_MARKER" ]; then
 else
   printf '%s' "$CROW_INSTANCE" > "$INSTANCE_MARKER"
   log "profile marked for instance ${CROW_INSTANCE}."
+fi
+
+# --- Chromium downgrade guard ---
+# The image records the Chromium it holds at build time (/opt/crow-chromium-version);
+# Chromium records the version that last wrote this profile in "Last Version". Chromium
+# refuses, then crash-loops on, a profile written by a NEWER major, so a profile ahead of
+# this image stops the container loudly instead. Skip the comparison whenever either side
+# is unreadable or is not a version (a fresh profile, an image from before the file was
+# written): then Chromium's own behaviour is the only answer there is.
+IMAGE_CHROMIUM_FILE="${CROW_CHROMIUM_VERSION_FILE:-/opt/crow-chromium-version}"
+PROFILE_LAST_VERSION="$PROFILE_DIR/Last Version"
+REFUSED_MARKER="$PROFILE_DIR/.crow-downgrade-refused"
+VERSION_PATTERN='^[0-9]+(\.[0-9]+)*$'
+IMAGE_CHROMIUM=""
+if [ -r "$IMAGE_CHROMIUM_FILE" ]; then
+  IFS= read -r IMAGE_CHROMIUM < "$IMAGE_CHROMIUM_FILE" || true
+fi
+PROFILE_CHROMIUM=""
+if [ -r "$PROFILE_LAST_VERSION" ]; then
+  IFS= read -r PROFILE_CHROMIUM < "$PROFILE_LAST_VERSION" || true
+fi
+if ! [[ "$IMAGE_CHROMIUM" =~ $VERSION_PATTERN ]]; then
+  log "warning: this image's Chromium version ('${IMAGE_CHROMIUM}') is unreadable from ${IMAGE_CHROMIUM_FILE}: skipping the downgrade guard"
+  rm -f "$REFUSED_MARKER"
+elif ! [[ "$PROFILE_CHROMIUM" =~ $VERSION_PATTERN ]]; then
+  log "no Chromium version in the profile ('${PROFILE_CHROMIUM}' from ${PROFILE_LAST_VERSION}): nothing to compare, Chromium decides"
+  rm -f "$REFUSED_MARKER"
+elif [ "$((10#${PROFILE_CHROMIUM%%.*}))" -gt "$((10#${IMAGE_CHROMIUM%%.*}))" ]; then
+  # A note for the next start (best effort: a marker that cannot be written must not
+  # change the refusal itself — the comparison already decided).
+  printf 'profile=%s image=%s at=%s\n' "$PROFILE_CHROMIUM" "$IMAGE_CHROMIUM" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$REFUSED_MARKER" 2>/dev/null || true
+  REFUSE_SLEEP="${CROW_DOWNGRADE_REFUSE_SLEEP:-30}"
+  [[ "$REFUSE_SLEEP" =~ ^[0-9]+$ ]] || REFUSE_SLEEP=30
+  die_after_sleep "$REFUSE_SLEEP" "this profile was last opened by Chromium ${PROFILE_CHROMIUM}, newer than this image's ${IMAGE_CHROMIUM}; Chromium cannot open a newer profile. Rebuild with the current add-on or restore the previous image."
+else
+  rm -f "$REFUSED_MARKER"
+  log "profile last opened by Chromium ${PROFILE_CHROMIUM}; image has ${IMAGE_CHROMIUM}: ok"
 fi
 # loopback_only PORT TABLE... — true only when something LISTENs on PORT in the
 # given /proc/net/tcp{,6}-format tables and every such listener is a loopback

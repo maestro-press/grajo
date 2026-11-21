@@ -419,7 +419,8 @@ test("crow_browser_status reports a gate key fed by readGateStatus", () => {
 /**
  * The gate's coverage rule reads what Playwright puts on the wire, so a Playwright change
  * that stops sending `Fetch.enable` with `*`, or stops wrapping init scripts, changes what
- * the relay can see. The ranges below are pinned to the range the bundle declares.
+ * the relay can see. The pin below is what the bundle declares — an exact version since
+ * 1.9.1 (a caret range before it) — and the installed playwright-core must be it.
  */
 test("Playwright's own per-page commands still have the shape the coverage rule reads", (t) => {
   const fromBundle = join(ROOT, "bundles", "browser", "package.json");
@@ -438,30 +439,54 @@ test("Playwright's own per-page commands still have the shape the coverage rule 
 
   const installed = JSON.parse(readFileSync(pkgPath, "utf8")).version;
   assert.equal(
-    satisfiesCaret(installed, BUNDLE_PKG.dependencies.playwright),
+    satisfiesPin(installed, BUNDLE_PKG.dependencies.playwright),
     true,
     `installed playwright-core ${installed} must satisfy the bundle's ${BUNDLE_PKG.dependencies.playwright}`,
   );
 
   const libRoot = dirname(pkgPath);
+
+  // The per-page wire commands live in one of two layouts: separate sources
+  // (lib/server/chromium/*.js) up to 1.5x, or bundled into a single lib/coreBundle.js
+  // from then on — where lib/server/chromium holds only appIcon.png. Read whichever
+  // this install ships, and refuse to pass on neither.
   const chromiumDir = join(libRoot, "lib", "server", "chromium");
-  assert.ok(existsSync(chromiumDir), "playwright-core has lib/server/chromium");
-  const chromiumSources = readdirSync(chromiumDir)
-    .filter((name) => name.endsWith(".js"))
-    .map((name) => readFileSync(join(chromiumDir, name), "utf8"));
+  const chromiumSources = existsSync(chromiumDir)
+    ? readdirSync(chromiumDir)
+      .filter((name) => name.endsWith(".js"))
+      .map((name) => readFileSync(join(chromiumDir, name), "utf8"))
+    : [];
+  const coreBundlePath = join(libRoot, "lib", "coreBundle.js");
+  if (existsSync(coreBundlePath)) chromiumSources.push(readFileSync(coreBundlePath, "utf8"));
+  assert.ok(
+    chromiumSources.length > 0,
+    `playwright-core ${installed} ships neither lib/server/chromium/*.js nor lib/coreBundle.js under ${libRoot}: the wire commands to check cannot be read`,
+  );
   const chromiumText = chromiumSources.join("\n");
 
   assert.match(chromiumText, /Fetch\.enable/, "a page session enables Fetch");
   assert.match(chromiumText, /urlPattern:\s*["']\*["']/, "with the catch-all pattern the coverage rule looks for");
   assert.match(chromiumText, /Page\.addScriptToEvaluateOnNewDocument/, "and init scripts are installed as page scripts");
 
-  const pageSource = readFileSync(join(libRoot, "lib", "server", "page.js"), "utf8");
-  assert.ok(pageSource.includes("(() => {"), "init scripts are wrapped as `(() => { … })()`, so the marker is never the first line");
+  const pagePath = join(libRoot, "lib", "server", "page.js");
+  if (existsSync(pagePath)) {
+    const pageSource = readFileSync(pagePath, "utf8");
+    assert.ok(pageSource.includes("(() => {"), "init scripts are wrapped as `(() => { … })()`, so the marker is never the first line");
+  } else {
+    assert.ok(existsSync(coreBundlePath), "playwright-core has lib/server/page.js or lib/coreBundle.js, where init scripts are wrapped");
+    assert.match(
+      readFileSync(coreBundlePath, "utf8"),
+      /\(\(\) => \{\s*\n\s*const module = \{\};/,
+      "init scripts are wrapped as `(() => { … })()`, so the marker is never the first line",
+    );
+  }
 });
 
-/** `^major.minor.patch` (the only range shape the bundle uses). */
-function satisfiesCaret(version, range) {
-  const m = /^\^(\d+)\.(\d+)\.(\d+)$/.exec(String(range || ""));
+/** `^major.minor.patch` or an exact `major.minor.patch` — the pin shapes the bundle has used. */
+function satisfiesPin(version, pin) {
+  const text = String(pin || "");
+  if (/^\d+\.\d+\.\d+$/.test(text)) return String(version) === text;
+  const m = /^\^(\d+)\.(\d+)\.(\d+)$/.exec(text);
   if (!m) return false;
   const [, major, minor, patch] = m.map(Number);
   const floor = [major, minor, patch];
@@ -471,7 +496,18 @@ function satisfiesCaret(version, range) {
 }
 
 test("the bundle's playwright dependency string is pinned", () => {
-  assert.equal(BUNDLE_PKG.dependencies.playwright, "^1.49.0");
+  const { playwright, "playwright-core": playwrightCore } = BUNDLE_PKG.dependencies;
+
+  assert.match(
+    String(playwright),
+    /^\d+\.\d+\.\d+$/,
+    "playwright is pinned to an exact version, not a range: the image's Chromium must not move under a rebuild",
+  );
+  assert.equal(
+    playwrightCore,
+    playwright,
+    "playwright-core is declared at the same exact version, so the Chromium browsers.json reports is the one Playwright drives",
+  );
 });
 
 // ---------------------------------------------------------------------------
