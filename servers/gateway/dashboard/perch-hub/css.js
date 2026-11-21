@@ -428,6 +428,27 @@ border-collapse:collapse;margin:0 0 8px;font-size:13px}
 #perch-hub-root .mdraft-field{display:grid;gap:4px;min-width:0}
 #perch-hub-root .mdraft-field input,#perch-hub-root .mdraft-field textarea,#perch-hub-root .mdraft-note,#perch-hub-root .mdraft-comment{width:100%;min-width:0;box-sizing:border-box;min-height:44px;font-size:16px;background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:10px}
 #perch-hub-root .mdraft-field textarea,#perch-hub-root .mdraft-note{min-height:96px;resize:vertical;white-space:pre-wrap}
+/* Message draft card (bot-door plan, PR B): the draft a bot wrote to one of the people it is allowed
+   to write to. Same furniture as the mail card — the fixed "Sent by …" line is greyed and never a
+   field, the recipient is a chip (a picker limited to the bot's allow-list for a bot's draft), the
+   textarea is the one editable thing, and every target is 44 px with a 16 px field so iOS does not
+   zoom on focus. Nothing here layers over the page, so no z-index is needed. */
+#perch-hub-root .mmsg-card{border:1px solid var(--line);border-radius:10px;padding:11px 12px;display:grid;gap:6px;background:var(--sky);min-width:0}
+#perch-hub-root .mmsg-card.mmsg-query{outline:2px solid var(--teal);outline-offset:2px}
+#perch-hub-root .mmsg-head{font-weight:600;overflow-wrap:anywhere}
+#perch-hub-root .mmsg-to{display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-width:0}
+#perch-hub-root .mmsg-label{font-size:11px;text-transform:uppercase;letter-spacing:.07em;font-weight:700;color:var(--teal)}
+#perch-hub-root .mmsg-chip{overflow-wrap:anywhere;min-width:0}
+#perch-hub-root .mmsg-recipient-picker{min-height:44px;font-size:16px;background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px;max-width:100%}
+#perch-hub-root .mmsg-sentby{font-size:12.5px;color:var(--dim);font-style:italic}
+#perch-hub-root .mmsg-body{width:100%;min-width:0;box-sizing:border-box;min-height:96px;resize:vertical;white-space:pre-wrap;font-size:16px;background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:10px}
+#perch-hub-root .mmsg-unverified{font-size:12.5px;color:var(--dim);overflow-wrap:anywhere}
+#perch-hub-root .mmsg-status{font-size:12.5px;color:var(--dim);overflow-wrap:anywhere}
+#perch-hub-root .mmsg-status:empty{display:none}
+#perch-hub-root .mmsg-receipt{font-weight:600;overflow-wrap:anywhere}
+#perch-hub-root .mmsg-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+#perch-hub-root .mmsg-actions button{min-height:44px;padding:10px 14px;display:inline-flex;align-items:center;justify-content:center}
+#perch-hub-root .mmsg-actions button:disabled{opacity:.55;cursor:default}
 #perch-hub-root .mdraft-menu{display:grid;gap:8px}
 #perch-hub-root .mdraft-menu[hidden]{display:none}
 #perch-hub-root .mdraft-history-list{display:grid;gap:4px}

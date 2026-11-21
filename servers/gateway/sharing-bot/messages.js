@@ -46,6 +46,7 @@
  * for a caller's mistake. The door turns the result into one MCP text block and one audit row.
  */
 import { createDraft, getOpenDraft } from "../messages/drafts-store.js";
+import { notifyBotDraft } from "../messages/drafts-bot-notes.js";
 import { listAllowedTargets, resolveAllowedContact, resolveAllowedGroup } from "./contacts.js";
 import { DEFAULT_RATE_PER_HOUR } from "./acl.js";
 
@@ -94,21 +95,22 @@ async function ownerEdited(db, draftId) {
  * The draft-two-ways write every message tool shares: revise this bot's own open draft when there is
  * one, else create. Both go through the store's compare-and-set, and every refusal is a code.
  */
-async function writeDraft(db, { conversationKind, conversationId, recipients, body, origin, botId, botName, opts }) {
+async function writeDraft(db, { conversationKind, conversationId, recipients, body, origin, botId, botName, chatThreadId = null, opts }) {
   const open = await getOpenDraft(db, conversationKind, conversationId);
   if (open) {
     if (open.origin !== "bot") return { ok: false, code: "owner_draft_open" };
     if (String(open.botId ?? "") !== String(botId)) return { ok: false, code: "draft_open" };
     if (await ownerEdited(db, open.id)) return { ok: false, code: "owner_edited" };
     const revised = await createDraft(db, {
-      conversationKind, conversationId, body, recipients, origin, botId, botName,
+      conversationKind, conversationId, body, recipients, origin, botId, botName, chatThreadId,
       expectVersion: open.version,
     }, opts);
     if (!revised.ok) return { ok: false, code: "draft_changed" };
     return { ok: true, outcome: "revised", draftId: revised.draft.id };
   }
   const created = await createDraft(db, {
-    conversationKind, conversationId, body, recipients, origin, botId, botName, expectVersion: 0,
+    conversationKind, conversationId, body, recipients, origin, botId, botName, chatThreadId,
+    expectVersion: 0,
   }, opts);
   if (!created.ok) return { ok: false, code: "draft_changed" };
   return { ok: true, outcome: "drafted", draftId: created.draft.id };
@@ -119,9 +121,12 @@ async function writeDraft(db, { conversationKind, conversationId, recipients, bo
  *
  * @param {object} db
  * @param {{botId: string, botName: string, entry?: object|null, aclFailure?: string|null,
- *   contact: string, message: string, now: number, loadSeed?: Function, emit?: Function}} input
+ *   contact: string, message: string, now: number, loadSeed?: Function, emit?: Function,
+ *   chatThreadId?: string|null, notify?: Function}} input
  *   `aclFailure` is "unreadable" when the allow-list file could not be read (never treated as "no
- *   restriction"); a missing entry is reported as `no_allowlist`.
+ *   restriction"); a missing entry is reported as `no_allowlist`. `chatThreadId` is the Perch session
+ *   the call was signed for (`claims.threadId`), recorded on the draft so the chat's own card lists it
+ *   and the fixed outcome note has a thread to go to. `notify` is the bell seam (a test stub).
  * @returns {Promise<{ok: true, outcome: "drafted"|"revised", draftId: string, target: string,
  *   label: string} | {ok: false, code: string, target?: string}>}
  */
@@ -153,10 +158,19 @@ export async function draftPeerMessage(db, input = {}) {
     origin: "bot",
     botId: input.botId,
     botName: input.botName,
+    chatThreadId: input.chatThreadId ?? null,
     opts: { now: input.now, ...(typeof input.loadSeed === "function" ? { loadSeed: input.loadSeed } : {}),
       ...(typeof input.emit === "function" ? { emit: input.emit } : {}) },
   });
   if (!written.ok) return { ...written, target: contact.crowId };
+  // A NEW draft rings the bell once; a revise is the same card and the same conversation.
+  if (written.outcome === "drafted") {
+    await notifyBotDraft(db, {
+      draft: { id: written.draftId, chatThreadId: input.chatThreadId ?? null },
+      botName: input.botName,
+      recipientName: contact.name,
+    }, { notify: input.notify });
+  }
   return { ok: true, outcome: written.outcome, draftId: written.draftId, target: contact.crowId, label: contact.name };
 }
 
@@ -170,7 +184,8 @@ export async function draftPeerMessage(db, input = {}) {
  *
  * @param {object} db
  * @param {{botId: string, botName: string, entry?: object|null, aclFailure?: string|null,
- *   group: string|number, message: string, now: number, loadSeed?: Function, emit?: Function}} input
+ *   group: string|number, message: string, now: number, loadSeed?: Function, emit?: Function,
+ *   chatThreadId?: string|null, notify?: Function}} input
  * @returns {Promise<{ok: true, outcome: "drafted"|"revised", draftId: string, target: string,
  *   label: string} | {ok: false, code: string, target?: string}>}
  */
@@ -197,10 +212,18 @@ export async function draftGroupMessage(db, input = {}) {
     origin: "bot",
     botId: input.botId,
     botName: input.botName,
+    chatThreadId: input.chatThreadId ?? null,
     opts: { now: input.now, ...(typeof input.loadSeed === "function" ? { loadSeed: input.loadSeed } : {}),
       ...(typeof input.emit === "function" ? { emit: input.emit } : {}) },
   });
   if (!written.ok) return { ...written, target: String(group.id) };
+  if (written.outcome === "drafted") {
+    await notifyBotDraft(db, {
+      draft: { id: written.draftId, chatThreadId: input.chatThreadId ?? null },
+      botName: input.botName,
+      recipientName: group.name,
+    }, { notify: input.notify });
+  }
   return { ok: true, outcome: written.outcome, draftId: written.draftId, target: String(group.id), label: group.name };
 }
 

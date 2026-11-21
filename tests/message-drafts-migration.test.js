@@ -104,6 +104,7 @@ const DRAFTS_COLUMNS = [
   column("origin", "TEXT", { notnull: 1 }),
   column("bot_id", "TEXT"),
   column("bot_name", "TEXT"),
+  column("chat_thread_id", "TEXT"),
   column("project_id", "INTEGER"),
   column("state", "TEXT", { notnull: 1, dflt_value: "'open'" }),
   column("version", "INTEGER", { notnull: 1, dflt_value: "1" }),
@@ -150,7 +151,7 @@ test("message draft tables exist after init-db", () => {
 
   const objects = tableObjects(dbPath, "message_drafts");
   const names = objects.map((o) => o.name);
-  for (const name of ["idx_message_drafts_open", "idx_message_drafts_conversation", "idx_message_drafts_state"]) {
+  for (const name of ["idx_message_drafts_open", "idx_message_drafts_conversation", "idx_message_drafts_state", "idx_message_drafts_chat_thread"]) {
     assert.ok(names.includes(name), `init-db created index ${name}`);
   }
   const openIndex = objects.find((o) => o.name === "idx_message_drafts_open");

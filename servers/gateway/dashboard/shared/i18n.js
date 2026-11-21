@@ -732,9 +732,9 @@ export const translations = {
   "messages.declineRequest": { en: "Decline", es: "Rechazar" },
   // ─── Messages: saved drafts (bot-door plan, PR A part 2) ───
   // The operator-approved copy table, verbatim. {n} is the open-draft count, {bot} a bot's display
-  // name, {name} the person a message is for. The bot-door/Sharing keys (botbuilder.sharing.*,
-  // messages.draft.errNotAllowed/errGroupChanged/bellTitle/cardHead/sentByLine) belong to PR B and
-  // are deliberately absent here. `unverified`, `errPubkey` and `errBlocked` ARE part of PR A: the
+  // name, {name} the person a message is for. The PR-B keys (the chat card's words, the two bot-only
+  // refusals, the bell and the fixed outcome lines, and the Bot Builder Sharing section) follow
+  // below, under their own heading. `unverified`, `errPubkey` and `errBlocked` ARE part of PR A: the
   // send path checks the seal, the audience and each recipient's key and blocked state before anything
   // leaves, and these are the approved sentences for those refusals (errPubkey's wording talks about
   // Bot Builder because that is where a bot's own allow-list is fixed; an owner's draft with a changed
@@ -745,7 +745,7 @@ export const translations = {
   "messages.draft.draftsHeading": { en: "Drafts ({n})", es: "Borradores ({n})" },
   "messages.draft.draftsEmpty": { en: "No saved drafts", es: "No hay borradores guardados" },
   "messages.draft.draftBy": { en: "by {bot}", es: "de {bot}" },
-  "messages.draft.draftBanner": { en: "Draft by {bot}. The first line will read: Sent by {bot} (bot)", es: "Borrador de {bot}. La primera línea dirá: Enviado por {bot} (bot)" },
+  "messages.draft.draftBanner": { en: "Draft by {bot}. The first line will read: Sent by {bot} (bot)", es: "Borrador de {bot}. La primera línea dirá: Sent by {bot} (bot)" },
   "messages.draft.send": { en: "Send", es: "Enviar" },
   "messages.draft.discard": { en: "Discard", es: "Descartar" },
   "messages.draft.discardConfirm": { en: "Discard this draft? It cannot be recovered.", es: "¿Descartar este borrador? No se puede recuperar." },
@@ -759,6 +759,40 @@ export const translations = {
   "messages.draft.errPubkey": { en: "{name}'s key changed since this bot was allowed to message them. Check the contact, then allow them again in Bot Builder.", es: "La clave de {name} cambió desde que se le permitió a este bot escribirle. Revisa el contacto y vuelve a permitirlo en Bot Builder." },
   "messages.draft.errBlocked": { en: "{name} is blocked.", es: "{name} está bloqueado." },
   "messages.draft.errSendFailed": { en: "Not sent. Your draft is still here; try again.", es: "No se envió. Tu borrador sigue aquí; inténtalo de nuevo." },
+
+  // ─── Messages: bot drafts, the chat card and the Sharing section (bot-door plan, PR B) ───
+  // The PR-B half of the same copy table: the card's own words, the refusals only a BOT draft can earn,
+  // the bell's title and the three FIXED outcome lines a bot is told in its chat (drafts-bot-notes.js;
+  // never the message text). `sentByLine` carries the same fixed `(bot)` marker the wire line does
+  // (drafts-send.js SENT_BY_MARKER), so the card and the message cannot disagree.
+  "messages.draft.cardHead": { en: "{bot} wrote a message for you to check", es: "{bot} escribió un mensaje para que lo revises" },
+  "messages.draft.to": { en: "To", es: "Para" },
+  // PREVIEW of the line that is actually sent, and that line is built in English by the server
+  // (`SENT_BY_PREFIX` in drafts-send.js) — the wire text does not translate. So es is deliberately
+  // the same string, and the key is listed in the parity test's IDENTICAL_OK for that reason.
+  "messages.draft.sentByLine": { en: "Sent by {bot} (bot)", es: "Sent by {bot} (bot)" },
+  "messages.draft.errNotAllowed": { en: "{bot} is no longer allowed to message {name}.", es: "{bot} ya no tiene permiso para escribirle a {name}." },
+  "messages.draft.errGroupChanged": { en: "This group's members changed. Allow the group again in Bot Builder before sending.", es: "Los miembros de este grupo cambiaron. Vuelve a permitir el grupo en Bot Builder antes de enviar." },
+  // The recipient-change route's 409 when the conversation the person picked already holds an open
+  // draft (owner_draft_open). It gets a sentence of its own rather than "changed somewhere else":
+  // nothing about the row moved, and reloading it would not help — the other draft has to leave
+  // first. The route's server-side sentence (messages-drafts-api.js FIXED_TEXT) is the same English
+  // string, so the card and the API answer say one thing.
+  "messages.draft.errDraftWaiting": { en: "That conversation already has a draft waiting. Send or discard it first.", es: "Esa conversación ya tiene un borrador esperando. Envíalo o descártalo primero." },
+  "messages.draft.bellTitle": { en: "{bot} drafted a message to {name}", es: "{bot} redactó un mensaje para {name}" },
+  "messages.draft.botNoteSent": { en: "[Crow] Your message to {name} was sent.", es: "[Crow] Se envió tu mensaje para {name}." },
+  "messages.draft.botNoteEdited": { en: "[Crow] Your message to {name} was edited and sent.", es: "[Crow] Tu mensaje para {name} se editó y se envió." },
+  "messages.draft.botNoteDiscarded": { en: "[Crow] Your message to {name} was not sent.", es: "[Crow] Tu mensaje para {name} no se envió." },
+  // Bot Builder → Safety → Sharing: who one bot may write to. Every message it writes is a draft.
+  "botbuilder.sharing.heading": { en: "Sharing", es: "Compartir" },
+  "botbuilder.sharing.intro": { en: "Who this bot may write to. Every message it writes waits for you as a draft.", es: "A quién puede escribir este bot. Cada mensaje que escriba te espera como borrador." },
+  "botbuilder.sharing.contacts": { en: "Contacts", es: "Contactos" },
+  "botbuilder.sharing.groups": { en: "Groups", es: "Grupos" },
+  "botbuilder.sharing.pinned": { en: "Safety number when allowed: {n}", es: "Número de seguridad al permitirlo: {n}" },
+  "botbuilder.sharing.none": { en: "This bot cannot message anyone yet.", es: "Este bot todavía no puede escribirle a nadie." },
+  "botbuilder.sharing.save": { en: "Save", es: "Guardar" },
+  "botbuilder.sharing.fixitTitle": { en: "{bot} lost messaging: choose who it may message", es: "{bot} perdió la mensajería: elige a quién puede escribir" },
+  "botbuilder.sharing.fixitUndo": { en: "Remove messaging from this bot", es: "Quitar la mensajería a este bot" },
 
   // ─── Chat — native model runtime (Item G, Task 10) ───
   "chat.native_model_loading": { en: "Loading local model \"{provider}\" — this can take a few minutes for larger models.", es: "Cargando el modelo local \"{provider}\" — esto puede tardar varios minutos en modelos más grandes." },

@@ -14,6 +14,12 @@ import dataBackendReapprovalDetector from "./detectors/data-backend-reapproval.j
 import bundleBindDriftDetector from "./detectors/bundle-bind-drift.js";
 import retiredBundleDetector, { SOURCE as RETIRED_BUNDLE_SOURCE, cardTitle as retiredBundleTitle, cardWhy as retiredBundleWhy } from "./detectors/retired-bundle.js";
 import browserImageStaleDetector from "./detectors/browser-image-stale.js";
+import sharingBotAclDetector, {
+  OPEN_BOT_BUILDER_ACTION as OPEN_BOT_BUILDER_FOR_SHARING,
+  SOURCE as SHARING_BOT_ACL_SOURCE,
+  cardTitle as sharingCardTitle,
+  cardWhy as sharingCardWhy,
+} from "./detectors/sharing-bot-acl.js";
 import addonWallDetector, {
   SOURCE as ADDON_WALL_SOURCE,
   TITLE as ADDON_WALL_TITLE,
@@ -46,12 +52,14 @@ import removeRetiredBundle, {
   STARTED_FLASH as RETIRED_REMOVING_FLASH,
   label as removeRetiredLabel,
 } from "./remedies/remove-retired-bundle.js";
+import removeBotSharing, { ACTION_ID as REMOVE_BOT_SHARING_ACTION, label as removeBotSharingLabel } from "./remedies/remove-bot-sharing.js";
 import { wallFailureByItemId } from "../../../scripts/addon-sandbox/failures.mjs";
 import { recordSuppressedRequest } from "./peer-card-counters.js";
 import { CARD_ACTION_IDS } from "./peer-card-policy.js";
 import { createNotification } from "../../shared/notifications.js";
 import { getInstance } from "../instance-registry.js";
 import { escapeHtml } from "../dashboard/shared/components.js";
+import { t } from "../dashboard/shared/i18n.js";
 import { csrfInput } from "../dashboard/shared/csrf.js";
 
 let wired = false;
@@ -66,6 +74,9 @@ export function wireFixIt() {
   registry.registerDetector(retiredBundleDetector);
   registry.registerDetector(browserImageStaleDetector);
   registry.registerDetector(addonWallDetector);
+  // An enabled bot that still selects crow-sharing with no allow-list entry (the bot door's
+  // Sharing section is where the owner fixes it; the second button takes messaging away).
+  registry.registerDetector(sharingBotAclDetector);
   registry.registerRemedy("expose-capability", exposeCapabilityRemedy);
   // The owner's own copy of a bundle compose, put back with the previous file kept
   // as <composefile>.bak (bundle-bind-drift.js's compose-edited card).
@@ -89,6 +100,8 @@ export function wireFixIt() {
   // A bundle Crow retired that is still installed: one click runs the product's own
   // uninstall for it (keeps its data folder; no undo beyond that).
   registry.registerRemedy(REMOVE_RETIRED_ACTION, removeRetiredBundle);
+  // Take crow-sharing out of one bot's definition (the sharing-bot-acl card's undo).
+  registry.registerRemedy(REMOVE_BOT_SHARING_ACTION, removeBotSharing);
   wired = true;
 }
 
@@ -104,6 +117,7 @@ export const BOOT_CHECK_DETECTORS = Object.freeze([
   bundleBindDriftDetector,
   retiredBundleDetector,
   browserImageStaleDetector,
+  sharingBotAclDetector,
 ]);
 
 /**
@@ -134,9 +148,27 @@ export const LINK_REMEDIES = Object.freeze({
   "open-extensions-page": "/dashboard/extensions",
 });
 
+/** A bot id a Bot Builder link may name (the same shape the panel routes accept). */
+const LINK_BOT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+
+/**
+ * A link remedy that needs a PER-BOT destination: the Bot Builder page, with the bot the card is
+ * about already selected. The id comes from the entry's stored `args` (a crow.db value), so it is
+ * re-checked here and only ever interpolated into a path this file built — never read as a URL.
+ */
+const LINK_REMEDY_TARGETS = Object.freeze({
+  [OPEN_BOT_BUILDER_FOR_SHARING]: (r) => {
+    const bot = typeof r.args?.bot === "string" ? r.args.bot : "";
+    return LINK_BOT_ID_RE.test(bot)
+      ? `/dashboard/bot-builder?bot=${encodeURIComponent(bot)}&tab=safety`
+      : "/dashboard/bot-builder";
+  },
+});
+
 /** The code-held target of a link remedy, or null (never a stored href). */
 export function linkRemedyTarget(r) {
   if (!r || typeof r.actionId !== "string") return null;
+  if (Object.hasOwn(LINK_REMEDY_TARGETS, r.actionId)) return LINK_REMEDY_TARGETS[r.actionId](r);
   return Object.hasOwn(LINK_REMEDIES, r.actionId) ? LINK_REMEDIES[r.actionId] : null;
 }
 
@@ -314,6 +346,37 @@ function cardParts(item, req, lang) {
       title: ADDON_WALL_TITLE,
       why: addonWallWhyText(record.id, record.reason),
       buttons: remedyButton(item, unwall, req) + remedyButton(item, keepOff, req),
+      details: "",
+    };
+  }
+
+  if (item.source === SHARING_BOT_ACL_SOURCE) {
+    // The retired-bundle card's rule, for the same reason: the row's title, body and button labels
+    // are crow.db columns, so the card is rebuilt from CODE in the dashboard's language instead of
+    // rendering them. That is what makes a Spanish dashboard show "Compartir" and "Quitar la
+    // mensajería a este bot" — words that agree with the Spanish body — rather than the stored EN.
+    // The two stored inputs are the bot's id (both remedies re-check it against BOT_ID_RE before
+    // acting) and the display name the detector flattened; the name is flattened again here by
+    // cardTitle, and every sentence it lands in comes from the copy table. An id that is not a
+    // string is treated as no id: the remedies then refuse, and the title falls back to no name.
+    const bot = typeof item.context?.bot === "string" ? item.context.bot : "";
+    const name = typeof item.context?.name === "string" ? item.context.name : "";
+    const openBuilder = {
+      actionId: OPEN_BOT_BUILDER_FOR_SHARING,
+      kind: "link",
+      label: t("botbuilder.sharing.heading", lang === "es" ? "es" : "en"),
+      args: { bot },
+    };
+    const removeMessaging = {
+      actionId: REMOVE_BOT_SHARING_ACTION,
+      kind: "instant",
+      label: removeBotSharingLabel(lang),
+      args: { bot },
+    };
+    return {
+      title: sharingCardTitle(name, bot, lang),
+      why: sharingCardWhy(lang),
+      buttons: remedyButton(item, openBuilder, req) + remedyButton(item, removeMessaging, req),
       details: "",
     };
   }

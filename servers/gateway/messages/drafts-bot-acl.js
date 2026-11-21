@@ -26,7 +26,7 @@
  * Nothing here writes, and nothing here decides a sentence: the route owns the answer, and its text is
  * fixed per code.
  */
-import { readBotAcl } from "../sharing-bot/acl.js";
+import { groupEntryId, readBotAcl } from "../sharing-bot/acl.js";
 import { sameMemberSet } from "../sharing-bot/contacts.js";
 import { resolveCrowHome } from "../../shared/crow-home.js";
 
@@ -71,7 +71,9 @@ export function botAudienceRefusal(draft, entry) {
 
   if (draft.conversationKind === "room") {
     const groups = Array.isArray(entry.groups) ? entry.groups : [];
-    const group = groups.find((candidate) => Number(candidate?.id) === Number(draft.conversationId));
+    // The id is read through the ACL's own accessor: the entry stores `{ id, members }` (never
+    // `group_id`), and the recipient picker reads it the same way.
+    const group = groups.find((candidate) => groupEntryId(candidate) === Number(draft.conversationId));
     if (!group) return "not_allowed";
     return sameMemberSet(group.members, recipients) ? null : "group_changed";
   }

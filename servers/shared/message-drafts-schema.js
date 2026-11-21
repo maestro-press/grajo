@@ -45,6 +45,7 @@ export const MESSAGE_DRAFTS_DDL = `
     origin TEXT NOT NULL,
     bot_id TEXT,
     bot_name TEXT,
+    chat_thread_id TEXT,
     project_id INTEGER,
     state TEXT NOT NULL DEFAULT 'open',
     version INTEGER NOT NULL DEFAULT 1,
@@ -67,6 +68,12 @@ export const MESSAGE_DRAFTS_DDL = `
 
   CREATE INDEX IF NOT EXISTS idx_message_drafts_state
     ON message_drafts(state, updated_at DESC);
+
+  -- The chat-thread index is NOT in this string, on purpose. It covers chat_thread_id, and both
+  -- rails execute the whole string BEFORE any late-column ALTER runs: on a store whose table was
+  -- made before that column existed, the CREATE INDEX would fail with "no such column" and take
+  -- the caller down with it (init-db exits non-zero). Both rails create it after the column is
+  -- there, from MESSAGE_DRAFTS_CHAT_THREAD_INDEX_DDL below.
 
   CREATE TABLE IF NOT EXISTS message_draft_audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,3 +104,38 @@ export const MESSAGE_DRAFTS_BOT_NAME_COLUMN = Object.freeze({
   column: "bot_name",
   ddl: "ALTER TABLE message_drafts ADD COLUMN bot_name TEXT",
 });
+
+/**
+ * `message_drafts.chat_thread_id`: the Perch session a BOT drafted in (null for an owner's draft, a
+ * job turn, or a bot turn that arrived over another channel). It is what the chat's own card lists
+ * (`GET /interactive/:sid/msg-drafts`), what the `msg_draft` frame is matched against, and where the
+ * fixed outcome note is queued when the owner sends or discards the draft. Never sealed: it is this
+ * instance's chat id, not part of who the message reaches.
+ *
+ * Its own constant for the same reason as the column above: an install that made the table from an
+ * earlier build has it already, and `CREATE TABLE IF NOT EXISTS` would leave the column out — both
+ * rails add it with this exact ALTER.
+ */
+export const MESSAGE_DRAFTS_CHAT_THREAD_COLUMN = Object.freeze({
+  table: "message_drafts",
+  column: "chat_thread_id",
+  ddl: "ALTER TABLE message_drafts ADD COLUMN chat_thread_id TEXT",
+});
+
+/** Every column an earlier build's table may be missing, in the order both rails ensure them. */
+export const MESSAGE_DRAFTS_LATE_COLUMNS = Object.freeze([
+  MESSAGE_DRAFTS_BOT_NAME_COLUMN,
+  MESSAGE_DRAFTS_CHAT_THREAD_COLUMN,
+]);
+
+/**
+ * The Perch card's own read: the drafts ONE chat made (`chat_thread_id` is the Perch session id).
+ *
+ * It has its own constant because it must be created AFTER the column exists, which MESSAGE_DRAFTS_DDL
+ * cannot promise: that string runs against stores whose table predates `chat_thread_id`, where a
+ * CREATE INDEX on it fails. Both rails therefore run this after their late-column ALTERs — init-db's
+ * "message draft tables" block right below the ALTERs, and scripts/migrations/0038-message-drafts-chat-thread.mjs,
+ * which delivers the column to installs that already applied 0036.
+ */
+export const MESSAGE_DRAFTS_CHAT_THREAD_INDEX_DDL =
+  "CREATE INDEX IF NOT EXISTS idx_message_drafts_chat_thread ON message_drafts(chat_thread_id)";

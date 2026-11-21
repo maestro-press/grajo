@@ -50,6 +50,9 @@ const IDENTICAL_OK = new Set([
   "messages.error",
   "messages.tokens",
   "messages.botTag", // "bot"
+  "messages.draft.sentByLine", // PREVIEW of the line actually sent: the server builds that line in
+  // English (drafts-send.js SENT_BY_PREFIX), so the wire text never translates and the preview
+  // stays English in both languages rather than promising a Spanish line that would not go out
   "blog.pageTitle",
   "blog.total",
   "blog.rss",

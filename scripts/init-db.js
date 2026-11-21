@@ -14,7 +14,9 @@ import {
 import { SATELLITE_DDL } from "../servers/shared/satellite-schema.js";
 import { MAIL_DDL, MAIL_ACCOUNT_SEND_COLUMNS, MAIL_DRAFTS_DDL } from "../servers/shared/mail-schema.js";
 import { REPORTS_DDL, REPORTS_RUNS_DDL, REPORTS_VERSIONS_DDL, REPORTS_SEND_DDL, REPORTS_STEPS_DDL } from "../servers/shared/reports-schema.js";
-import { MESSAGE_DRAFTS_BOT_NAME_COLUMN, MESSAGE_DRAFTS_DDL } from "../servers/shared/message-drafts-schema.js";
+import {
+  MESSAGE_DRAFTS_LATE_COLUMNS, MESSAGE_DRAFTS_DDL, MESSAGE_DRAFTS_CHAT_THREAD_INDEX_DDL,
+} from "../servers/shared/message-drafts-schema.js";
 import { BOT_SHARING_AUDIT_DDL } from "../servers/shared/bot-sharing-schema.js";
 import { PROVENANCE_COLUMNS, PROVENANCE_INDEX_SQL, NOTE_WITHDRAWAL_COLUMNS } from "../servers/research/provenance-schema.js";
 
@@ -3170,10 +3172,15 @@ await initTable("reports steps tables", REPORTS_STEPS_DDL);
 // SCHEMA_GENERATION bump. (0034 and 0035 belong to the reports stack, so this migration is numbered
 // past them; the runner applies by id and does not need contiguous numbers.)
 await initTable("message draft tables", MESSAGE_DRAFTS_DDL);
-// message_drafts.bot_name (the "Sent by <bot> (bot)" snapshot, sealed with the rest of the draft): in the
-// DDL above for a fresh table, added here for one created by an earlier build of this branch —
-// CREATE TABLE IF NOT EXISTS never adds a column. Same ALTER as the migration rail's, one constant.
-await ensureSchemaColumn(MESSAGE_DRAFTS_BOT_NAME_COLUMN);
+// message_drafts.bot_name (the "Sent by <bot> (bot)" snapshot, sealed with the rest of the draft) and
+// message_drafts.chat_thread_id (the Perch session a bot drafted in, which the chat's own card lists):
+// in the DDL above for a fresh table, added here for one created by an earlier build of this branch —
+// CREATE TABLE IF NOT EXISTS never adds a column. Same ALTERs as the migration rail's, one constant.
+for (const late of MESSAGE_DRAFTS_LATE_COLUMNS) await ensureSchemaColumn(late);
+// The chat-thread index comes AFTER those ALTERs: it covers chat_thread_id, and MESSAGE_DRAFTS_DDL
+// above runs (whole) before them on a store whose table predates the column — a CREATE INDEX there
+// would exit this script with "no such column". Same statement as the migration rail's 0038.
+await initTable("message_drafts chat thread index", MESSAGE_DRAFTS_CHAT_THREAD_INDEX_DDL);
 
 // staged_sends: one row per provider draft a bot staged for the operator's yes (spec §12;
 // servers/gateway/staged/store.js). LOCAL ONLY (instance-sync LOCAL_ONLY_TABLES): it holds the

@@ -7,6 +7,7 @@ import { perchSecretWarnJs } from "./secret-warn.js";
 import { perchConnectCardJs } from "./connect-card.js";
 import { perchStagedCardJs } from "./staged-card.js";
 import { perchMailDraftCardJs } from "./mail-draft-card.js";
+import { perchMsgDraftCardJs } from "./msg-draft-card.js";
 import { perchMailScheduleSheetJs } from "../panels/mail/schedule-sheet.js";
 import { perchCardChipJs } from "./card-chip.js";
 import { perchBriefingJs } from "./briefing-card.js";
@@ -1670,6 +1671,7 @@ export function perchHubJs(lang = "en") {
     fileSeen={};                          /* PR-E: same seam for the card dedupe */
     resetPhoneCards();
     resetArtifactCards(); resetCardChip(); resetBriefing(); resetSecretCard(); resetStaged(); resetMailDrafts();
+    resetMsgDrafts();                     /* bot-door PR B: the message draft cards die with it too */
     resetBrowserTiles();                  /* live browser tile: its pollers and header line die with the transcript */
     resetControls();                        /* the PREVIOUS session's picker must not bleed in */
     draftRestore(sid);                      /* nor its composer text: this session's own draft, or empty */
@@ -1946,6 +1948,9 @@ export function perchHubJs(lang = "en") {
     on('ask_user',function(d){ renderAsk(d); });
     /* Credential card (spec 10): metadata only ({id,label,state}); secret-card.js. */
     on('secret_request',function(d){ secretFrame(d); });
+    /* Bot-door PR B: a message draft this chat wrote moved. The frame is a pointer — ids only — and
+       the card re-reads the row from the owner's own draft route. */
+    on('msg_draft',function(d){ mmsgFrame(d); });
     on('ask_expired',function(d){
       if(askShown&&d&&askShown.requestId===d.requestId) renderAsk(Object.assign({},askShown,{expired:true}));
     });
@@ -2287,6 +2292,7 @@ export function perchHubJs(lang = "en") {
     fileSeen={};
     resetPhoneCards();
     resetArtifactCards(); resetCardChip(); resetBriefing(); resetSecretCard(); resetStaged(); resetMailDrafts();
+    resetMsgDrafts();
     resetBrowserTiles();
     histSettled=false; histBuf=[];
     seamEchoes=[];                   /* their rows died with the transcript */
@@ -2571,6 +2577,8 @@ export function perchHubJs(lang = "en") {
     loadStaged(current.sid);       /* spec 12: this chat's open Gmail drafts, as the card reads them */
     loadMailDrafts(current.sid);   /* plan 3, task 10a: this chat's mail drafts, one card each */
     loadMailDraftFromQuery();      /* a draft made in the reader has no chat: its id rides the URL */
+    loadMsgDrafts(current.sid);    /* bot-door PR B: this chat's message drafts, one card each */
+    loadMsgDraftFromQuery();       /* a bell's ?msgdraft= mounts that one card at the top */
   }
 
   /* Track 3 Task 4: session controls — model, thinking level, permission
@@ -2809,6 +2817,7 @@ export function perchHubJs(lang = "en") {
     toolChips={}; resetToolGroups(); fileSeen={}; commandsCache=null; hideCmdMenu();
     resetPhoneCards();
     resetArtifactCards(); resetCardChip(); resetBriefing(); resetSecretCard(); resetStaged(); resetMailDrafts();
+    resetMsgDrafts();            /* bot-door PR B: and none of its message draft cards */
     resetFacts();
     /* Composer dictation: a switch drops the recording and frees the mic;
        each open re-probes the server (dictation.js). */
@@ -4465,6 +4474,7 @@ ${perchSecretWarnJs(lang)}
 ${perchConnectCardJs(lang)}
 ${perchStagedCardJs(lang)}
 ${perchMailDraftCardJs(lang)}
+${perchMsgDraftCardJs(lang)}
 ${perchMailScheduleSheetJs(lang)}
   /* The staged card's host hooks (spec 12): the composer for "Ask for a change" — the note goes
      into the ordinary message box, so the normal send path and its paste detector run — and the
@@ -4606,6 +4616,7 @@ ${perchTakeOverJs(lang)}
      paint. parseHash being exhaustively unit-tested does not help: it is a
      pure function and it was green throughout. */
   loadMailDraftFromQuery();   /* ?maildraft= on a page with no chat yet still shows the card */
+  loadMsgDraftFromQuery();    /* ?msgdraft= on a page with no chat yet still shows that card */
   if(parseHash(location.hash)) applyHash();
   else { startListPolling(); loadList(); }
   takeOverFromLink();

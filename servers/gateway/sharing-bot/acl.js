@@ -168,6 +168,21 @@ function normalizeGroup(value) {
 }
 
 /**
+ * A group entry's id, as `normalizeBotEntry` stores it: the entry is `{ id, members }` — the file's own
+ * spelling is `id`, never `group_id` (`GROUP_FIELDS` is strict, so a file carrying `group_id` is
+ * refused as unreadable rather than half-read). EVERY reader of an entry's groups goes through this,
+ * so the recipient picker, the send's own room re-check and the door can never disagree about which
+ * group an entry names. Answers null for an id that is not a positive integer.
+ *
+ * @param {{id?: unknown}} group
+ * @returns {number|null}
+ */
+export function groupEntryId(group) {
+  const id = Number(group?.id);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+/**
  * One bot's entry in its canonical stored form: contacts, groups, rate — sorted, de-duplicated,
  * defaults filled. Throws an AclError naming the field for anything else.
  *

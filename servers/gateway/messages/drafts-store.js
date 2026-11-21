@@ -89,9 +89,9 @@ const BOT_NAME_MAX = 80;
 /** How long a draft may sit in `sending` before the boot sweep decides its process is gone. */
 export const STUCK_SEND_MS = 5 * 60 * 1000;
 
-const COLUMNS = `id, conversation_kind, conversation_id, origin, bot_id, bot_name, project_id, state,
-  version, body, body_hash, recipients_json, recipients_seal, sent_at, sent_message_id, fail_reason,
-  created_at, updated_at`;
+const COLUMNS = `id, conversation_kind, conversation_id, origin, bot_id, bot_name, chat_thread_id,
+  project_id, state, version, body, body_hash, recipients_json, recipients_seal, sent_at,
+  sent_message_id, fail_reason, created_at, updated_at`;
 
 /** A caller's refusal: a field or a row name, never a value. */
 export class DraftError extends Error {
@@ -149,6 +149,20 @@ function requireCreateVersion(value) {
 function requireBotName(value) {
   if (value == null || value === "") return null;
   if (typeof value !== "string" || value.length > BOT_NAME_MAX) throw bad("botName");
+  return value;
+}
+
+/**
+ * The Perch session a bot drafted in (`chat_thread_id`), or null.
+ *
+ * Only the chat's own id: it is what `GET /interactive/:sid/msg-drafts` lists and what the `msg_draft`
+ * frame is matched against, and the fixed outcome note is queued THERE when the owner sends or
+ * discards the draft. Not sealed (it is this instance's chat id, not part of who the message
+ * reaches) and never taken from an owner's draft: `createDraft` writes it as given by the door.
+ */
+function requireChatThreadId(value) {
+  if (value == null || value === "") return null;
+  if (typeof value !== "string" || value.length > ID_MAX) throw bad("chatThreadId");
   return value;
 }
 
@@ -214,6 +228,7 @@ function mapRow(row) {
     origin: row.origin,
     botId: row.bot_id ?? null,
     botName: row.bot_name ?? null,
+    chatThreadId: row.chat_thread_id ?? null,
     projectId: row.project_id == null ? null : Number(row.project_id),
     state: row.state,
     version: Number(row.version),
@@ -387,6 +402,7 @@ export async function createDraft(db, input, opts = {}) {
   if (!DRAFT_ORIGINS.includes(origin)) throw bad("origin");
   const botId = origin === "bot" ? requireId(input?.botId, "botId") : null;
   const botName = origin === "bot" ? requireBotName(input?.botName) : null;
+  const chatThreadId = requireChatThreadId(input?.chatThreadId);
   const projectId = input?.projectId == null ? null : input.projectId;
   if (projectId != null && !Number.isInteger(projectId)) throw bad("projectId");
   const expectVersion = input?.expectVersion == null ? null : requireCreateVersion(input.expectVersion);
@@ -418,11 +434,12 @@ export async function createDraft(db, input, opts = {}) {
       sql: `UPDATE message_drafts
                SET body = ?, body_hash = ?, recipients_json = ?, recipients_seal = ?,
                    origin = ?, bot_id = ?, bot_name = ?, project_id = COALESCE(?, project_id),
+                   chat_thread_id = COALESCE(?, chat_thread_id),
                    fail_reason = NULL, version = version + 1, updated_at = ?
              WHERE id = ? AND state = 'open'${compareAndSet ? " AND version = ?" : ""}`,
       args: [
         body, bodyHash(body), json, seal,
-        origin, botId, botName, projectId, at, existing.id,
+        origin, botId, botName, projectId, chatThreadId, at, existing.id,
         ...(compareAndSet ? [existing.version] : []),
       ],
     });
@@ -456,11 +473,12 @@ export async function createDraft(db, input, opts = {}) {
   try {
     await db.execute({
       sql: `INSERT INTO message_drafts
-              (id, conversation_kind, conversation_id, origin, bot_id, bot_name, project_id, state,
-               version, body, body_hash, recipients_json, recipients_seal, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'open', 1, ?, ?, ?, ?, ?, ?)`,
+              (id, conversation_kind, conversation_id, origin, bot_id, bot_name, chat_thread_id,
+               project_id, state, version, body, body_hash, recipients_json, recipients_seal,
+               created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', 1, ?, ?, ?, ?, ?, ?)`,
       args: [
-        id, conversationKind, conversationId, origin, botId, botName, projectId,
+        id, conversationKind, conversationId, origin, botId, botName, chatThreadId, projectId,
         body, bodyHash(body), json, seal, at, at,
       ],
     });
@@ -507,6 +525,95 @@ export async function updateBody(db, id, { body, expectVersion } = {}, opts = {}
            WHERE id = ? AND state = 'open' AND version = ?`,
     args: [nextBody, bodyHash(nextBody), at, draftId, version],
   });
+  if (!res.rowsAffected) return refusedWrite(db, draftId);
+  const draft = await getDraft(db, draftId);
+  await writeAudit(db, {
+    draftId,
+    action: "edit",
+    actor: "owner",
+    actorId: null,
+    version: draft.version,
+    hash: draft.bodyHash,
+    seal: draft.recipientsSeal,
+    at,
+  });
+  emitChanged(changedPayload(draft, "edit"), opts);
+  return { ok: true, draft };
+}
+
+/**
+ * Re-address an open BOT draft to another conversation the bot may still write to (the chat card's
+ * recipient picker). The words stay; the conversation and the sealed audience move.
+ *
+ * The seal covers the conversation (kind and id) as well as the audience, so a re-sealed row is the
+ * only honest way to move it: the old seal would stop verifying the moment the id changed, and the
+ * send would refuse a draft nobody tampered with. The new audience comes from the caller — the route
+ * derives it from the LIVE conversation and re-checks it against the bot's allow-list — and the
+ * row's own identity (id, origin, bot id and name, created_at) is carried over unchanged, so the
+ * draft is still the same bot's. An owner's draft never takes this path: it has nobody's permission
+ * to honour, and its audience is the operator's own choice made in the composer.
+ *
+ * The compare-and-set is `expectVersion`, exactly as an edit's: of two racing writers exactly one
+ * wins and the loser is handed the row as it now is (`changed`).
+ *
+ * THE MOVED DRAFT MUST BE THE CONVERSATION'S ONLY OPEN ONE. Every conversation holds at most one open
+ * draft (the partial unique index), so a target that already has one cannot take this row: the move is
+ * refused as `owner_draft_open` BEFORE the write, and the write itself is wrapped for the race that
+ * opens a draft in that conversation in between — the index is what really decides, and its constraint
+ * error is the same refusal, never a 500. A refused move leaves the row exactly where it was.
+ *
+ * Writes ONE audit row (`edit`, ACTOR `owner`) — the recipients hash is the seal's own, and the text
+ * never appears. The actor is the person, not the bot: the picker is the owner's, so a re-addressed
+ * draft is the owner's edit like any other. That matters twice — `ownerEdited` (the door's freeze on
+ * further bot revisions, servers/gateway/sharing-bot/messages.js) reads `actor = 'owner'` rows, and
+ * the outcome note compares the sent text with the newest row a BOT wrote (drafts-bot-notes.js),
+ * which a recipient change must not displace.
+ *
+ * @returns {Promise<{ok: true, draft: object}|{ok: false, refused: "changed"|"not_open"|"owner_draft_open", draft: object}>}
+ */
+export async function changeRecipient(db, id, {
+  conversationKind, conversationId, recipients, expectVersion,
+} = {}, opts = {}) {
+  const draftId = requireId(id, "id");
+  const kind = requireKind(conversationKind);
+  const nextConversationId = requireConversationId(conversationId);
+  const entries = canonicalRecipientEntries(recipients);
+  if (!entries.length) throw bad("recipients");
+  const version = requireVersion(expectVersion);
+  const at = clockOf(opts);
+  const seed = await seedOf(opts);
+  const existing = await getDraft(db, draftId);
+  if (!existing) throw missing("draft");
+  if (existing.state !== "open") return { ok: false, refused: "not_open", draft: existing };
+  if (existing.origin !== "bot") throw bad("origin");
+
+  // The target conversation is free, or this row is already its open draft. Checked here so the
+  // ordinary case is a plain refusal; the partial unique index is still the enforcement, and its
+  // error is turned into the same answer below.
+  const occupant = await getOpenDraft(db, kind, nextConversationId);
+  if (occupant && occupant.id !== draftId) {
+    return { ok: false, refused: "owner_draft_open", draft: existing };
+  }
+
+  const seal = sealRecipients(
+    sealFieldsFor({ ...existing, conversationKind: kind, conversationId: nextConversationId }, entries),
+    seed,
+  );
+  let res;
+  try {
+    res = await db.execute({
+      sql: `UPDATE message_drafts
+               SET conversation_kind = ?, conversation_id = ?, recipients_json = ?, recipients_seal = ?,
+                   version = version + 1, updated_at = ?
+             WHERE id = ? AND state = 'open' AND version = ?`,
+      args: [kind, nextConversationId, recipientsJson(entries), seal, at, draftId, version],
+    });
+  } catch (err) {
+    // Somebody opened a draft in the target conversation between the read above and this UPDATE, so
+    // the index refused the move. Nothing was written; the answer is the same refusal, not a crash.
+    if (!/UNIQUE/i.test(String(err?.message || ""))) throw err;
+    return { ok: false, refused: "owner_draft_open", draft: (await getDraft(db, draftId)) ?? existing };
+  }
   if (!res.rowsAffected) return refusedWrite(db, draftId);
   const draft = await getDraft(db, draftId);
   await writeAudit(db, {
@@ -807,12 +914,37 @@ async function refusedWrite(db, draftId) {
   return { ok: false, refused: "changed", draft };
 }
 
-/** The bus payload on every write: the draft id, its conversation and the action word. Nothing else. */
+/** The bus payload on every write: the draft id, its conversation, the chat it came from and the
+ *  action word. Nothing else — no body, no recipients. */
 function changedPayload(draft, action) {
   return {
     draftId: draft.id,
     conversationKind: draft.conversationKind,
     conversationId: draft.conversationId,
+    chatThreadId: draft.chatThreadId ?? null,
     action,
   };
+}
+
+/**
+ * The OPEN drafts one Perch chat made, newest first — the chat card's own list.
+ *
+ * A Perch session's id IS its chat thread id, which is what the door records on a bot's draft
+ * (`chat_thread_id`); an owner's draft, and a bot turn that arrived over another channel, carries
+ * none and never appears here. Ids and conversation identity only in practice (the caller maps them
+ * to `{id}`), but the row is returned whole, like every other read.
+ */
+export async function listDraftsForChat(db, chatThreadId, { state = "open", limit = 50 } = {}) {
+  const thread = requireChatThreadId(chatThreadId);
+  if (!thread) return [];
+  if (state != null && !DRAFT_STATES.includes(state)) throw bad("state");
+  const max = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 200) : 50;
+  const { rows } = await db.execute({
+    sql: `SELECT ${COLUMNS} FROM message_drafts
+           WHERE chat_thread_id = ?${state == null ? "" : " AND state = ?"}
+           ORDER BY updated_at DESC, id DESC
+           LIMIT ?`,
+    args: state == null ? [thread, max] : [thread, state, max],
+  });
+  return rows.map(mapRow);
 }

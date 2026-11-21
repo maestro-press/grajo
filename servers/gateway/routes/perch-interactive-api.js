@@ -79,6 +79,8 @@ import { randomBytes } from "node:crypto";
 import { isLocalPasswordSessionOn } from "../dashboard/local-session.js";
 import { mailEnabled } from "../mail/flag.js";
 import { listDraftsForChat } from "../mail/drafts/store.js";
+import bus from "../../shared/event-bus.js";
+import { DRAFT_CHANGED_EVENT, listDraftsForChat as listMessageDraftsForChat } from "../messages/drafts-store.js";
 
 /**
  * Project services (plan decision 1; Task 16 fix round 1, I1): who started a turn from this
@@ -883,8 +885,25 @@ export default function perchInteractiveApiRouter(dashboardAuth, { engine = getI
     // double-unsubscribe with the close handler.
     let unsubscribe = null;
     let gone = false;
+    /* Crow Messages' draft card (bot-door plan, PR B): EVERY write to a message draft pokes the
+       gateway's own bus with ids only (`message-drafts:changed`, servers/gateway/messages/
+       drafts-store.js), and this chat is told about the ones that were written IN IT —
+       `chat_thread_id` is this session's own id. The frame is `{type:"msg_draft", id}`: no body, no
+       recipient, nothing a chat could render without re-reading the row from the owner's own route
+       (the card's one read). A draft with no chat thread never reaches this test, so a bell-only
+       draft is never announced into a chat it did not come from. */
+    const onDraftChanged = (payload) => {
+      try {
+        if (!payload || String(payload.chatThreadId ?? "") !== sid) return;
+        const id = typeof payload.draftId === "string" ? payload.draftId : "";
+        if (!id) return;
+        stream.send("msg_draft", { type: "msg_draft", id });
+      } catch { /* a dead stream is the close handler's business */ }
+    };
+    bus.on(DRAFT_CHANGED_EVENT, onDraftChanged);
     const teardown = () => {
       gone = true;
+      bus.off(DRAFT_CHANGED_EVENT, onDraftChanged);
       const u = unsubscribe;
       unsubscribe = null;
       if (u) { try { u(); } catch { /* already gone */ } }
@@ -1339,6 +1358,46 @@ export default function perchInteractiveApiRouter(dashboardAuth, { engine = getI
       res.json({ drafts: drafts.map((draft) => ({ id: draft.id })) });
     } catch (err) {
       console.warn("[perch-interactive-api] mail drafts list failed: " + ((err && err.name) || "Error"));
+      jsonError(res, 500, "internal");
+    } finally {
+      try { conn.close(); } catch { /* already closed */ }
+    }
+  });
+
+  // ---- Crow Messages' draft card (bot-door plan, PR B): the drafts this chat made ----
+  //   GET /interactive/:sid/msg-drafts      the ids only; the card reads each one from the owner's own
+  //                                          draft route (/dashboard/messages/api/drafts/:id), which is
+  //                                          where every field, the seal's verdict and the bot's
+  //                                          allow-list come from.
+  //
+  // The shape and the rails are the mail card's, in its order: no-store first, then the owner (this
+  // machine's own password session; a peer's SSO session or a signed peer call is refused with no
+  // data at all — 403 owner_only before a row is read). Only ids travel here: the card is built from
+  // the draft route's answer, never from this list.
+  //
+  // A Perch session's id IS its chat thread id, which is what `message_drafts.chat_thread_id` records
+  // when a BOT drafts from this chat (the door's signed thread, servers/gateway/sharing-bot/call.js),
+  // so the list is one indexed read. A draft the owner wrote in the Messages panel, or a bot turn that
+  // arrived over another channel, has no chat thread and never appears here.
+  router.get(P + "/interactive/:sid/msg-drafts", stagedNoStore, async (req, res) => {
+    let owner = false;
+    let db = null;
+    try {
+      db = createDbClient();
+      owner = (await ownerCheck(db, req)) === true;
+    } catch {
+      owner = false;
+    } finally {
+      if (db) { try { db.close(); } catch { /* closed */ } }
+    }
+    if (!owner) return jsonError(res, 403, "owner_only");
+    const sid = String(req.params.sid);
+    const conn = createDbClient();
+    try {
+      const drafts = await listMessageDraftsForChat(conn, sid);
+      res.json({ drafts: drafts.map((draft) => ({ id: draft.id })) });
+    } catch (err) {
+      console.warn("[perch-interactive-api] message drafts list failed: " + ((err && err.name) || "Error"));
       jsonError(res, 500, "internal");
     } finally {
       try { conn.close(); } catch { /* already closed */ }

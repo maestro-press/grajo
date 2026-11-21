@@ -14,6 +14,11 @@
  * two does not answer `blocked`: `listRoomMembers` leaves blocked and pending contacts out, so that
  * member simply drops out of the live set and the answer is `recipients_changed` — the audience is
  * not the one the draft sealed. Without the option the send path is exactly what it always was.
+ *
+ * `sentByBot` (a bot's id) rides into the room envelope as `sent_by_bot`, the field part 2 adds for
+ * a message a bot drafted and the OWNER sent (servers/gateway/messages/drafts-send.js). It is a
+ * fixed id, never text, and the receiving side ignores a payload field it does not read — so an
+ * older peer stores the message exactly as it always did.
  */
 import { randomBytes } from "node:crypto";
 import { getRoom, listRoomMembers, insertRoomMessage, computeAddressedTo } from "./rooms-store.js";
@@ -35,7 +40,7 @@ function memberTarget(row) {
   };
 }
 
-export async function sendOperatorRoomMessage({ db, managers, groupId, message, expectedRecipients = null }) {
+export async function sendOperatorRoomMessage({ db, managers, groupId, message, expectedRecipients = null, sentByBot = null }) {
   const room = await getRoom(db, groupId);
   if (!room) return { ok: false, error: "no such room" };
   // ONE read of the member list, before anything is written: it is both what a strict caller is
@@ -59,11 +64,11 @@ export async function sendOperatorRoomMessage({ db, managers, groupId, message, 
     if (isHost) {
       const botRoster = (members || []).filter((m) => Number(m.is_bot) === 1).map((m) => ({ contactId: m.id, name: m.display_name || m.crow_id }));
       const addressedTo = room.mode === "always" ? botRoster.map((b) => b.name) : computeAddressedTo(message, botRoster);
-      const env = buildRoomMessageEnvelope({ roomUid: room.room_uid, roomName: room.name, hostCrowId: myCrowId, msgUid, author, text: message, addressedTo });
+      const env = buildRoomMessageEnvelope({ roomUid: room.room_uid, roomName: room.name, hostCrowId: myCrowId, msgUid, author, text: message, addressedTo, sentByBot });
       await fanOut({ nostrManager: managers.nostrManager, members: members || [], envelope: env, log: (m) => console.error("[rooms]", m) });
     } else {
       const host = (members || []).find((m) => m.crow_id === room.host_crow_id);
-      const env = buildRoomMessageEnvelope({ roomUid: room.room_uid, roomName: room.name, hostCrowId: room.host_crow_id, msgUid, author, text: message, addressedTo: [] });
+      const env = buildRoomMessageEnvelope({ roomUid: room.room_uid, roomName: room.name, hostCrowId: room.host_crow_id, msgUid, author, text: message, addressedTo: [], sentByBot });
       if (host) await fanOut({ nostrManager: managers.nostrManager, members: [host], envelope: env });
     }
   }

@@ -254,9 +254,10 @@ const INBOX = z.object({
  * the guard pinned, and writes exactly one audit row — allowed or refused — before answering.
  *
  * @param {{createDb?: Function, crowHome?: string|(() => string), now?: Function|number,
- *   loadSeed?: Function, emit?: Function, verifyActor?: Function}} [options]
+ *   loadSeed?: Function, emit?: Function, notify?: Function, verifyActor?: Function}} [options]
  *   The seams a test uses: the DB factory, the instance home (the allow-list file), the clock (the
- *   rate window), the draft seal seed, and the store's change-event emitter.
+ *   rate window), the draft seal seed, the store's change-event emitter, and the new-draft bell's
+ *   notifier.
  *
  * `verifyActor` is the door's OWN credential — the `sharing` actor signature — and it is checked by the
  * MOUNT GUARD (sharingBotMountAuth), never here: boot hands the guard and this factory the same dep
@@ -291,6 +292,7 @@ export function createSharingBotServer(options = {}) {
           now: options.now,
           loadSeed: options.loadSeed,
           emit: options.emit,
+          notify: options.notify,
         });
         return out.ok ? ok(out.data) : failed(out.code);
       } finally {

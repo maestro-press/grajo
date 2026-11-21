@@ -233,7 +233,9 @@ test("async continuations are guarded — a fast back button must not cross sess
   // one delayed refetch a draft tool's end frame schedules.
   // 52 with the mail draft card (mail-draft-card.js, plan 3 Task 10a): loadMailDrafts' list
   // continuation and mdraftLoad's own read, which must not draw into the next chat's transcript.
-  assert.equal(guards, 52, "expected exactly 52 identity guards, found " + guards);
+  // 54 with the message draft card (msg-draft-card.js, bot-door PR B): loadMsgDrafts' list
+  // continuation and mmsgLoad's own read, by the same rule.
+  assert.equal(guards, 54, "expected exactly 54 identity guards, found " + guards);
 });
 
 test("the emitted script never assigns to an innerHTML-class sink", async () => {

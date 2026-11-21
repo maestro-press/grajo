@@ -16,6 +16,7 @@ import {
 } from "../../../../../scripts/pi-bots/containment-status.mjs";
 import { containmentBots, currentProbe, LEVEL_KEY } from "../../settings/sections/bot-runtime.js";
 import { renderGitAccessCard } from "./git-access.js";
+import { renderSharingSection } from "./sharing-section.js";
 
 export async function renderSafety(ctx) {
   const { db, def, lang, hidden } = ctx;
@@ -106,11 +107,19 @@ export async function renderSafety(ctx) {
   // The Git access card is its OWN section with its OWN forms: nested forms are
   // invalid, so it is appended AFTER this form's closing tag (git-access.js).
   const gitCard = await renderGitAccessCard(ctx);
+  // The Sharing section (the bot door's allow-list) sits beside the email-send choice,
+  // and for the same reason as the git card it is its own section with its own Save
+  // button: it posts to the ACL owner route, never to this form's def save. Shown for
+  // every bot, enabled or not: the operator's starting state is "nobody", and this is
+  // the one place that changes it.
+  let sharingCard = "";
+  try { sharingCard = await renderSharingSection(ctx); } catch { sharingCard = ""; }
 
   return `<form method="POST" class="btb-form" id="btb-safety-form">${hidden("safety")}` +
     email + folders + satCard + ask +
     `<p class="btb-hint" data-testid="safety-summary">${escapeHtml(t(level.enforced ? "botbuilder.sfSummaryContained" : "botbuilder.sfSummaryNotContained", lang))}</p>` +
-    actionBar(`<button type="submit" class="btb-btn">${escapeHtml(t("botbuilder.sfSave", lang))}</button>`) + `</form>` + gitCard;
+    actionBar(`<button type="submit" class="btb-btn">${escapeHtml(t("botbuilder.sfSave", lang))}</button>`) + `</form>` +
+    sharingCard + gitCard;
 }
 
 /**

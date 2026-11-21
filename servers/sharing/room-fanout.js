@@ -5,13 +5,17 @@
  * to the host. No relay/identity coupling here — nostrManager is injected.
  */
 
-export function buildRoomMessageEnvelope({ roomUid, roomName, hostCrowId, msgUid, author, text, addressedTo = [], ts = null }) {
+export function buildRoomMessageEnvelope({ roomUid, roomName, hostCrowId, msgUid, author, text, addressedTo = [], ts = null, sentByBot = null }) {
   return JSON.stringify({
     type: "crow_social", version: 1, subtype: "room_message",
     payload: {
       room_uid: roomUid, room_name: roomName, host_crow_id: hostCrowId,
       msg_uid: msgUid, author: author || {}, text: text || "",
       addressed_to: Array.isArray(addressedTo) ? addressedTo : [],
+      // `sent_by_bot` names the bot whose draft the OWNER sent (a fixed id, never text). It rides as
+      // a payload field, like `addressed_to`/`ts`, and a receiving Crow that does not know it simply
+      // ignores it (servers/sharing/room-inbound.js reads the fields it needs and nothing else).
+      ...(typeof sentByBot === "string" && sentByBot.trim() ? { sent_by_bot: sentByBot.trim() } : {}),
       ts: ts || new Date().toISOString(),
     },
   });

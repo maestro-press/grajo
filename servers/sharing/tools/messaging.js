@@ -246,7 +246,11 @@ export function registerMessagingTools(server, ctx) {
         return { content: [{ type: "text", text: `Group "${grp.name}" has no members` }], isError: true };
       }
 
-      // Build group message envelope
+      // Build group message envelope. The plain contact-group fan-out carries NO attribution field: a
+      // bot's draft is attributed on the wire by the fixed `Sent by <bot> (bot)` first line of its
+      // text (servers/gateway/messages/drafts-send.js), and the one structured field this product
+      // does send (`sent_by_bot`) rides on the ROOM transport alone, where a `crow_social` envelope
+      // already exists to carry it. This tool has no option to set it.
       const envelope = JSON.stringify({
         type: "crow_social",
         version: 1,

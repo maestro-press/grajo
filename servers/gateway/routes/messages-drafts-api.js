@@ -37,7 +37,16 @@
  *                              panel's live redraw feeds this answer straight into the row builder.
  *                              Replying with the store's raw columns loses the name and the kind, and
  *                              a room draft's row then opens a contact thread with the room's id.
- *   - `GET  /:id`            — one draft and its audit trail (ids and hashes only).
+ *   - `GET  /:id`            — one draft and its audit trail (ids and hashes only), plus the three
+ *                              things the chat card cannot draw without: the recipient's name
+ *                              (`label`), the seal's verdict (`seal_ok`) and, for a BOT draft, the
+ *                              people its allow-list still covers (`allowed`). A bot draft also
+ *                              names itself the way the WIRE will (`sent_by_name`, the flattened
+ *                              `Sent by …` name drafts-send.js writes) so the card's greyed line and
+ *                              the first line a recipient reads can never disagree.
+ *   - `POST /:id/recipient`  — re-address an open BOT draft to another conversation its allow-list
+ *                              still covers (the chat card's picker). Re-seals over the new
+ *                              conversation; an owner's draft has no picker and answers bad_input.
  *   - `PUT  /`               — create the owner's draft for a conversation. `expectVersion: 0` is
  *                              CREATE ONLY: an open draft already there is 409 `changed` WITH it, and
  *                              the client adopts that row instead of overwriting words it never read.
@@ -87,12 +96,14 @@ import { isSameOriginRequest } from "../dashboard/same-origin.js";
 import { CONVERSATION_KINDS, audienceKeyChanges, resolveConversation, sameAudience } from "../messages/conversations.js";
 import { draftsWithBotNames } from "../messages/drafts-bots.js";
 import { botAudienceRefusal, readDraftBotAcl } from "../messages/drafts-bot-acl.js";
+import { groupEntryId } from "../sharing-bot/acl.js";
 import { draftRowViews } from "../messages/drafts-rows.js";
 import { loadDraftSealSeed, verifyRecipients } from "../messages/drafts-seal.js";
 import {
   DRAFT_STATES,
   DraftError,
   beginSend,
+  changeRecipient,
   createDraft,
   discardDraft,
   getDraft,
@@ -105,7 +116,8 @@ import {
   sealFieldsFor,
   updateBody,
 } from "../messages/drafts-store.js";
-import { sendDraftMessage } from "../messages/drafts-send.js";
+import { sendDraftMessage, sentByBotName } from "../messages/drafts-send.js";
+import { queueBotOutcomeNote } from "../messages/drafts-bot-notes.js";
 
 /** The mount point. The gateway's global JSON parser skips this prefix (see index.js `_hasOwnParser`). */
 export const MESSAGES_DRAFTS_API_PREFIX = "/dashboard/messages/api/drafts";
@@ -119,6 +131,7 @@ const FIXED_TEXT = Object.freeze({
   bad_input: "That request is not valid.",
   changed: "This draft changed while you were looking at it.",
   not_open: "This draft is no longer open.",
+  owner_draft_open: "That conversation already has a draft waiting. Send or discard it first.",
   seal_invalid: "This draft's recipients could not be verified, so nothing was sent.",
   recipients_changed: "Who this message would reach has changed. Open the draft again before sending.",
   pubkey_changed: "One of the recipients' keys changed since this draft was written, so nothing was sent.",
@@ -141,6 +154,10 @@ const CREATE_KEYS = Object.freeze([
 ]);
 const BODY_KEYS = Object.freeze(["body", "expectVersion"]);
 const DISCARD_KEYS = Object.freeze(["expectVersion"]);
+/** The recipient route's body: which conversation the bot's draft moves to, and the version it was
+ *  drawn from. Ids and a version only — the audience itself is derived server-side from the live
+ *  conversation, never taken from a caller. */
+const RECIPIENT_KEYS = Object.freeze(["conversationKind", "conversationId", "expectVersion"]);
 
 /* ------------------------------------------------------------------- runtime */
 
@@ -326,6 +343,99 @@ async function viewOne(db, draft) {
   return view;
 }
 
+/**
+ * Does this row's seal verify under this instance's key? The card asks so it can say "could not be
+ * verified" and offer no Send at all, instead of letting the person press a button the server is
+ * going to refuse.
+ *
+ * A Crow with no usable seal seed answers `false`: nothing on this box can verify the row, and a
+ * draft nobody can verify is exactly what the card must not offer to send.
+ */
+async function sealVerdict(draft) {
+  let seed = null;
+  try {
+    seed = await seedFor();
+  } catch {
+    return false;
+  }
+  if (!seed) return false;
+  try {
+    return verifyRecipients(sealFieldsFor(draft), draft.recipientsSeal, seed) === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The people a BOT may still write to, for the chat card's recipient picker.
+ *
+ * The allow-list pins crow ids and keys, not this instance's row ids, so the picker's own values are
+ * resolved here: each pinned contact is matched to its `contacts` row (the id the draft routes take)
+ * and each pinned group to its `contact_groups` row. An entry whose row is gone is DROPPED — a picker
+ * that offers somebody who cannot be resolved would only produce a `not_found` — and an unreadable
+ * allow-list answers empty lists plus its own code, never "everybody".
+ *
+ * `blocked` is carried for a contact the operator has blocked: still a permission the bot holds, and
+ * the send refuses it (`blocked`) rather than hiding it from the picker.
+ *
+ * @returns {Promise<{contacts: Array<{conversationId: number, crowId: string, name: string,
+ *   blocked: boolean}>, groups: Array<{conversationId: number, name: string}>, reason?: string}>}
+ */
+async function allowedRecipientsFor(db, draft, crowHome) {
+  const read = readDraftBotAcl(draft, crowHome);
+  if (!read.ok) return { contacts: [], groups: [], reason: read.code };
+  const entry = read.entry || {};
+  const contacts = [];
+  const groups = [];
+
+  const pinnedContacts = Array.isArray(entry.contacts) ? entry.contacts : [];
+  if (pinnedContacts.length) {
+    const crowIds = pinnedContacts.map((contact) => String(contact?.crow_id ?? "").trim()).filter(Boolean);
+    if (crowIds.length) {
+      let rows = [];
+      try {
+        const placeholders = crowIds.map(() => "?").join(", ");
+        ({ rows } = await db.execute({
+          sql: `SELECT id, crow_id, display_name, is_blocked FROM contacts WHERE crow_id IN (${placeholders})`,
+          args: crowIds,
+        }));
+      } catch {
+        rows = [];
+      }
+      const byCrowId = new Map((rows || []).map((row) => [String(row.crow_id ?? "").trim(), row]));
+      for (const crowId of crowIds) {
+        const row = byCrowId.get(crowId);
+        if (!row) continue;                       // the row is gone: it cannot be picked
+        contacts.push({
+          conversationId: Number(row.id),
+          crowId,
+          name: String(row.display_name ?? "").trim() || crowId,
+          blocked: Number(row.is_blocked ?? 0) === 1,
+        });
+      }
+    }
+  }
+
+  const pinnedGroups = Array.isArray(entry.groups) ? entry.groups : [];
+  for (const group of pinnedGroups) {
+    // The id as the ACL file stores it after `normalizeBotEntry` (`groups: [{ id, members }]` — never
+    // `group_id`), read through the same accessor the send's own room check uses, so the picker and
+    // the send can never disagree about which group an entry names.
+    const id = groupEntryId(group);
+    if (id == null) continue;
+    try {
+      const { rows } = await db.execute({ sql: "SELECT id, name, room_uid FROM contact_groups WHERE id = ?", args: [id] });
+      const row = (rows || [])[0];
+      if (!row) continue;
+      groups.push({ conversationId: Number(row.id), name: String(row.name ?? "").trim() || String(id) });
+    } catch {
+      // An unreadable row is one option fewer, never the whole answer.
+    }
+  }
+
+  return { contacts, groups };
+}
+
 /* -------------------------------------------------------------------- the router */
 
 /**
@@ -439,11 +549,30 @@ export function messagesDraftsRouter(dashboardAuth, deps = {}) {
     res.json({ drafts: await draftRowViews(db, await listDrafts(db, filter)) });
   }));
 
-  // GET /:id — one draft and its audit trail, oldest first (ids and hashes only).
+  // GET /:id — one draft and its audit trail, oldest first (ids and hashes only), plus the three
+  // things the chat card cannot draw without: the recipient's name (`label`), the seal's verdict
+  // (`seal_ok` — false means the card says "could not be verified" and offers no Send), and, for a BOT
+  // draft, the people its allow-list still covers (`allowed`), which is the recipient picker's whole
+  // list. An owner's draft answers `allowed: null` and `sent_by_name: null`: there is no permission
+  // behind it and no bot to attribute it to. `sent_by_name` is the SERVER's flattened attribution —
+  // the very string drafts-send.js puts on the wire — so a bot whose name carries a `(bot)` of its own
+  // reads the same on the card as in the message.
   router.get(`${base}/:id`, route(async (db, req, res) => {
     const draft = await getDraft(db, String(req.params.id ?? ""));
     if (!draft) return sendError(res, 404, "not_found");
-    res.json({ draft: await viewOne(db, draft), audit: await listAudit(db, draft.id) });
+    const [view, rows, sealOk, allowed] = await Promise.all([
+      viewOne(db, draft),
+      draftRowViews(db, [draft]),
+      sealVerdict(draft),
+      draft.origin === "bot" ? allowedRecipientsFor(db, draft, await crowHomeFor()) : null,
+    ]);
+    res.json({
+      draft: { ...view, label: rows[0]?.label ?? null },
+      audit: await listAudit(db, draft.id),
+      seal_ok: sealOk,
+      sent_by_name: sentByBotName(view),
+      allowed,
+    });
   }));
 
   /* ------------------------------------------------------------------ writes */
@@ -604,7 +733,81 @@ export function messagesDraftsRouter(dashboardAuth, deps = {}) {
       await markSentLate(db, id, { messageId: result.messageId ?? null }, storeOpts());
     }
     const sent = await getDraft(db, id);
+    // The bot whose draft this was learns the outcome on its next turn in the chat it wrote from — a
+    // FIXED line with the recipient's name and nothing else (drafts-bot-notes.js). "Edited" is
+    // decided by hash against the bot's own last write, never by trusting a flag on the request.
+    await queueBotOutcomeNote(db, draft, "sent", { sentBody: input.body, label: conversation.label });
     res.json({ ok: true, draft: await viewOne(db, sent) });
+  }));
+
+  // POST /:id/recipient — re-address an open BOT draft to another conversation its allow-list still
+  // covers (the chat card's recipient picker). The words are untouched: the audit trail keeps the
+  // text's hash, the row keeps its body, and the seal is rewritten over the new conversation and the
+  // new audience. Every rail of the bot's send is re-run first — the entry must exist, name the
+  // target, and pin the key the target holds now — so the picker can never widen a permission the
+  // operator did not give.
+  //
+  // An OWNER's draft has no such picker: `origin` must be `bot`, and anything else is `bad_input`.
+  // Codes: `not_found`, `not_open`, `bad_input` (a bad body or an owner's draft), `not_allowed`,
+  // `pubkey_changed`, `group_changed`, `acl_unreadable`, `owner_draft_open` (the target conversation
+  // already holds an open draft — the partial unique index allows one, so this row cannot move there
+  // until that one is sent or discarded), and `changed` from the compare-and-set.
+  router.post(`${base}/:id/recipient`, route(async (db, req, res) => {
+    const id = String(req.params.id ?? "");
+    const body = bodyOf(req);
+    if (body == null) return sendError(res, 400, "bad_input");
+    if (!keysWithin(body, RECIPIENT_KEYS)) return sendError(res, 400, "bad_input");
+    if (typeof body.conversationKind !== "string" || !CONVERSATION_KINDS.includes(body.conversationKind)) {
+      return sendError(res, 400, "bad_input");
+    }
+    if (!Number.isInteger(body.conversationId) || body.conversationId <= 0) return sendError(res, 400, "bad_input");
+    if (!Number.isInteger(body.expectVersion) || body.expectVersion < 1) return sendError(res, 400, "bad_input");
+
+    const draft = await getDraft(db, id);
+    if (!draft) return sendError(res, 404, "not_found");
+    if (draft.origin !== "bot") return sendError(res, 400, "bad_input");
+    if (draft.state !== "open") {
+      return res.status(409).json({
+        error: "not_open", message: messageFor("not_open"), version: draft.version,
+        draft: await viewOne(db, draft),
+      });
+    }
+
+    const conversation = await resolveConversation(db, {
+      kind: body.conversationKind,
+      id: body.conversationId,
+    });
+    if (!conversation.ok) {
+      return sendError(res, conversation.reason === "bad_kind" ? 400 : 404,
+        conversation.reason === "bad_kind" ? "bad_input" : "not_found");
+    }
+
+    const acl = readDraftBotAcl(draft, await crowHomeFor());
+    if (!acl.ok) return sendRefusal(db, res, 409, acl.code, id);
+    const refusal = botAudienceRefusal({
+      origin: "bot",
+      conversationKind: conversation.kind,
+      conversationId: conversation.id,
+      recipients: conversation.recipients,
+    }, acl.entry);
+    if (refusal) return sendRefusal(db, res, 409, refusal, id);
+
+    const outcome = await changeRecipient(db, id, {
+      conversationKind: conversation.kind,
+      conversationId: conversation.id,
+      recipients: conversation.recipients,
+      expectVersion: body.expectVersion,
+    }, storeOpts());
+    if (!outcome.ok) {
+      // The target conversation already has an open draft (or gained one while this write was in
+      // flight): its own code, its own sentence and the row as it still is, never a 500 from the
+      // index.
+      if (outcome.refused === "owner_draft_open") {
+        return sendRefusal(db, res, 409, "owner_draft_open", id);
+      }
+      return sendRefused(db, res, outcome);
+    }
+    res.json({ draft: { ...(await viewOne(db, outcome.draft)), label: conversation.label } });
   }));
 
   // POST /:id/discard — throw it away. `expectVersion` is optional: the card sends the version it was
@@ -623,6 +826,9 @@ export function messagesDraftsRouter(dashboardAuth, deps = {}) {
       storeOpts(),
     );
     if (!outcome.ok) return sendRefused(db, res, outcome);
+    // The bot is told, in fixed words, that its draft was NOT sent (the message's own text never rides
+    // back to it). An owner's draft, or a bot draft with no chat thread, queues nothing.
+    await queueBotOutcomeNote(db, outcome.draft, "discarded");
     res.json({ ok: true, draft: await viewOne(db, outcome.draft) });
   }));
 

@@ -35,9 +35,18 @@
  * and a name that carries its own `(bot)` has it removed before it is used: otherwise "Hank (bot)" would
  * go out with two markers, and a bot could spell one itself in a name the operator picks.
  *
- * (The envelope field `sent_by_bot:<bot_id>` is part 2's: it needs the two transports to carry a
- * structured field, and no receiving Crow reads it yet, so adding it here would change nothing a person
- * can see. The first line alone is what makes the attribution true today.)
+ * (THE ENVELOPE FIELD `sent_by_bot` IS CARRIED ON THE ROOM TRANSPORT, AND NOWHERE ELSE, BECAUSE
+ * THERE IS NOWHERE ELSE TO CARRY IT. A room message is a `crow_social` envelope with a `payload`, so
+ * the bot's id rides beside `addressed_to`/`ts` as a structured field the owner cannot edit out
+ * (`buildRoomMessageEnvelope`, sentByBot, through `sendOperatorRoomMessage`). A 1:1 peer message sends
+ * TEXT, and the plain contact-group fan-out (`crow_send_group_message`, servers/sharing/tools/
+ * messaging.js) builds its own `group_message` payload with no attribution field of any kind: adding a
+ * JSON envelope to a 1:1 DM would be read by the receiving Crow as a control message and never reach
+ * the chat, and the contact-group fan-out has no room transport of its own to hang a field on. The
+ * fixed first line below is therefore the whole attribution a peer message carries — and the whole
+ * attribution a contact-group message carries too. A receiving Crow that does not know the field
+ * simply ignores it — the room parser reads the fields it needs and nothing else
+ * (servers/sharing/room-inbound.js).)
  *
  * The one transformation is `trim()`, and it is here because the two send paths this module drives
  * already do it themselves: `POST /api/messages/peer/:contactId/send` calls `crow_send_message` with
@@ -77,8 +86,10 @@ export const SENT_BY_PREFIX = "Sent by ";
 /**
  * The fixed marker that follows the name on that line (`Sent by Hank (bot)`). It is the ONE part of the
  * line a bot cannot choose: `sentByBotName` strips any `(bot)` the name carries, and this suffix is
- * appended by `outboundText` alone. The Spanish copy of the same line (`Enviado por <name> (bot)`)
- * keeps the same fixed word, so the marker reads the same in both languages.
+ * appended by `outboundText` alone. The sent line always goes out in English (`Sent by <name> (bot)`),
+ * and the Spanish UI quotes that line verbatim — `messages.draft.sentByLine` and the draft banner
+ * (`messages.draft.draftBanner`) in the dashboard's i18n table — so the marker reads the same under
+ * either language setting.
  */
 export const SENT_BY_MARKER = " (bot)";
 
@@ -157,6 +168,21 @@ export function sentByBotName(draft) {
   if (!draft || draft.origin !== "bot") return null;
   const raw = String(draft.botName ?? "").trim() || String(draft.botId ?? "").trim();
   return flattenSentByName(raw) || flattenSentByName(String(draft.botId ?? "").trim()) || null;
+}
+
+/**
+ * The bot id a bot draft's room envelope carries (`sent_by_bot`), or null for an owner's draft. The id
+ * is the row's own `bot_id` (sealed with the rest of the draft), flattened to one plain token: it is
+ * an identifier the definition supplies, and it must not be able to smuggle whitespace or a second
+ * field into a payload. An id that flattens empty means no field at all.
+ */
+export function sentByBotId(draft) {
+  if (!draft || draft.origin !== "bot") return null;
+  const id = String(draft.botId ?? "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, "")
+    .replace(/\s+/g, "")
+    .slice(0, 64);
+  return id || null;
 }
 
 /**
@@ -253,6 +279,8 @@ export async function sendDraftMessage(db, draft, text, deps = {}) {
         groupId: draft.conversationId,
         message: outbound,
         expectedRecipients: Array.isArray(draft.recipients) ? draft.recipients : [],
+        // A bot's draft is attributed on the wire too: a fixed id, beside the visible first line.
+        sentByBot: draft.origin === "bot" ? sentByBotId(draft) : null,
       });
       if (result?.ok) return { ok: true, messageId: null };
       // The member rows the fan-out was about to reach are not the ones the draft sealed.

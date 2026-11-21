@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
-  AclError, DEFAULT_RATE_PER_HOUR, MAX_RATE_PER_HOUR, MAX_ACL_BYTES,
+  AclError, DEFAULT_RATE_PER_HOUR, MAX_RATE_PER_HOUR, MAX_ACL_BYTES, groupEntryId,
   normalizeBotEntry, readBotAcl, readSharingBotAcl, removeSharingBotAclEntry,
   setSharingBotAclEntry, sharingBotAclPath, sharingBotAclStat, sharingBotSecretsDirMode,
   writeSharingBotAcl,
@@ -78,6 +78,25 @@ test("a write replaces the file atomically and leaves no temp files behind", () 
   assert.equal(set.ok, true);
   assert.deepEqual(readSharingBotAcl(h).acl.otto, { contacts: [], groups: [], rate: { per_hour: 3 } });
   assert.equal(readSharingBotAcl(h).acl.hank.contacts.length, 2);
+});
+
+test("a group entry's id is `id`, the one spelling every reader uses — `group_id` is not a field", () => {
+  // The stored entry (normalizeBotEntry) is `{ id, members }`. Both readers of an entry's groups — the
+  // recipient picker (messages-drafts-api.js allowedRecipientsFor) and the send's own room re-check
+  // (messages/drafts-bot-acl.js botAudienceRefusal), plus the door's resolveAllowedGroup — go through
+  // groupEntryId, so they cannot disagree about which group an entry names.
+  const entry = normalizeBotEntry(ENTRY);
+  assert.equal(entry.groups[0].id, 7);
+  assert.equal(Object.hasOwn(entry.groups[0], "group_id"), false, "the file's spelling is `id`");
+  assert.equal(groupEntryId(entry.groups[0]), 7, "the accessor every reader uses");
+  assert.equal(groupEntryId({ id: "7" }), 7, "a hand-written numeric string still reads");
+  assert.equal(groupEntryId({ group_id: 7 }), null, "a reader must not invent the other spelling");
+  assert.equal(groupEntryId({ id: 0 }), null);
+  assert.equal(groupEntryId(null), null);
+  // A file carrying `group_id` is not half-read: the strict shape refuses it, and the door refuses
+  // every call that needs the allow-list rather than quietly seeing no group.
+  assert.throws(() => normalizeBotEntry({ groups: [{ group_id: 7, members: [PEER] }] }),
+    (err) => err instanceof AclError && err.detail === "groups");
 });
 
 test("a missing rate is the default cap; an explicit one is bounded", () => {

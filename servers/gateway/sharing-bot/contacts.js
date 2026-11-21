@@ -27,6 +27,7 @@
  * `group_not_a_room`), and the door turns them into one fixed sentence each.
  */
 import { getRoom, listRoomMembers } from "../dashboard/panels/messages/rooms-store.js";
+import { groupEntryId } from "./acl.js";
 
 /** The most text one contact-group label may be (a name, or a numeric id as text). */
 const LABEL_MAX = 200;
@@ -131,8 +132,9 @@ export async function resolveAllowedGroup(db, allowed, label) {
   if (!wanted || wanted.length > LABEL_MAX) return { ok: false, code: "not_allowed" };
   const numeric = /^[0-9]{1,12}$/.test(wanted) ? Number(wanted) : null;
 
-  // Group names are read for the allowed ids only: a name never widens the allow-list.
-  const ids = [...new Set((allowed || []).map((entry) => Number(entry.id)).filter((id) => Number.isInteger(id) && id > 0))];
+  // Group names are read for the allowed ids only: a name never widens the allow-list. The id is read
+  // through the ACL's own accessor (the entry stores `{ id, members }`), like every other reader.
+  const ids = [...new Set((allowed || []).map(groupEntryId).filter((id) => id != null))];
   const rooms = new Map();
   for (const id of ids) {
     const room = await getRoom(db, id);
@@ -142,13 +144,13 @@ export async function resolveAllowedGroup(db, allowed, label) {
   let entry = null;
   let room = null;
   if (numeric !== null) {
-    entry = (allowed || []).find((candidate) => Number(candidate.id) === numeric) || null;
+    entry = (allowed || []).find((candidate) => groupEntryId(candidate) === numeric) || null;
     room = entry ? rooms.get(numeric) || null : null;
   }
   if (!entry) {
     const lower = wanted.toLowerCase();
     for (const candidate of allowed || []) {
-      const live = rooms.get(Number(candidate.id));
+      const live = rooms.get(groupEntryId(candidate));
       if (!live) continue;
       if ((text(live.name) || `Room ${live.id}`).toLowerCase() === lower) {
         entry = candidate;

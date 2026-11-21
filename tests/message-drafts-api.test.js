@@ -272,6 +272,7 @@ test("a peer's single-sign-on session gets 403 owner_only on every route", async
     ["PUT", DRAFTS, { conversationKind: "contact", conversationId: s.contactId, body: "hi", expectVersion: 0 }],
     ["PATCH", `${DRAFTS}/${id}/body`, { body: "hi again", expectVersion: 1 }],
     ["POST", `${DRAFTS}/${id}/send`, { body: "hi", expectVersion: 1 }],
+    ["POST", `${DRAFTS}/${id}/recipient`, { conversationKind: "room", conversationId: s.roomId, expectVersion: 1 }],
     ["POST", `${DRAFTS}/${id}/discard`, {}],
   ]) {
     const res = await s.call(method, path, { body, token: SSO });
@@ -314,6 +315,18 @@ test("cross-site fetch metadata is refused; a same-origin write is not", async (
   });
   assert.equal(foreignOrigin.status, 403, foreignOrigin.text);
   assert.equal(foreignOrigin.json?.error, "cross_site");
+
+  // The recipient route is a write like any other, and it is refused the same way — before the body
+  // is parsed and before a stored draft could be re-addressed. (The id need not exist: the rail runs
+  // above every handler.)
+  const recipientWrite = { conversationKind: "room", conversationId: s.roomId, expectVersion: 1 };
+  const recipientCross = await s.call("POST", `${DRAFTS}/msgd-${"0".repeat(32)}/recipient`, {
+    body: recipientWrite,
+    headers: { "sec-fetch-site": "cross-site" },
+  });
+  assert.equal(recipientCross.status, 403, recipientCross.text);
+  assert.equal(recipientCross.json?.error, "cross_site");
+  assert.doesNotMatch(recipientCross.text, /not_found/, "the cross-site rail answers before any route reads a row");
 
   assert.equal((await store.listDrafts(s.db, {})).length, 0, "nothing was written by a refused write");
 
@@ -675,8 +688,8 @@ test("every write pokes message-drafts:changed with ids only", async () => {
   assert.deepEqual(seen.map((p) => p.action), ["create", "edit", "send", "send", "create", "discard"]);
   for (const payload of seen) {
     assert.deepEqual(Object.keys(payload).sort(),
-      ["action", "conversationId", "conversationKind", "draftId"],
-      "ids and the action word only");
+      ["action", "chatThreadId", "conversationId", "conversationKind", "draftId"],
+      "ids (the chat thread included) and the action word only");
   }
   assert.doesNotMatch(JSON.stringify(seen), /the words/, "no message text rides the live channel");
 });
@@ -1266,4 +1279,233 @@ test("a C1 control (U+0085 NEL) in a bot's name folds to a space, not through to
   });
   assert.equal(result.ok, true, JSON.stringify(result));
   assert.equal(calls[0].args.message, "Sent by Hank Smith (bot)\nHello den");
+});
+
+/* ------------------------------------------- the card's own read and its picker */
+
+// The chat card draws from GET /:id alone, so that answer carries the three things it cannot invent:
+// the recipient's name, the seal's verdict, and (for a bot's draft) the people the bot may still
+// write to — the recipient picker's whole list. An owner's draft has no allow-list behind it.
+test("GET /:id answers the label, the seal's verdict and a bot's allow-list", async () => {
+  const s = await setup();
+  await writeBotAcl(s);
+  const draft = await botDraft(s);
+
+  const res = await s.call("GET", `${DRAFTS}/${draft.id}`);
+  assert.equal(res.status, 200, res.text);
+  assert.equal(res.json.draft.label, "Peer", "the name a person reads");
+  assert.equal(res.json.seal_ok, true, "the store's own seal verifies under this instance's key");
+  assert.deepEqual(res.json.allowed.contacts.map((c) => c.name), ["Peer"], "the pinned contact");
+  assert.deepEqual(res.json.allowed.groups.map((g) => g.name), ["Den"], "and the pinned room");
+  assert.equal(res.json.allowed.groups[0].conversationId, s.roomId,
+    "the group's id as the ACL file stores it (`id` after normalizeBotEntry, never `group_id`)");
+  assert.equal(JSON.stringify(res.json.allowed).includes("secp256k1"), false,
+    "no key travels to the browser: the picker only needs who");
+
+  // An owner's draft: the same three fields, with no permission behind it. (The room, because the
+  // bot's own draft holds the contact's one open row.)
+  const owner = await s.call("PUT", DRAFTS, {
+    body: { conversationKind: "room", conversationId: s.roomId, body: "mine", expectVersion: 0 },
+  });
+  assert.equal(owner.status, 201, owner.text);
+  const own = await s.call("GET", `${DRAFTS}/${owner.json.draft.id}`);
+  assert.equal(own.json.allowed, null, "there is no allow-list for the operator's own words");
+  assert.equal(own.json.seal_ok, true);
+  assert.equal(own.json.draft.label, "Den");
+});
+
+// A row somebody edited by hand (a bot writing crow.db directly, a rewritten origin) has a seal that
+// does not verify: the card must be able to say so before offering Send, because the send route
+// refuses it (seal_invalid) anyway.
+test("GET /:id says seal_ok false for a row whose seal does not verify", async () => {
+  const s = await setup();
+  await writeBotAcl(s);
+  const draft = await botDraft(s);
+  await s.db.execute({
+    sql: "UPDATE message_drafts SET recipients_json = ? WHERE id = ?",
+    args: [JSON.stringify([{ contact_id: s.contactId, crow_id: "crow:somebody-else", secp256k1_pubkey: "02" + "9".repeat(64) }]), draft.id],
+  });
+  const res = await s.call("GET", `${DRAFTS}/${draft.id}`);
+  assert.equal(res.status, 200, res.text);
+  assert.equal(res.json.seal_ok, false, "the audience was rewritten under the seal");
+});
+
+// The recipient picker is a real write: `POST /:id/recipient` re-addresses an open BOT draft to
+// another conversation its allow-list still covers, re-seals over the new conversation (the seal
+// covers the conversation id, so the old one would stop verifying), and leaves the words alone.
+test("POST /:id/recipient re-addresses a bot's draft inside its allow-list", async () => {
+  const s = await setup();
+  await writeBotAcl(s);
+  const draft = await botDraft(s);
+  const { verifyRecipients } = await import("../servers/gateway/messages/drafts-seal.js");
+
+  const moved = await s.call("POST", `${DRAFTS}/${draft.id}/recipient`, {
+    body: { conversationKind: "room", conversationId: s.roomId, expectVersion: draft.version },
+  });
+  assert.equal(moved.status, 200, moved.text);
+  assert.equal(moved.json.draft.conversationKind, "room");
+  assert.equal(moved.json.draft.conversationId, s.roomId);
+  assert.equal(moved.json.draft.label, "Den", "the new recipient's name comes back with it");
+  assert.equal(moved.json.draft.body, draft.body, "the words are untouched");
+  assert.equal(moved.json.draft.version, draft.version + 1, "one edit, one version");
+
+  const row = await store.getDraft(s.db, draft.id);
+  assert.equal(verifyRecipients(store.sealFieldsFor(row), row.recipientsSeal, SEED), true,
+    "re-sealed over the new conversation and audience");
+
+  // The audit trail records the move as the OWNER's edit — the picker is the operator's control — and
+  // never the text. `actor: "owner"` is what freezes further bot revisions (sharing-bot/messages.js
+  // ownerEdited) and what keeps the bot's own last words in the trail for the outcome note.
+  const audit = await store.listAudit(s.db, draft.id);
+  assert.equal(audit[audit.length - 1].action, "edit");
+  assert.equal(audit[audit.length - 1].actor, "owner");
+  assert.equal(audit[audit.length - 1].actorId, null);
+  assert.equal(JSON.stringify(audit).includes(draft.body), false, "no message text in the audit");
+
+  // A stale version is the same compare-and-set as an edit's.
+  const stale = await s.call("POST", `${DRAFTS}/${draft.id}/recipient`, {
+    body: { conversationKind: "contact", conversationId: s.contactId, expectVersion: draft.version },
+  });
+  assert.equal(stale.status, 409, stale.text);
+  assert.equal(stale.json.error, "changed");
+  assert.equal(stale.json.version, moved.json.draft.version, "with the row as it now is");
+});
+
+test("POST /:id/recipient refuses an audience the bot's allow-list does not cover, and an owner's draft", async () => {
+  const s = await setup();
+  await writeBotAcl(s);
+  const draft = await botDraft(s);
+
+  // The operator unticked everything: the draft stays where it is, un-sendable rather than moved.
+  await writeBotAcl(s, { contacts: [], groups: [] });
+  const refused = await s.call("POST", `${DRAFTS}/${draft.id}/recipient`, {
+    body: { conversationKind: "room", conversationId: s.roomId, expectVersion: draft.version },
+  });
+  assert.equal(refused.status, 409, refused.text);
+  assert.equal(refused.json.error, "not_allowed");
+  assert.equal(refused.json.draft.conversationKind, "contact", "the draft did not move");
+  assert.equal((await store.getDraft(s.db, draft.id)).version, draft.version, "and its row never changed");
+
+  // An owner's draft has no picker: nobody granted it a permission to honour. The room is where the
+  // owner's own draft can live (the bot's holds the contact's one open row).
+  const owner = await s.call("PUT", DRAFTS, {
+    body: { conversationKind: "room", conversationId: s.roomId, body: "mine", expectVersion: 0 },
+  });
+  assert.equal(owner.status, 201, owner.text);
+  const own = await s.call("POST", `${DRAFTS}/${owner.json.draft.id}/recipient`, {
+    body: { conversationKind: "contact", conversationId: s.contactId, expectVersion: owner.json.draft.version },
+  });
+  assert.equal(own.status, 400, own.text);
+  assert.equal(own.json.error, "bad_input");
+});
+
+// One open draft per conversation is the store's own rule (the partial unique index), so a draft cannot
+// be moved onto a conversation that already has one. The route answers its own code with the row as it
+// still is — the 500 the index's constraint error used to produce (and the one it would still produce
+// if two writers raced) is what this pins.
+test("POST /:id/recipient answers 409 owner_draft_open when the target conversation already has a draft", async () => {
+  const s = await setup();
+  await writeBotAcl(s);
+  const draft = await botDraft(s);
+
+  // The owner is already writing to the room: the conversation the bot's draft would move to is taken.
+  const mine = await s.call("PUT", DRAFTS, {
+    body: { conversationKind: "room", conversationId: s.roomId, body: "mine to the den", expectVersion: 0 },
+  });
+  assert.equal(mine.status, 201, mine.text);
+
+  const moved = await s.call("POST", `${DRAFTS}/${draft.id}/recipient`, {
+    body: { conversationKind: "room", conversationId: s.roomId, expectVersion: draft.version },
+  });
+  assert.equal(moved.status, 409, moved.text);
+  assert.equal(moved.json.error, "owner_draft_open");
+  assert.ok(moved.json.message, "with a sentence a card can show");
+  assert.equal(moved.json.draft.conversationKind, "contact", "the answer carries the row, still where it was");
+  assert.equal(moved.json.draft.conversationId, s.contactId);
+
+  const row = await store.getDraft(s.db, draft.id);
+  assert.equal(row.conversationId, s.contactId, "the bot's draft did not move");
+  assert.equal(row.version, draft.version, "and its row never changed");
+  assert.equal((await store.getDraft(s.db, mine.json.draft.id)).body, "mine to the den",
+    "the conversation's own open draft is untouched");
+
+  // The move works the moment that conversation is free again.
+  assert.equal((await s.call("POST", `${DRAFTS}/${mine.json.draft.id}/discard`, { body: {} })).status, 200);
+  const again = await s.call("POST", `${DRAFTS}/${draft.id}/recipient`, {
+    body: { conversationKind: "room", conversationId: s.roomId, expectVersion: draft.version },
+  });
+  assert.equal(again.status, 200, again.text);
+  assert.equal(again.json.draft.conversationKind, "room");
+});
+
+// A draft cannot be re-addressed to a contact whose key moved out from under the pinned one (the pinned
+// key IS the permission), or to a room whose member set is no longer the one that was allowed.
+test("POST /:id/recipient refuses a re-keyed contact (pubkey_changed) and a moved room (group_changed)", async () => {
+  const s = await setup();
+  await writeBotAcl(s);
+
+  // The bot drafted to the room; the contact is the target the picker would offer.
+  const draft = await botDraft(s, { kind: "room" });
+  await s.db.execute({
+    sql: "UPDATE contacts SET secp256k1_pubkey = ? WHERE id = ?",
+    args: ["02" + "9".repeat(64), s.contactId],
+  });
+  const rekeyed = await s.call("POST", `${DRAFTS}/${draft.id}/recipient`, {
+    body: { conversationKind: "contact", conversationId: s.contactId, expectVersion: draft.version },
+  });
+  assert.equal(rekeyed.status, 409, rekeyed.text);
+  assert.equal(rekeyed.json.error, "pubkey_changed");
+  assert.equal((await store.getDraft(s.db, draft.id)).conversationKind, "room", "the draft did not move");
+  assert.equal((await store.getDraft(s.db, draft.id)).version, draft.version, "and its row never changed");
+
+  // The key back, the member set moved: the pinned member set is the permission, so the room is refused
+  // by its own code — for a draft that currently sits in a contact conversation.
+  await s.db.execute({
+    sql: "UPDATE contacts SET secp256k1_pubkey = ? WHERE id = ?",
+    args: [s.peerPubkey, s.contactId],
+  });
+  const other = await s.db.execute({
+    sql: `INSERT INTO contacts (crow_id, display_name, secp256k1_pubkey, ed25519_pubkey, contact_type)
+          VALUES ('crow:late', 'Late', ?, ?, 'crow')`,
+    args: ["02" + "b".repeat(64), "f".repeat(64)],
+  });
+  await s.db.execute({
+    sql: "INSERT INTO contact_group_members (group_id, contact_id) VALUES (?, ?)",
+    args: [s.roomId, Number(other.lastInsertRowid)],
+  });
+  const contactDraft = await botDraft(s);
+  const widened = await s.call("POST", `${DRAFTS}/${contactDraft.id}/recipient`, {
+    body: { conversationKind: "room", conversationId: s.roomId, expectVersion: contactDraft.version },
+  });
+  assert.equal(widened.status, 409, widened.text);
+  assert.equal(widened.json.error, "group_changed");
+  assert.equal((await store.getDraft(s.db, contactDraft.id)).conversationKind, "contact", "still where it was");
+});
+
+// The card's greyed "Sent by <bot> (bot)" line promises exactly what the recipient will read, so the
+// answer carries the SERVER's flattened attribution — the same `sentByBotName` the wire uses. A bot named
+// `Hank (bot)` would otherwise print one marker too many on the card (and on nothing else).
+test("GET /:id answers `sent_by_name`, the flattened name the wire writes", async () => {
+  const s = await setup();
+  await writeBotAcl(s);
+  const draft = await botDraft(s, { botName: "Hank (bot)" });
+
+  const res = await s.call("GET", `${DRAFTS}/${draft.id}`);
+  assert.equal(res.status, 200, res.text);
+  assert.equal(res.json.sent_by_name, "Hank", "the name without the marker the code adds");
+
+  const { outboundText } = await import("../servers/gateway/messages/drafts-send.js");
+  const { t: i18nT, fill: fillT } = await import("../servers/gateway/dashboard/shared/i18n.js");
+  assert.equal(outboundText(res.json.draft, "Hello").split("\n")[0], "Sent by Hank (bot)",
+    "the first line the recipient reads");
+  assert.equal(fillT(i18nT("messages.draft.sentByLine", "en"), { bot: res.json.sent_by_name }),
+    "Sent by Hank (bot)", "and the line the card draws from the same answer");
+
+  // An owner's draft has nobody to attribute: there is no bot and there is no line.
+  const owner = await s.call("PUT", DRAFTS, {
+    body: { conversationKind: "room", conversationId: s.roomId, body: "mine", expectVersion: 0 },
+  });
+  assert.equal(owner.status, 201, owner.text);
+  const own = await s.call("GET", `${DRAFTS}/${owner.json.draft.id}`);
+  assert.equal(own.json.sent_by_name, null);
 });

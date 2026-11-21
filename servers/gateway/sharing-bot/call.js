@@ -55,7 +55,10 @@ function clockOf(now) {
  * @param {object} db
  * @param {{tool: string, claims: {botId: string, threadId?: string|null, gatewayType?: string|null},
  *   args?: object}} call
- * @param {{crowHome?: string|Function, now?: Function|number, loadSeed?: Function, emit?: Function}} [options]
+ * @param {{crowHome?: string|Function, now?: Function|number, loadSeed?: Function, emit?: Function,
+ *   notify?: Function}} [options] `notify` is the new-draft bell's seam (a test stub; production
+ *   passes none and servers/shared/notifications.js rings it). The signed thread rides into the draft
+ *   as `chat_thread_id` — it is the Perch chat the card lives in.
  * @returns {Promise<{ok: true, data: object, outcome: string, target?: string|null,
  *   draftId?: string|null, refs?: object|null} | {ok: false, code: string, target?: string|null}>}
  */
@@ -79,7 +82,7 @@ export async function runDoorCall(db, call, options = {}) {
   let result;
 
   try {
-    result = await dispatch(db, { tool, botId, args, home, at, options });
+    result = await dispatch(db, { tool, botId, args, home, at, options, chatThreadId: claims.threadId ?? null });
     if (result.ok) {
       outcome = result.outcome;
       target = result.target ?? null;
@@ -131,7 +134,7 @@ async function usedThisHour(db, botId, at) {
   return countDraftsSince(db, botId, at - RATE_WINDOW_MS);
 }
 
-async function dispatch(db, { tool, botId, args, home, at, options }) {
+async function dispatch(db, { tool, botId, args, home, at, options, chatThreadId = null }) {
   if (tool === "crow_list_crosspost_transforms") {
     return { ok: true, data: { pairs: SUPPORTED_PAIRS }, outcome: "read" };
   }
@@ -166,10 +169,12 @@ async function dispatch(db, { tool, botId, args, home, at, options }) {
     ? await draftGroupMessage(db, {
       botId, botName, entry, aclFailure, group: args.group, message: args.message,
       now: at, usedThisHour: used, loadSeed: options.loadSeed, emit: options.emit,
+      chatThreadId, notify: options.notify,
     })
     : await draftPeerMessage(db, {
       botId, botName, entry, aclFailure, contact: args.contact, message: args.message,
       now: at, usedThisHour: used, loadSeed: options.loadSeed, emit: options.emit,
+      chatThreadId, notify: options.notify,
     });
   if (!draft.ok) return { ok: false, code: draft.code, target: draft.target ?? null };
   return {

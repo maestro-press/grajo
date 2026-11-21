@@ -33,6 +33,7 @@ const audit = await import("../servers/gateway/sharing-bot/audit.js");
 const inbox = await import("../servers/gateway/sharing-bot/inbox.js");
 const { runDoorCall } = await import("../servers/gateway/sharing-bot/call.js");
 const { SHARING_BOT_TOOL_NAMES } = await import("../servers/gateway/sharing-bot-mcp.js");
+const { fill, t } = await import("../servers/gateway/dashboard/shared/i18n.js");
 
 const SEED = Buffer.from("a fixed keychain seed for the sharing door");
 const BOT = "hank";
@@ -272,6 +273,36 @@ test("the owner's open draft is never overwritten; once the owner edits a bot's 
   const frozen = await sendPeer(f, { message: "the bot tries again" });
   assert.equal(frozen.code, "owner_edited");
   assert.equal((await store.getDraft(f.db, botDraft.data.draft_id)).body, "the owner's version");
+});
+
+// A recipient change from the chat card is the OWNER's act (drafts-store.js changeRecipient), so it
+// freezes the bot out exactly like a typed edit does — the bot cannot answer a re-address by writing
+// over the draft the owner just moved.
+test("a recipient change freezes the bot out, the same as an owner edit does", async () => {
+  const f = await fixture({ allow: [PEER, OTHER] });
+  const drafted = await sendPeer(f);
+  assert.equal(drafted.ok, true, JSON.stringify(drafted));
+  const draft = await store.getDraft(f.db, drafted.data.draft_id);
+
+  // The owner moves the draft to the other allow-listed contact; the words are untouched.
+  const moved = await store.changeRecipient(f.db, draft.id, {
+    conversationKind: "contact",
+    conversationId: f.otherId,
+    recipients: [{ contactId: f.otherId, crowId: OTHER.crowId, pubkey: OTHER.pubkey }],
+    expectVersion: draft.version,
+  }, f.opts);
+  assert.equal(moved.ok, true, JSON.stringify(moved));
+
+  // The bot's next turn revises the SAME draft (its own, in that conversation) — and is refused.
+  const frozen = await sendPeer(f, { contact: OTHER.crowId, message: "the bot tries again" });
+  assert.equal(frozen.ok, false, JSON.stringify(frozen));
+  assert.equal(frozen.code, "owner_edited");
+  const after = await store.getDraft(f.db, draft.id);
+  assert.equal(after.body, "Are we still on for Saturday?", "the owner's draft kept its words");
+  assert.equal(after.conversationId, f.otherId, "and stayed where the owner moved it");
+  assert.deepEqual((await store.listAudit(f.db, draft.id)).map((row) => [row.action, row.actor]),
+    [["create", "bot"], ["edit", "owner"]],
+    "the re-address is recorded as the owner's edit, never the bot's");
 });
 
 test("the rate cap counts the drafts the trail recorded, and a refusal says so", async () => {
@@ -717,4 +748,47 @@ test("draft_updates pages a shared millisecond, and never skips a draft inside i
   const legacyMark = await doorCall(f, "crow_bot_inbox", { cursor: `p0.r0.d${NOW}` });
   assert.equal(legacyMark.ok, true, JSON.stringify(legacyMark));
   assert.equal(legacyMark.data.draft_updates.length, 3, "an id-less mark restarts at that millisecond");
+});
+
+// ---------------------------------------------------------------------------
+// The chat the draft came from, and the bell it rings (bot-door plan, PR B).
+// ---------------------------------------------------------------------------
+
+/** The door call with the bell seam injected: a NEW draft rings once, a revise never. */
+function doorCallWithBell(f, tool, args, bells) {
+  return runDoorCall(f.db, { tool, claims: { botId: BOT, threadId: "perch-1", gatewayType: "perch" }, args }, {
+    crowHome: process.env.CROW_HOME, now: NOW, loadSeed: f.opts.loadSeed,
+    notify: async (db, opts) => { bells.push(opts); return { id: bells.length }; },
+  });
+}
+
+test("a bot's draft records the signed thread — the Perch chat its card lives in", async () => {
+  const f = await fixture();
+  const out = await sendPeer(f);
+  assert.equal(out.ok, true, JSON.stringify(out));
+  const draft = await store.getDraft(f.db, out.draftId);
+  assert.equal(draft.chatThreadId, "perch-1");
+  assert.equal(draft.origin, "bot");
+  // A room draft records it too.
+  const room = await sendRoom(f);
+  assert.equal(room.ok, true, JSON.stringify(room));
+  assert.equal((await store.getDraft(f.db, room.draftId)).chatThreadId, "perch-1");
+});
+
+test("a NEW bot draft rings the bell once, with names and a card link and no message text; a revise rings nothing", async () => {
+  const f = await fixture();
+  const bells = [];
+  const first = await doorCallWithBell(f, "crow_send_message", { contact: PEER.crowId, message: "Are we still on for Saturday?" }, bells);
+  assert.equal(first.ok, true, JSON.stringify(first));
+  assert.equal(bells.length, 1, "one bell for the new draft");
+  assert.equal(bells[0].source, "messages");
+  assert.equal(bells[0].title, fill(t("messages.draft.bellTitle", "en"), { bot: BOT_NAME, name: PEER.name }));
+  assert.equal(bells[0].action_url, `/dashboard/perch?msgdraft=${first.draftId}#perch-1`);
+  assert.equal(JSON.stringify(bells[0]).includes("Saturday"), false, "the bell carries no message text");
+
+  // The bot revises its own open draft: the same card, the same conversation — no second bell.
+  const revise = await doorCallWithBell(f, "crow_send_message", { contact: PEER.crowId, message: "Are we still on for Sunday?" }, bells);
+  assert.equal(revise.ok, true, JSON.stringify(revise));
+  assert.equal(revise.data.draft, "revised");
+  assert.equal(bells.length, 1, "a revise rings nothing");
 });

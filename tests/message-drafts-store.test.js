@@ -557,10 +557,24 @@ test("every write pokes message-drafts:changed with ids only", async () => {
     assert.equal(payload.conversationKind, "contact");
     assert.equal(payload.conversationId, 7);
     assert.deepEqual(Object.keys(payload).sort(),
-      ["action", "conversationId", "conversationKind", "draftId"],
-      "the payload is ids and the action word, nothing else");
+      ["action", "chatThreadId", "conversationId", "conversationKind", "draftId"],
+      "the payload is ids (the chat thread included) and the action word, nothing else");
+    assert.equal(payload.chatThreadId, null, "an owner's draft has no chat thread");
   }
   assert.doesNotMatch(JSON.stringify(seen), /secret words/, "no message text rides the live channel");
+});
+
+test("the store's source is formatted: no comment glued onto a statement, one trailing newline", () => {
+  // A review pass found a block comment joined onto a `);` line and no newline at the end of the file.
+  // Neither changes behaviour, and both make the compare-and-set's own explanation unreadable in a
+  // diff — so the file's shape is pinned here rather than left to the next reader to notice.
+  const src = readFileSync(new URL("../servers/gateway/messages/drafts-store.js", import.meta.url), "utf8");
+  assert.ok(src.endsWith("\n"), "the file ends with a newline");
+  assert.equal(src.endsWith("\n\n"), false, "exactly one, not a stray blank line at the end");
+  const glued = src.split("\n")
+    .map((line, at) => [at + 1, line])
+    .filter(([, line]) => /;\s{2,}\/\//.test(line));
+  assert.deepEqual(glued, [], "no statement carries a comment on its own line");
 });
 
 test("a store refusal is a DraftError naming a field, never a value", async () => {
