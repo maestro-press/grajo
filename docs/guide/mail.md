@@ -42,6 +42,64 @@ that instance, and connecting the same address here is refused. A different addr
 An account that cannot sign in shows "Sign-in failed. Update the password." with an **Update
 password** button. The rest of the accounts keep working.
 
+### Adding an account from a terminal
+
+The same add exists as a command, for a box you reach over ssh and would rather not open a browser on:
+
+```bash
+# a file only you can read, holding the password and the address
+(umask 077 && cat > ~/.crow-mail.env <<'EOF'
+IMAP_PASSWORD='your app password'
+MAIL_ADDRESS='alex@example.com'
+EOF
+)
+
+node scripts/cli/mail-add.js \
+  --label Personal --address-key MAIL_ADDRESS \
+  --password-env-file ~/.crow-mail.env --password-key IMAP_PASSWORD \
+  --imap imap.example.com:993:ssl --smtp smtp.example.com:465:ssl
+
+# once the account is added, the password lives in Crow's keychain — the file need not
+rm ~/.crow-mail.env
+```
+
+The env file is `KEY=VALUE` per line, and it is worth knowing exactly how it is read: `#` starts a
+line; an inline `#` is part of an **unquoted** value, so a password may contain one; a value in
+matching `'…'` or `"…"` quotes is taken exactly as written (`' lead '` keeps its spaces), and anything
+after a closing quote that starts with `#`, with or without spaces, is a comment; an unquoted value is
+trimmed of leading and trailing whitespace; nothing is escaped, so `\n` in that file is a backslash
+and an `n`, not a newline. A file that is readable by other users on the box
+gets a one-line warning — use the `umask 077` above.
+
+The steps are the form's steps: the address is refused if it is already connected here or on another
+of your instances, the password is checked against the mail server before anything is stored, and a
+failure part-way removes what it wrote. That check is an **IMAP** connect and folder listing — the
+SMTP host and port are stored for sending and are not dialled when an account is added, so an SMTP
+problem does not fail the add. The password is never taken on the command line — use the env file
+above, or `--password-stdin` with the password piped in (on a terminal it refuses, because it would
+echo) — and it is never printed. `--dry-run` connects and stops, storing nothing.
+
+The command writes to the instance the shell resolves, which is why it prints that instance's
+`CROW_HOME` and `crow.db` path first — run it as the user whose `CROW_HOME` the gateway uses. It
+refuses (`2`) instead of creating anything when that instance has no `crow.db` yet, or no usable
+keychain key (missing, empty or damaged all count): an account in a fresh empty database would be
+invisible to Mail, and a key minted by the command would make every password the gateway sealed under
+its own key unreadable. Let the gateway create both
+(start it, and seal one secret in Crow's Nest), then re-run.
+
+Two things to know:
+
+- With `CROW_MAIL` unset **in this shell** the command refuses, because it cannot tell whether the
+gateway has the flag. The flag usually lives in the gateway's systemd unit rather than your shell, so
+if Mail works in Crow's Nest, re-run with `CROW_MAIL=1` in front; `--force-flag-off` adds the account
+anyway and says that the gateway will not sync it.
+- The sync supervisor reads the accounts when it starts, so **restart the gateway** after adding one.
+
+Exit codes: `0` added, `2` usage (a bad flag, the flag is off, or this shell is not the gateway's
+instance), `3` refused (already connected), `4` failed and undone, `5` the mail server refused the
+sign-in — in which case the password is wrong or an app password is needed, `78` the gateway's own
+instance-path check refused this shell's `CROW_HOME` layout (the refusal the gateway makes at boot).
+
 ## The inbox
 
 The inbox opens on **All**: the newest mail from every account in one list. The chips above the list
