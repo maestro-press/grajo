@@ -269,12 +269,12 @@ test("rec-lanes and scene-plan are in WIDGETS with their sizes", () => {
   assert.deepEqual(page.WIDGETS["scene-plan"], WIDGETS["scene-plan"], "and the plan");
 });
 
-test("the record default is rec-lanes l, scene-plan m, takes m, pads m, scene-grid m, midi s, history s", () => {
+test("the record default is rec-lanes l, scene-plan m, takes m, pads l, scene-grid m, midi s, history s", () => {
   assert.deepEqual(defaultLayout("record", "laptop").shown, [
     { id: "rec-lanes", size: "l" },
     { id: "scene-plan", size: "m" },
     { id: "takes", size: "m" },
-    { id: "pads", size: "m" },
+    { id: "pads", size: "l" },
     { id: "scene-grid", size: "m" },
     { id: "midi", size: "s" },
     { id: "history", size: "s" },
@@ -346,7 +346,7 @@ test("the default layout of each mode is the plan's, with the agent in the tray"
   assert.deepEqual(defaultLayout("compose", "laptop").shown, [
     { id: "scene-grid", size: "l" },
     { id: "editor", size: "m" },
-    { id: "pads", size: "m" },
+    { id: "pads", size: "l" },
     { id: "steps", size: "l" },
     { id: "fx", size: "s" },
     { id: "history", size: "s" },
@@ -362,7 +362,7 @@ test("the default layout of each mode is the plan's, with the agent in the tray"
     { id: "rec-lanes", size: "l" },
     { id: "scene-plan", size: "m" },
     { id: "takes", size: "m" },
-    { id: "pads", size: "m" },
+    { id: "pads", size: "l" },
     { id: "scene-grid", size: "m" },
     { id: "midi", size: "s" },
     { id: "history", size: "s" },
@@ -419,14 +419,14 @@ test("parseLayout drops unknown and duplicate ids and repairs a disallowed size"
   ]);
 });
 
-test("compose default is scene-grid l, editor m, pads m, steps l, fx s, history s", () => {
+test("compose default is scene-grid l, editor m, pads l, steps l, fx s, history s", () => {
   const compose = defaultLayout("compose", "laptop");
   const sizes = {};
   for (const row of compose.shown) sizes[row.id] = row.size;
   assert.deepEqual(sizes, {
     "scene-grid": "l",
     editor: "m",
-    pads: "m",
+    pads: "l",
     steps: "l",
     fx: "s",
     history: "s",
@@ -514,7 +514,7 @@ test("hide then show round-trips a widget into the tray and back at the end", ()
   const back = showWidget(hidden, "editor");
   assert.deepEqual(back.shown, [
     { id: "scene-grid", size: "l" },
-    { id: "pads", size: "m" },
+    { id: "pads", size: "l" },
     { id: "steps", size: "l" },
     { id: "fx", size: "s" },
     { id: "history", size: "s" },
@@ -801,4 +801,39 @@ test("parseTemplate holds the version, the layouts table and the size cap", () =
   assert.deepEqual(repaired.layouts["perform.phone"], defaultLayout("perform", "phone"), "a wrong version becomes the default");
   assert.deepEqual(repaired.layouts["perform.tablet"], { v: 1, shown: [{ id: "takes", size: "s" }] }, "each entry goes through parseLayout");
   assert.deepEqual(repaired.layouts["perform.laptop"], defaultLayout("perform", "laptop"), "so does an entry with nothing left to show");
+});
+
+test("the Pads widget defaults to the full row in every mode on a laptop", () => {
+  // The pads' settings sit beside the grid once the widget is wide, so a song
+  // opens with the widget as wide as a laptop row gives it.
+  for (const mode of MODES) {
+    for (const sizeClass of SIZE_CLASSES) {
+      const layout = defaultLayout(mode, sizeClass);
+      const row = layout.shown.find((entry) => entry.id === "pads");
+      assert.ok(row, `${mode}.${sizeClass} shows the pads`);
+      assert.equal(row.size, "l", `${mode}.${sizeClass} gives the pads the full row`);
+    }
+  }
+  assert.equal(columnSpan("l", "laptop"), 12, "a full-size widget is the whole laptop row");
+  // The span table itself is untouched: the pads may still be half a row.
+  assert.deepEqual(WIDGETS.pads.sizes, ["m", "l"], "the pads take half a row or all of it");
+  assert.equal(columnSpan("m", "laptop"), 6, "and half a row is still six columns");
+});
+
+test("a pads size the operator saved is left as saved", () => {
+  // A layout this device already kept is the page the operator gets, whatever
+  // the built-in default says now.
+  const storage = memoryStorage();
+  assert.equal(saveLayout(storage, "song-1", "compose", "laptop", {
+    v: 1,
+    shown: [
+      { id: "scene-grid", size: "l" },
+      { id: "editor", size: "m" },
+      { id: "pads", size: "m" },
+    ],
+  }), true);
+  assert.equal(sizeOf(loadLayout(storage, "song-1", "compose", "laptop"), "pads"), "m", "the saved half row stays half a row");
+
+  const unsaved = loadLayout(memoryStorage(), "song-2", "compose", "laptop");
+  assert.equal(sizeOf(unsaved, "pads"), "l", "a song with nothing saved starts on the full row");
 });

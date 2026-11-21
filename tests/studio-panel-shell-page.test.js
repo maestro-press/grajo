@@ -795,7 +795,7 @@ test("the boot waits for the template, seeds the song from it, and remembers it 
       { id: "rec-lanes", size: "l" },
       { id: "scene-plan", size: "m" },
       { id: "takes", size: "m" },
-      { id: "pads", size: "m" },
+      { id: "pads", size: "l" },
       { id: "scene-grid", size: "m" },
       { id: "midi", size: "s" },
       { id: "history", size: "s" },

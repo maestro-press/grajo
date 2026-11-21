@@ -344,7 +344,10 @@ const STYLES = `
     --st-human: #F2A541; --st-agent: #5DA9F0; --st-danger: #F07A6A;
     background: var(--st-bg); color: var(--st-text);
     border: 1px solid var(--st-line); border-radius: 12px;
-    display: flex; flex-direction: column; gap: 0; overflow: hidden;
+    display: flex; flex-direction: column; gap: 0;
+    /* clip, not hidden: hidden is a scroll container, and a sticky descendant
+       would then stop following the window. */
+    overflow: clip;
     font-family: Inter, system-ui, sans-serif;
   }
   .studio * { box-sizing: border-box; }
@@ -1467,6 +1470,36 @@ const STYLES = `
   .studio .st-import { position: relative; display: inline-flex; align-items: center; }
   .studio .st-file { position: absolute; left: -9999px; width: 1px; height: 1px; opacity: 0; }
   .studio .st-btn.st-on { background: #3D3420; border-color: #5C4A1E; }
+  /* The selected pad's settings sit beside the pads once the Pads widget is wide
+     enough, and under them below that. The question is the widget's OWN width,
+     so the host is the query container: a wide widget on a narrow window still
+     sets the settings beside the grid. Below the threshold the split is a flex
+     column with the host's own 10 px rhythm, which is the stack the widget has
+     always drawn: grid, tools, live bar, settings, each 10 px apart. */
+  .studio [data-role=sampler-pads] { container-type: inline-size; }
+  /* A sticky box follows its nearest scroll container, and the shell clips every
+     widget frame with overflow: hidden — which is one, so a column inside it
+     would stick to the frame and never move. The frame the Pads widget lives in
+     is the shell's own section.st-widget, and here it clips its rounded corner
+     without becoming a scroll container, so the column follows the window. */
+  .studio .st-widget[data-widget=pads] { overflow: clip; }
+  .studio .st-pads-split { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  /* The pads and the tools above the live bar keep the host's own rhythm whether
+     the two columns are side by side or one above the other. */
+  .studio .st-pads-main,
+  .studio .st-pads-side { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  @container (min-width: 760px) {
+    .studio .st-pads-split {
+      display: grid; grid-template-columns: minmax(340px, 520px) minmax(260px, 1fr);
+      gap: 14px; align-items: start;
+    }
+    /* The live bar and the settings follow the page down instead of scrolling
+       out of reach, and are never taller than the window: their own scroll bar
+       is what moves through the pad's settings. */
+    .studio .st-pads-side {
+      position: sticky; top: 8px; max-height: calc(100vh - 16px); overflow: auto;
+    }
+  }
   .studio .st-pad-settings {
     border: 1px solid var(--st-line); border-radius: 10px; background: var(--st-head);
     padding: 10px 12px; display: flex; flex-direction: column; gap: 8px;

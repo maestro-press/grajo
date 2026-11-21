@@ -547,7 +547,7 @@ test("compose mounts its six widgets; perform and record follow the defaults", a
   assert.deepEqual(shownWidgets(b.page), COMPOSE);
   assert.equal(sizeOf(b.page, "scene-grid"), "l");
   assert.equal(sizeOf(b.page, "editor"), "m");
-  assert.equal(sizeOf(b.page, "pads"), "m");
+  assert.equal(sizeOf(b.page, "pads"), "l");
   assert.equal(sizeOf(b.page, "steps"), "l");
   assert.equal(sizeOf(b.page, "fx"), "s");
   assert.equal(sizeOf(b.page, "history"), "s");
@@ -565,7 +565,7 @@ test("compose mounts its six widgets; perform and record follow the defaults", a
   assert.equal(sizeOf(b.page, "rec-lanes"), "l");
   assert.equal(sizeOf(b.page, "scene-plan"), "m");
   assert.equal(sizeOf(b.page, "takes"), "m");
-  assert.equal(sizeOf(b.page, "pads"), "m");
+  assert.equal(sizeOf(b.page, "pads"), "l");
   assert.equal(frame(b.page, "agent").parentNode, b.page.querySelector("[data-role=widget-tray]"));
   assert.deepEqual(trayWidgets(b.page), ["editor", "steps", "chop", "fx", "keyboard", "mixer-strip", "agent"]);
 });
@@ -976,7 +976,7 @@ test("Remove moves a widget to the tray and writes only this song, mode and clas
     [
       { id: "scene-grid", size: "l" },
       { id: "editor", size: "l" },
-      { id: "pads", size: "m" },
+      { id: "pads", size: "l" },
       { id: "steps", size: "l" },
       { id: "fx", size: "s" },
       { id: "history", size: "s" },
@@ -1012,7 +1012,7 @@ test("Reset restores the built-in default and deletes the song key", async () =>
   assert.deepEqual(shownWidgets(b.page), COMPOSE, "the built-in default");
   assert.equal(sizeOf(b.page, "scene-grid"), "l");
   assert.equal(sizeOf(b.page, "editor"), "m");
-  assert.equal(sizeOf(b.page, "pads"), "m");
+  assert.equal(sizeOf(b.page, "pads"), "l");
   assert.equal(sizeOf(b.page, "steps"), "l");
   assert.equal(sizeOf(b.page, "fx"), "s");
   assert.equal(sizeOf(b.page, "history"), "s");
