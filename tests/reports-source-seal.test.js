@@ -417,6 +417,61 @@ test("a settings change after approval does not run", async () => {
   assert.deepEqual(folders, []);
 });
 
+/* ------------------------------------------------- http_json: the owner's User-Agent */
+
+test("a userAgent setting moves the sources hash, and a bot's preview of it is gated", async () => {
+  const db = await freshDb();
+  const { report, deps } = await liveReport(db, { recipe: { blocks: [FEED_BLOCK] } });
+  await approveHostFor(db, report.id);
+
+  const plain = { blocks: [FEED_BLOCK] };
+  const withAgent = {
+    blocks: [{
+      ...FEED_BLOCK,
+      settings: { ...FEED_BLOCK.settings, userAgent: "Example Reader contact@example.com" },
+    }],
+  };
+  assert.equal(sourcesHash(plain, blockRegistry), report.sourcesHash);
+  assert.notEqual(sourcesHash(withAgent, blockRegistry), report.sourcesHash,
+    "the agent is a source setting, so it is inside the sealed sources hash");
+
+  // A bot's save of it may not ride the owner's approval: this is not a free change.
+  const saved = await botSaveRecipe(db, deps, { reportId: report.id, recipe: withAgent });
+  assert.equal(saved.needsGoLive, true);
+  assert.equal(saved.pendingFreeChange, false);
+
+  // And a bot's preview of the changed block reads nothing: the block is waiting for the owner's OK.
+  const urls = [];
+  const preview = await botPreview(db, report.id, deps, fakeFetch(urls));
+  assert.deepEqual(preview.sourceErrors, [waiting("feed")]);
+  assert.deepEqual(urls, [], "no request was made for content the owner never approved");
+});
+
+/* ------------------------------------------- the block log's own advisory code */
+
+test("a run whose model was down records the ai_fallback code in its block log", async () => {
+  const db = await freshDb();
+  const recipe = {
+    blocks: [FEED_BLOCK, { id: "ai1", type: "ai_commentary", settings: {} }],
+  };
+  const report = await prepare(db, { recipe });
+  await updateReportColumns(db, report.id, { ai_commentary: 1 });
+  await approveHostFor(db, report.id);
+  const model = { providerId: "local-chat", model: "m1", locality: "local", baseUrlHost: "127.0.0.1:8013" };
+  const deps = approvalDeps(report, { resolveModelRef: async () => model });
+  await approveGoLive(db, deps, { reportId: report.id, previewRunId: PREVIEW, actor: OWNER });
+
+  const runId = await queueRun(db, report.id, { trigger: "manual", requestedBy: "owner" });
+  const out = await executeRun(db, runDeps(deps, {
+    ...fakeFetch([]),
+    complete: async () => { throw new Error("model down"); },
+  }), runId);
+  assert.equal(out.status, "ok", "a model that is down fails no run");
+  const row = await getRun(db, runId);
+  assert.deepEqual(row.blockLog.sourceErrors, []);
+  assert.deepEqual(row.blockLog.warnings, [{ source: "ai1", message: "ai_fallback" }]);
+});
+
 /* ------------------------------------------------- the mail account rule on a draft */
 
 test("an owner preview of a draft mail_alerts block they wrote reads the report's own sender account", async () => {

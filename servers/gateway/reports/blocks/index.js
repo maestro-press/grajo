@@ -29,10 +29,17 @@
  * prefixes each with the block's path (`blocks[2].field`) so a refusal names what to fix. A registry
  * entry that carries no `validate` (a test's narrow stub registry) only has its `settings` checked for
  * being an object.
+ *
+ * ONE ROLE PER REPORT, AND NO MIXED RECIPE: a model-calling block may name the model role its report
+ * uses (`settings.modelRole`, `role:<id>`). Because a report's live set seals ONE model reference, a
+ * recipe either names the same role on EVERY model-calling block it has, or names none at all: a block
+ * naming another role, and a block naming none beside one that does, are both refused here, on that
+ * block's `modelRole` field. A mixed recipe would otherwise preview against two different models while
+ * sealing one, so it would fail its first live run on `model_changed`.
  */
 import { MODEL_BLOCK_TYPES } from "../recipe-hash.js";
 import { customBlock } from "./custom.js";
-import { aiCommentaryBlock, annotateBlock } from "./present/ai-commentary.js";
+import { aiCommentaryBlock, annotateBlock, modelRoleOfBlock } from "./present/ai-commentary.js";
 import { cardsBlock } from "./present/cards.js";
 import { chartBlock } from "./present/chart.js";
 import { mapBlock } from "./present/map.js";
@@ -198,5 +205,28 @@ export function validateRecipe(recipe, registry = BLOCKS) {
       errors.push(`${path}.settings`);
     }
   });
+  errors.push(...modelRoleConflicts(blocks));
+  return errors;
+}
+
+/**
+ * The one-role rule: a model-calling block that names a role sets THE role for the recipe, and every other
+ * model-calling block in it must name that same role. A block naming another role is refused on its own
+ * `modelRole` field, and so is a block naming none (it would use the report's bot model: a second model,
+ * which the seal has no room for). A recipe with no role named at all is fine: every model block then uses
+ * the report's bot model.
+ */
+function modelRoleConflicts(blocks) {
+  const modelBlocks = [];
+  blocks.forEach((block, index) => {
+    if (!isPlainObject(block) || !MODEL_BLOCK_TYPES.includes(block.type)) return;
+    modelBlocks.push({ index, role: modelRoleOfBlock(block) });
+  });
+  const named = modelBlocks.find((entry) => entry.role);
+  if (!named) return [];
+  const errors = [];
+  for (const entry of modelBlocks) {
+    if (entry.role !== named.role) errors.push(`blocks[${entry.index}].modelRole`);
+  }
   return errors;
 }

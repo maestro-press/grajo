@@ -1276,6 +1276,16 @@ test("each source validate rejects bad settings", () => {
     [httpJsonBlock, { url: "https://example.com", surprise: true }, "surprise"],
     [httpJsonBlock, { url: "https://example.com", credential: { host: "Example.com" } }, "credential.host"],
     [httpJsonBlock, { url: "https://example.com", itemsPath: 5 }, "itemsPath"],
+    [httpJsonBlock, { url: "https://example.com", userAgent: "" }, "userAgent"],
+    [httpJsonBlock, { url: "https://example.com", userAgent: "a\r\nb" }, "userAgent"],
+    [httpJsonBlock, { url: "https://example.com", userAgent: "Example Reader \u00e9" }, "userAgent"],
+    [httpJsonBlock, { url: "https://example.com", userAgent: "a".repeat(121) }, "userAgent"],
+    [httpJsonBlock, { url: "https://example.com", userAgent: "Example\tReader" }, "userAgent"],
+    [httpJsonBlock, { url: "https://example.com", userAgent: "Example\u007fReader" }, "userAgent"],
+    [httpJsonBlock, { url: "https://example.com", userAgent: 7 }, "userAgent"],
+    [httpJsonBlock, { url: "https://example.com", userAgent: " " }, "userAgent"],
+    [httpJsonBlock, { url: "https://example.com", userAgent: " Example Reader" }, "userAgent"],
+    [httpJsonBlock, { url: "https://example.com", userAgent: "Example Reader " }, "userAgent"],
     [rssBlock, {}, "url"],
     [rssBlock, { url: "ftp://example.com/feed.xml" }, "url"],
     [rssBlock, { url: "https://example.com/feed.xml", credential: { host: "example.com" } }, "credential"],
@@ -1308,6 +1318,115 @@ test("each source validate rejects bad settings", () => {
     mailAlertsBlock.validate({ accountId: "ma-1", folder: "INBOX", sinceDays: 7 }),
     [],
   );
+  assert.deepEqual(
+    httpJsonBlock.validate({ url: "https://example.com", userAgent: "Example Reader contact@example.com" }),
+    [],
+  );
+  assert.deepEqual(
+    httpJsonBlock.validate({ url: "https://example.com", userAgent: "a".repeat(120) }),
+    [],
+    "a full-length agent is still a value the block may send",
+  );
+});
+
+/* ---------------------------------------------------- http_json: the owner's User-Agent */
+
+const READER_UA = "Example Reader contact@example.com";
+
+test("http_json sends the owner's User-Agent when one is set, and adds no header when it is not", async () => {
+  const db = await freshDb();
+  const reportId = await reportWithHost(db);
+  const calls = [];
+  const fetch = async (url, request) => { calls.push({ url, request }); return response([]); };
+
+  const plain = await httpJsonBlock.run(blockCtx(
+    { url: "https://example.com/v1/issues" }, { db, report: { id: reportId }, fetch },
+  ), {});
+  assert.deepEqual(plain.items, []);
+  assert.equal(calls[0].request.headers, undefined, "absent, the block adds no header at all");
+
+  const named = await httpJsonBlock.run(blockCtx(
+    { url: "https://example.com/v1/issues", userAgent: READER_UA }, { db, report: { id: reportId }, fetch },
+  ), {});
+  assert.deepEqual(named.items, []);
+  assert.equal(calls[1].request.headers["User-Agent"], READER_UA);
+  assert.deepEqual(Object.keys(calls[1].request.headers), ["User-Agent"], "and nothing else beside it");
+});
+
+test("a credentialed http_json request carries both the credential and the owner's User-Agent", async () => {
+  const db = await freshDb();
+  const reportId = await reportWithCredential(db, { inject: HEADER_RULE });
+  const calls = [];
+  const out = await httpJsonBlock.run(blockCtx({
+    url: "https://example.com/v1/issues", credential: { host: "example.com" }, userAgent: READER_UA,
+  }, {
+    db,
+    report: { id: reportId },
+    fetch: async (url, request) => { calls.push({ url, request }); return response([{ id: "a" }]); },
+  }), {});
+  assert.deepEqual(out.items, [{ id: "a" }]);
+  assert.equal(calls[0].request.headers.Authorization, `Bearer ${SECRET}`);
+  assert.equal(calls[0].request.headers["User-Agent"], READER_UA);
+  assertNoSecret(calls[0].request.headers["User-Agent"], "the owner's own agent");
+});
+
+test("a credential whose secret rides the user-agent header is refused when the owner also sets one", async () => {
+  const db = await freshDb();
+  const agentRule = Object.freeze({
+    header: "user-agent", format: "Reader {}", pathPrefixes: ["/v1/issues"], methods: ["GET"],
+  });
+  const reportId = await reportWithCredential(db, { inject: agentRule });
+  const calls = [];
+  const fetch = async (url, request) => { calls.push({ url, request }); return response([{ id: "a" }]); };
+
+  const both = await httpJsonBlock.run(blockCtx({
+    url: "https://example.com/v1/issues", credential: { host: "example.com" }, userAgent: READER_UA,
+  }, { db, report: { id: reportId }, fetch }), {});
+  assert.equal(both.sourceError.message, "user_agent_conflict", "the two cannot both be sent");
+  assert.deepEqual(calls, [], "nothing reached the network");
+
+  // The same rule without the owner's own agent is fine: there the credential IS the user agent.
+  const alone = await httpJsonBlock.run(blockCtx({
+    url: "https://example.com/v1/issues", credential: { host: "example.com" },
+  }, { db, report: { id: reportId }, fetch }), {});
+  assert.deepEqual(alone.items, [{ id: "a" }]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].request.headers["user-agent"], `Reader ${SECRET}`);
+});
+
+test("the owner's User-Agent rides a same-origin hop and is dropped on a cross-origin one", async () => {
+  const db = await freshDb();
+  const reportId = await makeReport(db);
+  for (const host of ["a.example.com", "b.example.com"]) {
+    await proposeHost(db, deps(), { reportId, host });
+    await approveHost(db, deps(), { reportId, host, actor: OWNER });
+  }
+  const fetch = async (url, request) => {
+    const answer = await guardedRequest(url, { ...request, lookup, isAllowedAddress: allowAll });
+    return { ...answer, content_type: "application/json", buffer: Buffer.from("[]", "utf8") };
+  };
+
+  seen.a.length = 0;
+  const same = await httpJsonBlock.run(blockCtx(
+    { url: `http://a.example.com:${portA}/same`, userAgent: READER_UA }, { db, report: { id: reportId }, fetch },
+  ), {});
+  assert.deepEqual(same.items, []);
+  assert.equal(seen.a.length, 2);
+  assert.equal(seen.a[0].headers["user-agent"], READER_UA, "the first hop carries it");
+  assert.equal(seen.a[1].headers["user-agent"], READER_UA, "a same-origin hop carries it too");
+
+  seen.a.length = 0;
+  seen.b.length = 0;
+  const crossed = await httpJsonBlock.run(blockCtx(
+    { url: `http://a.example.com:${portA}/cross`, userAgent: READER_UA }, { db, report: { id: reportId }, fetch },
+  ), {});
+  assert.deepEqual(crossed.items, []);
+  assert.equal(seen.a.length, 1);
+  assert.equal(seen.a[0].headers["user-agent"], READER_UA);
+  assert.equal(seen.b.length, 1);
+  assert.match(seen.b[0].headers["user-agent"], /Crow-Research/,
+    "a cross-origin hop is sent with the guard's own default agent");
+  assert.notEqual(seen.b[0].headers["user-agent"], READER_UA);
 });
 
 /* ------------------------------------------------------------------------ parseCsv */

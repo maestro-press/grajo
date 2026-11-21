@@ -744,6 +744,36 @@ test("a model-only change pauses with the model sentence", async () => {
   assert.equal(notes.length, 1);
 });
 
+test("a role report whose role now resolves another model pauses with the same model sentence", async () => {
+  const db = await freshDb();
+  const seeded = await seedReport(db, { ai: 1, nextRun: "2026-10-26T07:00:00.000Z" });
+  // The head names a role for its AI block, and the role resolves one model at go-live time.
+  const roleRecipe = {
+    blocks: [{ id: "ai1", type: "ai_commentary", settings: { modelRole: "role:everyday" } }],
+  };
+  const saved = await saveRecipe(db, { reportId: seeded.id, recipe: roleRecipe, authorKind: "owner", registry: REGISTRY });
+  const report = { ...seeded, rev: saved.rev };
+  let current = { providerId: "local-chat", model: "m1", locality: "local", baseUrlHost: "127.0.0.1:8013" };
+  const resolver = async () => current;
+  await approveGoLive(db, approvalsDeps(report, { resolveRoleModelRef: resolver }), {
+    reportId: report.id, previewRunId: "prv-1", actor: OWNER,
+  });
+  const live = await getReport(db, report.id);
+  assert.equal(JSON.parse(live.model_ref).model, "m1", "the role's model was sealed");
+
+  // The role is rebound: the guard pauses on the model path, with the model sentence.
+  current = { ...current, model: "m2" };
+  const hook = registerReportsHook(db, hookDeps(report, {
+    approvals: approvalsDeps(report, { resolveRoleModelRef: resolver }),
+  }));
+  await hook.tick(db);
+  const paused = await getReport(db, report.id);
+  assert.equal(paused.status, "paused");
+  assert.equal(paused.pause_reason,
+    "The bot's model changed (m1 -> m2). Check and go live again.");
+  assert.equal(notes.length, 1);
+});
+
 test("a status flipped back to live after a pause is paused again and never runs", async () => {
   const db = await freshDb();
   const report = await liveReport(db, { nextRun: "2026-10-26T07:00:00.000Z" });

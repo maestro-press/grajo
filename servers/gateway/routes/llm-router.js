@@ -70,6 +70,7 @@ import { requesterTag } from "../requester-tag.js";
 import { ReservedError, readReservation } from "../box-reservation.js";
 import { ServingClassError } from "../models/serving-class.js";
 import { connectTimeout, isTimeoutError, LLM_CONNECT_TIMEOUT_MS } from "../../shared/http-timeout.js";
+import { isLazyLoader } from "../../shared/lazy-loader.js";
 import { extractUsageFromOpenAIResponse, recordUsageEvent } from "../../shared/metering.js";
 import { resolveTenantId } from "../../shared/tenancy.js";
 import { loadProviders } from "../../shared/providers.js";
@@ -760,28 +761,34 @@ async function voiceKeysFor(deps) {
 
 export const resolveVoiceKey = (key) => resolveKey(key);
 
-/** completeText's resolver: resolveKey's answer plus the row's `host` (the
- *  owner check needs it), uncached. */
-async function resolveDirectKey(key) {
+/**
+ * One raw `provider/model` key resolved against the given db client: resolveKey's answer plus the row's
+ * `host` (the owner check needs it), uncached. `resolveKeyFrom(dbc)` is the same resolution bound to a
+ * CALLER'S db, for a caller that must not read the gateway's own: the reports model blocks resolve the
+ * endpoint they were sealed over from the run's db, so a row repointed in between cannot be reached.
+ */
+function resolveKeyFrom(dbc, key) {
   const [providerId, modelId] = splitKey(key);
-  const r = await resolveProviderConfig(db(), providerId, modelId);
-  return {
+  return resolveProviderConfig(dbc, providerId, modelId).then((r) => ({
     baseUrl: (r.baseUrl || r.base_url || "").replace(/\/$/, ""),
     model: r.model || r.modelId || r.model_id || modelId,
     apiKey: r.apiKey || r.api_key || "none",
     host: r.host || "local",
     providerType: r.provider_type || r.providerType || null,
-  };
+  }));
 }
 
-/** Provider kinds that load a model on the first request (a lazy loader is a
- *  model starter): completeText never sends them anything. */
-const LAZY_LOADER_RE = /ollama|llama[-_ ]?swap|lemonade|lm[-_ ]?studio|localai/i;
-/** Ollama's well-known port, for a row whose kind was never recorded. */
-const LAZY_LOADER_PORT_RE = /:11434(\/|$)/;
-export function isLazyLoader(up) {
-  return !!up && (LAZY_LOADER_RE.test(String(up.providerType || "")) || LAZY_LOADER_PORT_RE.test(String(up.baseUrl || "")));
+/** `resolveKeyFrom` bound to one db client: what a caller hands completeText as `resolveKeyFn`. */
+export const resolveDirectKeyFrom = (dbc) => (key) => resolveKeyFrom(dbc, key);
+
+/** completeText's own resolver: the gateway's db, as before. */
+async function resolveDirectKey(key) {
+  return resolveKeyFrom(db(), key);
 }
+
+// The lazy-loader rule lives in servers/shared/lazy-loader.js (the reports approvals path reads it too);
+// re-exported here for this route's callers.
+export { isLazyLoader };
 
 /** completeText's skip: `reason` is a fixed code (box_reserved, lazy_loader, ...). */
 export class CompleteTextSkipped extends Error {

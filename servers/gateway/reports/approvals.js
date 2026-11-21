@@ -23,6 +23,19 @@
  * text, or of either hash column, therefore cannot leave a seal verifying; and the report head is
  * never read for them, so a later save cannot silently re-bless the seal either.
  *
+ * THE MODEL A ROLE NAMES (`modelRole` on an AI block). The live set's sealed `modelRef` is the RESOLVED
+ * reference of that role at go-live time: `liveSetFor` seals what `freshModelRef` resolved a moment
+ * ago, and `freshModelRef` reads the role the sealed revision's own recipe names and resolves it through
+ * `resolveRoleKey` with the loaded role context (asked for a CHAT model: a report's block writes, so an
+ * embed, score or transcription binding is not one), then the provider row behind the key
+ * (the same chain `defaultResolveModelRef` takes for a bot's model). A role that resolves nothing,
+ * resolves to an endpoint that is not on this machine, or resolves to one the completion would refuse
+ * (a lazy loader, a `/llm/v1` door) is `model_unresolved` at go-live: no live set and
+ * nothing sealed. At every later check the role is resolved AGAIN and its reference compared with the
+ * sealed one, so a role rebound to another model (or another endpoint) breaks the seal exactly like a
+ * bot repointed at another model does, and the report pauses on the same path with the same notice. The
+ * block itself never calls a model other than the sealed one (blocks/present/ai-commentary.js).
+ *
  * WHAT THE SEAL DOES NOT COVER, stated here so no reader has to infer it:
  *
  *   - `status` is not a sealed field. A direct `UPDATE reports SET status = 'live'` therefore undoes an
@@ -54,6 +67,9 @@
  *   - `getSchedule(db, report)`: `{cron, tz}` from the report's `schedules` row, or null. The default
  *     also answers null for a disabled row (`enabled = 0`): a switched-off schedule fires nothing.
  *   - `resolveModelRef(db, report)`: `{providerId, model, locality, baseUrlHost}`, or null.
+ *   - `resolveRoleModelRef(db, modelRole)`: the same shape, for a recipe whose AI block names a role
+ *     (`modelRole: "role:<id>"`). It resolves the role NOW, through `resolveRoleKey` and this instance's
+ *     loaded role context. See THE MODEL A ROLE NAMES below.
  *   - `senderReady(db, accountId)`: whether that Crow Mail account can send right now. Nothing is
  *     injected by default and the default answers false (fail closed): the real reader lives in
  *     `reports/sender-ready.js`, which the routes inject, because this module imports nothing under
@@ -77,7 +93,7 @@
  * kinds in seal.js and no approval path here yet.
  */
 import { randomBytes } from "node:crypto";
-import { canonicalJson, recipeCallsModel, recipeHash, sourcesHash } from "./recipe-hash.js";
+import { MODEL_BLOCK_TYPES, canonicalJson, recipeCallsModel, recipeHash, sourcesHash } from "./recipe-hash.js";
 import { blockRegistry } from "./blocks/index.js";
 import { approvalSeal, newApprovalNonce, verifyApprovalSeal } from "./seal.js";
 import { getReport, getRevision, recordAudit, saveRecipe, updateReportColumns } from "./store.js";
@@ -86,6 +102,8 @@ import { resolveProviderConfig } from "../ai/resolve-profile.js";
 import { getSecretValues } from "../../shared/secret-values.js";
 import { redactSecrets } from "../../shared/redact-secrets.js";
 import { isLocallyOrchestratable } from "../../shared/locality.js";
+import { isLazyLoader } from "../../shared/lazy-loader.js";
+import { isDoorUrl } from "../models/door-resolve.js";
 
 /* ------------------------------------------------------------------------ the words */
 
@@ -335,21 +353,11 @@ async function botModelKey(db, botId) {
 }
 
 /**
- * Resolve the model a report's bot would run with, the way a chat request resolves one: the bot's
- * stored key, then the provider row behind it (a DB row first, then models.json), then the locality of
- * that endpoint. The host is sealed too, so a provider repointed from one cloud endpoint to another
- * under the same id changes the live set.
- *
- * The chain is four existing accessors rather than one: `pi_bot_defs.definition.models.default` (the
- * key every gateway panel reads), `resolveRole` (model-roles-store.js, for a `role:` key),
- * `resolveProviderConfig` (ai/resolve-profile.js, the same resolver /llm/v1 uses) and
- * `isLocallyOrchestratable` (shared/locality.js). There is no single bot-model accessor in the
- * gateway; a caller that wants a different chain injects `resolveModelRef`, and the production
- * callers take this one through `buildApprovalsDeps` (reports/approvals-deps.js).
+ * The provider row behind a key, and the reference a seal carries for it: the same read, so a caller that
+ * has to judge the ENDPOINT (not only its locality or host) never resolves the row twice.
+ * Null when the key is not a key, or no provider row can be read for it.
  */
-export async function defaultResolveModelRef(db, report) {
-  const key = await botModelKey(db, report?.bot_id);
-  if (!key) return null;
+async function providerForKey(db, key) {
   const { providerId, model } = splitKey(key);
   if (!providerId || !model) return null;
   let config;
@@ -360,11 +368,115 @@ export async function defaultResolveModelRef(db, report) {
   }
   const baseUrl = text(config?.baseUrl);
   return {
-    providerId,
-    model: text(config?.model) || model,
-    locality: isLocallyOrchestratable({ baseUrl }) ? "local" : "cloud",
-    baseUrlHost: hostOf(baseUrl),
+    baseUrl,
+    providerType: text(config?.provider_type || config?.providerType),
+    ref: {
+      providerId,
+      model: text(config?.model) || model,
+      locality: isLocallyOrchestratable({ baseUrl }) ? "local" : "cloud",
+      baseUrlHost: hostOf(baseUrl),
+    },
   };
+}
+
+/**
+ * A raw `provider/model` key as the resolved reference every seal carries
+ * (`{providerId, model, locality, baseUrlHost}`): the provider row behind the key (a DB row first,
+ * then models.json), then the locality of that endpoint. The host is sealed too, so a provider
+ * repointed from one cloud endpoint to another under the same id changes the live set. Null when the
+ * key is not a key, or no provider row can be read for it.
+ */
+async function modelRefForKey(db, key) {
+  const found = await providerForKey(db, key);
+  return found ? found.ref : null;
+}
+
+/**
+ * Resolve the model a report's bot would run with, the way a chat request resolves one: the bot's
+ * stored key, then the provider row behind it. A bot whose stored key is a `role:<id>` is resolved
+ * through this instance's bindings first (the same resolver a bot's session uses).
+ *
+ * The chain is a few existing accessors rather than one: `pi_bot_defs.definition.models.default` (the
+ * key every gateway panel reads), `resolveRole` (model-roles-store.js, for a `role:` key),
+ * `resolveProviderConfig` (ai/resolve-profile.js, the same resolver /llm/v1 uses) and
+ * `isLocallyOrchestratable` (shared/locality.js). There is no single bot-model accessor in the
+ * gateway; a caller that wants a different chain injects `resolveModelRef`, and the production
+ * callers take this one through `buildApprovalsDeps` (reports/approvals-deps.js).
+ */
+export async function defaultResolveModelRef(db, report) {
+  const key = await botModelKey(db, report?.bot_id);
+  if (!key) return null;
+  return modelRefForKey(db, key);
+}
+
+/** The prefix a recipe's `modelRole` setting carries: the one vocabulary model-roles.js owns. */
+const ROLE_PREFIX = "role:";
+
+let roleModules = null;
+
+/** The two role modules, loaded on first use so the approvals module never costs a boot its roles. */
+function loadRoleModules() {
+  if (!roleModules) {
+    roleModules = Promise.all([
+      import("../../shared/model-roles.js"),
+      import("../../shared/model-roles-store.js"),
+    ]).then(([roles, store]) => ({ roles, store }));
+  }
+  return roleModules;
+}
+
+/**
+ * The reference a model role names NOW: `role:<id>` -> its chain (`resolveRoleKey`, over this
+ * instance's loaded role context, asked for a CHAT model) -> the raw `provider/model` it resolves to ->
+ * the provider row behind it. The same shape `defaultResolveModelRef` answers, so a seal made over a
+ * role's reference compares with a bot's the same way. Null when the role resolves nothing (unbound,
+ * unknown, unconfigured, foreign, a class or capability refusal), when no provider row can be read for
+ * what it does resolve, or when that row is an endpoint the completion itself refuses (a lazy loader
+ * that would load its model on the first request, or a `/llm/v1` door: `isLazyLoader`, `isDoorUrl`).
+ *
+ * This is what `liveSetFor` seals for a recipe whose AI block names a role, and what the block and every
+ * later verification resolve again to compare with the sealed reference.
+ */
+export async function defaultResolveRoleModelRef(db, modelRole) {
+  if (typeof modelRole !== "string" || !modelRole.startsWith(ROLE_PREFIX)) return null;
+  let key = null;
+  try {
+    const { roles, store } = await loadRoleModules();
+    const ctx = await store.loadRoleContext(db);
+    // `need: "chat"`: a report's block asks a model to WRITE, so a role bound to an embedding, re-rank or
+    // transcription model is not a model this report may use, whatever capability the role itself declares.
+    const resolved = roles.resolveRoleKey(modelRole, { ...ctx, need: "chat" });
+    key = resolved && typeof resolved.key === "string" && resolved.key ? resolved.key : null;
+  } catch {
+    return null;
+  }
+  if (!key) return null;
+  const found = await providerForKey(db, key);
+  if (!found) return null;
+  // The completion refuses both of these, so a report sealed over one could never run: refused here,
+  // where the reference is resolved, so go-live answers `model_unresolved`.
+  if (isLazyLoader({ baseUrl: found.baseUrl, providerType: found.providerType })) return null;
+  if (isDoorUrl(found.baseUrl)) return null;
+  return found.ref;
+}
+
+/**
+ * The role a recipe's AI blocks name, or null. A `modelRole` that does not begin with `role:` is not a
+ * role: it is validated away at save (`blocks/present/ai-commentary.js`), and a value that reached a
+ * stored recipe some other way resolves to nothing rather than silently sealing a different model.
+ * One role per report: `validateRecipe` refuses a recipe naming two different ones.
+ */
+export function modelRoleOfRecipe(recipe) {
+  const blocks = Array.isArray(recipe?.blocks) ? recipe.blocks : [];
+  for (const block of blocks) {
+    if (block == null || typeof block !== "object" || Array.isArray(block)) continue;
+    if (!MODEL_BLOCK_TYPES.includes(block.type)) continue;
+    const settings = block.settings;
+    if (settings == null || typeof settings !== "object" || Array.isArray(settings)) continue;
+    const role = settings.modelRole;
+    if (typeof role === "string" && role.startsWith(ROLE_PREFIX)) return role;
+  }
+  return null;
 }
 
 /**
@@ -395,6 +507,7 @@ function resolveDeps(deps) {
     getRun: fn("getRun", defaultGetRun),
     getSchedule: fn("getSchedule", defaultGetSchedule),
     resolveModelRef: fn("resolveModelRef", defaultResolveModelRef),
+    resolveRoleModelRef: fn("resolveRoleModelRef", defaultResolveRoleModelRef),
     senderReady: fn("senderReady", defaultSenderReady),
     getSecrets: fn("getSecrets", defaultGetSecrets),
     // The block registry is the server's own; a caller may narrow it, and an explicit null still means
@@ -495,6 +608,10 @@ function idField(value) {
  * moment ago). Every other writer passes none of them: a re-stamp seals the live set it just verified,
  * so it neither re-reads the schedule nor resolves the model again.
  *
+ * `modelRef` is the sealed model reference: for a recipe whose AI block names a role, the RESOLVED
+ * reference of that role at go-live time (`{providerId, model, locality, baseUrlHost}`, see THE MODEL A
+ * ROLE NAMES in the header), and otherwise the bot's own model as before.
+ *
  * @param {object} db
  * @param {object} [deps]
  * @param {object} report a report row
@@ -537,9 +654,15 @@ export async function liveSetFor(db, deps, report, overrides = {}) {
 }
 
 /**
- * The model reference a revision needs, resolved afresh: "" when that recipe calls no model,
- * otherwise the canonical text of what `deps.resolveModelRef` answers now. Null when the recipe needs a
- * model and none resolved.
+ * The model reference a revision needs, resolved afresh: "" when that recipe calls no model, otherwise
+ * the canonical text of what the recipe's own model answers now. Null when the recipe needs a model and
+ * none resolved.
+ *
+ * WHICH MODEL: a recipe whose AI block names a role (`modelRole: "role:<id>"`) is resolved through
+ * `deps.resolveRoleModelRef` (the role, through `resolveRoleKey` with the loaded role context), and one
+ * that names none through `deps.resolveModelRef` (the report's bot). A role that resolves to an endpoint
+ * that is not on this machine is `model_unresolved` here too: it is the same rule a preview applies, and
+ * a report may not go live on a model nowhere near this box.
  */
 async function freshModelRef(db, deps, report, revision) {
   if (!revision) return "";
@@ -550,9 +673,14 @@ async function freshModelRef(db, deps, report, revision) {
     return null;
   }
   if (!callsModel(recipe, report.ai_commentary)) return "";
-  const resolved = await deps.resolveModelRef(db, report);
+  const modelRole = modelRoleOfRecipe(recipe);
+  const resolved = modelRole
+    ? await deps.resolveRoleModelRef(db, modelRole)
+    : await deps.resolveModelRef(db, report);
   const ref = modelRefText(resolved);
-  return ref === "" ? null : ref;
+  if (ref === "") return null;
+  if (modelRole && modelRefLocality(resolved) !== "local") return null;
+  return ref;
 }
 
 /**

@@ -10,10 +10,13 @@
  * model through `approvals.resolveModelRef`, and with no resolver injected it named the new model as
  * "unavailable" in the sentence the owner reads.
  *
- * So the three real readers are the base:
+ * So the three real readers are the base (plus the role reader, so a report whose AI block names a
+ * `role:<id>` can name the model it resolves to in the model-change sentence):
  *   - `senderReady`: reports/sender-ready.js, the Crow Mail account read.
  *   - `getRun`: reports/run.js's `getRunForApproval`, the run table's reader.
  *   - `resolveModelRef`: approvals.js's own `defaultResolveModelRef`, the bot's model chain.
+ *   - `resolveRoleModelRef`: approvals.js's own `defaultResolveRoleModelRef`, the role a recipe's AI
+ *     block names.
  * `registry` is the base too, and it is `blocks/index.js`'s `blockRegistry`: the block registry the
  * server's own save, seal and verification paths all read. A caller that passes its own still wins.
  * Anything a caller passes in `overrides` wins (`loadSeed`, `now`, `getSchedule`, `registry`,
@@ -22,7 +25,7 @@
  * A member that is absent, or is not a function, falls back to the real reader: `{senderReady:
  * undefined}` is a caller saying nothing, not a caller switching the seam off.
  */
-import { defaultResolveModelRef } from "./approvals.js";
+import { defaultResolveModelRef, defaultResolveRoleModelRef } from "./approvals.js";
 import { blockRegistry } from "./blocks/index.js";
 import { getRunForApproval } from "./run.js";
 import { senderReady } from "./sender-ready.js";
@@ -39,12 +42,14 @@ export function buildApprovalsDeps(overrides = {}) {
     senderReady,
     getRun: getRunForApproval,
     resolveModelRef: defaultResolveModelRef,
+    resolveRoleModelRef: defaultResolveRoleModelRef,
     registry: blockRegistry,
     ...given,
   };
   if (typeof deps.senderReady !== "function") deps.senderReady = senderReady;
   if (typeof deps.getRun !== "function") deps.getRun = getRunForApproval;
   if (typeof deps.resolveModelRef !== "function") deps.resolveModelRef = defaultResolveModelRef;
+  if (typeof deps.resolveRoleModelRef !== "function") deps.resolveRoleModelRef = defaultResolveRoleModelRef;
   if (deps.registry == null) deps.registry = blockRegistry;
   return deps;
 }

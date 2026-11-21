@@ -2,7 +2,7 @@
  * The `http_json` block: one JSON document from one host the owner approved, and the array of items
  * inside it.
  *
- * Settings: `{url, method: "GET", itemsPath?, credential?: {host}}`.
+ * Settings: `{url, method: "GET", itemsPath?, credential?: {host}, userAgent?}`.
  *   - `method` is GET and nothing else. A report reads; it never writes to a site.
  *   - `itemsPath` is a dotted path to the array (`data.items`), and an empty or absent path means the
  *     document itself is the array. A plain object in the array is an item; anything else (a string, a
@@ -10,6 +10,18 @@
  *     At most `MAX_ITEMS` items are kept.
  *   - `credential: {host}` names the site the report's approved credential binding belongs to. It sends
  *     a secret, so it is also the block's strictest path (below).
+ *   - `userAgent` is the `User-Agent` this request sends instead of the guarded request's own default. It
+ *     is plain text the owner typed: printable ASCII, 1 to 120 characters, no leading or trailing
+ *     whitespace and not whitespace only, and no control character (so no
+ *     line break can be spliced into a header). It is NEVER defaulted here: absent means the guard's own
+ *     default agent, byte for byte what this block sent before the setting existed. It rides EVERY request
+ *     the block makes, credentialed or not, through the guarded request's `headers` option, which carries
+ *     a caller's headers on the first hop and on later hops only while they stay on the same origin: a
+ *     redirect that crosses to another origin is sent with the default agent, the guard's own rule (see
+ *     servers/shared/fetch-page.js). It is a source setting like the URL, so it is inside the sealed
+ *     `sourcesHash`: changing it needs the owner's tap. A credential rule that attaches its secret to the
+ *     `user-agent` header itself (in any case) is a conflict this setting cannot win: the request is
+ *     refused with `user_agent_conflict` and nothing is sent.
  *
  * THE HOST IS CHECKED BEFORE ANYTHING ELSE, AND ON EVERY HOP: the report's approved and verified host
  * rows are read ONCE before the request, and the URL's host must be on that list, or the block answers
@@ -82,7 +94,19 @@ export const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 /** The milliseconds one response may take, every hop and every body read included. */
 export const REQUEST_TIMEOUT_MS = 15000;
 
-const SETTING_KEYS = new Set(["url", "method", "itemsPath", "credential"]);
+const SETTING_KEYS = new Set(["url", "method", "itemsPath", "credential", "userAgent"]);
+
+/**
+ * A `User-Agent` the owner may set: printable ASCII (0x20 to 0x7e) only, 1 to 120 characters, no leading
+ * or trailing whitespace and not whitespace only. CR, LF and
+ * every other control character are refused here, so no value can splice a second header line.
+ */
+const USER_AGENT_RE = /^[\x20-\x7e]{1,120}$/;
+
+/** Is this a User-Agent this block may send? The shape above, and the value is the words it reads as. */
+function userAgentOk(value) {
+  return typeof value === "string" && USER_AGENT_RE.test(value) && value.trim() === value;
+}
 
 /** A lower-case host name with at least two labels: the shape a credential binds. */
 const HOST_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/;
@@ -398,6 +422,9 @@ function validate(settings) {
   if (!httpUrlOf(settings.url)) errors.push("url");
   if (settings.method !== undefined && settings.method !== "GET") errors.push("method");
   if (settings.itemsPath !== undefined && typeof settings.itemsPath !== "string") errors.push("itemsPath");
+  if (settings.userAgent !== undefined) {
+    if (!userAgentOk(settings.userAgent)) errors.push("userAgent");
+  }
   if (settings.credential !== undefined) {
     const credential = settings.credential;
     if (!isPlainObject(credential)) {
@@ -459,6 +486,12 @@ async function credentialFor(ctx, url, host, rawPathname) {
   return { code: "credential_not_allowed" };
 }
 
+/** Does this resolved credential attach its secret to the `user-agent` header, in any case? */
+function credentialSendsAgent(credential) {
+  return isPlainObject(credential?.headers)
+    && Object.keys(credential.headers).some((name) => name.toLowerCase() === "user-agent");
+}
+
 async function run(ctx, input) {
   const settings = isPlainObject(ctx.block?.settings) ? ctx.block.settings : {};
   const secrets = [];
@@ -473,6 +506,7 @@ async function run(ctx, input) {
   if (!hostOk(url)) return refuse("host_unapproved");
 
   const host = url.hostname.replace(/^\[|\]$/g, "");
+  const userAgent = typeof settings.userAgent === "string" ? settings.userAgent : "";
   let requestUrl = url;
   let headers = null;
   let credential = null;
@@ -482,14 +516,23 @@ async function run(ctx, input) {
     }
     credential = await credentialFor(ctx, url, host, rawPathOf(settings.url));
     if (credential.code) return refuse(credential.code);
+    // The owner's own agent and a credential whose secret rides the `user-agent` header (in any case)
+    // cannot both be sent: one of the two would silently replace the other, so neither is. Refused here,
+    // before the claim, so a refused request spends nothing.
+    if (userAgent && credentialSendsAgent(credential)) return refuse("user_agent_conflict");
     // The rule is resolved and allowed, so this request really is one of the day's extra step runs: the
     // run's claim is taken here and nowhere earlier, so a refused credential spends nothing. A claim
     // that finds the cap used up throws `cap_reached`, which the executor records against this block.
     if (typeof ctx?.extraStepClaim === "function") await ctx.extraStepClaim();
     if (credential.secret) secrets.push(...secretForms(credential.secret));
-    if (credential.headers) headers = credential.headers;
+    if (credential.headers) headers = { ...credential.headers };
     if (credential.url) requestUrl = credential.url;
   }
+
+  // The owner's own agent, when the owner set one, on every request this block makes. It is applied
+  // after the credential's header so a setting the owner approved is what the site is told, and the
+  // guard carries it on the first hop and on same-origin hops only. Absent, the guard's default is sent.
+  if (userAgent) headers = { ...(headers || {}), "User-Agent": userAgent };
 
   // What the credential sent may not come back: every spelling of it, and the header value itself.
   const echoed = credential && credential.secret

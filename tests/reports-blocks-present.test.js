@@ -9,7 +9,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -24,7 +24,7 @@ const MASTER = join(root, "master", "crow.db");
 const WORKSPACE = join(root, "workspace");
 
 const { createDbClient } = await import("../servers/db.js");
-const { createReport, getReport, saveRecipe, stampAuthoredBy } = await import(
+const { createReport, getReport, saveRecipe, stampAuthoredBy, updateReportColumns } = await import(
   "../servers/gateway/reports/store.js");
 const { canonicalJson, recipeHash } = await import("../servers/gateway/reports/recipe-hash.js");
 const { runRecipe } = await import("../servers/gateway/reports/blocks/run-recipe.js");
@@ -33,6 +33,10 @@ const { tableBlock } = await import("../servers/gateway/reports/blocks/present/t
 const { addUsage, getUsage } = await import("../servers/gateway/reports/caps.js");
 const { markdownBlocks } = await import("../servers/blog/renderer.js");
 const { Marked } = await import("marked");
+const { validateRecipe } = await import("../servers/gateway/reports/blocks/index.js");
+const {
+  AI_FALLBACK_ELLIPSIS, AI_FALLBACK_HEADING, AI_FALLBACK_NOTE, AI_FALLBACK_TITLE_MAX, fallbackMarkdown,
+} = await import("../servers/gateway/reports/blocks/present/ai-commentary.js");
 
 // The artifacts renderer's document options, so "is this still a link" is the renderer's answer.
 const md = new Marked({ gfm: true, breaks: true });
@@ -148,13 +152,14 @@ async function freshDb() {
 /**
  * Run one recipe through the executor: the real `workspace_file` source first (the temp CSV), then the
  * blocks under test. The model seams are injected, so a block that reached a model would be visible.
+ * `run` overrides the run row's own fields (its `trigger` is what makes a run a preview).
  */
-function runBlocks(blocks, { report = {}, live = null, deps = {}, path = CSV } = {}) {
+function runBlocks(blocks, { report = {}, live = null, deps = {}, path = CSV, run = {} } = {}) {
   const recipe = { blocks: [{ id: "src", type: "workspace_file", settings: { path } }, ...blocks] };
   return runRecipe(null, { testSeams: true, workspaceDirFor: () => WORKSPACE, ...deps }, {
     report: { id: "rpt-0000000000000000", title: "Weekly listings", ...report },
     recipe,
-    run: { id: "rrn-0000000000000000", trigger: "manual", startedAt: T0, createdAt: T0 },
+    run: { id: "rrn-0000000000000000", trigger: "manual", startedAt: T0, createdAt: T0, ...run },
     live,
   });
 }
@@ -662,7 +667,8 @@ test("a caller's completion counts only under the test flag", async () => {
     live: { modelRef: JSON.stringify(odd), tz: "UTC" },
   });
   assert.equal(calls, 0, "a caller cannot replace the model a report is sealed to");
-  assert.deepEqual(out.warnings, [{ source: "ai1", message: "model_failed" }]);
+  assert.deepEqual(out.warnings, [{ source: "ai1", message: "ai_fallback" }],
+    "the production completion refused the reference, so the templated fallback is written");
 });
 
 test("a model call that fails still adds its time to the day's bot minutes", async () => {
@@ -687,7 +693,7 @@ test("a model call that fails still adds its time to the day's bot minutes", asy
     run: { id: "rrn-0000000000000003", trigger: "manual", startedAt: T0, createdAt: T0 },
     live: { modelRef: JSON.stringify(MODEL), tz: "UTC" },
   });
-  assert.deepEqual(out.warnings, [{ source: "ai1", message: "model_failed" }]);
+  assert.deepEqual(out.warnings, [{ source: "ai1", message: "ai_fallback" }]);
   const usage = await getUsage(db, id, "2023-11-14");
   assert.ok(usage.botMs > 0, "a call that failed still spent its time");
 });
@@ -804,6 +810,429 @@ test("a bot text block's heading is a bold paragraph, an owner's is a heading", 
     { id: "t1", type: "text", authoredBy: "owner", settings: { heading: "Week one", content: "Body." } },
   ]);
   assert.match(owner.sections[0].markdown, /^## Week one$/m, "an owner's heading is a real heading");
+});
+
+/* ------------------------------------------------- the model role a block names, and the fallback */
+
+const ROLE = "role:finance";
+const ROLE_MODEL = Object.freeze({
+  providerId: "local-chat", model: "m1", locality: "local", baseUrlHost: "127.0.0.1:8013",
+});
+const OTHER_ROLE_MODEL = Object.freeze({
+  providerId: "local-chat", model: "m2", locality: "local", baseUrlHost: "127.0.0.1:8013",
+});
+
+/** A role seam that records every role it was asked about and answers `ref`. */
+function roleSeam(ref, asked = []) {
+  return { resolveRoleModelRef: async (_db, role) => { asked.push(role); return ref; } };
+}
+
+test("a model that is down writes the automatic summary and its note, and the run goes on", async () => {
+  let calls = 0;
+  const deps = {
+    approvals: { resolveModelRef: async () => MODEL },
+    complete: async () => { calls += 1; throw Object.assign(new Error("model down"), { code: "ECONNREFUSED" }); },
+  };
+  const out = await runBlocks([
+    { id: "t1", type: "table", settings: { columns: ["title"] } },
+    { id: "ai1", type: "ai_commentary", settings: {} },
+  ], { deps, report: { ai_commentary: 1 }, live: { modelRef: JSON.stringify(MODEL), tz: "UTC" } });
+  assert.equal(calls, 1, "the call was attempted");
+  assert.deepEqual(out.sourceErrors, [], "a model that is down is not a source error");
+  assert.deepEqual(out.warnings, [{ source: "ai1", message: "ai_fallback" }]);
+  const section = out.sections.find((entry) => entry.type === "ai_commentary");
+  assert.ok(section, "the AI section slot is filled, with the automatic summary");
+  assert.ok(section.markdown.startsWith(`**${AI_FALLBACK_HEADING}**`));
+  assert.ok(section.markdown.includes("2 items, 0 new."), "the run's own counts");
+  assert.ok(section.markdown.endsWith(AI_FALLBACK_NOTE), "the honest note closes it");
+  assert.deepEqual(out.sections.at(-1), section, "the fallback is an AI section, so it sits last");
+});
+
+test("a skipped completion (a lazy loader or a reserved box) also writes the automatic summary", async () => {
+  const skipped = Object.assign(new Error("completeText: skipped, lazy_loader"), { reason: "lazy_loader" });
+  const out = await runBlocks([{ id: "ai1", type: "ai_commentary", settings: {} }], {
+    deps: { approvals: { resolveModelRef: async () => MODEL }, complete: async () => { throw skipped; } },
+    report: { ai_commentary: 1 },
+    live: { modelRef: JSON.stringify(MODEL), tz: "UTC" },
+  });
+  assert.deepEqual(out.warnings, [{ source: "ai1", message: "ai_fallback" }]);
+  assert.ok(out.sections[0].markdown.endsWith(AI_FALLBACK_NOTE));
+});
+
+test("the automatic summary carries only escaped item text, one line per title", async () => {
+  writeFileSync(join(WORKSPACE, "unsafe-titles.json"), JSON.stringify([
+    { title: `See [the note](https://example.net/x)\nand more`, link: ANSWER_URL },
+    { title: "www.evil.example", link: ANSWER_URL },
+    { title: "x@evil.example" },
+    { body: "no title field, so its first string field", _diff: "changed" },
+    { title: "fifth" },
+    { title: "sixth is past the cap" },
+  ]), "utf8");
+  const out = await runBlocks([{ id: "ai1", type: "ai_commentary", settings: {} }], {
+    deps: { approvals: { resolveModelRef: async () => MODEL }, complete: async () => { throw new Error("down"); } },
+    report: { ai_commentary: 1 },
+    live: { modelRef: JSON.stringify(MODEL), tz: "UTC" },
+    path: "unsafe-titles.json",
+  });
+  const markdown = out.sections[0].markdown;
+  assert.deepEqual(linkTokens(markdown), [], "no item title becomes a link");
+  assert.deepEqual(headingTokens(markdown), [], "and none becomes a heading");
+  assert.ok(markdown.includes("https&#58;//example.net/x"), "the title's URL is written as inert text");
+  const bullet = markdown.split("\n").filter((line) => line.startsWith("- "));
+  assert.equal(bullet.length, 5, "five titles, the sixth past the cap");
+  assert.match(bullet[0], /and more$/, "the title's line break is flattened, so it stays one line");
+  assert.ok(bullet.includes("- www&#46;evil.example"), "a www host does not autolink");
+  assert.ok(bullet.includes("- x&#64;evil.example"), "nor does an e-mail address");
+  assert.ok(markdown.includes("- no title field, so its first string field"),
+    "a title-less item shows its first string field, never its _diff marker");
+  assert.ok(!markdown.includes("sixth is past the cap"));
+  assert.ok(markdown.startsWith(`**${AI_FALLBACK_HEADING}**`));
+  assert.ok(markdown.endsWith(AI_FALLBACK_NOTE));
+});
+
+test("the automatic summary counts the diff markers when a diff block ran", async () => {
+  const markdown = fallbackMarkdown([
+    { title: "one", _diff: "new" },
+    { title: "two", _diff: "changed" },
+    { title: "three", _diff: "same" },
+    { title: "gone-key", _diff: "gone" },
+  ]);
+  assert.ok(markdown.includes("4 items, 1 new."));
+  assert.ok(markdown.includes("new 1, changed 1, gone 1."));
+  assert.ok(!fallbackMarkdown([{ title: "no diff block ran" }]).includes("gone"),
+    "a run with no diff marker says nothing about a diff");
+});
+
+test("the day's cap and the AI column produce no automatic summary either", async () => {
+  const db = await freshDb();
+  const { id } = await createReport(db, { projectId: PROJECT, owner: "owner", title: "Listings" });
+  const report = await getReport(db, id);
+  await addUsage(db, { reportId: id, day: "2023-11-14", botMs: 30 * 60_000 });
+  let calls = 0;
+  const capped = await runRecipe(db, {
+    testSeams: true,
+    workspaceDirFor: () => WORKSPACE,
+    now: () => T0,
+    approvals: { resolveModelRef: async () => MODEL },
+    complete: async () => { calls += 1; return "never"; },
+  }, {
+    report: { ...report, ai_commentary: 1 },
+    recipe: {
+      blocks: [
+        { id: "src", type: "workspace_file", settings: { path: CSV } },
+        { id: "ai1", type: "ai_commentary", settings: {} },
+      ],
+    },
+    run: { id: "rrn-0000000000000011", trigger: "manual", startedAt: T0, createdAt: T0 },
+    live: { modelRef: JSON.stringify(MODEL), tz: "UTC" },
+  });
+  assert.equal(calls, 0);
+  assert.deepEqual(capped.warnings, [{ source: "ai1", message: "cap_reached" }],
+    "the cap is the one code, not a fallback beside it");
+  assert.ok(!capped.sections.some((section) => section.type === "ai_commentary"));
+
+  const off = await runBlocks([{ id: "ai1", type: "ai_commentary", settings: {} }], {
+    report: { ai_commentary: 0 },
+    deps: { approvals: { resolveModelRef: async () => MODEL }, complete: async () => { throw new Error("down"); } },
+  });
+  assert.deepEqual(off.warnings, [], "the column off means nothing at all, not even a fallback");
+  assert.deepEqual(off.sections, []);
+});
+
+test("a block that names a role uses the role's model, and a role that moved stops the run", async () => {
+  const asked = [];
+  let calls = 0;
+  const preview = await runBlocks([{ id: "ai1", type: "ai_commentary", settings: { modelRole: ROLE } }], {
+    report: { ai_commentary: 1 },
+    deps: {
+      approvals: roleSeam(ROLE_MODEL, asked),
+      complete: async ({ modelRef }) => { calls += 1; return `model ${JSON.parse(modelRef).model}`; },
+    },
+  });
+  assert.deepEqual(asked, [ROLE], "the block resolved the role the recipe named");
+  assert.equal(calls, 1);
+  assert.equal(preview.sections.at(-1).markdown, "model m1", "the role's model answered");
+
+  // The report is live, sealed over the role's reference: the same role answers the same model.
+  const live = await runBlocks([{ id: "ai1", type: "ai_commentary", settings: { modelRole: ROLE } }], {
+    report: { ai_commentary: 1 },
+    live: { modelRef: JSON.stringify(ROLE_MODEL), tz: "UTC" },
+    deps: { approvals: roleSeam(ROLE_MODEL), complete: async () => "still the sealed model" },
+  });
+  assert.equal(live.sections.at(-1).markdown, "still the sealed model");
+
+  // The role now resolves another model: the run stops, exactly like a model switch.
+  let refused = 0;
+  await assert.rejects(() => runBlocks([
+    { id: "ai1", type: "ai_commentary", settings: { modelRole: ROLE } },
+  ], {
+    report: { ai_commentary: 1 },
+    live: { modelRef: JSON.stringify(ROLE_MODEL), tz: "UTC" },
+    deps: { approvals: roleSeam(OTHER_ROLE_MODEL), complete: async () => { refused += 1; return "never"; } },
+  }), (err) => err.code === "model_changed");
+  assert.equal(refused, 0, "nothing reached a model");
+});
+
+test("a role that resolves no model writes the automatic summary on a preview", async () => {
+  let calls = 0;
+  const out = await runBlocks([{ id: "ai1", type: "ai_commentary", settings: { modelRole: ROLE } }], {
+    report: { ai_commentary: 1 },
+    deps: { approvals: roleSeam(null), complete: async () => { calls += 1; return "never"; } },
+  });
+  assert.equal(calls, 0, "an unresolved role sends nothing to a model");
+  assert.deepEqual(out.warnings, [{ source: "ai1", message: "ai_fallback" }]);
+  assert.ok(out.sections[0].markdown.endsWith(AI_FALLBACK_NOTE));
+
+  // A live report whose SEAL names no model is still the hard stop it always was.
+  await assert.rejects(() => runBlocks([
+    { id: "ai1", type: "ai_commentary", settings: { modelRole: ROLE } },
+  ], {
+    report: { ai_commentary: 1 },
+    live: { modelRef: "", tz: "UTC" },
+    deps: { approvals: roleSeam(null), complete: async () => "never" },
+  }), (err) => err.code === "model_unresolved");
+});
+
+test("a preview may not send the items to a role that is not on this machine", async () => {
+  const cloud = { providerId: "cloud-chat", model: "m", locality: "cloud", baseUrlHost: "api.example.com" };
+  let calls = 0;
+  await assert.rejects(() => runBlocks([
+    { id: "ai1", type: "ai_commentary", settings: { modelRole: ROLE } },
+  ], {
+    report: { ai_commentary: 1 },
+    deps: { approvals: roleSeam(cloud), complete: async () => { calls += 1; return "never"; } },
+  }), (err) => err.code === "model_not_local");
+  assert.equal(calls, 0);
+});
+
+test("an endpoint repointed between the seal check and the call is refused", async () => {
+  const sealed = Object.freeze({
+    providerId: "sealed-chat", model: "m1", locality: "local", baseUrlHost: "127.0.0.1:8999",
+  });
+  const asked = [];
+  const repointed = {
+    baseUrl: "https://api.example-cloud.test/v1", model: "m1", apiKey: "none", host: "cloud", providerType: null,
+  };
+  await assert.rejects(() => runBlocks([{ id: "ai1", type: "ai_commentary", settings: {} }], {
+    report: { ai_commentary: 1 },
+    live: { modelRef: JSON.stringify(sealed), tz: "UTC" },
+    deps: {
+      approvals: {
+        resolveModelRef: async () => sealed,
+        resolveEndpoint: async (key) => { asked.push(key); return repointed; },
+      },
+    },
+  }), (err) => err.code === "model_changed");
+  assert.deepEqual(asked, ["sealed-chat/m1"], "the endpoint was resolved once, from the run's own db seam");
+
+  // The host the seal carries, on an endpoint this machine does not orchestrate: refused on the same path.
+  const remote = Object.freeze({
+    providerId: "sealed-chat", model: "m1", locality: "local", baseUrlHost: "api.example.com",
+  });
+  await assert.rejects(() => runBlocks([{ id: "ai1", type: "ai_commentary", settings: {} }], {
+    report: { ai_commentary: 1 },
+    live: { modelRef: JSON.stringify(remote), tz: "UTC" },
+    deps: {
+      approvals: {
+        resolveModelRef: async () => remote,
+        resolveEndpoint: async () => ({
+          baseUrl: "https://api.example.com/v1", model: "m1", apiKey: "none", host: "cloud", providerType: null,
+        }),
+      },
+    },
+  }), (err) => err.code === "model_changed");
+});
+
+test("a gated preview writes the automatic summary for an unapproved model block that names a role", async () => {
+  const db = await freshDb();
+  const { id } = await createReport(db, { projectId: PROJECT, owner: "owner", title: "Listings" });
+  await db.execute({
+    sql: "INSERT INTO project_spaces (id, slug, name, workspace_dir) VALUES (?, ?, ?, ?)",
+    args: [PROJECT, "listings", "Listings", WORKSPACE],
+  });
+  // The source block is the owner's own (an unbroken owner history), the model block is a bot's addition.
+  const src = { id: "src", type: "workspace_file", settings: { path: CSV } };
+  await saveRecipe(db, { reportId: id, recipe: { blocks: [src] }, authorKind: "owner" });
+  await saveRecipe(db, {
+    reportId: id,
+    recipe: { blocks: [src, { id: "ai1", type: "ai_commentary", settings: { modelRole: ROLE } }] },
+    authorKind: "bot",
+  });
+  await updateReportColumns(db, id, { ai_commentary: 1 });
+  const report = await getReport(db, id);
+  let roleAsked = 0;
+  let calls = 0;
+  const deps = {
+    testSeams: true,
+    approvals: {
+      resolveModelRef: async () => MODEL,
+      resolveRoleModelRef: async () => { roleAsked += 1; return ROLE_MODEL; },
+    },
+    complete: async () => { calls += 1; return "never"; },
+  };
+  const runWith = (trigger) => runRecipe(db, deps, {
+    report,
+    recipe: JSON.parse(report.recipe_json),
+    run: { id: "rrn-0000000000000008", trigger, startedAt: T0, createdAt: T0 },
+  });
+
+  const preview = await runWith("preview");
+  assert.deepEqual(preview.sourceErrors, [], "the owner's own source block is approved, so the preview read it");
+  assert.equal(roleAsked, 0, "the role's model is not resolved for a block nobody approved");
+  assert.equal(calls, 0);
+  assert.deepEqual(preview.warnings, [{ source: "ai1", message: "ai_fallback" }]);
+  assert.ok(preview.sections.at(-1).markdown.endsWith(AI_FALLBACK_NOTE));
+
+  // A manual run is not gated: it executes the revision the owner sealed, so the role's model answers.
+  const manual = await runWith("manual");
+  assert.equal(roleAsked, 1);
+  assert.equal(calls, 1);
+  assert.equal(manual.sections.at(-1).markdown, "never");
+});
+
+test("a 300 KB item title is cut before it is escaped, so the document still assembles", async () => {
+  writeFileSync(join(WORKSPACE, "huge-title.json"),
+    JSON.stringify([{ title: `Huge ${"x".repeat(300 * 1024)}` }]), "utf8");
+  const out = await runBlocks([{ id: "ai1", type: "ai_commentary", settings: {} }], {
+    path: "huge-title.json",
+    report: { ai_commentary: 1 },
+    live: { modelRef: JSON.stringify(MODEL), tz: "UTC" },
+    deps: {
+      approvals: { resolveModelRef: async () => MODEL },
+      complete: async () => { throw new Error("down"); },
+    },
+  });
+  assert.deepEqual(out.warnings, [{ source: "ai1", message: "ai_fallback" }]);
+  const bullet = out.sections[0].markdown.split("\n").find((line) => line.startsWith("- "));
+  assert.ok(bullet.length <= AI_FALLBACK_TITLE_MAX + 2, `the listed title is ${bullet.length} characters`);
+  assert.ok(bullet.endsWith(AI_FALLBACK_ELLIPSIS), "and it says it was cut");
+  assert.ok(out.document.markdown.length < 256 * 1024, "the assembly's own byte limit is not reached");
+});
+
+test("validate takes one role per report and refuses a malformed one", () => {
+  const ai = (id, settings) => ({ id, type: "ai_commentary", settings });
+  assert.deepEqual(validateRecipe({ blocks: [ai("ai1", {})] }), []);
+  assert.deepEqual(validateRecipe({ blocks: [ai("ai1", { modelRole: ROLE })] }), []);
+  assert.deepEqual(validateRecipe({ blocks: [ai("ai1", { modelRole: "finance" })] }),
+    ["blocks[0].modelRole"], "a role is named role:<id>, never a bare id");
+  assert.deepEqual(validateRecipe({ blocks: [ai("ai1", { modelRole: "role:Finance" })] }),
+    ["blocks[0].modelRole"]);
+  assert.deepEqual(validateRecipe({ blocks: [ai("ai1", { modelRole: `role:${"a".repeat(33)}` })] }),
+    ["blocks[0].modelRole"]);
+  assert.deepEqual(validateRecipe({ blocks: [ai("ai1", { modelRole: 7 })] }), ["blocks[0].modelRole"]);
+  assert.deepEqual(validateRecipe({ blocks: [ai("ai1", { modelRole: ROLE }), ai("ai2", { modelRole: ROLE })] }),
+    [], "the same role twice is one role");
+  assert.deepEqual(validateRecipe({ blocks: [
+    ai("ai1", { modelRole: ROLE }),
+    { id: "an1", type: "annotate", settings: { modelRole: "role:everyday" } },
+  ] }), ["blocks[1].modelRole"], "a second, different role is refused on its own field");
+});
+
+test("validate refuses a recipe that mixes a role-naming model block with one that names none", () => {
+  const ai = (id, settings) => ({ id, type: "ai_commentary", settings });
+  const annotate = (id, settings) => ({ id, type: "annotate", settings });
+  assert.deepEqual(validateRecipe({ blocks: [ai("ai1", { modelRole: ROLE }), annotate("an1", {})] }),
+    ["blocks[1].modelRole"],
+    "the block naming none would run the report's bot model: a second model the seal has no room for");
+  assert.deepEqual(validateRecipe({ blocks: [annotate("an1", {}), ai("ai1", { modelRole: ROLE })] }),
+    ["blocks[0].modelRole"], "the rule does not depend on which block comes first");
+  assert.deepEqual(validateRecipe({ blocks: [ai("ai1", {}), annotate("an1", {})] }), [],
+    "no role anywhere is the ordinary bot-model recipe, and stays valid");
+  assert.deepEqual(validateRecipe({ blocks: [ai("ai1", { modelRole: ROLE }), annotate("an1", { modelRole: ROLE })] }),
+    [], "every model block naming the one role is the recipe the seal describes");
+});
+
+test("the block cannot start a model: no starter is imported or read, and the call is one completion", async () => {
+  const source = readFileSync(
+    new URL("../servers/gateway/reports/blocks/present/ai-commentary.js", import.meta.url), "utf8",
+  );
+  for (const name of ["acquireOrStart", "startModel", "ensureModel", "maybeAcquireLocalProvider",
+    "warmProviderByName", "modelResolveStart", "gpu-orchestrator", "acquireFn", "warmFn"]) {
+    assert.equal(source.includes(name), false, `the module never names ${name}`);
+  }
+  assert.match(source, /orchestrator/, "the header says so in words, which is not a name it can call");
+  assert.ok(source.includes("completeText"), "its one model call is the router's completeText");
+
+  // The rest of the path a model block and go-live resolve through: none of it may name a starter either.
+  for (const path of [
+    "../servers/gateway/reports/approvals.js",
+    "../servers/shared/model-roles.js",
+    "../servers/shared/model-roles-store.js",
+  ]) {
+    const moduleText = readFileSync(new URL(path, import.meta.url), "utf8");
+    for (const name of ["acquireOrStart", "startModel", "ensureModel"]) {
+      assert.equal(moduleText.includes(name), false, `${path} never names ${name}`);
+    }
+    assert.equal(/gpu-orchestrator/.test(moduleText), false, `${path} imports no orchestrator`);
+  }
+
+  // The deps members this module reads, taken from its own source: a start-shaped seam added to it lands
+  // here, instead of being ignored by a test that traps names the block cannot reach anyway.
+  const read = new Set();
+  for (const match of source.matchAll(/ctx\.deps\??\.([A-Za-z_$][\w$]*)/g)) read.add(match[1]);
+  assert.deepEqual([...read].sort(), ["approvals", "complete", "now", "testSeams"],
+    "no other deps member is read, so no start-shaped one can be");
+
+  // Behavioural: the PRODUCTION completion path (no injected completion), with the global fetch replaced,
+  // so a warm-up, a probe or any other request a start would make is recorded instead of reaching a model.
+  const db = await freshDb();
+  await db.execute({
+    sql: `INSERT OR REPLACE INTO providers (id, base_url, host, models, disabled)
+          VALUES ('trap-chat', 'http://127.0.0.1:8999/v1', 'local', ?, 0)`,
+    args: [JSON.stringify([{ id: "m1" }])],
+  });
+  const { id } = await createReport(db, { projectId: PROJECT, owner: "owner", title: "Listings" });
+  const report = await getReport(db, id);
+  const sealed = { providerId: "trap-chat", model: "m1", locality: "local", baseUrlHost: "127.0.0.1:8999" };
+  const traps = [];
+  const trap = (name) => () => { traps.push(name); return true; };
+  const deps = {
+    testSeams: true,
+    workspaceDirFor: () => WORKSPACE,
+    now: () => T0,
+    approvals: { resolveModelRef: async () => sealed },
+    acquireOrStart: trap("acquireOrStart"),
+    startModel: trap("startModel"),
+    ensureModel: trap("ensureModel"),
+    acquire: trap("acquire"),
+    warm: trap("warm"),
+  };
+  const requests = [];
+  const realFetch = globalThis.fetch;
+  const reservationPath = process.env.CROW_BOX_RESERVATION_PATH;
+  process.env.CROW_BOX_RESERVATION_PATH = join(root, "no-box-reservation.json");
+  globalThis.fetch = async (url, options = {}) => {
+    requests.push({ url: String(url), method: options.method || "GET" });
+    return new Response(JSON.stringify({ choices: [{ message: { content: "A production commentary." } }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  let out;
+  try {
+    out = await runRecipe(db, deps, {
+      report: { ...report, ai_commentary: 1 },
+      recipe: {
+        blocks: [
+          { id: "src", type: "workspace_file", settings: { path: CSV } },
+          { id: "ai1", type: "ai_commentary", settings: {} },
+        ],
+      },
+      run: { id: "rrn-0000000000000009", trigger: "manual", startedAt: T0, createdAt: T0 },
+      live: { modelRef: JSON.stringify(sealed), tz: "UTC" },
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+    if (reservationPath === undefined) delete process.env.CROW_BOX_RESERVATION_PATH;
+    else process.env.CROW_BOX_RESERVATION_PATH = reservationPath;
+  }
+  assert.deepEqual(traps, [], "no start-shaped seam was called");
+  assert.deepEqual(out.sourceErrors, [], "the run finished");
+  assert.deepEqual(requests.map((entry) => entry.method), ["POST"],
+    "one request, and it is the completion: nothing warmed or probed a model first");
+  assert.match(requests[0].url, /\/chat\/completions$/);
+  assert.equal(out.sections.at(-1).markdown, "A production commentary.");
+  assert.deepEqual(out.warnings, []);
 });
 
 /* ------------------------------------------------------------------ the text block stamps */

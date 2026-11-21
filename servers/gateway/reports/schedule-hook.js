@@ -91,12 +91,12 @@ import {
 import { hasRunsTable, hasTzColumn, instanceZone } from "../../shared/schedule-store.js";
 import { registerSchedulerHook, unregisterSchedulerHook } from "../scheduler-hooks.js";
 import { gatewayRunId } from "../run-id.js";
-import { verifyLive, REPORT_LIVE } from "./approvals.js";
+import { modelRoleOfRecipe, verifyLive, REPORT_LIVE } from "./approvals.js";
 import { releaseLease, takeLease } from "./lease.js";
 import { executeRun, getRun, getScheduledRun, NOT_LIVE_TEXT, RESTARTED_TEXT, startRun, statusAuditOk } from "./run.js";
 import { claimRunRequests, pruneRunRequests } from "./run-requests.js";
 import { sweepStaleSends } from "./send-sweep.js";
-import { getReport, recordAudit } from "./store.js";
+import { getReport, getRevision, recordAudit } from "./store.js";
 
 /** The hook id the gateway's scheduler knows this by. */
 export const REPORTS_HOOK_ID = "reports";
@@ -383,15 +383,34 @@ export function registerReportsHook(database, deps = {}) {
     }
   }
 
-  /** The model the report's bot resolves to NOW, or null when nothing injected can say. */
+  /**
+   * The model the report resolves to NOW, or null when nothing injected can say. A recipe whose AI block
+   * names a role resolves THAT role (the same reference `liveSetFor` seals), so the model-change sentence
+   * names the model the report would use next rather than the bot's own.
+   */
   async function freshModelName(db, report) {
-    const resolver = d.approvals && typeof d.approvals.resolveModelRef === "function"
-      ? d.approvals.resolveModelRef
-      : null;
+    const role = await sealedRoleOf(db, report);
+    const resolver = !d.approvals ? null
+      : role
+        ? (typeof d.approvals.resolveRoleModelRef === "function" ? d.approvals.resolveRoleModelRef : null)
+        : (typeof d.approvals.resolveModelRef === "function" ? d.approvals.resolveModelRef : null);
     if (!resolver) return null;
     try {
-      const resolved = await resolver(db, report);
+      const resolved = role ? await resolver(db, role) : await resolver(db, report);
       return resolved && text(resolved.model) ? text(resolved.model) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** The role the report's sealed revision names for its AI block, or null. Never throws. */
+  async function sealedRoleOf(db, report) {
+    try {
+      const rev = Number(report?.live_rev);
+      if (!Number.isInteger(rev) || rev < 1) return null;
+      const revision = await getRevision(db, report.id, rev);
+      if (!revision || typeof revision.recipe_json !== "string") return null;
+      return modelRoleOfRecipe(JSON.parse(revision.recipe_json));
     } catch {
       return null;
     }
@@ -434,12 +453,15 @@ export function registerReportsHook(database, deps = {}) {
     let reason = SETTINGS_CHANGED_TEXT;
     if (!live) {
       // Was the model resolution the only thing that moved? Re-verify with the model the row stored:
-      // when that verifies, nothing the owner approved changed except which model the bot resolves to.
+      // when that verifies, nothing the owner approved changed except which model the report resolves
+      // to. Both seams are pinned, because a report's model comes from the bot OR from the role its
+      // recipe names, and either one moving is that same one thing.
       const stored = storedModelRef(report);
       if (stored) {
         const pinned = {
           ...(d.approvals ?? {}),
           resolveModelRef: async () => stored,
+          resolveRoleModelRef: async () => stored,
         };
         if (await verifyLive(db, pinned, report)) {
           const oldName = text(stored.model) || "unavailable";

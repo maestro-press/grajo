@@ -48,8 +48,9 @@
  *   - `runBlocks({report, recipe, run, live, state, db})`: runs the recipe and answers
  *     `{items, sections, warnings, sourceErrors, stateWrites, document?, allowedLinks?}`. The default is
  *     the block registry's executor (`blocks/run-recipe.js`), handed this module's own deps so a custom
- *     block reaches `custom-step.js`. Warnings are recorded nothing: they are a shape block's own
- *     trouble, and the status rule below is about source errors.
+ *     block reaches `custom-step.js`. Warnings are recorded beside the source errors and NEVER as one
+ *     (a shape block's own trouble, a model block's `ai_fallback`): the status rule below is about source
+ *     errors, so an advisory note fails no run.
  *   - `deliver(db, {report, run, live, status, artifactVersion})`: required for `schedule` and `manual`.
  *   - `writeVersion(db, {report, run, live, result})` -> `{artifactVersion}`: optional; absent, the run
  *     keeps no artifact version.
@@ -553,7 +554,18 @@ async function runClaimed(db, d, runId, processRunId) {
           message: redactedText(entry?.message, secrets, MESSAGE_MAX),
         }))
         .filter((entry) => entry.source || entry.message);
-      blockLog = { items: items.length, sourceErrors };
+      // A block's own advisory note (`chart_rows_dropped`, a model block's `ai_fallback`) is recorded
+      // beside the source errors and never as one: an advisory note fails no run. The key is absent on a
+      // run that had no note, so a run's log keeps the shape it always had.
+      const warnings = (Array.isArray(result?.warnings) ? result.warnings : [])
+        .map((entry) => ({
+          source: redactedText(entry?.source, secrets, MESSAGE_MAX),
+          message: redactedText(entry?.message, secrets, MESSAGE_MAX),
+        }))
+        .filter((entry) => entry.source || entry.message);
+      blockLog = warnings.length
+        ? { items: items.length, sourceErrors, warnings }
+        : { items: items.length, sourceErrors };
       if (sourceErrors.length) {
         status = "failed";
         errorText = redactedText(sourceErrors

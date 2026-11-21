@@ -28,6 +28,7 @@ const {
   liveSetFor, ownerSaveRecipe, pauseReport, pauseReportSystem, resumeReport, updateSettings, verifyLive,
 } = await import("../servers/gateway/reports/approvals.js");
 const { senderReady } = await import("../servers/gateway/reports/sender-ready.js");
+const { saveCustomRole, setBinding } = await import("../servers/shared/model-roles-store.js");
 const {
   createReport, getReport, getRevision, saveRecipe, updateReportColumns,
 } = await import("../servers/gateway/reports/store.js");
@@ -173,6 +174,38 @@ async function liveReport(options = {}) {
 
 async function row(db, id) {
   return getReport(db, id);
+}
+
+/* ------------------------------------------------------- the model a role names */
+
+/**
+ * One provider row and one custom role bound to one of its models, through the roles store (which
+ * invalidates its own memoized context, so the next resolution sees the write).
+ *
+ * @returns {Promise<string>} the role id
+ */
+async function bindRole(db, { label = "Finance", model = "local-chat/m1", provider = {
+  id: "local-chat", baseUrl: "http://127.0.0.1:8013/v1", host: "local",
+} } = {}) {
+  await db.execute({
+    sql: "INSERT OR REPLACE INTO providers (id, base_url, host, models, disabled) VALUES (?, ?, ?, ?, 0)",
+    args: [provider.id, provider.baseUrl, provider.host, JSON.stringify([{ id: "m1" }, { id: "m2" }])],
+  });
+  const made = await saveCustomRole(db, { label, job: "", capability: "chat" });
+  assert.equal(made.ok, true, JSON.stringify(made));
+  const bound = await setBinding(db, made.id, { model }, {});
+  assert.equal(bound.ok, true, JSON.stringify(bound));
+  return made.id;
+}
+
+/** The recipe of a report whose AI block names a role. */
+function roleRecipe(roleId) {
+  return {
+    blocks: [
+      { id: "b1", type: "http_json", settings: { url: "https://api.example.com/items?page=1" } },
+      { id: "ai1", type: "ai_commentary", settings: { modelRole: `role:${roleId}` } },
+    ],
+  };
 }
 
 async function auditRows(db, reportId) {
@@ -1092,4 +1125,159 @@ test("the default model reader resolves the bot's own key through the provider r
     args: [JSON.stringify({ models: { default: "crow-chat/m2" } })],
   });
   assert.equal(await isLive(db, deps, await row(db, report.id)), false);
+});
+
+/* --------------------------------------------- the model an AI block's role names */
+
+test("go live seals the RESOLVED reference of the role a recipe names", async () => {
+  const { db } = await freshDb();
+  const roleId = await bindRole(db);
+  const report = await prepare(db, { recipe: roleRecipe(roleId) });
+  const runs = { "prv-1": { id: "prv-1", reportId: report.id, kind: "preview", status: "ok", recipeRev: report.rev } };
+  const deps = { loadSeed: () => ({ seed: SEED }), senderReady: async () => true, registry: REGISTRY, getRun: runReader(runs) };
+  await approveGoLive(db, deps, { reportId: report.id, previewRunId: "prv-1", actor: OWNER });
+
+  const live = await row(db, report.id);
+  assert.equal(live.status, "live");
+  assert.deepEqual(JSON.parse(live.model_ref), {
+    providerId: "local-chat", model: "m1", locality: "local", baseUrlHost: "127.0.0.1:8013",
+  }, "the role's own resolved reference, not the bot's model");
+  assert.equal(await isLive(db, deps, live), true);
+
+  // The seal covers exactly that reference.
+  const verified = await verifyLive(db, deps, live);
+  assert.equal(verified.liveSet.modelRef, live.model_ref);
+});
+
+test("a role rebound to another model breaks the seal, like a bot's model switch", async () => {
+  const { db } = await freshDb();
+  const roleId = await bindRole(db);
+  const report = await prepare(db, { recipe: roleRecipe(roleId) });
+  const runs = { "prv-1": { id: "prv-1", reportId: report.id, kind: "preview", status: "ok", recipeRev: report.rev } };
+  const deps = { loadSeed: () => ({ seed: SEED }), senderReady: async () => true, registry: REGISTRY, getRun: runReader(runs) };
+  await approveGoLive(db, deps, { reportId: report.id, previewRunId: "prv-1", actor: OWNER });
+  assert.equal(await isLive(db, deps, await row(db, report.id)), true);
+
+  // The owner rebinds the role: a different model is a different live set.
+  assert.equal((await setBinding(db, roleId, { model: "local-chat/m2" }, {})).ok, true);
+  const moved = await row(db, report.id);
+  assert.equal(await isLive(db, deps, moved), false);
+  assert.equal(await verifyLive(db, deps, moved), null);
+  assert.equal(moved.status, "live", "the row is not written here; the guard is what pauses it");
+
+  // Putting the SAME model back approves nothing again on its own: the seal was never re-made, and it
+  // verifies only because every field it covers is the one the owner approved.
+  assert.equal((await setBinding(db, roleId, { model: "local-chat/m1" }, {})).ok, true);
+  assert.equal(await isLive(db, deps, await row(db, report.id)), true);
+});
+
+test("an unresolved role and a role that is not local are both model_unresolved at go live", async () => {
+  const { db } = await freshDb();
+  const roleId = await bindRole(db);
+  const runs = {};
+  const deps = { loadSeed: () => ({ seed: SEED }), senderReady: async () => true, registry: REGISTRY, getRun: runReader(runs) };
+
+  // No model bound: nothing resolves, so there is no reference to seal.
+  const unbound = await prepare(db, { recipe: roleRecipe(roleId) });
+  assert.equal((await setBinding(db, roleId, { model: null }, {})).ok, true);
+  runs["prv-1"] = { id: "prv-1", reportId: unbound.id, kind: "preview", status: "ok", recipeRev: unbound.rev };
+  await assert.rejects(
+    () => approveGoLive(db, deps, { reportId: unbound.id, previewRunId: "prv-1", actor: OWNER }),
+    (err) => err.code === "model_unresolved",
+  );
+  assert.equal((await row(db, unbound.id)).status, "draft");
+  assert.equal((await row(db, unbound.id)).live_seal, null);
+
+  // A cloud provider behind the role: the report's items may not go there, so no live set either.
+  await db.execute({
+    sql: "INSERT OR REPLACE INTO providers (id, base_url, host, models, disabled) VALUES (?, ?, 'cloud', ?, 0)",
+    args: ["cloud-chat", "https://api.example.com/v1", JSON.stringify([{ id: "m1" }])],
+  });
+  assert.equal((await setBinding(db, roleId, { model: "cloud-chat/m1" }, {})).ok, true);
+  const cloud = await prepare(db, { recipe: roleRecipe(roleId) });
+  runs["prv-2"] = { id: "prv-2", reportId: cloud.id, kind: "preview", status: "ok", recipeRev: cloud.rev };
+  await assert.rejects(
+    () => approveGoLive(db, deps, { reportId: cloud.id, previewRunId: "prv-2", actor: OWNER }),
+    (err) => err.code === "model_unresolved",
+  );
+  assert.equal((await row(db, cloud.id)).status, "draft");
+});
+
+test("a role that is not a chat model and a role behind a lazy loader are both model_unresolved", async () => {
+  const { db } = await freshDb();
+  const runs = {};
+  const deps = { loadSeed: () => ({ seed: SEED }), senderReady: async () => true, registry: REGISTRY, getRun: runReader(runs) };
+
+  // An embedding endpoint, bound to the core embed role: a report's block writes, so it may not go live.
+  await db.execute({
+    sql: "INSERT OR REPLACE INTO providers (id, base_url, host, models, disabled) VALUES (?, ?, 'local', ?, 0)",
+    args: ["embed-chat", "http://127.0.0.1:8015/v1", JSON.stringify([{ id: "e1", task: "embed" }])],
+  });
+  assert.equal((await setBinding(db, "embed", { model: "embed-chat/e1" }, {})).ok, true);
+  const embedded = await prepare(db, { recipe: roleRecipe("embed") });
+  runs["prv-1"] = { id: "prv-1", reportId: embedded.id, kind: "preview", status: "ok", recipeRev: embedded.rev };
+  await assert.rejects(
+    () => approveGoLive(db, deps, { reportId: embedded.id, previewRunId: "prv-1", actor: OWNER }),
+    (err) => err.code === "model_unresolved",
+  );
+  assert.equal((await row(db, embedded.id)).status, "draft");
+
+  // A provider that loads its model on the first request: the completion refuses it, so go-live does too.
+  await db.execute({
+    sql: `INSERT OR REPLACE INTO providers (id, base_url, host, models, disabled, provider_type)
+          VALUES (?, ?, 'local', ?, 0, 'ollama')`,
+    args: ["ollama-chat", "http://127.0.0.1:11434/v1", JSON.stringify([{ id: "m1" }])],
+  });
+  const roleId = await bindRole(db);
+  assert.equal((await setBinding(db, roleId, { model: "ollama-chat/m1" }, {})).ok, true);
+  const lazy = await prepare(db, { recipe: roleRecipe(roleId) });
+  runs["prv-2"] = { id: "prv-2", reportId: lazy.id, kind: "preview", status: "ok", recipeRev: lazy.rev };
+  await assert.rejects(
+    () => approveGoLive(db, deps, { reportId: lazy.id, previewRunId: "prv-2", actor: OWNER }),
+    (err) => err.code === "model_unresolved",
+  );
+  assert.equal((await row(db, lazy.id)).status, "draft");
+});
+
+test("a recipe mixing a role-naming model block with one that names none is refused at save", async () => {
+  const { db } = await freshDb();
+  const roleId = await bindRole(db);
+  const report = await prepare(db);
+  const mixed = {
+    blocks: [
+      { id: "ai1", type: "ai_commentary", settings: { modelRole: `role:${roleId}` } },
+      { id: "an1", type: "annotate", settings: {} },
+    ],
+  };
+  await assert.rejects(
+    () => saveRecipe(db, { reportId: report.id, recipe: mixed, authorKind: "owner", registry: REGISTRY }),
+    (err) => err.code === "bad_recipe" && err.detail === "blocks[1].modelRole",
+  );
+});
+
+test("a recipe naming two different roles is refused, and the AI block's own validate refuses a bad one", async () => {
+  const { db } = await freshDb();
+  const roleId = await bindRole(db);
+  const recipe = {
+    blocks: [
+      { id: "ai1", type: "ai_commentary", settings: { modelRole: `role:${roleId}` } },
+      { id: "an1", type: "annotate", settings: { modelRole: "role:everyday" } },
+    ],
+  };
+  await assert.rejects(
+    () => saveRecipe(db, { reportId: "rpt-0123456789abcdef", recipe, authorKind: "owner", registry: REGISTRY }),
+    () => true,
+  );
+  const report = await prepare(db);
+  await assert.rejects(
+    () => saveRecipe(db, { reportId: report.id, recipe, authorKind: "owner", registry: REGISTRY }),
+    (err) => err.code === "bad_recipe" && err.detail === "blocks[1].modelRole",
+  );
+  const malformed = {
+    blocks: [{ id: "ai1", type: "ai_commentary", settings: { modelRole: "finance" } }],
+  };
+  await assert.rejects(
+    () => saveRecipe(db, { reportId: report.id, recipe: malformed, authorKind: "owner", registry: REGISTRY }),
+    (err) => err.code === "bad_recipe" && err.detail === "blocks[0].modelRole",
+  );
 });

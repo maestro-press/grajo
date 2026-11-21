@@ -51,6 +51,9 @@
  *     alone is worth nothing, because neither member is read from a recipe.
  *   - `sources` keeps each source (and custom) block's own output by block id, which is what
  *     `enrich_lookup` joins against. It is deleted with the run: nothing here writes it anywhere.
+ *   - `blockUnapproved` is `true` only on a GATED preview (see below) whose model block the owner has not
+ *     approved. A model block that names a role writes the templated fallback rather than spending that
+ *     role's model, so a bot's new model block costs no model time before the owner's tap.
  *
  * A present block has a `run` now: it turns the items into a document section (and, for a model block,
  * adds one section of the model's writing). Its failures are the SHAPE kind of failure (a warning), with
@@ -81,7 +84,10 @@
  * `Source <blockId> is waiting for your OK`, and nothing reaches the network, a mailbox or a file: the
  * gate is asked first, and the block's `run` is never entered. The run then goes on with the remaining
  * blocks, the same way any other source error does. A `custom` block is gated by this rule as well, on
- * top of its own step approval (steps.js).
+ * top of its own step approval (steps.js). A MODEL block (`kind: "present"`, `sourceBearing: true`) is
+ * asked the same gate, and an answer of "not approved" reaches it as `ctx.blockUnapproved` rather than a
+ * source error: it still renders, but a block that names a role writes the templated fallback instead of
+ * calling that role's model.
  *
  * ONE READ OF THE REVISIONS PER RUN: the owner-history half of the gate is one map built from a single
  * read of the report's revisions (`ownerChainAnswers`), asked for lazily on the first gated block and
@@ -397,7 +403,16 @@ export async function runRecipe(db, deps, { report, recipe, run, live = null, st
       }
     }
 
-    const blockCtx = { ...ctx, block, blockId };
+    // A MODEL block is present-shaped but sends the run's items to a model, so a gated preview asks the
+    // same gate for it and hands the answer on: an unapproved block that names a role may not spend that
+    // role's model, and writes the templated fallback instead (blocks/present/ai-commentary.js).
+    let blockUnapproved = false;
+    if (gated && entry.kind === "present" && entry.sourceBearing === true) {
+      const verdict = await isSourceApprovedForBot(db, seam, report, block, await gateFor());
+      blockUnapproved = !(verdict && verdict.ok === true);
+    }
+
+    const blockCtx = { ...ctx, block, blockId, blockUnapproved };
     const input = { items, sections };
     let output;
     try {
