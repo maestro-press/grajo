@@ -2038,7 +2038,7 @@ test("HOLD on a pad that is not a Gate pad shows the note and latches nothing", 
   await ui.settle();
 
   assert.equal(ui.engine.engine.holds.length, 0, "the engine refused the latch and was asked nothing more");
-  assert.equal(toastText(ui), "HOLD works on Gate pads", "and the page says why, in those words");
+  assert.equal(toastText(ui), "HOLD works on Gate pads: set the pad's Playback → Mode to Gate", "and the page says why, in those words");
   assert.deepEqual(ui.engine.engine.live.map((one) => one.index), [2],
     "the press still played the pad");
 
