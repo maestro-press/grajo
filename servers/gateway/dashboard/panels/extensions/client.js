@@ -112,7 +112,14 @@ export function extensionsClientJS(lang, { servicesUi = servicesUiEnabled() } = 
                 showStatus(id, res.data.message || '${tJs("extensions.done", lang)}', "info");
                 setTimeout(function() { location.reload(); }, 1500);
               } else {
-                showStatus(id, res.data.error || '${tJs("extensions.failed", lang)}', "error");
+                // A second Start while one is in flight answers 409 already_running;
+                // that is a wait, not a failure, so it gets the approved sentence and
+                // the info tone instead of the raw machine code.
+                if (res.data && res.data.code === "already_running") {
+                  showStatus(id, '${tJs("fixit.flash.alreadyRestarting", lang)}', "info");
+                } else {
+                  showStatus(id, res.data.error || '${tJs("extensions.failed", lang)}', "error");
+                }
               }
             }).catch(function(err) {
               showStatus(id, '${tJs("extensions.networkError", lang)}', "error");
@@ -741,8 +748,10 @@ export function extensionsClientJS(lang, { servicesUi = servicesUiEnabled() } = 
                     statusDiv.textContent = '${tJs("extensions.bundleRestarted", lang)}';
                     setTimeout(finish, 1200);
                   } else {
+                    // Same 409 as the card's Start: a restart already in flight is a
+                    // wait, not a failure, so the approved sentence replaces the raw code.
                     statusDiv.style.color = "var(--crow-error, #e74c3c)";
-                    statusDiv.textContent = (r.data && r.data.error) || '${tJs("extensions.failed", lang)}';
+                    statusDiv.textContent = (r.data && r.data.code === "already_running") ? '${tJs("fixit.flash.alreadyRestarting", lang)}' : ((r.data && r.data.error) || '${tJs("extensions.failed", lang)}');
                     restartBtn.disabled = false;
                     restartBtn.textContent = '${tJs("extensions.retry", lang)}';
                   }

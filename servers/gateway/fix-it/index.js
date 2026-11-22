@@ -31,6 +31,7 @@ import addonWallDetector, {
 import exposeCapabilityRemedy from "./remedies/expose-capability.js";
 import restoreBundleCompose, {
   ACTION_ID as RESTORE_COMPOSE_ACTION,
+  ALREADY_RESTARTING_FLASH,
   APPLY_UPDATE_ACTION_ID as APPLY_COMPOSE_UPDATE_ACTION,
   NEEDS_KEY_FLASH,
   OWNER_ONLY_FLASH,
@@ -201,7 +202,7 @@ export function linkRemedyTarget(r) {
  * The flash codes a remedy may send the owner back with. Fixed here, never read
  * from the remedy result unchecked: the redirect target is built from it.
  */
-export const REMEDY_FLASHES = Object.freeze(["fixit_addon_stale", "fixit_addon_unwalled", OWNER_ONLY_FLASH, NEEDS_KEY_FLASH, RETIRED_REMOVED_FLASH, RETIRED_REMOVING_FLASH]);
+export const REMEDY_FLASHES = Object.freeze(["fixit_addon_stale", "fixit_addon_unwalled", OWNER_ONLY_FLASH, ALREADY_RESTARTING_FLASH, NEEDS_KEY_FLASH, RETIRED_REMOVED_FLASH, RETIRED_REMOVING_FLASH]);
 
 /** Build a db-bound store; the bound upsertItem also fires urgent push. */
 function boundStore(db) {

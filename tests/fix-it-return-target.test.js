@@ -27,7 +27,7 @@ process.env.CROW_TASKS_DB_PATH = join(dir, "tasks.db");
 const SHEET_PREFIX = "/dashboard/perch?sheet=attention&";
 const NEST_PREFIX = "/dashboard/nest?";
 
-let db, idx, registry, store, flash;
+let db, idx, registry, store, flash, ALREADY_RESTARTING_FLASH;
 
 before(async () => {
   execFileSync(process.execPath, ["scripts/init-db.js"], {
@@ -39,6 +39,7 @@ before(async () => {
   registry = await import("../servers/shared/fix-it/registry.js");
   store = await import("../servers/shared/fix-it/store.js");
   flash = await import("../servers/gateway/fix-it/flash.js");
+  ALREADY_RESTARTING_FLASH = (await import("../servers/gateway/fix-it/remedies/restore-bundle-compose.js")).ALREADY_RESTARTING_FLASH;
 
   assert.equal(typeof flash.returnTargetOf, "function", "servers/gateway/fix-it/flash.js must export returnTargetOf(value)");
   assert.equal(typeof flash.returnUrl, "function", "servers/gateway/fix-it/flash.js must export returnUrl(target, flash, params)");
@@ -229,6 +230,17 @@ test("flashBanner: tones and texts, and never a banner for a code the Nest does 
   assert.equal(flash.flashBanner("fixit_retired_removing", "en").tone, "info",
     "a removal that only started is neither a success nor an error");
 
+  // A start already in flight is not a failure: the approved sentence, in both languages,
+  // drawn by the same flashBanner that draws OWNER_ONLY_FLASH.
+  assert.deepEqual(flash.flashBanner(ALREADY_RESTARTING_FLASH, "en"), {
+    tone: "info",
+    text: "This add-on is already restarting. Give it a few minutes.",
+  });
+  assert.deepEqual(flash.flashBanner(ALREADY_RESTARTING_FLASH, "es"), {
+    tone: "info",
+    text: "Este complemento ya se está reiniciando. Dale unos minutos.",
+  });
+
   for (const code of flash.FLASH_CODES) {
     const banner = flash.flashBanner(code, "en");
     assert.ok(banner && typeof banner.text === "string" && banner.text.length > 0,
@@ -246,9 +258,15 @@ test("flashBanner: tones and texts, and never a banner for a code the Nest does 
     "backup_ok", "backup_fail", "fixit_fixed", "fixit_dismissed", "fixit_error",
     "fixit_not_pending", "fixit_addon_stale", "fixit_addon_unwalled", "fixit_owner_only",
     "fixit_compose_needs_key", "fixit_retired_removed", "fixit_retired_removing", "fixit_done",
+    "fixit_already_restarting",
   ]) {
     assert.ok(flash.FLASH_CODES.includes(code), `FLASH_CODES must still carry "${code}"`);
   }
+});
+
+test("index.js lets the already-restarting flash through to the redirect", () => {
+  assert.ok(idx.REMEDY_FLASHES.includes(ALREADY_RESTARTING_FLASH),
+    "REMEDY_FLASHES must carry the already-restarting flash, or the Nest drops it");
 });
 
 test("both backup redirects go through returnUrl/returnTargetOf (source shape)", () => {

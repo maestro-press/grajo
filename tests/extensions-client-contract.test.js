@@ -74,14 +74,14 @@ const MANY_MEDIA = Array.from({ length: 10 }, (_, i) => ({
  * @param {string}   opts.hash        initial location.hash
  * @returns the DOM plus the spies the tests assert against
  */
-function boot({ available = AVAILABLE, collections = COLLECTIONS, installed = {}, needsConfig = {}, fetchImpl, session = {}, hash = "", servicesUi = false } = {}) {
+function boot({ available = AVAILABLE, collections = COLLECTIONS, installed = {}, needsConfig = {}, bundleStatus = {}, fetchImpl, session = {}, hash = "", servicesUi = false } = {}) {
   // The Services UI flag is read when the client is rendered (Task 12): flag-on runs get their own copy.
   const clientHtml = servicesUi ? extensionsClientJS("en", { servicesUi: true }) : extensionsClientJS("en", { servicesUi: false });
   const clientJs = clientHtml.slice(clientHtml.indexOf("<script>") + "<script>".length, clientHtml.lastIndexOf("</script>"));
   const overlayHtml = clientHtml.slice(0, clientHtml.indexOf("<script>"));
   const { viewsHtml, addonRegistryScript, collectionsScript } = buildExtensionsHTML({
     installed, available, collections, needsConfig,
-    registrySource: "local", communityStores: [], bundleStatus: {}, lang: "en",
+    registrySource: "local", communityStores: [], bundleStatus, lang: "en",
   });
 
   const { window, document } = parseHTML(
@@ -1153,4 +1153,65 @@ test("SMOKE: no hardcoded English in the collection UI — the labels come from 
   assert.match(es, /Se ejecuta en este Crow/);
   assert.match(es, /Casa inteligente/);
   assert.ok(!/Install collection/.test(es), "the Spanish client must not carry the English label");
+});
+
+// ─── Start/restart 409 already_running ───
+//
+// The route answers 409 {error:"already_running", code:"already_running", job_id} when a
+// second Start lands while one is in flight. `error` is a machine string, so the client
+// must branch on `code` and show the already-approved sentence instead of "already_running".
+
+const ALREADY_RESTARTING_EN = "This add-on is already restarting. Give it a few minutes.";
+const ALREADY_RESTARTING_ES = "Este complemento ya se está reiniciando. Dale unos minutos.";
+
+function startFetch(answer) {
+  return (url) => {
+    if (url.includes("/bundles/api/start")) return answer;
+    return { ok: true, status: 200, json: () => Promise.resolve({}) };
+  };
+}
+
+function startBoot(answer) {
+  return boot({
+    installed: { jellyfin: { version: "1.0.0" } },
+    bundleStatus: { jellyfin: { running: false } },
+    fetchImpl: startFetch(answer),
+  });
+}
+
+const ALREADY_RUNNING_409 = { ok: false, status: 409, json: () => Promise.resolve({ error: "already_running", code: "already_running", job_id: "x" }) };
+
+test("SMOKE: the emitted client carries the approved already-restarting sentence in en and es", () => {
+  assert.ok(CLIENT_HTML.includes(ALREADY_RESTARTING_EN), "the English sentence is in the client");
+  assert.ok(
+    extensionsClientJS("es").includes(ALREADY_RESTARTING_ES),
+    "the Spanish client carries the Spanish sentence",
+  );
+  const checks = CLIENT_JS.match(/code === "already_running"/g) || [];
+  assert.ok(checks.length >= 2, `both spots branch on the code (found ${checks.length})`);
+});
+
+test("BEHAVIOR: a 409 already_running on Start shows the approved sentence, in the info tone", async () => {
+  const { $, click, settle } = startBoot(ALREADY_RUNNING_409);
+  const status = $("#status-jellyfin");
+  const btn = $('.bundle-action[data-action="start"][data-id="jellyfin"]');
+  assert.ok(btn, "the fixture renders a Start button");
+
+  click(btn);
+  await settle();
+
+  assert.equal(status.textContent, ALREADY_RESTARTING_EN, "the user reads the sentence, not the machine code");
+  assert.ok(!status.textContent.includes("already_running"), "the raw code never reaches the page");
+  assert.match(status.style.color, /accent/, "already restarting is not a failure: info tone");
+});
+
+test("BEHAVIOR: any other Start failure still shows the server's error", async () => {
+  const { $, click, settle } = startBoot({ ok: false, status: 500, json: () => Promise.resolve({ error: "boom" }) });
+  const status = $("#status-jellyfin");
+
+  click($('.bundle-action[data-action="start"][data-id="jellyfin"]'));
+  await settle();
+
+  assert.equal(status.textContent, "boom");
+  assert.match(status.style.color, /error/);
 });

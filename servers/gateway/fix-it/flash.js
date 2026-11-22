@@ -28,6 +28,7 @@ import {
   unwalledMessageFor,
 } from "./remedies/addon-unwall.js";
 import {
+  ALREADY_RESTARTING_FLASH,
   FLASH_KEY_RE,
   NEEDS_KEY_FLASH,
   OWNER_ONLY_FLASH,
@@ -80,6 +81,7 @@ export const FLASH_CODES = Object.freeze([
   STALE_FLASH,
   UNWALLED_FLASH,
   OWNER_ONLY_FLASH,
+  ALREADY_RESTARTING_FLASH,
   NEEDS_KEY_FLASH,
   RETIRED_REMOVED_FLASH,
   RETIRED_REMOVING_FLASH,
@@ -182,6 +184,9 @@ export function flashBanner(flash, lang = "en", { addon = null, key = null } = {
       return { tone: "error", text: t("fixit.addonWall.stale", language) };
     case OWNER_ONLY_FLASH:
       return { tone: "error", text: t("fixit.flash.ownerOnly", language) };
+    // Not a failure: the start the owner asked for is already running.
+    case ALREADY_RESTARTING_FLASH:
+      return { tone: "info", text: t("fixit.flash.alreadyRestarting", language) };
     case NEEDS_KEY_FLASH:
       return { tone: "error", text: needsKeyMessage(key, language) };
     default:

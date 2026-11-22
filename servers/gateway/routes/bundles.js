@@ -42,7 +42,7 @@ import { execFile } from "node:child_process";
 import { withoutCredentialKeys } from "../../shared/credentials-env.js";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, cpSync, rmSync, copyFileSync, unlinkSync, symlinkSync, readlinkSync, renameSync, statSync, realpathSync, readdirSync, lstatSync, mkdtempSync, openSync, closeSync, fchmodSync, fstatSync, constants as fsConstants } from "node:fs";
 import { join, dirname, resolve as resolvePath, relative as relativePath, isAbsolute, basename } from "node:path";
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes, createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { checkInstall as checkHardwareGate } from "../hardware-gate.js";
 import { checkGpuArchCompatible, ensureGpuProbed } from "../gpu-arch.js";
@@ -2570,6 +2570,9 @@ export { recreateBundleGuarded as _recreateBundleGuardedForTest };
 // It needs no request, so the boot pass may run it exactly as the card's route does.
 export { recreateBundleGuarded };
 
+// bundleId -> jobId of the start/restart currently in flight for it.
+const startsInFlight = new Map();
+
 /**
  * The LOCAL start of one installed bundle: everything POST /bundles/api/start does once it
  * knows the bundle is not forwarded to a peer. Extracted (not copied) so an in-process
@@ -2580,13 +2583,39 @@ export { recreateBundleGuarded };
  * The route maps the result to the status/body it always answered with; the Fix-it card's
  * restart (restartBundleInProcess) calls this directly.
  *
+ * Only one start per bundle id may be in flight: the exported wrapper holds a module-level
+ * map keyed by bundle id until the compose runner's promise settles (success, rejection or
+ * throw — a caller-side timeout does not release it), and a second call for that id answers
+ * `{ ok: false, status: 409, code: "already_running", error: "already_running", jobId }`
+ * without running anything, naming the in-flight run; a successful start's own result
+ * carries that same `jobId`.
+ *
  * @param {string} bundleId
  * @param {{ recreate?: boolean, crossHost?: boolean }} [opts]  recreate = `--force-recreate`
  *   (the Configure dialog's explicit Restart); crossHost = the caller is a peer request, so
  *   the owner's install-time consent is not carried into the check.
- * @returns {Promise<{ok: true} | {ok: false, status: number, code?: string, error: string}>}
+ * @returns {Promise<{ok: true, jobId?: string} | {ok: false, status: number, code?: string, error: string, jobId?: string}>}
  */
-export async function startBundleLocal(bundleId, { recreate = false, crossHost = false } = {}) {
+export async function startBundleLocal(bundleId, opts = {}) {
+  // Only a real id is guarded: an invalid/absent one must reach the existing refusals.
+  if (typeof bundleId !== "string" || bundleId === "") return startBundleLocalInner(bundleId, opts);
+  if (startsInFlight.has(bundleId)) {
+    const inFlightJobId = startsInFlight.get(bundleId);
+    return { ok: false, status: 409, code: "already_running", error: "already_running", jobId: inFlightJobId };
+  }
+  // Taken BEFORE any await, so overlapping callers cannot both get past the check.
+  const jobId = randomUUID();
+  startsInFlight.set(bundleId, jobId);
+  try {
+    const out = await startBundleLocalInner(bundleId, opts);
+    return out.ok ? { ...out, jobId } : out;
+  } finally {
+    // Only this run's entry: never release a successor's guard.
+    if (startsInFlight.get(bundleId) === jobId) startsInFlight.delete(bundleId);
+  }
+}
+
+async function startBundleLocalInner(bundleId, { recreate = false, crossHost = false } = {}) {
   const orchRefusal = bundleOrchestrationRefusal(bundleId);
   if (orchRefusal) return { ok: false, status: orchRefusal.status, code: orchRefusal.code, error: orchRefusal.error };
 
@@ -6206,6 +6235,11 @@ export default function bundlesRouter() {
         crossHost: !!req?.crossHostAuth,
       });
       if (!started.ok) {
+        // A start already in flight for this bundle: the conflict names the run it collided
+        // with, so a caller can follow the job instead of running a second compose.
+        if (started.code === "already_running") {
+          return res.status(409).json({ error: "already_running", code: "already_running", job_id: started.jobId });
+        }
         // The 500 body stays exactly `{ error }`: a `code` rides along only for the other
         // statuses, so an existing failure response is unchanged.
         return res.status(started.status).json({

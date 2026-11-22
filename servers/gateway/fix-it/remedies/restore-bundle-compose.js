@@ -55,6 +55,8 @@ export const APPLY_UPDATE_ACTION_ID = "apply-bundle-compose-update";
 
 /** The flash the Nest renders when the click was not the owner's own session. */
 export const OWNER_ONLY_FLASH = "fixit_owner_only";
+/** The flash the Nest renders when a start for this add-on is already in flight. */
+export const ALREADY_RESTARTING_FLASH = "fixit_already_restarting";
 /** What the owner is told when someone else (a peer sign-in, no session) clicked. */
 export const OWNER_ONLY_MESSAGE = t("fixit.flash.ownerOnly", "en");
 /** The flash the Nest renders when the shipped compose needs a key set first. */

@@ -55,14 +55,15 @@
  * (fix-it/detectors/browser-image-stale.js, COPY). Copy approved by the operator
  * 2026-11-19. This file adds none: a refusal reuses the compose restore's owner-only flash,
  * and a restart that did not run falls back to the Nest's generic "Couldn't
- * apply that fix" line rather than inventing a second sentence here.
+ * apply that fix" line — except a start already in flight, which sends the approved
+ * already-restarting sentence from the dashboard's flash table.
  */
 import { join } from "node:path";
 import { isLocalPasswordSessionOn } from "../../dashboard/local-session.js";
 import { CROW_HOME } from "../../bundles-config.js";
 import { dockerRunner } from "../../bundle-core.js";
 import { restartWouldDowngrade, runningBrowserContainerIds } from "../browser-chromium-guard.js";
-import { OWNER_ONLY_FLASH, OWNER_ONLY_MESSAGE } from "./restore-bundle-compose.js";
+import { ALREADY_RESTARTING_FLASH, OWNER_ONLY_FLASH, OWNER_ONLY_MESSAGE } from "./restore-bundle-compose.js";
 
 export const ACTION_ID = "restart-browser-addon";
 /** The ONE bundle this card is about — held here, never read from the stored card. */
@@ -203,6 +204,9 @@ export default async function restartBrowserAddon(_args, ctx) {
   }
   if (!out || out.ok !== true) {
     warnRestartDidNotRun(startFailureCode(out));
+    // The route's in-flight guard answered 409 already_running: the start the owner
+    // asked for is already under way. Not a failure, so the approved sentence.
+    if (out?.code === "already_running") return { resolved: false, flash: ALREADY_RESTARTING_FLASH };
     return { resolved: false };
   }
   return { resolved: true };

@@ -36,6 +36,7 @@ let setComposeConfigRunner;
 let setComposeRunner;
 let OWNER_ONLY_FLASH;
 let OWNER_ONLY_MESSAGE;
+let ALREADY_RESTARTING_FLASH;
 let home;
 
 const OWNER = async () => true;
@@ -89,6 +90,7 @@ before(async () => {
   const restore = await import("../servers/gateway/fix-it/remedies/restore-bundle-compose.js");
   OWNER_ONLY_FLASH = restore.OWNER_ONLY_FLASH;
   OWNER_ONLY_MESSAGE = restore.OWNER_ONLY_MESSAGE;
+  ALREADY_RESTARTING_FLASH = restore.ALREADY_RESTARTING_FLASH;
 });
 
 after(() => {
@@ -201,6 +203,20 @@ for (const [name, guard] of [
 
 // ── a restart that did not run ────────────────────────────────────────────
 
+test("(e) a start already in flight → the already-restarting flash, still one (start_failed:already_running) warn", async () => {
+  assert.equal(ALREADY_RESTARTING_FLASH, "fixit_already_restarting",
+    "restore-bundle-compose.js must export the flash code the remedy answers with");
+  const { value, lines } = await captureWarn(() => run({
+    deps: { startBundle: async () => ({ ok: false, status: 409, code: "already_running", error: "already_running", jobId: "job-1" }) },
+  }));
+
+  assert.equal(value.resolved, false, "the card stays pending until the running start settles");
+  assert.equal(value.flash, ALREADY_RESTARTING_FLASH, "an approved sentence, not the generic failure line");
+  assert.equal(value.message, undefined, "no unapproved copy travels beside the flash");
+  assert.equal(lines.length, 1, "exactly one line");
+  assert.match(lines[0], /^\[fix-it\] browser add-on: the restart did not run \(start_failed:already_running\)$/);
+});
+
 test("(e) the start refuses on the compose safety check → one warn naming its code", async () => {
   const { value, lines } = await captureWarn(() => run({
     deps: { startBundle: async () => ({ ok: false, status: 403, code: "compose_security_check", error: "Security check failed: x" }) },
@@ -210,6 +226,17 @@ test("(e) the start refuses on the compose safety check → one warn naming its 
   assert.equal(value.flash, undefined, "the Nest's generic failure line, not a made-up sentence");
   assert.equal(lines.length, 1);
   assert.match(lines[0], /^\[fix-it\] browser add-on: the restart did not run \(start_failed:compose_security_check\)$/);
+});
+
+test("(e) any other start failure (compose_failed) → still no flash", async () => {
+  const { value, lines } = await captureWarn(() => run({
+    deps: { startBundle: async () => ({ ok: false, status: 500, code: "compose_failed", error: "compose failed" }) },
+  }));
+
+  assert.equal(value.resolved, false);
+  assert.equal(value.flash, undefined, "only already_running earns a sentence");
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^\[fix-it\] browser add-on: the restart did not run \(start_failed:compose_failed\)$/);
 });
 
 test("(f) the start refuses with only a message → the warn names the message", async () => {
@@ -252,6 +279,7 @@ test("(g) a restart that hangs is bounded by the seam's timeout → one (timeout
   }));
 
   assert.equal(value.resolved, false, "a hung build never holds the click open");
+  assert.equal(value.flash, undefined, "a timeout is not an in-flight start: no flash");
   assert.equal(settled, false, "the bound resolved first, not the restart");
   assert.equal(lines.length, 1);
   assert.match(lines[0], /^\[fix-it\] browser add-on: the restart did not run \(timeout\)$/);
