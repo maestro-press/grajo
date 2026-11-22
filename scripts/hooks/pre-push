@@ -12,33 +12,68 @@
 # Locally the check also applies your untracked personal-token denylist
 # (~/.crow-public-denylist, one token per line, mode 600; override with
 # CROW_PUBLIC_DENYLIST). Bypass once, deliberately: git push --no-verify
+#
+# Which messages a push publishes is measured from the pushed remote's own
+# main (refs/remotes/$1/main, falling back to origin/main) — never from a
+# possibly stale origin/main that reaches back over main's already-public
+# history. A fast-forward of branch-only commits scans the remote head..local.
+# When the remote head is already on main (a rebase or force push), it scans
+# from the merge-base with that main instead.
 set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
 zero=0000000000000000000000000000000000000000
 status=0
+remote="${1:-origin}"
+main_ref=""
+if git rev-parse -q --verify "refs/remotes/$remote/main" >/dev/null 2>&1; then
+  main_ref="refs/remotes/$remote/main"
+elif git rev-parse -q --verify refs/remotes/origin/main >/dev/null 2>&1; then
+  # This remote has no main of its own, so measure from origin/main instead.
+  # The base is then on origin: commits that are new to THIS remote but
+  # already public on origin are not rescanned. That is intended — they have
+  # already been checked once, when origin published them.
+  main_ref="refs/remotes/origin/main"
+fi
 # stdin: <local ref> <local sha> <remote ref> <remote sha>, one line per ref
 while read -r _local_ref local_sha _remote_ref remote_sha; do
   [ -z "${local_sha:-}" ] && continue
   [ "$local_sha" = "$zero" ] && continue          # branch deletion: nothing published
-  # The messages this push publishes. A fast-forward: what is new since the
-  # remote's head. A rebase or force push: the remote head is not an ancestor,
-  # and remote..local would also scan main's own (already public) messages, so
-  # scan from where the branch leaves main.
+  base=""
+  if [ -n "$main_ref" ]; then
+    base="$(git merge-base "$main_ref" "$local_sha" 2>/dev/null || true)"
+  fi
+  # The messages this push publishes. A plain fast-forward: what is new since
+  # the remote's head. When that head is already on main (a rebase or force
+  # push, where the old head is still an ancestor), remote..local would also
+  # scan main's own (already public) messages, so scan from where the branch
+  # leaves main.
   if [ "$remote_sha" != "$zero" ] && git cat-file -e "$remote_sha" 2>/dev/null \
      && git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
-    range="$remote_sha..$local_sha"
-  elif git rev-parse -q --verify origin/main >/dev/null; then
-    base="$(git merge-base origin/main "$local_sha" 2>/dev/null || true)"
-    range="${base:-origin/main}..$local_sha"
+    if [ -n "$base" ] && git merge-base --is-ancestor "$remote_sha" "$base" 2>/dev/null; then
+      range="$base..$local_sha"
+    else
+      range="$remote_sha..$local_sha"
+    fi
+  elif [ -n "$main_ref" ]; then
+    # The full ref, not the short name: a local branch called e.g. "gitea/main"
+    # must not be picked up by git's ref lookup in place of the remote-tracking
+    # ref.
+    range="${base:-$main_ref}..$local_sha"
   else
     range=""
   fi
   if [ -n "$range" ]; then
     node "$root/scripts/check-public-hygiene.mjs" --rev "$local_sha" --messages "$range" || status=1
   else
-    # No remote head and no origin/main to measure from: the messages being
-    # published cannot be told apart, so refuse rather than skip them.
-    echo "pre-push: no origin/main to scan commit messages from; run 'git fetch origin' and push again (or --no-verify deliberately)" >&2
+    # No remote head and no main on the pushed remote (or origin) to measure
+    # from: the messages being published cannot be told apart, so refuse
+    # rather than skip them.
+    if [ "$remote" = origin ]; then
+      missing="origin/main"
+    else
+      missing="$remote/main or origin/main"
+    fi
+    echo "pre-push: no $missing to scan commit messages from; run 'git fetch $remote' and push again (or --no-verify deliberately)" >&2
     status=1
   fi
 done

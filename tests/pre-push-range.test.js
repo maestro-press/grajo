@@ -1,8 +1,10 @@
 // scripts/hooks/pre-push: which commit messages a push is checked for. A
 // fast-forward scans what is new since the remote head; a rebase or force push
-// scans only from where the branch leaves main (scanning remote..local there
-// would re-check main's own, already public, messages). Runs the real hook in a
-// throwaway repo, with a stub hygiene script that records its arguments.
+// scans only from where the branch leaves the pushed remote's own main (the
+// remote is the hook's $1, falling back to origin) — scanning remote..local, or
+// measuring from a stale origin/main, would re-check main's own, already public,
+// messages. Runs the real hook in a throwaway repo, with a stub hygiene script
+// that records its arguments.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -31,12 +33,15 @@ function makeRepo() {
   // One file per commit, so a rebase never conflicts.
   const commit = (msg) => { const f = "f" + (++n) + ".txt"; writeFileSync(join(dir, f), msg); git("add", f); git("commit", "-q", "-m", msg); return git("rev-parse", "HEAD"); };
   const out = join(dir, "ranges.txt");
-  const push = (localSha, remoteSha, { expectFail = false } = {}) => {
+  const push = (localSha, remoteSha, { expectFail = false, remote = null, ref = "refs/heads/b" } = {}) => {
     writeFileSync(out, "");
+    // git passes the remote's name as $1 and its URL as $2.
+    const args = [join(dir, "scripts", "hooks", "pre-push")];
+    if (remote) args.push(remote, `https://example.invalid/${remote}.git`);
     let failure = null;
     try {
-      execFileSync("bash", [join(dir, "scripts", "hooks", "pre-push")], {
-        cwd: dir, input: `refs/heads/b ${localSha} refs/heads/b ${remoteSha}\n`,
+      execFileSync("bash", args, {
+        cwd: dir, input: `${ref} ${localSha} ${ref} ${remoteSha}\n`,
         env: { ...process.env, RANGES_OUT: out }, stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (e) {
@@ -95,6 +100,95 @@ test("a new branch scans from where it leaves main", () => {
   } finally { r.cleanup(); }
 });
 
+test("a new branch measures from the pushed remote's main, not a stale origin/main", () => {
+  const r = makeRepo();
+  try {
+    const older = r.commit("main 1");
+    r.git("update-ref", "refs/remotes/origin/main", older);
+    const current = r.commit("main 2 (already public on gitea)");
+    r.git("update-ref", "refs/remotes/gitea/main", current);
+    r.git("checkout", "-q", "-b", "b");
+    const tip = r.commit("branch 1");
+    const range = r.push(tip, ZERO, { remote: "gitea" });
+    assert.equal(range, `${current}..${tip}`, "merge-base(gitea/main, local)..local");
+    assert.ok(!r.git("log", "--format=%s", range).includes("main 2"), "gitea/main's own message is not re-checked");
+  } finally { r.cleanup(); }
+});
+
+test("pushing a named remote's main itself scans exactly its one new commit", () => {
+  const r = makeRepo();
+  try {
+    const old = r.commit("main 1");                    // already on refs/remotes/gitea/main
+    r.git("update-ref", "refs/remotes/gitea/main", old);
+    const tip = r.commit("main 2 (new)");               // local main is one commit ahead
+    const range = r.push(tip, old, { remote: "gitea", ref: "refs/heads/main" });
+    assert.equal(range, `${old}..${tip}`, "the pushed remote's main head..local, one commit");
+    assert.deepEqual(r.git("log", "--format=%s", range).split("\n"), ["main 2 (new)"],
+      "the recorded range covers exactly the one new commit");
+  } finally { r.cleanup(); }
+});
+
+test("a force push whose old remote head is on main starts at the merge-base with that main", () => {
+  const r = makeRepo();
+  try {
+    const m1 = r.commit("main 1");
+    r.git("update-ref", "refs/remotes/origin/main", m1);   // stale copy on another host
+    r.git("update-ref", "refs/remotes/gitea/main", m1);
+    r.git("checkout", "-q", "-b", "b");
+    r.commit("branch 1");
+    r.git("checkout", "-q", "main");
+    const m2 = r.commit("main 2 (already public)");
+    r.git("update-ref", "refs/remotes/gitea/main", m2);
+    r.git("checkout", "-q", "b");
+    r.git("rebase", "-q", "main");
+    const newTip = r.git("rev-parse", "HEAD");
+    // The old remote head is m1 — an ancestor of the new local sha (so this
+    // looks like a fast-forward), but already on main.
+    const range = r.push(newTip, m1, { remote: "gitea" });
+    assert.equal(range, `${m2}..${newTip}`, "merge-base(gitea/main, local)..local, not the old head");
+    const scanned = r.git("log", "--format=%s", range);
+    assert.ok(!scanned.includes("main 2"), "main's own message is not re-checked: " + scanned);
+    assert.ok(scanned.includes("branch 1"), "the branch's own message is checked");
+  } finally { r.cleanup(); }
+});
+
+test("a fast-forward of branch-only commits still scans remote_sha..local", () => {
+  const r = makeRepo();
+  try {
+    const base = r.commit("main 1");
+    r.git("update-ref", "refs/remotes/gitea/main", base);
+    r.git("checkout", "-q", "-b", "b");
+    const one = r.commit("branch 1");
+    const two = r.commit("branch 2");
+    assert.equal(r.push(two, one, { remote: "gitea" }), `${one}..${two}`);
+  } finally { r.cleanup(); }
+});
+
+test("a remote with no <remote>/main falls back to origin/main", () => {
+  const r = makeRepo();
+  try {
+    const base = r.commit("main 1");
+    r.git("update-ref", "refs/remotes/origin/main", base);
+    r.git("checkout", "-q", "-b", "b");
+    const tip = r.commit("branch 1");
+    assert.equal(r.push(tip, ZERO, { remote: "gitea" }), `${base}..${tip}`);
+  } finally { r.cleanup(); }
+});
+
+test("with neither <remote>/main nor origin/main the hook refuses and names the remote", () => {
+  const r = makeRepo();
+  try {
+    r.commit("main 1");
+    r.git("checkout", "-q", "-b", "b");
+    const tip = r.commit("branch 1");
+    const res = r.push(tip, ZERO, { expectFail: true, remote: "gitea" });
+    assert.equal(res.refused, true);
+    assert.equal(res.ranges, "", "no scan ran with a made-up range");
+    assert.match(res.stderr, /gitea\/main/);
+    assert.match(res.stderr, /git fetch gitea/);
+  } finally { r.cleanup(); }
+});
+
 test("with no origin/main the hook refuses instead of skipping the messages", () => {
   const r = makeRepo();
   try {
@@ -115,6 +209,6 @@ test("a branch with no history in common with main scans the whole branch", () =
     r.git("update-ref", "refs/remotes/origin/main", base);
     r.git("checkout", "-q", "--orphan", "lone");
     const tip = r.commit("lone 1");
-    assert.equal(r.push(tip, ZERO), `origin/main..${tip}`, "an empty merge-base falls back to origin/main..local");
+    assert.equal(r.push(tip, ZERO), `refs/remotes/origin/main..${tip}`, "an empty merge-base falls back to the full origin/main ref");
   } finally { r.cleanup(); }
 });
