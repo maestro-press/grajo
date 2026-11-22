@@ -45,6 +45,13 @@
  * `FAKE_CHROME_CLOSE_EXIT_MS`). That is the window a real Chromium has between `Browser.close`
  * and its exit, while its pages still run their pagehide beacons and image requests.
  *
+ * The knob that shapes the DESTROY order is `FAKE_CHROME_DESTROY_DELAY_MS` (default 0, cap 2000):
+ * with it set, `Target.closeTarget` answers `{success:true}` at once but the target (and its
+ * sessions) stays in `Target.getTargets` until the delay elapses, and
+ * `Target.disposeBrowserContext` answers at once while the context and its pages stay listed —
+ * the order a real Chromium has, where the close is answered before the target is gone. 0 keeps
+ * the fixture's old synchronous destroy, byte for byte.
+ *
  * Session ids are prefix-distinguishable, as in the other fake: `S…` browser sessions,
  * `T…` `Target.attachToTarget`, `A…` auto-attached children. Target ids carry the type they
  * were created as (`P…` page, `FR…` iframe, `WK…` worker, `SW…` shared worker, `SV…` service
@@ -83,6 +90,55 @@ const CLOSE_EXIT_CODE = Number(process.env.FAKE_CHROME_CLOSE_EXIT_CODE || 0);
  * keeps the old behaviour byte for byte: reply, then exit in the same command handler.
  */
 const CLOSE_HANDLE_DELAY_MS = Math.max(0, Math.min(2000, Math.trunc(Number(process.env.FAKE_CHROME_CLOSE_HANDLE_DELAY_MS ?? 0)) || 0));
+/**
+ * How long a target outlives its `Target.closeTarget` AFTER the reply — the order a REAL Chromium
+ * has, where the answer comes back before the target is destroyed. 0 (the default) keeps the old
+ * behaviour byte for byte: the target is gone before its reply is written. With a delay set,
+ * `Target.closeTarget` answers `{success:true}` at once and the target stays in
+ * `Target.getTargets` (with its sessions, its events and its held requests) until the delay
+ * elapses, and then the ordinary close runs (the `close-target` trace, `Target.targetDestroyed`,
+ * the detaches). `Target.disposeBrowserContext` answers at once the same way: the context stays
+ * in `Target.getBrowserContexts` and its pages stay listed until the delay, then the pages are
+ * closed and the context leaves the list.
+ *
+ * That is the window a relay's verification scan runs in: it closes a page, lists the targets a
+ * few milliseconds later, and still sees the page it just closed.
+ */
+const DESTROY_DELAY_MS = Math.max(0, Math.min(2000, Math.trunc(Number(process.env.FAKE_CHROME_DESTROY_DELAY_MS ?? 0)) || 0));
+/**
+ * A page the browser makes, in a NON-DEFAULT context of its own, right after the Nth
+ * `Page.navigate` whose url is `about:blank` — the window in which a popup appears while a
+ * cleanup is between its navigation pass and its verification scan. Nothing the relay asked for
+ * creates it and the relay never closes it: only the cleanup's context disposal (the fixture's
+ * `Target.disposeBrowserContext`, which closes every page of that context) takes it away.
+ *
+ *   FAKE_CHROME_LATE_CONTEXT_PAGE_AFTER_NAVIGATE=1
+ *
+ * 0 (the default) creates nothing. The creation runs synchronously at the END of the navigate
+ * command, after its reply and its `Page.frameNavigated`, so the relay's next commands already
+ * see the page and its context, in the pipe order a real browser would have.
+ */
+const LATE_CONTEXT_PAGE_AFTER_NAVIGATE = Math.max(0, Math.min(1000, Math.trunc(Number(process.env.FAKE_CHROME_LATE_CONTEXT_PAGE_AFTER_NAVIGATE ?? 0)) || 0));
+/**
+ * A worker the browser makes at the instant a `Target.disposeBrowserContext` command arrives —
+ * the window AFTER the cleanup's remainder listing and BEFORE its verification scan, which is the
+ * one window a target can attach in without that listing ever carrying it.
+ *
+ *   FAKE_CHROME_WORKER_ON_CONTEXT_DISPOSE="shared_worker|https://bot.example/late-shared.js"
+ *
+ * Comma-separated `type|url` entries (`type` defaults to `other`; a bare entry is a URL), each
+ * announced like any other new target (discoverers, then every auto-attacher that can see it) and
+ * recorded as a `late-worker` trace line. Empty (the default) creates nothing, byte for byte.
+ */
+const WORKERS_ON_CONTEXT_DISPOSE = (
+  process.env.FAKE_CHROME_WORKER_ON_CONTEXT_DISPOSE === undefined
+    ? []
+    : String(process.env.FAKE_CHROME_WORKER_ON_CONTEXT_DISPOSE).split(",")
+).map((part) => part.trim()).filter(Boolean).map((entry) => {
+  const at = entry.indexOf("|");
+  if (at < 0) return { type: "other", url: entry };
+  return { type: entry.slice(0, at).trim() || "other", url: entry.slice(at + 1).trim() };
+});
 
 // Deliberately identical to the other fake's version block: a relay cannot tell the two
 // fixtures apart, so one can stand in for the other without moving any other needle.
@@ -379,6 +435,39 @@ if (process.env.FAKE_CHROME_START_CONTEXT === "1") {
   trace({ t: "start-context", id });
 }
 
+/**
+ * The late popup above: one page, in a context of its own, announced like any other new target
+ * (the gate's browser session sees it, and its record is a page the remainder loop must not
+ * close). Called at the end of every `Page.navigate`; it acts once, on the Nth blank navigation.
+ */
+let blankNavigations = 0;
+function maybeCreateLateContextPage(url) {
+  if (!LATE_CONTEXT_PAGE_AFTER_NAVIGATE || url !== "about:blank") return;
+  blankNavigations += 1;
+  if (blankNavigations !== LATE_CONTEXT_PAGE_AFTER_NAVIGATE) return;
+  const contextId = `C${++contextCount}`;
+  noteContext(contextId);
+  const target = makeTarget({ id: nextTargetId("page"), type: "page", url: "https://bot.example/late-popup", contextId });
+  targets.set(target.id, target);
+  trace({ t: "late-page", targetId: target.id, contextId, afterBlankNavigations: blankNavigations });
+  notifyDiscoverers(target);
+  announceToAutoAttachers(target);
+}
+
+/**
+ * The workers above: created at the end of a `Target.disposeBrowserContext` command, before the
+ * reply goes out on the wire (so the relay's next `Target.getTargets` already carries them).
+ */
+function createWorkersOnContextDispose() {
+  for (const entry of WORKERS_ON_CONTEXT_DISPOSE) {
+    const target = makeTarget({ id: nextTargetId(entry.type), type: entry.type, url: entry.url });
+    targets.set(target.id, target);
+    trace({ t: "late-worker", targetId: target.id, type: entry.type, url: entry.url });
+    notifyDiscoverers(target);
+    announceToAutoAttachers(target);
+  }
+}
+
 /** A fresh target id for a type, skipping anything a test has already named itself. */
 function nextTargetId(type) {
   let candidate;
@@ -643,6 +732,22 @@ function closeTarget(target) {
 }
 
 /**
+ * The destroy a real browser performs a moment AFTER it answered `Target.closeTarget`: with
+ * `FAKE_CHROME_DESTROY_DELAY_MS` set, the target (and its sessions) stays exactly as it is until
+ * this runs — so a listing taken right after the reply still carries it.
+ */
+const pendingDestroys = new Set();
+function scheduleDestroy(target) {
+  if (pendingDestroys.has(target.id)) return;
+  pendingDestroys.add(target.id);
+  setTimeout(() => {
+    pendingDestroys.delete(target.id);
+    closeTarget(target);
+    maybeExitOnNoPages();
+  }, DESTROY_DELAY_MS);
+}
+
+/**
  * What `Browser.close` does once its reply is out: the shape of a real browser's close, with
  * `FAKE_CHROME_CLOSE_EXIT_MS` deciding whether the pipe goes first and the process a moment
  * later, or the process goes at once.
@@ -825,6 +930,13 @@ function handle(msg) {
     }
     case "Target.closeTarget": {
       const target = targets.get(msg.params?.targetId);
+      if (DESTROY_DELAY_MS > 0 && target && !target.closed) {
+        // A real Chromium answers BEFORE the target is gone: the reply goes out now, the
+        // destroy (trace, events, session removal) runs when the delay elapses.
+        reply({ success: true });
+        scheduleDestroy(target);
+        return;
+      }
       const success = closeTarget(target);
       reply({ success });
       maybeExitOnNoPages();
@@ -877,13 +989,27 @@ function handle(msg) {
     }
     case "Target.disposeBrowserContext": {
       const id = msg.params?.browserContextId;
-      for (const target of [...targets.values()]) {
-        if (!target.closed && target.contextId === id) closeTarget(target);
+      const dispose = () => {
+        for (const target of [...targets.values()]) {
+          if (!target.closed && target.contextId === id) closeTarget(target);
+        }
+        const at = createdContexts.indexOf(id);
+        if (at >= 0) createdContexts.splice(at, 1);
+        trace({ t: "dispose-context", id });
+      };
+      if (DESTROY_DELAY_MS > 0) {
+        // Answered at once; the context (and its pages) stay listed until the delay.
+        reply({});
+        // The mid-cleanup worker (see FAKE_CHROME_WORKER_ON_CONTEXT_DISPOSE): announced after the
+        // reply, so the relay's next `Target.getTargets` already carries it.
+        createWorkersOnContextDispose();
+        setTimeout(() => { dispose(); maybeExitOnNoPages(); }, DESTROY_DELAY_MS);
+        return;
       }
-      const at = createdContexts.indexOf(id);
-      if (at >= 0) createdContexts.splice(at, 1);
-      trace({ t: "dispose-context", id });
+      // The synchronous path's old order, unchanged: the trace, then the reply, then the exit.
+      dispose();
       reply({});
+      createWorkersOnContextDispose();
       maybeExitOnNoPages();
       return;
     }
@@ -990,6 +1116,7 @@ function handle(msg) {
         );
       }
       trace({ t: "navigate", targetId: target.id, url, loaderId, committed });
+      maybeCreateLateContextPage(url);
       return;
     }
     case "Page.getNavigationHistory": {

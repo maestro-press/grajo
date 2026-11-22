@@ -816,6 +816,22 @@ export async function createRelay(config) {
   /** The replacement page of the cleanup on the move: resumed at once, never navigated. */
   let cleanupReplacementId = null;
   /**
+   * The non-default browser contexts THE CLEANUP disposed. A real Chromium answers
+   * `Target.disposeBrowserContext` before the context (and its pages) are gone from
+   * `Target.getBrowserContexts` / `Target.getTargets`, so this is the set the CONTEXT check may
+   * WAIT on (see `listGateContextsSettled`), and nothing else: a page that goes away with its
+   * context is not a page the gate closed, so the TARGET wait never waits on it.
+   */
+  const disposedContextIds = new Set();
+  /**
+   * The targetIds THIS cleanup run sent `Target.closeTarget` for — every close site of the run,
+   * a target with no `gateTargets` record (the remainder loop's unrecorded worker) included. It
+   * is the ONLY set the target wait may pend on (see `listGateTargetsSettled`): a page that left
+   * because its context was disposed, or one the gate never closed at all, is never waited on,
+   * so the scan fails closed on it. Cleared at the start of every run.
+   */
+  const closedByRun = new Set();
+  /**
    * How many asks for a `Browser.close` are outstanding. A COUNT, never one flag, because two
    * different owners ask — the stop path (`shutdown()`, SIGTERM) and a client's `Browser.close`
    * — and neither may undo the other's ask. Above zero, the cleanup that comes back clean must
@@ -1091,6 +1107,65 @@ export async function createRelay(config) {
   }
 
   /**
+   * The target list, re-read until the targets THE GATE ITSELF CLOSED IN THIS RUN have left it.
+   *
+   * A real Chromium answers `Target.closeTarget` BEFORE the target is destroyed: a listing taken
+   * a few milliseconds after the close still carries the page the gate just closed. The cleanup's
+   * verification scan reads that listing, so without this wait it fails on a page it closed
+   * itself and hands a healthy browser to the stop path (the turn-2 regression, ~1 in 3 live
+   * runs).
+   *
+   * ONLY those targets are waited on: the ids of `closedByRun`, which is every `Target.closeTarget`
+   * this run sent, a target with no `gateTargets` record included. Anything else — a page the
+   * gate never closed, a page that only left because its CONTEXT was disposed — is never waited
+   * on, skipped or forgiven: the listing is returned at once and the caller's unchanged scan
+   * fails closed on it. The replacement page is in `ignoreIds`, so it is never in the wait set.
+   * Bounded by `ms`: on timeout the listing is returned AS IT IS, so the scan fails closed on
+   * whatever is left. null still means "the list could not be read".
+   */
+  async function listGateTargetsSettled(ignoreIds, ms) {
+    const ignored = ignoreIds instanceof Set ? ignoreIds : new Set(ignoreIds || []);
+    const deadlineAt = Date.now() + Math.max(0, ms);
+    for (;;) {
+      // Never wait longer for the listing itself than the cleanup has left (a hung browser must
+      // not overrun the budget on the last iteration).
+      const listed = await listGateTargets(Math.min(5000, Math.max(100, deadlineAt - Date.now())));
+      if (!listed) return null;
+      let pending = false;
+      for (const targetId of listed.keys()) {
+        if (ignored.has(targetId)) continue;
+        if (closedByRun.has(targetId)) { pending = true; break; }
+      }
+      if (!pending || Date.now() >= deadlineAt) return listed;
+      await delay(Math.min(25, Math.max(1, deadlineAt - Date.now())));
+    }
+  }
+
+  /**
+   * The browser-context list, re-read until the contexts THE CLEANUP disposed have left it — the
+   * same race: a real Chromium answers `Target.disposeBrowserContext` before the context (and its
+   * pages) are gone. Only ids this cleanup disposed are waited on; a non-default context it did
+   * NOT dispose is returned at once, so the caller fails closed on it. Bounded by `ms`; the reply
+   * is returned as it is on timeout, and one the caller cannot read still fails it.
+   */
+  async function listGateContextsSettled(ms) {
+    const deadlineAt = Date.now() + Math.max(0, ms);
+    for (;;) {
+      const reply = noteDefaultContext(await gateRequest(
+        gateBrowserSession,
+        "Target.getBrowserContexts",
+        {},
+        Math.max(100, Math.min(1000, deadlineAt - Date.now())),
+      ));
+      const ids = reply && reply.result && Array.isArray(reply.result.browserContextIds) ? reply.result.browserContextIds : null;
+      if (!ids) return reply;
+      const pending = ids.some((id) => typeof id === "string" && !isDefaultContext(id) && disposedContextIds.has(id));
+      if (!pending || Date.now() >= deadlineAt) return reply;
+      await delay(Math.min(25, Math.max(1, deadlineAt - Date.now())));
+    }
+  }
+
+  /**
    * Steps a to e of section 4, on the gate's own sessions. True when the scan came back clean;
    * false hands the caller to the stop path — and NOTHING on that path is closed, because a
    * page whose commit was never observed is a document the cleanup did not leave.
@@ -1100,6 +1175,9 @@ export async function createRelay(config) {
     const deadlineAt = Date.now() + cleanupBudgetMs;
     const left = () => Math.max(0, deadlineAt - Date.now());
     const budget = (ms) => Math.max(100, Math.min(ms, left()));
+    // Only the closes and contexts THIS run issued may be waited on by the checks below.
+    disposedContextIds.clear();
+    closedByRun.clear();
 
     // (a) The fresh replacement, ALWAYS first: headful Chromium exits on its last page, and no
     // page the bot (or a pre-ready document) left is trusted by its URL — a scripted
@@ -1136,6 +1214,7 @@ export async function createRelay(config) {
       record.gateClosed = true; // the GATE closed it: its requests fail in every state
       record.resumed = true;
       dropGateEvents(record);
+      closedByRun.add(record.targetId);
       await gateRequest(gateBrowserSession, "Target.closeTarget", { targetId: record.targetId }, budget(1000));
     }
 
@@ -1179,6 +1258,7 @@ export async function createRelay(config) {
       record.gateClosed = true; // the GATE closed it: its requests fail in every state
       record.resumed = true;
       dropGateEvents(record);
+      closedByRun.add(record.targetId);
       await gateRequest(gateBrowserSession, "Target.closeTarget", { targetId: record.targetId }, budget(1000));
     }
 
@@ -1187,7 +1267,7 @@ export async function createRelay(config) {
     // bot's, and is left alone (section 3).
     const remainder = new Set();
     for (const [targetId, record] of gateTargets) if (!record.closed) remainder.add(targetId);
-    const afterCloses = await listGateTargets();
+    const afterCloses = await listGateTargetsSettled([replacementId], left());
     if (afterCloses) for (const targetId of afterCloses.keys()) remainder.add(targetId);
     for (const targetId of remainder) {
       if (targetId === replacementId) continue;
@@ -1200,6 +1280,9 @@ export async function createRelay(config) {
       // Chromium's, exactly like the attached one: it is never closed.
       if (isExemptNonPageTarget(targetId)) continue;
       if (record) { record.closed = true; record.gateClosed = true; record.resumed = true; dropGateEvents(record); }
+      // Unrecorded too: a target with no `gateTargets` record is still a target THIS run closed,
+      // so the scan waits for its destroy as it does for every other close of the run.
+      closedByRun.add(targetId);
       await gateRequest(gateBrowserSession, "Target.closeTarget", { targetId }, budget(1000));
     }
 
@@ -1211,11 +1294,16 @@ export async function createRelay(config) {
     // default context out of that array altogether.
     for (const contextId of contexts.result.browserContextIds) {
       if (typeof contextId !== "string" || isDefaultContext(contextId)) continue;
+      disposedContextIds.add(contextId);
       await gateRequest(gateBrowserSession, "Target.disposeBrowserContext", { browserContextId: contextId }, budget(1000));
     }
 
     // (e) The scan: exactly the replacement page, no worker and no other target, default context.
-    const scan = await listGateTargets();
+    //     The listing waits for the targets THE GATE CLOSED ITSELF in this run to leave it (a
+    //     real Chromium answers the close before the target is gone); anything else — a page the
+    //     gate never closed, one only the context disposal took away — is not waited for, and
+    //     fails the scan below at once.
+    const scan = await listGateTargetsSettled([replacementId], left());
     if (!scan || !scan.has(replacementId)) return false;
     for (const [targetId, info] of scan) {
       if (targetId === replacementId) {
@@ -1226,7 +1314,7 @@ export async function createRelay(config) {
       if (isExemptNonPageTarget(targetId)) continue;
       return false;
     }
-    const contextsAfter = noteDefaultContext(await gateRequest(gateBrowserSession, "Target.getBrowserContexts", {}, budget(1000)));
+    const contextsAfter = await listGateContextsSettled(left());
     if (!contextsAfter || !contextsAfter.result || !Array.isArray(contextsAfter.result.browserContextIds)) return false;
     for (const contextId of contextsAfter.result.browserContextIds) {
       if (typeof contextId === "string" && !isDefaultContext(contextId)) return false;
@@ -1598,6 +1686,12 @@ export async function createRelay(config) {
     record.gateClosed = true; // the GATE closed it: its requests fail in every state
     dropGateEvents(record);
     record.resumed = true; // never resumed again for any reason
+    // THIS RUN'S close, exactly like the cleanup's own: a target that attaches DURING a cleanup
+    // (a worker, an `other` target) is closed here too, and a real Chromium answers the close
+    // before the target is destroyed, so the verification scan has to wait for it. Added
+    // unconditionally: each run clears the set at its start, so a close made outside a run never
+    // carries over to the next one.
+    closedByRun.add(record.targetId);
     void gateRequest(gateBrowserSession, "Target.closeTarget", { targetId: record.targetId });
   }
 
@@ -1816,8 +1910,8 @@ export async function createRelay(config) {
   // Chromium's events on the gate's own sessions
   // -----------------------------------------------------------------------------------
 
-  async function listGateTargets() {
-    const reply = await gateRequest(gateBrowserSession, "Target.getTargets", {}, 5000);
+  async function listGateTargets(timeoutMs = 5000) {
+    const reply = await gateRequest(gateBrowserSession, "Target.getTargets", {}, timeoutMs);
     if (!reply || !reply.result || !Array.isArray(reply.result.targetInfos)) return null;
     // While the gate is still starting, its own listing is a SECOND source of component-extension
     // workers, beside the attach events: Chromium 145 LISTS one as
