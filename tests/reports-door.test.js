@@ -25,7 +25,7 @@ const MASTER = join(root, "master", "crow.db");
 const { createDbClient } = await import("../servers/db.js");
 const {
   approveGoLive, approveRecipient, listRecipients, pauseReport, proposeRecipient, refuseRecipient,
-  revokeRecipient,
+  revokeRecipient, updateSettings,
 } = await import("../servers/gateway/reports/approvals.js");
 const { createReport, getReport, saveRecipe, updateReportColumns } = await import(
   "../servers/gateway/reports/store.js"
@@ -161,6 +161,9 @@ async function world({ address = "reports@example.com", title = "Weekly listings
     comment_tier_default: "c",
     comment_visibility: "own",
     ai_commentary: 0,
+  });
+  await updateSettings(db, approvalsDeps(), {
+    reportId: id, settings: { sender_account_id: account.id }, actor: OWNER,
   });
   const preview = {
     id: "prv-1", reportId: id, kind: "preview", status: "ok", recipeRev: saved.rev,

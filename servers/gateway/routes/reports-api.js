@@ -32,6 +32,18 @@
  * `schedules` row, and both are part of the live seal, so a change to either on a live report pauses it
  * with the same fixed sentence a live-set settings change leaves.
  *
+ * THE CARD: `GET /:id/card` is the one read a report's card in a Perch chat is drawn from
+ * (reports/card-view.js). It carries the full settings of everything the card offers to act on: a
+ * bot's pending free change with both sides' settings, and the head settings of every draft source
+ * waiting for an OK. It carries no seal, nonce, token or secret, like every other answer here. Its
+ * `headRev` and `changesHash` are what an Apply is bound to. `POST /:id/apply` is the one tap that
+ * applies a bot's FREE change to a live report, and nothing else applies it: no other route, no bot
+ * tool and no scheduled tick does. The body carries that `headRev` and `changesHash`, and the route
+ * recomputes the diff: anything that moved since the card was read, and any diff the card could only
+ * show in part, is 409 `conflict` and applies nothing. The approvals module re-derives both revisions'
+ * sources hashes before it re-stamps, so a change that moved a source answers 409 `go_live_needed` and
+ * the card asks for a preview and a go-live instead.
+ *
  * NOTHING ON THIS ROUTER SENDS MAIL, and it never imports the send door or a delivery module. An owner
  * add of a recipient is a propose plus an approve in one tap; "Send to the rest" only writes `pending`
  * `report_sends` rows for a run (reports/send-log.js); the delivery seam is somebody else's, and it
@@ -43,10 +55,11 @@ import { Router, json as jsonParserOf, raw as rawParserOf } from "express";
 import { auditLog, createDbClient } from "../../db.js";
 import { isLocalPasswordSessionOn } from "../dashboard/local-session.js";
 import {
-  approveGoLive, approveRecipient, isLive, listRecipients, ownerSaveRecipe, pauseReport,
-  proposeRecipient, refuseRecipient, resumeReport, revokeRecipient, updateSettings,
+  applyPendingFreeChange, approveGoLive, approveRecipient, isLive, listRecipients, ownerSaveRecipe,
+  pauseReport, proposeRecipient, refuseRecipient, resumeReport, revokeRecipient, updateSettings,
 } from "../reports/approvals.js";
 import { buildApprovalsDeps } from "../reports/approvals-deps.js";
+import { buildReportCardView, computeReportChanges } from "../reports/card-view.js";
 import { deleteReport } from "../reports/delete.js";
 import { setReportSchedule } from "../reports/schedule-set.js";
 import { listRuns } from "../reports/run.js";
@@ -88,6 +101,9 @@ const INJECT_HASH_RE = /^[0-9a-f]{64}$/;
 
 /** The bundle hash an owner's view carries into a step approval, exactly what `bundleHashOf` writes. */
 const BUNDLE_HASH_RE = /^[0-9a-f]{64}$/;
+
+/** The diff digest a card carries into an Apply, exactly what `computeReportChanges` writes. */
+const CHANGES_HASH_RE = /^[0-9a-f]{64}$/;
 
 /** A step revision in a path. */
 const STEP_REV_RE = /^\d{1,7}$/;
@@ -410,6 +426,18 @@ export function reportsApiRouter(dashboardAuth, deps = {}) {
     res.json({ report: await reportView(db, approvalsDeps, row) });
   }));
 
+  // GET /:id/card — the whole card for one report, from one read: the report, its sender account, its
+  // schedule and any proposed one, its newest preview, a bot's pending free change with both sides'
+  // settings, the draft sources waiting for an OK, its people, and its proposed steps, hosts and
+  // credential bindings. No seal, no nonce, no token, no secret.
+  router.get(`${REPORTS_API_PREFIX}/:id/card`, route("GET /:id/card", async (db, req, res) => {
+    const id = idOf(req, res);
+    if (!id) return;
+    const row = await getReport(db, id);
+    if (!row) return sendError(res, 404, "not_found");
+    res.json({ card: await buildReportCardView(db, approvalsDeps, row) });
+  }));
+
   /* ------------------------------------------------------------------------- writes */
 
   // PUT /:id/recipe — the owner's save. A live report is re-stamped only when nothing it approved
@@ -428,6 +456,37 @@ export function reportsApiRouter(dashboardAuth, deps = {}) {
       actor: { kind: "owner" },
     });
     res.json(saved);
+  }));
+
+  // POST /:id/apply — the ONE tap that applies a bot's free change to a live report, and nothing else
+  // applies it: no other route, no bot tool and no scheduled tick does. The body carries the head
+  // revision and the diff digest the card was drawn from (`expectedRev`, `changesHash`), and the diff
+  // is recomputed here: a head that moved, a digest that does not match it, or a diff a card could
+  // only show in part is 409 `conflict` and applies nothing. The approvals module re-reads both
+  // revisions' own recipe text and refuses (`go_live_needed`) when a source moved, so a change the
+  // owner should re-approve never goes through this tap.
+  router.post(`${REPORTS_API_PREFIX}/:id/apply`, route("POST /:id/apply", async (db, req, res) => {
+    const id = idOf(req, res);
+    if (!id) return;
+    const body = req.body == null ? {} : req.body;
+    if (typeof body !== "object" || Array.isArray(body)) return sendError(res, 400, "bad_input");
+    if (!Number.isInteger(body.expectedRev)) return sendError(res, 400, "bad_input");
+    if (typeof body.changesHash !== "string" || !CHANGES_HASH_RE.test(body.changesHash)) {
+      return sendError(res, 400, "bad_input");
+    }
+    const row = await getReport(db, id);
+    if (!row) return sendError(res, 404, "not_found");
+    const diff = await computeReportChanges(db, row, approvalsDeps);
+    if (diff.unreadable || diff.truncated) return sendError(res, 409, "conflict");
+    if (diff.headRev !== body.expectedRev || diff.changesHash !== body.changesHash) {
+      return sendError(res, 409, "conflict");
+    }
+    const result = await applyPendingFreeChange(db, approvalsDeps, {
+      reportId: id,
+      actor: { kind: "owner" },
+      expectedRev: body.expectedRev,
+    });
+    res.json(result);
   }));
 
   // PUT /:id/settings — the sender, the delivery rule, the comment defaults, the AI switch, the title
@@ -464,12 +523,21 @@ export function reportsApiRouter(dashboardAuth, deps = {}) {
     res.json({ report: await reportView(db, approvalsDeps, row) });
   }));
 
-  // POST /:id/go-live — seal the live set over the head revision the preview ran against.
+  // POST /:id/go-live — seal the live set over the head revision the preview ran against. The body MUST
+  // carry `expectedSenderAccountId` (the sender the card showed, the empty string for none): a missing
+  // or non-string one is 400 `bad_input`, because a tap nobody bound to a sender could seal a report
+  // that would send from an account the owner never saw, and the row naming another account is 409
+  // `conflict` and seals nothing.
   router.post(`${REPORTS_API_PREFIX}/:id/go-live`, route("POST /:id/go-live", async (db, req, res) => {
     const id = idOf(req, res);
     if (!id) return;
     const body = req.body == null ? {} : req.body;
     if (typeof body !== "object" || Array.isArray(body)) return sendError(res, 400, "bad_input");
+    if (typeof body.expectedSenderAccountId !== "string") return sendError(res, 400, "bad_input");
+    const row = await getReport(db, id);
+    if (!row) return sendError(res, 404, "not_found");
+    const sender = row.sender_account_id == null ? "" : String(row.sender_account_id);
+    if (body.expectedSenderAccountId !== sender) return sendError(res, 409, "conflict");
     const result = await approveGoLive(db, approvalsDeps, {
       reportId: id,
       previewRunId: body.previewRunId,

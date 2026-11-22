@@ -395,6 +395,26 @@ test("(d) the door imports no send service, no schedule service, no draft seal, 
   assert.equal(closure.files.has(SEND_SERVICE), false, "and not the mail send service");
 });
 
+test("(d) reports/mcp closure has no door, delivery, run, send or schedule service", () => {
+  // The bot reports door is a proposal surface: it may import the stores that own a proposal, and it
+  // must reach no seam that sends, delivers or runs anything. `approvals-deps.js` is watched by name
+  // too, because it is the one builder that wires the run engine into the approvals seam.
+  const APPROVALS_DEPS = resolve(REPORTS_DIR, "approvals-deps.js");
+  const SCHEDULE_HOOK = resolve(REPORTS_DIR, "schedule-hook.js");
+  const MCP = resolve(REPORTS_DIR, "mcp.js");
+  assert.ok(statSync(MCP).isFile(), "the reports bot door is a real module");
+
+  const closure = importClosure([MCP]);
+  assert.ok(closure.files.size > 5,
+    `the reports door's imports were really walked (${closure.files.size} modules)`);
+  for (const forbidden of [
+    REPORTS_DOOR, REPORTS_DELIVERY, REPORTS_RUN, SEND_SERVICE, SCHEDULE_SERVICE, APPROVALS_DEPS, SCHEDULE_HOOK,
+  ]) {
+    assert.equal(closure.files.has(forbidden), false,
+      `servers/gateway/reports/mcp.js reaches ${rel(forbidden)}`);
+  }
+});
+
 test("(d) nothing under servers/gateway/reports registers a tool whose name matches mail send or schedule", () => {
   const files = walk(REPORTS_DIR);
   assert.ok(files.length > 5, `the reports tree was really walked (${files.length} files)`);

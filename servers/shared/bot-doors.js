@@ -34,6 +34,11 @@
  * path-scoped token plus a required signed `sharing` actor are what admit a call;
  * nothing there can send, and every message it writes is a draft the owner checks.
  *
+ * THE REPORTS DOOR adds `/reports/mcp`: the bot tools for building a report, under
+ * the reports token and a required signed `reports` actor. Every call lands in the
+ * project derived from the verified bot, and nothing there approves, goes live or
+ * reads a credential.
+ *
  * The doors are PATHS ONLY — isDoorPath never sees the request method, so a
  * door admits every method on its path. That is the whole of the upload door:
  * the route behind it is a PUT route, so any other method reaches no handler
@@ -52,6 +57,7 @@ export const BOT_DOOR_PREFIXES = Object.freeze([
   "/artifacts/upload/",  // the upload PUT: the one-time token in the path is the capability (2026-11-16 ruling)
   "/secrets/mcp",  // the bot-only credential-card mount, under the secrets token and a signed Perch actor
   "/sharing-bot/mcp",  // the bot sharing door (saved message drafts only), under the sharing-bot token and a signed `sharing` actor
+  "/reports/mcp",  // the reports door (report proposals only), under the reports token and a signed `reports` actor
   "/mail-draft/mcp",  // Crow Mail's drafting mount: a per-turn `mdt_` token and a `mail-draft` actor signature
   "/peer-relay/",  // the relay to paired peers, under the relay token
 ]);

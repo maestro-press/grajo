@@ -8,6 +8,7 @@ import { perchConnectCardJs } from "./connect-card.js";
 import { perchStagedCardJs } from "./staged-card.js";
 import { perchMailDraftCardJs } from "./mail-draft-card.js";
 import { perchMsgDraftCardJs } from "./msg-draft-card.js";
+import { perchReportCardJs } from "./report-card.js";
 import { perchMailScheduleSheetJs } from "../panels/mail/schedule-sheet.js";
 import { perchCardChipJs } from "./card-chip.js";
 import { perchBriefingJs } from "./briefing-card.js";
@@ -1672,6 +1673,7 @@ export function perchHubJs(lang = "en") {
     resetPhoneCards();
     resetArtifactCards(); resetCardChip(); resetBriefing(); resetSecretCard(); resetStaged(); resetMailDrafts();
     resetMsgDrafts();                     /* bot-door PR B: the message draft cards die with it too */
+    resetReportCards();                   /* and the report cards, with their preview polls */
     resetBrowserTiles();                  /* live browser tile: its pollers and header line die with the transcript */
     resetControls();                        /* the PREVIOUS session's picker must not bleed in */
     draftRestore(sid);                      /* nor its composer text: this session's own draft, or empty */
@@ -2293,6 +2295,7 @@ export function perchHubJs(lang = "en") {
     resetPhoneCards();
     resetArtifactCards(); resetCardChip(); resetBriefing(); resetSecretCard(); resetStaged(); resetMailDrafts();
     resetMsgDrafts();
+    resetReportCards();
     resetBrowserTiles();
     histSettled=false; histBuf=[];
     seamEchoes=[];                   /* their rows died with the transcript */
@@ -2579,6 +2582,7 @@ export function perchHubJs(lang = "en") {
     loadMailDraftFromQuery();      /* a draft made in the reader has no chat: its id rides the URL */
     loadMsgDrafts(current.sid);    /* bot-door PR B: this chat's message drafts, one card each */
     loadMsgDraftFromQuery();       /* a bell's ?msgdraft= mounts that one card at the top */
+    loadReportCards(current.sid);  /* this chat's reports, one card each, and its 8 s id list */
   }
 
   /* Track 3 Task 4: session controls — model, thinking level, permission
@@ -2818,6 +2822,7 @@ export function perchHubJs(lang = "en") {
     resetPhoneCards();
     resetArtifactCards(); resetCardChip(); resetBriefing(); resetSecretCard(); resetStaged(); resetMailDrafts();
     resetMsgDrafts();            /* bot-door PR B: and none of its message draft cards */
+    resetReportCards();
     resetFacts();
     /* Composer dictation: a switch drops the recording and frees the mic;
        each open re-probes the server (dictation.js). */
@@ -4476,6 +4481,7 @@ ${perchStagedCardJs(lang)}
 ${perchMailDraftCardJs(lang)}
 ${perchMsgDraftCardJs(lang)}
 ${perchMailScheduleSheetJs(lang)}
+${perchReportCardJs(lang)}
   /* The staged card's host hooks (spec 12): the composer for "Ask for a change" — the note goes
      into the ordinary message box, so the normal send path and its paste detector run — and the
      refetch after a replacement. */

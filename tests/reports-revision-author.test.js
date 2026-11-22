@@ -137,9 +137,12 @@ async function addMailAccount(db, address = "alex@example.com") {
  * One saved report with a schedule, a sender and the live-set settings a go-live needs.
  *
  * `sealed` decides how the first revision is saved: through the owner's own route (which writes the
- * author seal), or through the bare store call an older build made (which writes none).
+ * author seal), or through the bare store call an older build made (which writes none). `sealSender`
+ * decides whether the sender is sealed with the owner's settings save or left a plain column write.
  */
-async function prepare(db, { recipe, sender = "ma-0011223344556677", authorKind = "owner", sealed = true } = {}) {
+async function prepare(db, {
+  recipe, sender = "ma-0011223344556677", authorKind = "owner", sealed = true, sealSender = true,
+} = {}) {
   const scheduleId = await addSchedule(db);
   const { id } = await createReport(db, {
     projectId: PROJECT, owner: "owner", botId: "bot-1", title: "Weekly listings",
@@ -158,6 +161,7 @@ async function prepare(db, { recipe, sender = "ma-0011223344556677", authorKind 
     comment_visibility: "own",
     ai_commentary: 0,
   });
+  if (sealSender) await sealSenderViaSettings(db, id, sender);
   return { id, rev: saved.rev };
 }
 
@@ -541,7 +545,7 @@ test("a never-live report whose sender was never sealed is refused, whatever its
   };
 
   // A bot's head revision, over a row that names the very account the block names, with no sender seal.
-  const bot = await prepare(db, { recipe: { blocks: [block] }, sender: accountId, authorKind: "bot" });
+  const bot = await prepare(db, { recipe: { blocks: [block] }, sender: accountId, authorKind: "bot", sealSender: false });
   const deps = approvalDeps(bot);
   const botHead = await getReport(db, bot.id);
   assert.equal(await senderSealVerifies(db, SEED, botHead), false);
@@ -556,7 +560,7 @@ test("a never-live report whose sender was never sealed is refused, whatever its
 
   // An owner revision saved before the author seal existed, and a sender set by a column write: the same
   // refusal. The owner's settings save is what seals the sender (the test above).
-  const bare = await prepare(db, { recipe: { blocks: [block] }, sender: accountId, sealed: false });
+  const bare = await prepare(db, { recipe: { blocks: [block] }, sender: accountId, sealed: false, sealSender: false });
   const bareHead = await getReport(db, bare.id);
   assert.equal(await senderSealVerifies(db, SEED, bareHead), false);
   assert.equal(await approvedSenderAccount(db, deps, null, bareHead), "");

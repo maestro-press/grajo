@@ -3,7 +3,7 @@
  *
  * Kinds signed with the one per-boot key (each its own MAC domain, so none
  * replays as another): "bot" (phone), "board", "board-thread", "artifacts", "secrets",
- * "mail-draft", "sharing"
+ * "mail-draft", "sharing", "reports"
  * over the v1 tuple below, and the session-bound (v2) kind "peer-relay"
  * (the loopback relay to paired peers, item 46 PR-B, below).
  *
@@ -187,6 +187,25 @@ export function signSharingActor({ botId, threadId, gatewayType } = {}) {
 /** Constant-time check of a presented sharing-door signature. False without a key. */
 export function verifySharingActorSig({ botId, threadId, gatewayType, sig } = {}) {
   return verifyActorSig({ kind: "sharing", botId, threadId, gatewayType, sig });
+}
+
+// ---- reports actor headers (reports door, /reports/mcp) ----
+//
+// The reports door attributes every call to (bot, thread, gateway) and refuses an UNSIGNED caller
+// outright — there is no unattributed mode there, because a door call proposes a report, a step or a
+// recipient into the owner's queue. Same key and MAC as the kinds above; kind "reports", so no
+// phone, board, artifacts, board-thread, secrets, mail-draft or sharing signature replays here, nor
+// this one there. Key-less bot hosts get theirs from the signing relay (routes/actor-sign.js), which
+// signs only a live session's (or a running job's) own tuple.
+
+/** Signature for the reports door's actor headers, or null without a key / bot id. */
+export function signReportsActor({ botId, threadId, gatewayType } = {}) {
+  return signActor({ kind: "reports", botId, threadId, gatewayType });
+}
+
+/** Constant-time check of a presented reports door signature. False without a key. */
+export function verifyReportsActorSig({ botId, threadId, gatewayType, sig } = {}) {
+  return verifyActorSig({ kind: "reports", botId, threadId, gatewayType, sig });
 }
 
 // ---- secrets actor headers (credential card, spec §10.2) ----
@@ -431,7 +450,7 @@ function messageFor(kind, { botId, sessionId, threadId, gatewayType, jobId, work
   if (kind === "board") return v1Message({ kind, botId, threadId: jobId, gatewayType: null });
   // mail-draft: the thread slot carries `<draftId>:<turnId>`, gatewayType null (signMailDraftActor).
   if (kind === "mail-draft") return v1Message({ kind, botId, threadId, gatewayType: null });
-  if (kind === "bot" || kind === "artifacts" || kind === "board-thread" || kind === "sharing") return v1Message({ kind, botId, threadId, gatewayType });
+  if (kind === "bot" || kind === "artifacts" || kind === "board-thread" || kind === "sharing" || kind === "reports") return v1Message({ kind, botId, threadId, gatewayType });
   return null;
 }
 

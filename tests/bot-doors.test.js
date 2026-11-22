@@ -33,6 +33,9 @@ test("path spellings", () => {
     "/sharing-bot/mcp",
     "/sharing-bot/mcp?x=1",
     "/sharing-bot/mcp/",
+    "/reports/mcp",
+    "/reports/mcp?x=1",
+    "/reports/mcp/",
     "/mail-draft/mcp",
     "/mail-draft/mcp?x=1",
     "/peer-relay/i/m/mcp",
@@ -64,6 +67,9 @@ test("path spellings", () => {
     "/sharing-bot/mcpx",
     "/sharing-bot",
     "/sharing/mcp",
+    "/reports/mcpx",
+    "/reports",
+    "/reports/api",
     "/mail-draft/mcpx",
     "/mail-draft",
     "/memory/mcp",
@@ -81,7 +87,7 @@ test("path spellings", () => {
 
 test("the door list is exactly the doors the operator's ruling fixed, frozen", () => {
   assert.deepEqual([...BOT_DOOR_PREFIXES],
-    ["/llm/v1/", "/llm/p/", "/llm/c/", "/board/mcp", "/phone/mcp", "/artifacts/mcp", "/artifacts/upload/", "/secrets/mcp", "/sharing-bot/mcp", "/mail-draft/mcp", "/peer-relay/"]);
+    ["/llm/v1/", "/llm/p/", "/llm/c/", "/board/mcp", "/phone/mcp", "/artifacts/mcp", "/artifacts/upload/", "/secrets/mcp", "/sharing-bot/mcp", "/reports/mcp", "/mail-draft/mcp", "/peer-relay/"]);
   assert.equal(Object.isFrozen(BOT_DOOR_PREFIXES), true);
   assert.equal(RELAY_SOURCE_V4, "127.0.77.1");
 });

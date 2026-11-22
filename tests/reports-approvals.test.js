@@ -35,7 +35,7 @@ const {
 const { senderReady } = await import("../servers/gateway/reports/sender-ready.js");
 const { saveCustomRole, setBinding } = await import("../servers/shared/model-roles-store.js");
 const {
-  createReport, getReport, getRevision, saveRecipe, updateReportColumns,
+  createReport, getReport, getRevision, getState, saveRecipe, updateReportColumns,
 } = await import("../servers/gateway/reports/store.js");
 const { verifyApprovalSeal } = await import("../servers/gateway/reports/seal.js");
 const { sealFor } = await import("../servers/gateway/mail/drafts/seal.js");
@@ -137,9 +137,12 @@ async function addSchedule(db, { cron = "0 7 * * 1", tz = "Europe/Berlin" } = {}
 
 /**
  * One report, saved once at rev 1 and set up the way go-live needs it: a schedule row, a sender, the
- * live-set settings. `schedule: false` leaves no schedule (the `no_schedule` case).
+ * live-set settings. `schedule: false` leaves no schedule (the `no_schedule` case); `sealSender: false`
+ * leaves the sender a plain column write (the never-sealed case).
  */
-async function prepare(db, { recipe = SOURCE_RECIPE, registry = REGISTRY, ai = 0, schedule = true } = {}) {
+async function prepare(db, {
+  recipe = SOURCE_RECIPE, registry = REGISTRY, ai = 0, schedule = true, sealSender = true,
+} = {}) {
   const scheduleId = schedule ? await addSchedule(db) : null;
   const { id } = await createReport(db, {
     projectId: PROJECT, owner: "owner", botId: "bot-1", title: "Weekly listings",
@@ -153,6 +156,11 @@ async function prepare(db, { recipe = SOURCE_RECIPE, registry = REGISTRY, ai = 0
     comment_visibility: "own",
     ai_commentary: ai,
   });
+  if (sealSender) {
+    await updateSettings(db, depsWith(), {
+      reportId: id, settings: { sender_account_id: SENDER }, actor: OWNER,
+    });
+  }
   return { id, rev: saved.rev, sourcesHash: saved.sourcesHash, scheduleId };
 }
 
@@ -1096,7 +1104,9 @@ test("the injected sender reader wants an active account with its credential on 
   await credentials.saveSecret(account.id, "MAIL_PASSWORD", "app-password-value");
 
   const report = await prepare(db);
-  await updateReportColumns(db, report.id, { sender_account_id: account.id });
+  await updateSettings(db, { loadSeed: () => ({ seed: SEED }), senderReady }, {
+    reportId: report.id, settings: { sender_account_id: account.id }, actor: OWNER,
+  });
   const runs = { "prv-1": { id: "prv-1", reportId: report.id, kind: "preview", status: "ok", recipeRev: report.rev } };
   // The sender half of go-live reads the real Crow Mail state here: reports/sender-ready.js is the reader
   // the routes inject, and this module's own default is a fail-closed false.
@@ -1133,6 +1143,74 @@ test("with no sender reader injected, go live fails closed", async () => {
   );
   assert.equal((await row(db, report.id)).status, "draft");
   assert.equal((await row(db, report.id)).live_seal, null);
+});
+
+/* ------------------------------------------------------- the sender seal at go live */
+
+test("go-live is refused when the sender was never sealed", async () => {
+  const { db } = await freshDb();
+  const report = await prepare(db, { sealSender: false });
+  assert.equal(await getState(db, report.id, "sender_seal"), null, "the row names an account, nothing proves it");
+  await assert.rejects(
+    () => goLive(db, report),
+    (err) => { assert.equal(err.code, "sender_not_ready"); return true; },
+  );
+  const after1 = await row(db, report.id);
+  assert.equal(after1.status, "draft", "the status is unchanged");
+  assert.equal(after1.live_seal, null, "nothing was sealed");
+  assert.equal(await getState(db, report.id, "sender_seal"), null);
+});
+
+test("go-live is refused when the sender column was tampered after the seal", async () => {
+  const { db } = await freshDb();
+  const report = await prepare(db);
+  assert.equal((await getState(db, report.id, "sender_seal")).accountId, SENDER);
+  await db.execute({
+    sql: "UPDATE reports SET sender_account_id = ? WHERE id = ?",
+    args: ["ma-8899aabbccddeeff", report.id],
+  });
+  await assert.rejects(
+    () => goLive(db, report),
+    (err) => { assert.equal(err.code, "sender_not_ready"); return true; },
+  );
+  const after1 = await row(db, report.id);
+  assert.equal(after1.status, "draft", "the status is unchanged");
+  assert.equal(after1.live_seal, null, "the seal names the account the owner chose, not this one");
+});
+
+test("go-live is allowed after an owner settings save sealed the sender", async () => {
+  const { db } = await freshDb();
+  const report = await prepare(db, { sealSender: false });
+  const sealed = await updateSettings(db, depsWith(), {
+    reportId: report.id, settings: { sender_account_id: SENDER }, actor: OWNER,
+  });
+  assert.equal(sealed.sender_account_id, SENDER);
+  assert.equal((await getState(db, report.id, "sender_seal")).accountId, SENDER);
+
+  const { result } = await goLive(db, report);
+  assert.equal(result.ok, true);
+  const after1 = await row(db, report.id);
+  assert.equal(after1.status, "live");
+  assert.match(after1.live_seal, /^[0-9a-f]{64}$/);
+  assert.equal(await isLive(db, depsWith(), after1), true);
+});
+
+test("a bot path cannot satisfy the sender seal", async () => {
+  const { db } = await freshDb();
+  const report = await prepare(db, { sealSender: false });
+  const saved = await botSaveRecipe(db, depsWith(), { reportId: report.id, recipe: FREE_EDIT_RECIPE });
+  const proposed = await proposeRecipient(db, depsWith(), {
+    reportId: report.id, address: "alex@example.com", proposedBy: "bot:bot-1",
+  });
+  assert.equal(proposed.state, "proposed");
+  assert.equal(await getState(db, report.id, "sender_seal"), null, "no bot path writes the seal");
+
+  await assert.rejects(
+    () => goLive(db, report, { run: { recipeRev: saved.rev } }),
+    (err) => { assert.equal(err.code, "sender_not_ready"); return true; },
+  );
+  assert.equal((await row(db, report.id)).status, "draft");
+  assert.equal(await getState(db, report.id, "sender_seal"), null, "and the refusal wrote none");
 });
 
 test("the default model reader resolves the bot's own key through the provider row", async () => {

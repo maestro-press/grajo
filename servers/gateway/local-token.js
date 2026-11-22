@@ -629,6 +629,24 @@ const SECRETS_PATH_RE = /^\/secrets\/(?:mcp|sse|messages)$/;
 export const SHARING_BOT_TOKEN = pathScopedToken({ name: "sharing-bot", hashKey: "mcp_sharing_bot_token_hash", createdKey: "mcp_sharing_bot_token_created" });
 const SHARING_BOT_PATH_RE = /^\/sharing-bot\/(?:mcp|sse|messages)$/;
 
+// Reports door: the bots' token for the narrow /reports/(mcp|sse|messages) mount ONLY
+// (servers/gateway/reports/mcp.js). Same family shape as the secrets and sharing-bot tokens:
+// <crowHome>/secrets/reports-token, 0600 in the 0700 dir the pi sandbox masks, rotated at every
+// boot (a bot's config is rebuilt every turn). It opens nothing else, and on that mount it proves
+// only "a bot's config", never who: the mount's guard also requires a signed `reports` actor, so a
+// token alone proposes nothing. The raw value is read by the bot catalog
+// (scripts/pi-bots/crow-server-catalog.mjs) when it mints the door block, exactly as the board
+// token is.
+export const REPORTS_TOKEN = pathScopedToken({ name: "reports", hashKey: "mcp_reports_token_hash", createdKey: "mcp_reports_token_created" });
+const REPORTS_PATH_RE = /^\/reports\/(?:mcp|sse|messages)$/;
+
+/** The reports door's boot-mint entry point: the same rotation the family list runs, under the
+ *  name the mount's callers use. A fresh value every call, so `minted` is always true. */
+export async function ensureReportsToken(db) {
+  await REPORTS_TOKEN.rotate(db);
+  return { minted: true };
+}
+
 // MCP transport paths are `/mcp`, `/sse`, `/messages`, optionally under ONE
 // server-prefix segment (e.g. /router/mcp, /memory/sse, /tools-x/messages,
 // /blog-mcp/mcp; see mcp.js:194-196 and the single-segment mountMcpServer
@@ -718,6 +736,13 @@ export function localTokenAuthMiddleware(db) {
       // this branch is the transport-level half, not the decision.
       if (!req.localTokenAuth && SHARING_BOT_PATH_RE.test(req.path) && await SHARING_BOT_TOKEN.validate(db, token)) {
         req.localTokenAuth = { token: "local-mcp", scope: "sharing-bot" };
+      }
+      // The reports door's token: the same path-scoped rule once more, so it authenticates on
+      // /reports/(mcp|sse|messages) and nowhere else. The mount's own guard
+      // (servers/gateway/reports/mcp.js) re-validates it AND requires a signed `reports` actor, so
+      // this branch is the transport-level half, not the decision.
+      if (!req.localTokenAuth && REPORTS_PATH_RE.test(req.path) && await REPORTS_TOKEN.validate(db, token)) {
+        req.localTokenAuth = { token: "local-mcp", scope: "reports" };
       }
     } catch (err) {
       // Treat a DB/read error as non-fatal: log and fall through to the other

@@ -466,6 +466,33 @@ border-collapse:collapse;margin:0 0 8px;font-size:13px}
 #perch-hub-root .msched-shortcuts button,#perch-hub-root .msched-pick button{min-height:44px;padding:10px 14px}
 #perch-hub-root .msched-sheet button:disabled{opacity:.55;cursor:default}
 #perch-hub-root .msched-box{font-size:12.5px;color:var(--dim);overflow-wrap:anywhere}
+/* --- the report card -------------------------------------------------- */
+/* The report a bot is building, in the chat: its status, the sender its go-live tap would send from,
+   and every proposal the owner has to approve. The owner sees everything a tap puts under their
+   approval, so a settings value and a diff line wrap instead of widening the column and nothing here
+   is clipped with an ellipsis. Every target is 44 px so iOS does not zoom on a press. No layer here
+   covers the page, so nothing needs a z-index. */
+#perch-hub-root .rcard-card{border:1px solid var(--line);border-radius:10px;padding:11px 12px;display:grid;gap:6px;background:var(--sky);min-width:0}
+#perch-hub-root .rcard-head{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;min-width:0}
+#perch-hub-root .rcard-title{font-weight:600;overflow-wrap:anywhere}
+#perch-hub-root .rcard-chip{font-size:11px;text-transform:uppercase;letter-spacing:.07em;font-weight:700;color:var(--dim);border:1px solid var(--line);border-radius:999px;padding:1px 8px}
+#perch-hub-root .rcard-chip-live{color:var(--teal);border-color:var(--teal)}
+#perch-hub-root .rcard-chip-paused{color:var(--warn)}
+#perch-hub-root .rcard-pause,#perch-hub-root .rcard-status,#perch-hub-root .rcard-preview-line,#perch-hub-root .rcard-from,#perch-hub-root .rcard-notice,#perch-hub-root .rcard-schedule-prop,#perch-hub-root .rcard-step-meta,#perch-hub-root .rcard-tier,#perch-hub-root .rcard-more{font-size:12.5px;color:var(--dim);overflow-wrap:anywhere}
+#perch-hub-root .rcard-status:empty{display:none}
+#perch-hub-root .rcard-h{font-size:11px;text-transform:uppercase;letter-spacing:.07em;font-weight:700;color:var(--teal)}
+#perch-hub-root .rcard-label{font-size:11px;text-transform:uppercase;letter-spacing:.07em;font-weight:700;color:var(--teal)}
+#perch-hub-root .rcard-block,#perch-hub-root .rcard-addr,#perch-hub-root .rcard-host-line,#perch-hub-root .rcard-step-key,#perch-hub-root .rcard-step-path{font-weight:600;overflow-wrap:anywhere}
+#perch-hub-root .rcard-type,#perch-hub-root .rcard-change-word,#perch-hub-root .rcard-name,#perch-hub-root .rcard-step-entry{overflow-wrap:anywhere;min-width:0}
+#perch-hub-root .rcard-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+#perch-hub-root .rcard-from{flex-basis:100%}
+#perch-hub-root .rcard-change,#perch-hub-root .rcard-source,#perch-hub-root .rcard-rcpt,#perch-hub-root .rcard-step,#perch-hub-root .rcard-host,#perch-hub-root .rcard-cred{border:1px solid var(--line);border-radius:8px;padding:8px 10px;display:grid;gap:6px;min-width:0;background:var(--card)}
+#perch-hub-root .rcard-settings{display:grid;gap:1px;min-width:0}
+#perch-hub-root .rcard-setting{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;white-space:pre-wrap;overflow-wrap:anywhere}
+#perch-hub-root .rcard-diff{display:grid;gap:1px;max-height:40vh;overflow:auto;overscroll-behavior:contain;min-width:0}
+#perch-hub-root .rcard-diff-line{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;white-space:pre-wrap;overflow-wrap:anywhere}
+#perch-hub-root .rcard-actions button,#perch-hub-root .rcard-change button,#perch-hub-root .rcard-source button,#perch-hub-root .rcard-rcpt button,#perch-hub-root .rcard-step button,#perch-hub-root .rcard-host button,#perch-hub-root .rcard-cred button{min-height:44px;padding:10px 14px;display:inline-flex;align-items:center;justify-content:center}
+#perch-hub-root .rcard-card button:disabled{opacity:.55;cursor:default}
 /* --- hub layout ------------------------------------------------------- */
 /* Two views, one at a time on a phone, side by side on a wide screen.
    List is the default (no attribute needed): the old standalone page

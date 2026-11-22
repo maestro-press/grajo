@@ -29,7 +29,7 @@ import {
   resolveEnvValue,
 } from "../server-registry.js";
 import { botsDbPath, resolveSqlitePath } from "./instance-paths.mjs";
-import { signActor, signBoardActor, signArtifactsActor, signBoardThreadActor, signSecretsActor, signSharingActor } from "./actor-sig.mjs";
+import { signActor, signBoardActor, signArtifactsActor, signBoardThreadActor, signSecretsActor, signSharingActor, signReportsActor } from "./actor-sig.mjs";
 // Leaf module (registry read only): no path back to ext_registry.mjs or mcp_writer.mjs.
 import { isLegacyConfiguredAddon, addonDerivedEnv } from "../../servers/gateway/services/legacy-sources.js";
 // Leaf module (no imports): loader/injection names a child must never inherit from the
@@ -333,6 +333,50 @@ function sharingBotBlock(crowHome, { botId, threadId, gatewayType, port } = {}) 
   return { url: `http://127.0.0.1:${gatewayPort}${SHARING_BOT_DOOR_PATH}`, headers };
 }
 
+/** The catalog name of the reports door (the bot tools for building reports). */
+export const REPORTS_SERVER = "reports";
+
+/** The reports door's token file: <crowHome>/secrets, the 0700 dir the pi sandbox masks for bots. */
+function reportsTokenPath(crowHome) { return join(crowHome, "secrets", "reports-token"); }
+
+/**
+ * The reports door: `{url, headers}` for /reports/mcp, signed with kind "reports" (actor-sig.mjs) so
+ * the mount can attribute every call and refuse an unsigned one. The project a call lands in is
+ * derived from the verified bot, never from an argument, which is why the tuple is signed here.
+ *
+ * It is returned only when this build can mint a COMPLETE block: the token file exists, the caller
+ * named a bot, and this process holds the per-boot actor key (or a presigned tuple for it). A door
+ * block missing any of those would be refused at the mount after a spawn, so it is not emitted at
+ * all, and the bot simply has no reports tools.
+ *
+ * SELECTION IS UNCHANGED: like every catalog entry, this block reaches a bot's config only when the
+ * bot's def selects `reports` (`buildBotMcp`'s closed-world pass). No Crow server carries that name,
+ * so there is no stdio shape to keep away from a bot and nothing to exclude.
+ */
+function reportsBlock(crowHome, { botId, threadId, gatewayType, port } = {}) {
+  let token;
+  try {
+    token = readFileSync(reportsTokenPath(crowHome), "utf8").trim();
+  } catch {
+    return null;
+  }
+  if (!token || botId == null || String(botId).trim() === "") return null;
+  const sig = signReportsActor({ botId, threadId, gatewayType });
+  // No key in this process (a GUI/CLI build for a validation, or a host that signs over the relay):
+  // an unsigned door block would be refused at the mount, so it is not emitted at all.
+  if (!sig) return null;
+  const gatewayPort = port || process.env.CROW_GATEWAY_PORT || 3001;
+  const headers = {
+    Authorization: "Bearer " + token,
+    "X-Crow-Actor-Kind": "reports",
+    "X-Crow-Actor-Id": String(botId),
+    "X-Crow-Actor-Sig": sig,
+  };
+  if (threadId) headers["X-Crow-Actor-Thread"] = String(threadId);
+  if (gatewayType) headers["X-Crow-Actor-Gateway"] = String(gatewayType);
+  return { url: `http://127.0.0.1:${gatewayPort}/reports/mcp`, headers };
+}
+
 function applyJournalGuard(env) {
   // The WAL-unlink scar: every server touching a crow.db runs journal DELETE.
   if (env && env.CROW_DB_PATH) env.CROW_JOURNAL_MODE = "DELETE";
@@ -572,6 +616,13 @@ export function crowServerCatalog(crowHome = process.env.CROW_HOME || join(homed
   const sharing = sharingBotBlock(crowHome, { botId: opts.botId, threadId: opts.threadId, gatewayType: opts.gatewayType, port: opts.gatewayPort });
   if (sharing) { servers[BOT_SHARING_SERVER] = sharing; coreNames.push(BOT_SHARING_SERVER); }
   else unconfigured[BOT_SHARING_SERVER] = "is not available to bots yet: the sharing door has no token, or this build holds no signed actor for the bot";
+  // The reports door (bot tools for building reports): an http block at THIS instance's
+  // /reports/mcp, under the reports token and a signed `reports` actor, emitted only when it can be
+  // complete (token + a signed actor); see reportsBlock. A def that never selects `reports` never
+  // sees it. No `unconfigured` line: the name stands for its own mount alone, so a bot that selects
+  // it with no door available just has no reports tools.
+  const reports = reportsBlock(crowHome, { botId: opts.botId, threadId: opts.threadId, gatewayType: opts.gatewayType, port: opts.gatewayPort });
+  if (reports) { servers[REPORTS_SERVER] = reports; coreNames.push(REPORTS_SERVER); }
 
   for (const spec of CORE_SERVERS) {
     if (isBotExcludedServer(spec.name)) continue; // never in a bot's config (BOT_EXCLUDED_SERVERS)

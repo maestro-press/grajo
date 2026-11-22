@@ -22,6 +22,7 @@ const FULL = "test-full-local-token";
 const BOARD = "test-board-token";
 const SECRETS = "test-secrets-token";
 const SHARING_BOT = "test-sharing-bot-token";
+const REPORTS = "test-reports-token";
 const sha256 = (t) => createHash("sha256").update(t).digest("hex");
 
 /** The settings registry reads `{rows:[{value}]}`; a known key answers with its hash. */
@@ -30,6 +31,7 @@ const HASHES = {
   mcp_board_token_hash: sha256(BOARD),
   mcp_secrets_token_hash: sha256(SECRETS),
   mcp_sharing_bot_token_hash: sha256(SHARING_BOT),
+  mcp_reports_token_hash: sha256(REPORTS),
 };
 const db = {
   execute: async ({ sql, args }) => {
@@ -102,4 +104,23 @@ test("the path-scoped sharing-bot token authenticates a relayed /sharing-bot/mcp
     const elsewhere = await run(fakeReq({ remoteAddress: RELAY, path, token: SHARING_BOT }));
     assert.equal(elsewhere.localTokenAuth, undefined, `the sharing-bot token opens nothing but its own mount (${path})`);
   }
+});
+
+test("the path-scoped reports token authenticates a relayed /reports/mcp socket, and nothing else", async () => {
+  // The reports door is called FROM a contained bot too, so a relayed socket must be able to present
+  // its own token — and only on its own mount.
+  const req = await run(fakeReq({ remoteAddress: RELAY, path: "/reports/mcp", token: REPORTS }));
+  assert.deepEqual(req.localTokenAuth, { token: "local-mcp", scope: "reports" });
+  const full = await run(fakeReq({ remoteAddress: RELAY, path: "/reports/mcp", token: FULL }));
+  assert.equal(full.localTokenAuth, undefined, "the full local token is never the operator on a relayed socket");
+  for (const path of ["/reports/sse", "/reports/messages"]) {
+    const transport = await run(fakeReq({ remoteAddress: RELAY, path, token: REPORTS }));
+    assert.deepEqual(transport.localTokenAuth, { token: "local-mcp", scope: "reports" }, path);
+  }
+  for (const path of ["/reports/mcp-x", "/reports", "/memory/mcp", "/board/mcp", "/sharing-bot/mcp"]) {
+    const elsewhere = await run(fakeReq({ remoteAddress: RELAY, path, token: REPORTS }));
+    assert.equal(elsewhere.localTokenAuth, undefined, `the reports token opens nothing but its own mount (${path})`);
+  }
+  const crossed = await run(fakeReq({ remoteAddress: RELAY, path: "/reports/mcp", token: SHARING_BOT }));
+  assert.equal(crossed.localTokenAuth, undefined, "and no other family's token opens it");
 });

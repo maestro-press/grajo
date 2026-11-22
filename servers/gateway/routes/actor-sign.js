@@ -105,8 +105,12 @@ export const ACTOR_SIGN_PATH = "/internal/actor-sign";
  * job turns whose bots may draft messages, and it holds no key of its own, so the relay is its only
  * way to sign the (bot, thread, gateway) the door requires. Step 6 already binds the tuple to a live
  * session (or a job) of that bot on this host.
+ *
+ * "reports" (the reports door, /reports/mcp) IS here for the same reason: those turns run on the
+ * separate bot hosts too, they hold no key, and the door admits only a signed actor. Step 6 binds
+ * the tuple to a live session (or a job) of that bot on this host, exactly as for "sharing".
  */
-export const ACTOR_SIGN_KINDS = Object.freeze(["bot", "board", "artifacts", "board-thread", "sharing", ...SESSION_ACTOR_KINDS, ...SCOPE_ACTOR_KINDS]);
+export const ACTOR_SIGN_KINDS = Object.freeze(["bot", "board", "artifacts", "board-thread", "sharing", "reports", ...SESSION_ACTOR_KINDS, ...SCOPE_ACTOR_KINDS]);
 
 /**
  * Kinds a caller may name that this relay must never sign, whatever tuple it presents: 403 for the

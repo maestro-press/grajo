@@ -20,7 +20,7 @@ import { actorSignRouter } from "../servers/gateway/routes/actor-sign.js";
 import { createBotHostCallerResolver } from "../servers/gateway/bot-host-caller.js";
 import {
   initGatewayActorKey, _resetActorKeyForTest, verifyActorSig, verifyBoardActorSig, verifyArtifactsActorSig,
-  verifyBoardThreadActorSig, verifyPeerRelayActorSig, verifySharingActorSig, presignActors, _resetPresignedForTest,
+  verifyBoardThreadActorSig, verifyPeerRelayActorSig, verifySharingActorSig, verifyReportsActorSig, presignActors, _resetPresignedForTest,
   signPeerRelayActor, signBoardActor, signActor, verifyScopeActorSig, setActorKey,
 } from "../scripts/pi-bots/actor-sig.mjs";
 
@@ -36,7 +36,7 @@ const hostUnit = (template, instance) => ({
 const ME = hostUnit("bridge", "alpha");
 let units = [ME];
 let envFiles = {}; // path -> instance config text (filled in before())
-const ALL = ["bot", "board", "artifacts", "board-thread", "peer-relay", "sharing"];
+const ALL = ["bot", "board", "artifacts", "board-thread", "peer-relay", "sharing", "reports"];
 
 before(async () => {
   assert.ok(process.env.CROW_SUITE_SCRATCH, "runs only in the scratch suite env");
@@ -136,6 +136,12 @@ test("a bot host's main process gets every kind for a live session; only sigs co
   // The bot sharing door's kind: a key-less bot host signs a channel turn's drafts through the relay.
   assert.equal(verifySharingActorSig({ ...t, sig: s.sharing }), true);
   assert.equal(verifySharingActorSig({ ...t, threadId: "t-101", sig: s.sharing }), false, "bound to the thread");
+  // The reports door's kind: a key-less bot host signs a channel or job turn's proposals through
+  // the relay, and the signature never carries over to another door's verifier.
+  assert.equal(verifyReportsActorSig({ ...t, sig: s.reports }), true);
+  assert.equal(verifyReportsActorSig({ ...t, threadId: "t-101", sig: s.reports }), false, "bound to the thread");
+  assert.equal(verifyReportsActorSig({ ...t, sig: s.sharing }), false, "a sharing signature is not a reports one");
+  assert.equal(verifySharingActorSig({ ...t, sig: s.reports }), false, "and the reverse");
   for (const l of cap.lines) for (const sig of Object.values(s)) assert.ok(!l.includes(sig), "no signature in a log line");
 });
 

@@ -32,7 +32,8 @@ const { default: express, json: expressJson } = await import("express");
 const { createDbClient } = await import("../servers/db.js");
 const { csrfMiddleware } = await import("../servers/gateway/dashboard/shared/csrf.js");
 const { reportsApiRouter, REPORTS_API_PREFIX, OWNER_LABEL } = await import("../servers/gateway/routes/reports-api.js");
-const { SETTINGS_CHANGED_PAUSE_REASON } = await import("../servers/gateway/reports/approvals.js");
+const { SETTINGS_CHANGED_PAUSE_REASON, updateSettings } = await import("../servers/gateway/reports/approvals.js");
+const { senderReady } = await import("../servers/gateway/reports/sender-ready.js");
 const { createReport, getReport, getState, saveRecipe, updateReportColumns } = await import("../servers/gateway/reports/store.js");
 const { createAccount } = await import("../servers/gateway/mail/store/accounts.js");
 const { createMailCredentials } = await import("../servers/gateway/mail/credentials.js");
@@ -216,6 +217,9 @@ async function prepareReport(db, { schedule = true, recipe = RECIPE } = {}) {
     comment_visibility: "own",
     ai_commentary: 0,
   });
+  await updateSettings(db, { loadSeed: () => ({ seed: SEED }), senderReady: async () => true }, {
+    reportId: id, settings: { sender_account_id: SENDER }, actor: { kind: "owner" },
+  });
   return { id, rev: saved.rev };
 }
 
@@ -335,7 +339,9 @@ test("the owner saves a recipe, changes settings, goes live, pauses and resumes"
   assert.equal(settings.json.report.title, "Weekly listings, renamed");
   assert.equal(settings.json.report.status, "draft", "a draft does not pause");
 
-  const live = await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId });
+  const live = await post(`${reportPath(report.id)}/go-live`, {
+    previewRunId: runId, expectedSenderAccountId: SENDER,
+  });
   assert.equal(live.status, 200, live.text);
   assert.deepEqual(live.json, { ok: true, liveRev: saved.json.rev });
 
@@ -374,9 +380,13 @@ test("the router wires the real sender reader, so go live reads this instance's 
   await credentials.saveSecret(account.id, "MAIL_PASSWORD", "app-password-value");
 
   const report = await prepareReport(world.db);
-  await updateReportColumns(world.db, report.id, { sender_account_id: account.id });
+  await updateSettings(world.db, { loadSeed: () => ({ seed: SEED }), senderReady }, {
+    reportId: report.id, settings: { sender_account_id: account.id }, actor: { kind: "owner" },
+  });
   const runId = addPreviewRun(world, report);
-  const live = await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId });
+  const live = await post(`${reportPath(report.id)}/go-live`, {
+    previewRunId: runId, expectedSenderAccountId: account.id,
+  });
   assert.equal(live.status, 200, live.text);
   assert.equal(live.json.ok, true);
   assert.equal(live.json.liveRev, report.rev);
@@ -385,7 +395,9 @@ test("the router wires the real sender reader, so go live reads this instance's 
   const other = await prepareReport(world.db);
   await updateReportColumns(world.db, other.id, { sender_account_id: "ma-8899aabbccddeeff" });
   const otherRun = addPreviewRun(world, other, "prv-2");
-  const refused = await post(`${reportPath(other.id)}/go-live`, { previewRunId: otherRun });
+  const refused = await post(`${reportPath(other.id)}/go-live`, {
+    previewRunId: otherRun, expectedSenderAccountId: "ma-8899aabbccddeeff",
+  });
   assert.equal(refused.status, 409, refused.text);
   assert.deepEqual(refused.json, {
     error: "sender_not_ready", message: "Choose a mail account that is ready to send.",
@@ -397,7 +409,9 @@ test("pause then resume on an unchanged report goes back to live", async () => {
   const world = await setup();
   const report = await prepareReport(world.db);
   const runId = addPreviewRun(world, report);
-  assert.equal((await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId })).status, 200);
+  assert.equal((await post(`${reportPath(report.id)}/go-live`, {
+    previewRunId: runId, expectedSenderAccountId: SENDER,
+  })).status, 200);
 
   const paused = await post(`${reportPath(report.id)}/pause`, {});
   assert.equal(paused.status, 200, paused.text);
@@ -436,7 +450,9 @@ test("preview asks for a preview run, run-now needs a live report, and the list 
 
   // Live: run now is accepted.
   const previewRunId = addPreviewRun(world, report);
-  assert.equal((await post(`${reportPath(report.id)}/go-live`, { previewRunId })).status, 200);
+  assert.equal((await post(`${reportPath(report.id)}/go-live`, {
+    previewRunId, expectedSenderAccountId: SENDER,
+  })).status, 200);
   const runNow = await post(`${reportPath(report.id)}/run-now`, {});
   assert.equal(runNow.status, 202, runNow.text);
   assert.deepEqual(runNow.json, { requested: true });
@@ -536,7 +552,9 @@ test("a failed go-live answers its own code and gets 409", async () => {
   const world = await setup();
   const report = await prepareReport(world.db, { schedule: false });
   addPreviewRun(world, report);
-  const r = await post(`${reportPath(report.id)}/go-live`, { previewRunId: "prv-1" });
+  const r = await post(`${reportPath(report.id)}/go-live`, {
+    previewRunId: "prv-1", expectedSenderAccountId: SENDER,
+  });
   assert.equal(r.status, 409, r.text);
   assert.deepEqual(r.json, {
     error: "no_schedule", message: "Choose when this report runs before going live.",
@@ -544,13 +562,36 @@ test("a failed go-live answers its own code and gets 409", async () => {
 
   const stale = await prepareReport(world.db);
   addPreviewRun(world, stale, "prv-2", { recipeRev: stale.rev - 1 });
-  const refused = await post(`${reportPath(stale.id)}/go-live`, { previewRunId: "prv-2" });
+  const refused = await post(`${reportPath(stale.id)}/go-live`, {
+    previewRunId: "prv-2", expectedSenderAccountId: SENDER,
+  });
   assert.equal(refused.status, 409, refused.text);
   assert.equal(refused.json.error, "preview_stale");
 
-  const none = await post(`${reportPath(stale.id)}/go-live`, {});
+  const none = await post(`${reportPath(stale.id)}/go-live`, { expectedSenderAccountId: SENDER });
   assert.equal(none.status, 409);
   assert.equal(none.json.error, "preview_missing");
+});
+
+test("go-live needs expectedSenderAccountId", async () => {
+  const world = await setup();
+  const report = await prepareReport(world.db);
+  addPreviewRun(world, report);
+  const path = `${reportPath(report.id)}/go-live`;
+  for (const body of [
+    undefined,
+    {},
+    { previewRunId: "prv-1" },
+    { previewRunId: "prv-1", expectedSenderAccountId: 7 },
+    { previewRunId: "prv-1", expectedSenderAccountId: null },
+  ]) {
+    const r = await post(path, body);
+    assert.equal(r.status, 400, `${JSON.stringify(body)}: ${r.status} ${r.text}`);
+    assert.deepEqual(r.json, { error: "bad_input", message: "That request is not valid." });
+  }
+  const row = await getReport(world.db, report.id);
+  assert.equal(row.status, "draft", "nothing was sealed");
+  assert.equal(row.live_seal, null);
 });
 
 test("a bad recipe is a 400 from the save", async () => {
@@ -601,7 +642,9 @@ test("no answer carries the live seal or the live nonce", async () => {
   const world = await setup();
   const report = await prepareReport(world.db);
   const runId = addPreviewRun(world, report);
-  assert.equal((await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId })).status, 200);
+  assert.equal((await post(`${reportPath(report.id)}/go-live`, {
+    previewRunId: runId, expectedSenderAccountId: SENDER,
+  })).status, 200);
   const stored = await getReport(world.db, report.id);
   assert.match(stored.live_seal, /^[0-9a-f]{64}$/);
   assert.match(stored.live_nonce, /^[0-9a-f]{32}$/);
@@ -632,7 +675,9 @@ test("an internal failure answers 500 with no message from the failure", async (
   console.warn = (...args) => { warnings.push(args.map(String).join(" ")); };
   let r;
   try {
-    r = await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId });
+    r = await post(`${reportPath(report.id)}/go-live`, {
+      previewRunId: runId, expectedSenderAccountId: SENDER,
+    });
   } finally {
     console.warn = original;
   }

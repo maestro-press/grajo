@@ -30,7 +30,7 @@ const { DEFAULT_EMPTY_TEXT } = await import("../servers/gateway/reports/document
 const { STORAGE_NEARLY_FULL_TEXT } = await import("../servers/gateway/reports/artifact-bridge.js");
 const { EMAILS_SKIPPED_BODY } = await import("../servers/gateway/reports/email/copy.js");
 const {
-  approveGoLive, approveRecipient, proposeRecipient, revokeRecipient,
+  approveGoLive, approveRecipient, proposeRecipient, revokeRecipient, updateSettings,
 } = await import("../servers/gateway/reports/approvals.js");
 const {
   createReport, getReport, saveRecipe, updateReportColumns,
@@ -146,6 +146,9 @@ async function world({ address = "reports@example.com", title = "Weekly listings
     comment_tier_default: "c",
     comment_visibility: "own",
     ai_commentary: 0,
+  });
+  await updateSettings(db, approvalsDeps(), {
+    reportId: id, settings: { sender_account_id: account.id }, actor: OWNER,
   });
   const preview = { id: "prv-1", reportId: id, kind: "preview", status: "ok", recipeRev: saved.rev };
   await approveGoLive(db, approvalsDeps({

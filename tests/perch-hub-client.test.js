@@ -235,7 +235,9 @@ test("async continuations are guarded — a fast back button must not cross sess
   // continuation and mdraftLoad's own read, which must not draw into the next chat's transcript.
   // 54 with the message draft card (msg-draft-card.js, bot-door PR B): loadMsgDrafts' list
   // continuation and mmsgLoad's own read, by the same rule.
-  assert.equal(guards, 54, "expected exactly 54 identity guards, found " + guards);
+  // 55 with the report card (report-card.js): its id-list continuation, its own card read and the
+  // id-list poll timer, none of which may draw into the next chat.
+  assert.equal(guards, 57, "expected exactly 57 identity guards, found " + guards);
 });
 
 test("the emitted script never assigns to an innerHTML-class sink", async () => {
@@ -308,8 +310,9 @@ test("a failing reconnect schedules the NEXT slot at the doubled delay, and one 
   FakeEventSource.instances[0]._nativeError();
   await new Promise((r) => setTimeout(r, 0));
   await new Promise((r) => setTimeout(r, 0));   // probe rejection -> schedule
-  // Wave 1: the watchdog (15000) shares the delay map — assert on the retry slots.
-  const retryDelays = () => [...hub.timerDelays.values()].filter((d) => d !== 15000);
+  // Wave 1: the watchdog (15000) shares the delay map — assert on the retry slots. The report
+  // card's id-list poll (8000) is resident too, and asks for nothing but that chat's ids.
+  const retryDelays = () => [...hub.timerDelays.values()].filter((d) => d !== 15000 && d !== 8000);
   assert.deepEqual(retryDelays(), [2000], "first retry at 2s");
   let notes = hub.els["perch-activity-list"].children.map((c) => c.textContent);
   assert.equal(notes.filter((x) => x.includes("Reconnecting…")).length, 1);
@@ -335,7 +338,7 @@ test("a failing reconnect schedules the NEXT slot at the doubled delay, and one 
   assert.equal(FakeEventSource.instances.length, 3, "re-opens immediately, not at the next slot");
   // Wave 1: the watchdog interval (15000) is a legitimate resident now —
   // assert the RETRY SLOT is gone, not that the map is empty.
-  assert.equal([...hub.timerDelays.values()].filter((d) => d !== 15000).length, 0,
+  assert.equal([...hub.timerDelays.values()].filter((d) => d !== 15000 && d !== 8000).length, 0,
     "the pending backoff slot is cancelled, not stacked");
 });
 

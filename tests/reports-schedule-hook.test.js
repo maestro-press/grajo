@@ -26,7 +26,7 @@ const {
   SETTINGS_CHANGED_TEXT, deliverNotWired, kickReportsHook, registerReportsHook,
   startReportsAtBoot, _setReportsHookForTest,
 } = await import("../servers/gateway/reports/schedule-hook.js");
-const { approveGoLive, approveRecipient, pauseReport, proposeRecipient } =
+const { approveGoLive, approveRecipient, pauseReport, proposeRecipient, updateSettings } =
   await import("../servers/gateway/reports/approvals.js");
 const { NOT_LIVE_TEXT, RESTARTED_TEXT, startRun } = await import("../servers/gateway/reports/run.js");
 const {
@@ -159,6 +159,9 @@ async function seedReport(db, { nextRun = null, ai = 0, title = "Weekly listings
     comment_tier_default: "c",
     comment_visibility: "own",
     ai_commentary: ai,
+  });
+  await updateSettings(db, approvalsDeps({ id }), {
+    reportId: id, settings: { sender_account_id: SENDER }, actor: OWNER,
   });
   return { id, scheduleId, rev: saved.rev };
 }

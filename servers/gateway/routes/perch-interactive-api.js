@@ -105,6 +105,12 @@ const P = "/dashboard/perch-api";
 /** Inbound message cap — same value, same reasoning, as perch.js's MESSAGE_CAP. */
 const MESSAGE_CAP = 32_000;
 
+/**
+ * A Perch session id as a reports chat-thread key: the characters a session id is made of, bounded.
+ * A sid of another shape names no chat, so the reports list answers 404 for it.
+ */
+const REPORT_SID_RE = /^[A-Za-z0-9._:-]{1,120}$/;
+
 /** The instance-global tasks store — cards live ONLY here, never per-project
  * (Track 1 §board-truth). Resolved once at module load, same idiom as
  * bot-board-api.js's own TASKS_DB constant. */
@@ -1398,6 +1404,52 @@ export default function perchInteractiveApiRouter(dashboardAuth, { engine = getI
       res.json({ drafts: drafts.map((draft) => ({ id: draft.id })) });
     } catch (err) {
       console.warn("[perch-interactive-api] message drafts list failed: " + ((err && err.name) || "Error"));
+      jsonError(res, 500, "internal");
+    } finally {
+      try { conn.close(); } catch { /* already closed */ }
+    }
+  });
+
+  // ---- Crow Recurring Reports' card (plan 9a): the reports this chat works on ----
+  //   GET /interactive/:sid/reports      the ids only; the card reads each report from the owner's
+  //                                      own route (/dashboard/api/reports/:id/card), which is where
+  //                                      every field, every setting and every proposal comes from.
+  //
+  // The two rails are the mail drafts list's, in its order: the owner first (this machine's own
+  // password session; a peer's single-sign-on session or a signed peer call is refused with no data
+  // at all), then the sid's shape. No flag gate: Reports has no flag. No-store, like every answer on
+  // this path.
+  //
+  // A Perch session's id IS its chat thread id, which is what a report made from this chat holds under
+  // `report_state.chat_thread`, so the list is one indexed read joined to the reports table for its
+  // order. Only ids travel: the card is built from the report route's answer, never from this list.
+  router.get(P + "/interactive/:sid/reports", stagedNoStore, async (req, res) => {
+    let owner = false;
+    let db = null;
+    try {
+      db = createDbClient();
+      owner = (await ownerCheck(db, req)) === true;
+    } catch {
+      owner = false;
+    } finally {
+      if (db) { try { db.close(); } catch { /* closed */ } }
+    }
+    if (!owner) return jsonError(res, 403, "owner_only");
+    const sid = String(req.params.sid);
+    if (!REPORT_SID_RE.test(sid)) return jsonError(res, 404, "not_found");
+    const conn = createDbClient();
+    try {
+      const { rows } = await conn.execute({
+        sql: `SELECT s.report_id AS id FROM report_state AS s
+                JOIN reports AS r ON r.id = s.report_id
+               WHERE s.key = 'chat_thread' AND s.value_json = ?
+               ORDER BY r.created_at DESC, r.id DESC
+               LIMIT 20`,
+        args: [JSON.stringify(sid)],
+      });
+      res.json({ reports: rows.map((row) => ({ id: String(row.id) })) });
+    } catch (err) {
+      console.warn("[perch-interactive-api] reports list failed: " + ((err && err.name) || "Error"));
       jsonError(res, 500, "internal");
     } finally {
       try { conn.close(); } catch { /* already closed */ }

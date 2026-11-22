@@ -1474,3 +1474,62 @@ test("a def listing crow-sharing/* gets the door block and identity.json masked,
     _resetActorKeyForTest();
   }
 });
+
+// ---- The reports door in the contain tier (bot tools for building reports) ----
+
+// A def that lists `reports/*` must spawn CONTAINED with the reports DOOR in its config — an http
+// block at this instance's `/reports/mcp` — and never a spawned server: no Crow server carries that
+// name, so a stdio block under it could only be somebody else's. The config the plan sees is the
+// spawner-built one, so this builds it with the real catalog/writer and hands its active blocks to
+// the real plan builder. No bwrap runs: the question is what the argv says.
+test("a def listing reports/* gets the door block and identity.json masked, never a stdio server under that name", async () => {
+  const { crowServerCatalog, REPORTS_SERVER, instanceBinding } = await import("../scripts/pi-bots/crow-server-catalog.mjs");
+  const { buildBotMcp } = await import("../scripts/pi-bots/mcp_writer.mjs");
+  const { initGatewayActorKey, _resetActorKeyForTest } = await import("../scripts/pi-bots/actor-sig.mjs");
+
+  _resetActorKeyForTest();
+  initGatewayActorKey();
+  try {
+    // A scratch instance home: the catalog reads the reports token from `<crowHome>/secrets/`.
+    const ch = mk(T, "reportsdoor", "crow");
+    const dd = mk(ch, "data");
+    writeFileSync(join(dd, "crow.db"), "");
+    writeFileSync(join(dd, "identity.json"), "{}");
+    const secrets = mk(ch, "secrets");
+    chmodSync(secrets, 0o700);
+    writeFileSync(join(secrets, "reports-token"), "e".repeat(64) + "\n", { mode: 0o600 });
+
+    const def = {
+      bot_id: "hank",
+      session_dir: mk(T, "reportsdoor", "session"),
+      // Both spellings pi accepts for a reports tool selection.
+      tools: { pi_builtin: ["read"], crow_mcp: ["reports/crow_report_create", "reports__crow_report_status"] },
+      permission_policy: { bash: "deny", write_paths: [], read_paths: [] },
+    };
+    const binding = instanceBinding(ch);
+    const { servers: catalog, unconfigured } = crowServerCatalog(ch, {
+      binding, botId: "hank", threadId: "perch-1", gatewayType: "perch", gatewayPort: 3999,
+    });
+
+    const built = buildBotMcp(def, { mcpServers: {} }, { catalog, unconfigured, binding, crowHome: ch, interactive: true });
+    const block = built.json.mcpServers[REPORTS_SERVER];
+    assert.equal(REPORTS_SERVER, "reports", "a def's tools are mcp__reports__*");
+    assert.ok(block, "the config holds the door");
+    assert.equal(block.url, "http://127.0.0.1:3999/reports/mcp");
+    assert.equal(block.command, undefined, "never a stdio block");
+    assert.equal(block.headers["X-Crow-Actor-Kind"], "reports");
+    assert.ok(built.servers.includes(REPORTS_SERVER), "and the spawner counts it as active");
+
+    // Exactly what the plan is handed: the ACTIVE blocks of that config.
+    const active = Object.values(built.json.mcpServers).filter((b) => b && typeof b === "object" && !b.disabled);
+    assert.deepEqual(active.map((b) => b.url || b.command), [block.url], "only the door is active");
+
+    const { args } = buildContainPlan(base({
+      crowHome: ch, dataDir: dd, botCacheDir: mk(ch, "bot-cache"), mcpServers: active,
+    }));
+    assert.ok(has(args, "--ro-bind", "/dev/null", join(dd, "identity.json")), "identity.json is masked");
+    assert.equal(args.some((a) => /servers[/\\]reports/.test(a)), false, "nothing in the argv spawns a reports server");
+  } finally {
+    _resetActorKeyForTest();
+  }
+});

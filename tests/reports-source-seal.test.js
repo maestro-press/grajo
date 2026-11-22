@@ -203,6 +203,9 @@ async function prepare(db, { recipe, sender = SENDER, authorKind = "owner" } = {
     comment_visibility: "own",
     ai_commentary: 0,
   });
+  await updateSettings(db, approvalDeps({ id }), {
+    reportId: id, settings: { sender_account_id: sender }, actor: OWNER,
+  });
   return { id, rev: saved.rev, sourcesHash: saved.sourcesHash };
 }
 

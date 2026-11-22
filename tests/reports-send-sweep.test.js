@@ -24,7 +24,7 @@ const MASTER = join(root, "master", "crow.db");
 
 const { createDbClient } = await import("../servers/db.js");
 const {
-  approveGoLive, approveRecipient, proposeRecipient,
+  approveGoLive, approveRecipient, proposeRecipient, updateSettings,
 } = await import("../servers/gateway/reports/approvals.js");
 const { createAccount } = await import("../servers/gateway/mail/store/accounts.js");
 const { sendReportMail } = await import("../servers/gateway/mail/reports-door.js");
@@ -128,6 +128,9 @@ async function world({ title = "Weekly listings" } = {}) {
     comment_tier_default: "c",
     comment_visibility: "own",
     ai_commentary: 0,
+  });
+  await updateSettings(db, approvalsDeps(), {
+    reportId: id, settings: { sender_account_id: account.id }, actor: OWNER,
   });
   const preview = { id: "prv-1", reportId: id, kind: "preview", status: "ok", recipeRev: saved.rev };
   await approveGoLive(db, approvalsDeps({

@@ -32,7 +32,7 @@ const { REPORTS_BUNDLE, saveServiceSecret } = await import("../servers/gateway/k
 const {
   approveCredential, approveHost, injectHashOf, proposeCredential, proposeHost,
 } = await import("../servers/gateway/reports/steps.js");
-const { approveGoLive, approveRecipient, ownerAuthorSealerFor, proposeRecipient } = await import(
+const { approveGoLive, approveRecipient, ownerAuthorSealerFor, proposeRecipient, updateSettings } = await import(
   "../servers/gateway/reports/approvals.js"
 );
 const { deliver } = await import("../servers/gateway/reports/delivery.js");
@@ -199,7 +199,7 @@ async function addSchedule(db) {
   return Number(rows[0].id);
 }
 
-async function prepare(db, { recipe = CUSTOM_RECIPE, registry } = {}) {
+async function prepare(db, { recipe = CUSTOM_RECIPE, registry, sealSender = false } = {}) {
   const scheduleId = await addSchedule(db);
   const { id } = await createReport(db, {
     projectId: PROJECT, owner: "owner", botId: "bot-1", title: "Weekly listings",
@@ -221,6 +221,11 @@ async function prepare(db, { recipe = CUSTOM_RECIPE, registry } = {}) {
     comment_visibility: "own",
     ai_commentary: 0,
   });
+  if (sealSender) {
+    await updateSettings(db, approvalsDeps({ id }), {
+      reportId: id, settings: { sender_account_id: SENDER }, actor: OWNER,
+    });
+  }
   return { id, rev: saved.rev };
 }
 
@@ -242,7 +247,7 @@ async function approveStepFor(db, reportId) {
 /** A live report with its step approved: the world a scheduled or manual run starts from. */
 async function liveReport({ recipe = CUSTOM_RECIPE } = {}) {
   const db = await freshDb();
-  const report = await prepare(db, { recipe });
+  const report = await prepare(db, { recipe, sealSender: true });
   await approveStepFor(db, report.id);
   const deps = approvalsDeps(report);
   await approveGoLive(db, deps, { reportId: report.id, previewRunId: "prv-1", actor: OWNER });
@@ -298,15 +303,17 @@ async function queueRun(db, reportId, over = {}) {
 
 /**
  * The state keys this run wrote. The owner revision's author seal lives in the same table under the
- * reserved `revision_author:` prefix (revision-author.js), which is not run state: these readers answer
- * with the run's own keys.
+ * reserved `revision_author:` prefix (revision-author.js), and the owner's settings save keeps the
+ * report's sender seal under `sender_seal` (sender-seal.js); neither is run state, so these readers
+ * answer with the run's own keys.
  */
 async function stateRows(db, reportId) {
   const { rows } = await db.execute({
     sql: "SELECT key FROM report_state WHERE report_id = ? ORDER BY key",
     args: [reportId],
   });
-  return rows.map((row) => row.key).filter((key) => !key.startsWith("revision_author:"));
+  return rows.map((row) => row.key)
+    .filter((key) => !key.startsWith("revision_author:") && key !== "sender_seal");
 }
 
 /* ---------------------------------------------------------------- the executor's ctx */
@@ -540,7 +547,7 @@ test("a manual run with one custom block counts one extra step run, not two", as
 
 test("a manual run with only an approved credentialed http_json block counts one extra step run", async () => {
   const db = await freshDb();
-  const report = await prepare(db, { recipe: { blocks: [CREDENTIALED_ITEMS] } });
+  const report = await prepare(db, { recipe: { blocks: [CREDENTIALED_ITEMS] }, sealSender: true });
   const deps = approvalsDeps(report);
   await approveCredentialFor(db, report.id);
   await approveGoLive(db, deps, { reportId: report.id, previewRunId: "prv-1", actor: OWNER });
@@ -652,7 +659,7 @@ test("a preview whose gate blocks an unapproved credentialed http_json block cla
 test("a run with a custom block plus a credentialed http_json block claims one extra step run in total", async () => {
   const db = await freshDb();
   const recipe = { blocks: [CREDENTIALED_ITEMS, UNAPPROVED_CUSTOM] };
-  const report = await prepare(db, { recipe });
+  const report = await prepare(db, { recipe, sealSender: true });
   const deps = approvalsDeps(report);
   await approveStepFor(db, report.id);
   await approveCredentialFor(db, report.id);

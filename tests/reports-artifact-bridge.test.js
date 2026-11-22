@@ -31,7 +31,7 @@ const {
   isReservedStateKey, latestRecipientVersion, makeWriteVersion, normalizeAllowedLinks, reportVersionFor,
   writeRunVersion,
 } = await import("../servers/gateway/reports/artifact-bridge.js");
-const { approveGoLive, pauseReport, verifyLive } = await import(
+const { approveGoLive, pauseReport, updateSettings, verifyLive } = await import(
   "../servers/gateway/reports/approvals.js");
 const { createReport, getReport, getState, saveRecipe, setState, updateReportColumns } = await import(
   "../servers/gateway/reports/store.js");
@@ -177,6 +177,9 @@ async function prepare(db) {
     comment_tier_default: "c",
     comment_visibility: "own",
     ai_commentary: 0,
+  });
+  await updateSettings(db, approvalsDeps({}), {
+    reportId: id, settings: { sender_account_id: SENDER }, actor: OWNER,
   });
   return { id, rev: saved.rev };
 }

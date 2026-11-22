@@ -35,7 +35,8 @@ const { createDbClient } = await import("../servers/db.js");
 const { csrfMiddleware } = await import("../servers/gateway/dashboard/shared/csrf.js");
 const { reportsApiRouter, REPORTS_API_PREFIX, OWNER_LABEL } =
   await import("../servers/gateway/routes/reports-api.js");
-const { SETTINGS_CHANGED_PAUSE_REASON } = await import("../servers/gateway/reports/approvals.js");
+const { SETTINGS_CHANGED_PAUSE_REASON, updateSettings } =
+  await import("../servers/gateway/reports/approvals.js");
 const { createReport, getReport, saveRecipe, updateReportColumns } =
   await import("../servers/gateway/reports/store.js");
 const { REPORT_PREFIX, REPORT_TASK_GLOB, REPORT_TASK_RE, cronNext } =
@@ -197,8 +198,7 @@ async function setup() {
   return { db, crow, opened, runTable, approvalsDeps, hasOwnParser };
 }
 
-/** A saved report. `schedule` points it at a schedule row of its own that is NOT a report's row, which
- *  is what a report has before the page ever sets one. */
+/** A saved report, set up the way go-live needs it: a schedule row and a sender the owner sealed. */
 async function prepareReport(db, { schedule = true, recipe = RECIPE } = {}) {
   let scheduleId = null;
   if (schedule) {
@@ -218,6 +218,11 @@ async function prepareReport(db, { schedule = true, recipe = RECIPE } = {}) {
     comment_tier_default: "c",
     comment_visibility: "own",
     ai_commentary: 0,
+  });
+  // Go-live trusts the row's sender only behind the seal the owner's settings save writes, so a report
+  // that is going to be taken live is sealed here (tests/reports-api.test.js does the same).
+  await updateSettings(db, { loadSeed: () => ({ seed: SEED }), senderReady: async () => true }, {
+    reportId: id, settings: { sender_account_id: SENDER }, actor: { kind: "owner" },
   });
   return { id, rev: saved.rev, foreignScheduleId: scheduleId };
 }
@@ -444,7 +449,7 @@ test("a preview that failed with no_schedule goes live once the route sets the s
   const report = await prepareReport(world.db, { schedule: false });
   const runId = addPreviewRun(world, report);
 
-  const refused = await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId });
+  const refused = await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId, expectedSenderAccountId: SENDER });
   assert.equal(refused.status, 409, refused.text);
   assert.deepEqual(refused.json, {
     error: "no_schedule", message: "Choose when this report runs before going live.",
@@ -455,7 +460,7 @@ test("a preview that failed with no_schedule goes live once the route sets the s
   assert.equal(set.status, 200, set.text);
   assert.equal(set.json.report.status, "draft", "a draft is not paused by its own schedule");
 
-  const live = await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId });
+  const live = await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId, expectedSenderAccountId: SENDER });
   assert.equal(live.status, 200, live.text);
   assert.deepEqual(live.json, { ok: true, liveRev: report.rev });
 
@@ -472,7 +477,7 @@ test("the identical cron and zone leave a live report live, and a moved one paus
   const report = await prepareReport(world.db, { schedule: false });
   assert.equal((await put(schedulePath(report.id), { cron: CRON, tz: TZ })).status, 200);
   const runId = addPreviewRun(world, report);
-  assert.equal((await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId })).status, 200);
+  assert.equal((await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId, expectedSenderAccountId: SENDER })).status, 200);
   const live = await getReport(world.db, report.id);
   assert.equal(live.status, "live");
   assert.match(live.live_seal, /^[0-9a-f]{64}$/);
@@ -514,7 +519,7 @@ test("a live report whose only move is the cron is paused, with the seal, the no
   const report = await prepareReport(world.db, { schedule: false });
   assert.equal((await put(schedulePath(report.id), { cron: CRON, tz: TZ })).status, 200);
   const runId = addPreviewRun(world, report);
-  assert.equal((await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId })).status, 200);
+  assert.equal((await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId, expectedSenderAccountId: SENDER })).status, 200);
   const live = await getReport(world.db, report.id);
   assert.equal(live.status, "live");
   assert.match(live.live_seal, /^[0-9a-f]{64}$/);
@@ -550,7 +555,7 @@ test("a row switched off with the same cron and zone gets a window from now, and
   const report = await prepareReport(world.db, { schedule: false });
   assert.equal((await put(schedulePath(report.id), { cron: CRON, tz: TZ })).status, 200);
   const runId = addPreviewRun(world, report);
-  assert.equal((await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId })).status, 200);
+  assert.equal((await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId, expectedSenderAccountId: SENDER })).status, 200);
   const live = await getReport(world.db, report.id);
   assert.equal(live.status, "live");
   const [own] = await ownRows(world.db, report.id);
@@ -588,7 +593,7 @@ test("a live report pointing at a missing row is paused when the route writes it
   const report = await prepareReport(world.db, { schedule: false });
   assert.equal((await put(schedulePath(report.id), { cron: CRON, tz: TZ })).status, 200);
   const runId = addPreviewRun(world, report);
-  assert.equal((await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId })).status, 200);
+  assert.equal((await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId, expectedSenderAccountId: SENDER })).status, 200);
   const live = await getReport(world.db, report.id);
   assert.equal(live.status, "live");
   const [own] = await ownRows(world.db, report.id);
@@ -628,7 +633,7 @@ test("a live report pointing at another report's row is paused when the route mo
   assert.equal((await put(schedulePath(mine.id), { cron: CRON, tz: TZ })).status, 200);
   assert.equal((await put(schedulePath(theirs.id), { cron: OTHER_CRON, tz: TZ })).status, 200);
   const runId = addPreviewRun(world, mine);
-  assert.equal((await post(`${reportPath(mine.id)}/go-live`, { previewRunId: runId })).status, 200);
+  assert.equal((await post(`${reportPath(mine.id)}/go-live`, { previewRunId: runId, expectedSenderAccountId: SENDER })).status, 200);
   assert.equal((await getReport(world.db, mine.id)).status, "live");
   const [own] = await ownRows(world.db, mine.id);
   const [otherRow] = await ownRows(world.db, theirs.id);
@@ -696,7 +701,7 @@ test("a paused report that still carries a seal loses the seal on a change and k
   const report = await prepareReport(world.db, { schedule: false });
   assert.equal((await put(schedulePath(report.id), { cron: CRON, tz: TZ })).status, 200);
   const runId = addPreviewRun(world, report);
-  assert.equal((await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId })).status, 200);
+  assert.equal((await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId, expectedSenderAccountId: SENDER })).status, 200);
 
   // An owner pause keeps the seal on purpose, so a resume can prove nothing moved.
   const paused = await post(`${reportPath(report.id)}/pause`, { reason: "Starting over" });
@@ -728,7 +733,7 @@ test("the reports hook's row guard accepts the row the route wrote", async () =>
   const report = await prepareReport(world.db, { schedule: false });
   assert.equal((await put(schedulePath(report.id), { cron: CRON, tz: TZ })).status, 200);
   const runId = addPreviewRun(world, report);
-  assert.equal((await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId })).status, 200);
+  assert.equal((await post(`${reportPath(report.id)}/go-live`, { previewRunId: runId, expectedSenderAccountId: SENDER })).status, 200);
   assert.equal((await getReport(world.db, report.id)).status, "live");
 
   const notes = [];

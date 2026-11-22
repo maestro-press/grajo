@@ -1990,6 +1990,57 @@ const SPEC_END = "end";
 const SPEC_END_SUFFIX = `;${SPEC_END}`;
 
 /**
+ * The label a bot hands to `crow_request_secret` for one credential binding: the grammar
+ * `parseCredentialSpec` reads, in the order `SPEC_KEYS` names, or null when the assembled label is not
+ * one that grammar reads.
+ *
+ * The label is built from the caller's values and then READ BACK through `parseCredentialSpec`, so this
+ * function can only ever answer a label that names exactly the binding it was given: a value holding a
+ * `;` or an `=`, two targets, a missing path list, a bad host, a control character and a label past the
+ * grammar's bound all answer null rather than a shorter or a different binding. No secret is involved:
+ * the label names a keychain row to be filled in, never a value.
+ *
+ * @param {{reportId: string, host: string, header?: string|null, query?: string|null,
+ *   format?: string|null, paths: string[], methods?: string[]|null}} spec
+ * @returns {string|null}
+ */
+export function credentialSpecLabel({ reportId, host, header, query, format, paths, methods } = {}) {
+  if (typeof reportId !== "string" || !reportId) return null;
+  if (typeof host !== "string" || !host) return null;
+  for (const value of [header, query, format]) {
+    if (value === undefined || value === null) continue;
+    if (typeof value !== "string" || !value) return null;
+  }
+  if (!Array.isArray(paths) || paths.length === 0) return null;
+  for (const path of paths) {
+    if (typeof path !== "string" || !path) return null;
+  }
+  if (methods !== undefined && methods !== null) {
+    if (!Array.isArray(methods) || methods.length === 0) return null;
+    for (const method of methods) {
+      if (typeof method !== "string" || !method) return null;
+    }
+  }
+  const values = new Map([
+    ["report", reportId],
+    ["host", host],
+    ["header", header],
+    ["query", query],
+    ["format", format],
+    ["paths", paths.join(",")],
+    ["methods", Array.isArray(methods) ? methods.join(",") : null],
+  ]);
+  const parts = [];
+  for (const key of SPEC_KEYS) {
+    const value = values.get(key);
+    if (value === undefined || value === null || value === "") continue;
+    parts.push(`${key}=${value}`);
+  }
+  const label = `${parts.join(";")}${SPEC_END_SUFFIX}`;
+  return parseCredentialSpec(label) === null ? null : label;
+}
+
+/**
  * A credential request's `label` as the binding it asks for, or null.
  *
  * The secret card carries no report fields, so the bot spells the binding in its own label with one

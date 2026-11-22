@@ -101,7 +101,7 @@ import { MODEL_BLOCK_TYPES, canonicalJson, recipeCallsModel, recipeHash, sources
 import { blockRegistry } from "./blocks/index.js";
 import { approvalSeal, newApprovalNonce, verifyApprovalSeal } from "./seal.js";
 import { sealAuthorRevision } from "./revision-author.js";
-import { SENDER_SEAL_KEY, sealSender } from "./sender-seal.js";
+import { SENDER_SEAL_KEY, sealSender, senderSealVerifies } from "./sender-seal.js";
 import { getReport, getRevision, recordAudit, saveRecipe, setState, updateReportColumns } from "./store.js";
 import { linkFor } from "./links.js";
 import { loadKeychainKey } from "../keychain/key.js";
@@ -870,10 +870,12 @@ async function requireRecipientLinks(db, d, report, previewRun) {
  * Approve a report to run: seal the live set over the head revision and make it `live`.
  *
  * The preview must be this report's, of the current head revision, and it must have finished `ok` or
- * `empty`. A schedule must resolve, the sender account must be ready, every APPROVED recipient must have
- * a link its mail can open (`link_unavailable` when one has none), and a recipe that calls a model must
- * resolve one now (a null resolution is `model_unresolved`, never a guessed default). Nothing is written
- * until every check has passed, and the write is one UPDATE with the fresh nonce and seal.
+ * `empty`. A schedule must resolve, the sender account must be ready AND must be one the owner sealed
+ * with a settings save (`sender-seal.js`: the seal names the row's current `sender_account_id`), every
+ * APPROVED recipient must have a link its mail can open (`link_unavailable` when one has none), and a
+ * recipe that calls a model must resolve one now (a null resolution is `model_unresolved`, never a
+ * guessed default). Nothing is written until every check has passed, and the write is one UPDATE with
+ * the fresh nonce and seal.
  *
  * @param {object} db
  * @param {object} deps
@@ -897,6 +899,7 @@ export async function approveGoLive(db, deps, { reportId, previewRunId, actor } 
   const accountId = text(report.sender_account_id);
   if (!accountId) throw fail("sender_not_ready");
   if ((await d.senderReady(db, accountId)) !== true) throw fail("sender_not_ready");
+  if (!(await senderSealVerifies(db, await seedOf(d), report))) throw fail("sender_not_ready");
 
   await requireRecipientLinks(db, d, report, run);
 
@@ -1199,12 +1202,17 @@ export async function botSaveRecipe(db, deps, { reportId, recipe } = {}) {
  * registry: the head hash columns are a cache, and neither a direct UPDATE of `reports.recipe_json`,
  * of `reports.sources_hash`, nor of a revision row may turn a source change into a free one.
  *
+ * `expectedRev` is optional. When a caller gives it (the owner's route gives the head revision the card
+ * showed), it must equal the head revision this function reads, or the call is `conflict` and nothing
+ * is written: a save that landed between the card read and the tap never gets applied unseen. A caller
+ * with no `expectedRev` behaves as before.
+ *
  * @param {object} db
  * @param {object} deps
- * @param {{reportId: string, actor: {kind: "owner"}}} input
+ * @param {{reportId: string, actor: {kind: "owner"}, expectedRev?: number}} input
  * @returns {Promise<{ok: true, liveRev: number}>}
  */
-export async function applyPendingFreeChange(db, deps, { reportId, actor } = {}) {
+export async function applyPendingFreeChange(db, deps, { reportId, actor, expectedRev } = {}) {
   requireOwner(actor);
   const d = resolveDeps(deps);
   const report = await requireReport(db, reportId);
@@ -1214,6 +1222,7 @@ export async function applyPendingFreeChange(db, deps, { reportId, actor } = {})
   if (!verified) throw fail("go_live_needed");
   const headRev = Number(report.recipe_rev);
   if (!Number.isInteger(headRev) || headRev < 1) throw fail("go_live_needed");
+  if (expectedRev !== undefined && Number(expectedRev) !== headRev) throw fail("conflict");
   if (!(await getRevision(db, report.id, headRev))) throw fail("go_live_needed");
   // The re-stamp derives the head revision's own hashes and model-call status and refuses when either
   // moved, so nothing here has to trust the head columns.

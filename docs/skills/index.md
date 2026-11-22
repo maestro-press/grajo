@@ -32,6 +32,7 @@ Skills are markdown files in `skills/` that define behavioral prompts for the AI
 | **Onboarding Tour** | `onboarding-tour.md` | First-run tour showing new users what Crow can do |
 | **Peer Network** | `peer-network.md` | Manage your Crow peer network: view and manage contacts, configure relays, check identity information, block/unblock pee |
 | **Podcast** | `podcast.md` | Podcast publishing — upload audio, create episodes, iTunes-compatible RSS |
+| **Reports** | `reports.md` | Build a Recurring Report by proposing blocks, hosts, steps and credentials, then let the owner approve it. |
 | **Safety Guardrails** | `safety-guardrails.md` | Universal safety checkpoints — confirm before destructive, resource-heavy, or network-altering actions |
 | **Scheduling** | `scheduling.md` | Manage the user's reminders and recurring schedules. |
 | **Sharing** | `sharing.md` | Share memories, research projects, sources, and notes with trusted contacts via Crow's peer-to-peer sharing layer. All d |

@@ -28,7 +28,7 @@ const PLATFORM_SKILLS = new Set([
   "crow-context", "safety-guardrails", "ideation", "blog", "podcast", "storage",
   "sharing", "social", "peer-network", "onboarding", "onboarding-tour",
   "data-backends", "add-ons", "network-setup", "scheduling", "tutoring",
-  "backup", "bug-report", "context-management",
+  "backup", "bug-report", "context-management", "reports",
 ]);
 
 const DEVELOPER_SKILLS = new Set([

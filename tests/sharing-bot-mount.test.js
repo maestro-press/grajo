@@ -48,9 +48,12 @@ function sharingMountBlock() {
   const src = readFileSync(MOUNTS, "utf8");
   const start = src.indexOf("// Bot sharing door");
   assert.ok(start >= 0, "mcp-mounts.js still has a bot sharing door block");
-  const end = src.indexOf("// Phone bundle", start);
-  assert.ok(end > start, "the sharing block is closed by the next mount");
-  return src.slice(start, end);
+  // The next mount installs after it — the reports door, then the phone bundle — closes the block.
+  const ends = ["// Reports door", "// Phone bundle"]
+    .map((marker) => src.indexOf(marker, start))
+    .filter((i) => i > start);
+  assert.ok(ends.length > 0, "the sharing block is closed by the next mount");
+  return src.slice(start, Math.min(...ends));
 }
 
 test("the module the boot step imports resolves, with the exports the mount destructures", async () => {

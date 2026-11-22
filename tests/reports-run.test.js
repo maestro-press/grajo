@@ -30,7 +30,7 @@ const {
 const {
   claimRunRequests, pruneRunRequests, requestRun,
 } = await import("../servers/gateway/reports/run-requests.js");
-const { approveGoLive, ownerSaveRecipe, pauseReport } = await import(
+const { approveGoLive, ownerSaveRecipe, pauseReport, updateSettings } = await import(
   "../servers/gateway/reports/approvals.js"
 );
 const {
@@ -143,6 +143,9 @@ async function prepare(db, { recipe = SOURCE_RECIPE } = {}) {
     comment_tier_default: "c",
     comment_visibility: "own",
     ai_commentary: 0,
+  });
+  await updateSettings(db, approvalsDeps(), {
+    reportId: id, settings: { sender_account_id: SENDER }, actor: OWNER,
   });
   return { id, rev: saved.rev, scheduleId };
 }
