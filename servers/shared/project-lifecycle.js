@@ -10,6 +10,7 @@ import { existsSync, lstatSync, mkdirSync, realpathSync, renameSync } from "node
 import { join, resolve, relative, isAbsolute } from "node:path";
 import { createDbClient, auditLog, resolveDataDir } from "../db.js";
 import { disconnectProjectConnections } from "./service-connections.js";
+import { serviceById, isPanelService } from "./service-catalog.js";
 import { CROW_VOICE_BOT_ID } from "./voice-bot.js";
 import { resolveSqlitePath, tasksDbPath as defaultTasksDbPath } from "../../scripts/pi-bots/instance-paths.mjs";
 
@@ -314,6 +315,27 @@ async function botsBlock(db, id) {
   return bots.length ? { code: "bots", detail: { bots } } : null;
 }
 
+/**
+ * An ACTIVE connection of a panel-only service (connect.method "panel"): its sealed secrets are
+ * the bundle panel's own, and a project delete purges service_connections — so the delete would
+ * leave those keychain rows with no connection. Refused until the panel disconnects it. The
+ * detail names the first such service by catalog name (never a uuid, never a value).
+ */
+async function panelBlock(db, id) {
+  const rows = await tolerant(async () => (await db.execute({
+    sql: "SELECT service_id, method FROM service_connections WHERE project_id = ? AND status = 'active' ORDER BY id",
+    args: [id],
+  })).rows, []);
+  for (const r of rows) {
+    const service = serviceById(r.service_id);
+    if (r.method === "panel" || isPanelService(service)) {
+      const name = service?.name ? String(service.name) : String(r.service_id);
+      return { code: "panel_connected", detail: `Disconnect ${name} in its panel first` };
+    }
+  }
+  return null;
+}
+
 async function everCloneShared(db, id) {
   const members = await countOf(db,
     "SELECT COUNT(*) AS n FROM project_members WHERE project_id = ? AND contact_id IS NOT NULL AND mode = 'clone'", [id]);
@@ -343,7 +365,7 @@ async function summaryCounts(db, project, opts) {
 /**
  * What a delete would remove, and whether it is refused. Read-only: it never opens a missing
  * tasks store (no file is created) and writes nothing.
- * @returns {Promise<{ blocked: null | { code: 'not_owner'|'shared'|'bots', detail: object|null },
+ * @returns {Promise<{ blocked: null | { code: 'not_owner'|'shared'|'bots'|'panel_connected', detail: object|string|null },
  *   counts: null | { cards, files, notes, sources, sessions, connections, backends, workspace, everCloneShared } }>}
  *   counts is null for not_owner (a visited or missing project is never described).
  *   `crowHome` is accepted for the callers' signature; every path comes from the instance anchor
@@ -354,7 +376,7 @@ export async function deleteSummary(db, projectId, { crowHome, tasksDbPath } = {
   const project = await loadProject(db, projectId);
   if (!project) return { blocked: { code: "not_owner", detail: null }, counts: null };
   const id = Number(project.id);
-  const blocked = (await sharedBlock(db, id)) || (await botsBlock(db, id));
+  const blocked = (await sharedBlock(db, id)) || (await botsBlock(db, id)) || (await panelBlock(db, id));
   return { blocked, counts: await summaryCounts(db, project, { tasksDbPath }) };
 }
 
@@ -377,10 +399,10 @@ async function txWrite(db, sql, args) {
   try { return await db.execute({ sql, args }); } catch (err) { if (isAbsent(err)) return { rowsAffected: 0, skipped: true }; throw err; }
 }
 
-/** The refusals (owner, shared, bots) as they stand now, or null. Synchronous DB reads only. */
+/** The refusals (owner, shared, bots, an active panel connection) as they stand now, or null. Synchronous DB reads only. */
 async function currentBlock(db, id) {
   if (!(await canOwnProject(db, id))) return { code: "not_owner", detail: null };
-  return (await sharedBlock(db, id)) || (await botsBlock(db, id));
+  return (await sharedBlock(db, id)) || (await botsBlock(db, id)) || (await panelBlock(db, id));
 }
 
 /** A refusal found inside the transaction: rolls it back, and deleteProject returns its code. */
@@ -635,7 +657,7 @@ function moveWorkspace(project, dataDir, now, partial) {
  * @param {Function} [opts._beforeTombstone]  test seam: runs inside the transaction, before the tombstone
  * @param {(db:object, project:object)=>Promise<object>} [opts._eraseHistory]  test seam over the at-once history erase
  * @returns {Promise<{ ok: true, counts: object, movedTo?: string, partial?: string[] } |
- *   { ok: false, code: 'bad_actor'|'not_owner'|'shared'|'bots'|'name_mismatch'|'failed', detail?: object }>}
+ *   { ok: false, code: 'bad_actor'|'not_owner'|'shared'|'bots'|'panel_connected'|'name_mismatch'|'failed', detail?: object|string }>}
  *   A refusal found inside the transaction carries detail.disconnected: the connections already disconnected.
  */
 export async function deleteProject(db, projectId, {
@@ -679,7 +701,12 @@ export async function deleteProject(db, projectId, {
     purged = await purgeCrowDb(db, project, { actor, counts, beforeTombstone: _beforeTombstone });
   } catch (err) {
     // A refusal this late comes after the disconnects: say how many connections were disconnected.
-    if (err instanceof DeleteRefused) return { ok: false, code: err.code, detail: { ...(err.detail || {}), disconnected } };
+    // A string detail (the panel connection's sentence) keeps its text as `message`, since this
+    // answer also carries the count.
+    if (err instanceof DeleteRefused) {
+      const detail = typeof err.detail === "string" ? { message: err.detail } : err.detail;
+      return { ok: false, code: err.code, detail: { ...(detail || {}), disconnected } };
+    }
     console.warn(`[project-lifecycle] delete ${id}: crow.db purge rolled back:`, err?.message || err);
     return { ok: false, code: "failed" };
   }

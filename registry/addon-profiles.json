@@ -598,6 +598,53 @@
         ]
       }
     },
+    "coinbase": {
+      "id": "coinbase",
+      "source": "repo",
+      "network": {
+        "internet": false,
+        "hosts": [
+          {
+            "host": "127.0.0.1",
+            "port": 3062,
+            "scheme": "http",
+            "from": "CROW_COINBASE_ENGINE_URL",
+            "source": "default-own-service"
+          }
+        ]
+      },
+      "doors": [],
+      "files": {
+        "read": [],
+        "write": [],
+        "oauthDir": null,
+        "state": []
+      },
+      "crowDb": false,
+      "ownEnvFile": true,
+      "refused": [],
+      "labelParts": [
+        {
+          "kind": "local-host",
+          "label": "127.0.0.1:3062",
+          "host": "127.0.0.1",
+          "port": 3062
+        },
+        {
+          "kind": "own-folder"
+        }
+      ],
+      "label": {
+        "en": [
+          "reach 127.0.0.1:3062 on this computer",
+          "keep files in its own folder"
+        ],
+        "es": [
+          "acceder a 127.0.0.1:3062 en este equipo",
+          "guardar archivos en su propia carpeta"
+        ]
+      }
+    },
     "crowdsec": {
       "id": "crowdsec",
       "source": "repo",

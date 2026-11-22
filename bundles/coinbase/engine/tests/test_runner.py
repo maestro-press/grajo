@@ -26,6 +26,7 @@ import pytest
 
 from crow_coinbase import money, runner as runner_module
 from crow_coinbase.benchmark import Benchmark
+from crow_coinbase.books import BookRouter
 from crow_coinbase.exchange import DryRunExchange
 from crow_coinbase.gateway import (
     CLOCK_SKEW,
@@ -507,6 +508,7 @@ def insert_order_row(
         status=status,
         order_id=order_id,
         basis_per_base=None if basis is None else D(basis),
+        book="dry",
     )
     fields = {"opposite": opposite}
     if filled_size is not None:
@@ -623,30 +625,46 @@ def rejected_follow_up(
 # ---------------------------------------------------------------- start-up
 
 
-def test_startup_refuses_live_in_p1(envs):
+def test_startup_accepts_live_and_refuses_an_unrecognised_switch(envs):
+    """The live switch is a ceiling now, not a refusal: only a bad value blocks."""
     env = envs()
-    for value in ("true", "1", "TRUE", "yes", "on"):
-        runner = env.new_runner(env={**BASE_ENV, "CROW_COINBASE_LIVE": value})
-        found = runner.startup_checks()
-        assert any("live trading lands in P2" in problem for problem in found), value
-
-    for value in ("false", "0", "no", "off", "FALSE", ""):
-        assert env.new_runner(
-            env={**BASE_ENV, "CROW_COINBASE_LIVE": value}
-        ).startup_checks() == [], value
+    for value in (
+        "true",
+        "1",
+        "TRUE",
+        "yes",
+        "on",
+        "false",
+        "0",
+        "no",
+        "off",
+        "FALSE",
+        "",
+    ):
+        assert (
+            env.new_runner(
+                env={**BASE_ENV, "CROW_COINBASE_LIVE": value}
+            ).startup_checks()
+            == []
+        ), value
 
     assert env.new_runner(env=dict(BASE_ENV)).startup_checks() == []
 
-    banana = env.new_runner(
-        env={**BASE_ENV, "CROW_COINBASE_LIVE": "banana"}
-    ).startup_checks()
-    assert any("unrecognised CROW_COINBASE_LIVE value" in p for p in banana)
+    # Only a value neither list names is still a startup problem, and it is
+    # refused whatever it might have meant.
+    for value in ("banana", "2", "maybe"):
+        found = env.new_runner(
+            env={**BASE_ENV, "CROW_COINBASE_LIVE": value}
+        ).startup_checks()
+        assert any(
+            "unrecognised CROW_COINBASE_LIVE value" in problem for problem in found
+        ), value
 
-    live_gateway = env.build_gateway(live_enabled=True)
-    assert any(
-        "live trading lands in P2" in p
-        for p in env.new_runner(gateway=live_gateway).startup_checks()
+    # A gateway with a live book wired is no longer a startup problem either.
+    live_gateway = env.build_gateway(
+        books=BookRouter(env.exchange, lambda: env.exchange)
     )
+    assert env.new_runner(gateway=live_gateway).startup_checks() == []
 
 
 def test_startup_checks_validate_and_fee_guard_per_bot(envs):
@@ -1663,7 +1681,7 @@ def test_pending_submit_resolved_after_restart(envs):
     assert landed["ok"] is True
     env.store.insert_order(
         cid, BOT, "bot", PRODUCT, "BUY", -1, D("0.98"), D("10"),
-        status=PENDING_SUBMIT,
+        status=PENDING_SUBMIT, book="dry",
     )
     env.store.set_init_done(BOT)
 
@@ -1751,7 +1769,9 @@ def test_portfolio_drawdown_halts_until_cleared(envs):
             if "portfolio" in message.lower()
         ]
 
-    assert env.gateway.is_halted() is True
+    assert env.gateway.is_halted() is False
+    assert env.gateway.is_halted("dry") is True
+    assert env.gateway.is_halted("live") is False
     assert len(portfolio_alerts()) == 1
     assert bot_row(env)["status"] == ACTIVE  # the grid is untouched by the halt
 
@@ -1783,6 +1803,7 @@ def test_portfolio_drawdown_halts_until_cleared(envs):
     assert env.store.hwm(PORTFOLIO_OWNER) == low
     assert any("re-based" in message for message in messages(env.store, "info"))
     assert env.gateway.is_halted() is False
+    assert env.gateway.is_halted("dry") is False
     assert any("re-initialised" in message for message in messages(env.store, "info"))
     assert bot_row(env)["init_done"] is False
     assert orders(env.store, BOT, LIVE_STATUSES) == []
@@ -1794,6 +1815,7 @@ def test_portfolio_drawdown_halts_until_cleared(envs):
     # Still at the low price: the mark sits at the equity rather than above it,
     # so nothing halts again, and the grid lays its book from the re-init.
     assert env.gateway.is_halted() is False
+    assert env.gateway.is_halted("dry") is False
     assert len(portfolio_alerts()) == 1
     assert env.store.hwm(PORTFOLIO_OWNER) == low
     assert spy.init_calls == calls_before[0] + 1
@@ -1908,7 +1930,7 @@ def test_unusable_snapshot_means_no_pause_ratchet_or_benchmark(envs):
     crossed = FakeMarket(bid=D("1.05"), ask=D("1.00"))
     env = envs(market=crossed)
     env.store.update_hwm(BOT, D("1000"))
-    assert env.store.get("benchmark:b1") is None
+    assert env.store.get("bench:dry:b1") is None
 
     env.runner.cycle()
 
@@ -1918,7 +1940,7 @@ def test_unusable_snapshot_means_no_pause_ratchet_or_benchmark(envs):
     assert snap is not None and snap.bid > snap.ask
     assert bot_row(env)["status"] == ACTIVE
     assert env.store.hwm(BOT) == D("1000")
-    assert env.store.get("benchmark:b1") is None
+    assert env.store.get("bench:dry:b1") is None
     assert not [
         message
         for message in messages(env.store, "ALERT")
@@ -1996,6 +2018,7 @@ def test_reconcile_called_with_epoch_now_and_no_transaction(envs, monkeypatch):
     assert call.get("store") is env.store
     assert call.get("exchange") is env.exchange
     assert call.get("gateway") is env.gateway
+    assert call.get("book") == "dry"
     now = call.get("now")
     assert now is not None
     assert now > 1e9  # epoch seconds, not a monotonic clock
@@ -2021,7 +2044,7 @@ def test_benchmark_started_on_first_cycle_before_orders(envs):
     env = envs()
     env.runner.cycle()
 
-    mix = env.store.get("benchmark:b1")
+    mix = env.store.get("bench:dry:b1")
     assert mix is not None
     assert D(mix["base"]) == D("50")
     assert D(mix["quote"]) == D("100")
@@ -2031,13 +2054,13 @@ def test_benchmark_started_on_first_cycle_before_orders(envs):
     assert len(orders(env.store, BOT)) == 6
 
     env.runner.cycle()
-    assert env.store.get("benchmark:b1") == mix
+    assert env.store.get("bench:dry:b1") == mix
 
     env.runner.forget_benchmark(BOT)
-    assert env.store.get("benchmark:b1") is None
+    assert env.store.get("bench:dry:b1") is None
     env.market.set_book(D("1.04"), D("1.05"))
     env.runner.cycle()
-    restarted = env.store.get("benchmark:b1")
+    restarted = env.store.get("bench:dry:b1")
     assert restarted is not None
     assert D(restarted["price"]) == D("1.045")
 
@@ -2286,11 +2309,11 @@ def test_recenter_settle_sweeps_again_each_pass(envs):
     real_cancel_all = env.gateway.cancel_all
     sweeps = []
 
-    def first_sweep_misses(scope, owner=None):
+    def first_sweep_misses(scope, owner=None, *, book=None):
         sweeps.append((scope, owner))
         if len(sweeps) == 1:
             return 0  # the first sweep cancels nothing at all
-        return real_cancel_all(scope=scope, owner=owner)
+        return real_cancel_all(scope=scope, owner=owner, book=book)
 
     env.gateway.cancel_all = first_sweep_misses
 
@@ -2312,9 +2335,9 @@ def test_recenter_restores_prior_status(envs):
     real_cancel_all = paused_env.gateway.cancel_all
     seen = []
 
-    def watching_cancel_all(scope, owner=None):
+    def watching_cancel_all(scope, owner=None, *, book=None):
         seen.append(bot_row(paused_env)["status"])
-        return real_cancel_all(scope=scope, owner=owner)
+        return real_cancel_all(scope=scope, owner=owner, book=book)
 
     paused_env.gateway.cancel_all = watching_cancel_all
     paused_env.runner.recenter(BOT, "1.1")
@@ -2378,7 +2401,7 @@ def test_recenter_aborts_when_orders_stay_live(envs):
     assert len(orders(env.store, BOT)) == 6
     sweeps = []
 
-    def never_sweeps(scope, owner=None):
+    def never_sweeps(scope, owner=None, *, book=None):
         sweeps.append((scope, owner))
         return 0
 

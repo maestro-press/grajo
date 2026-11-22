@@ -47,8 +47,11 @@ function plant(path, text, mode = 0o600) {
 }
 
 test("the code-declared defaults (the operator, 2026-10-29): obsidian locked private; notion and discord private by default; the rest open", () => {
+  // coinbase is the Trading panel's own service: its sealed key opens the live trading account,
+  // so it is private and locked like obsidian. The other catalog services are named below.
   const expect = {
     obsidian: { default: true, locked: true },
+    coinbase: { default: true, locked: true },
     notion: { default: true, locked: false },
     discord: { default: true, locked: false },
   };

@@ -11,7 +11,7 @@
  * 172.17.0.1 on docker0 and 172.18.0.1 on a compose bridge (an injected interface table);
  * the owner's laptop is 100.64.20.9 on the tailnet, 10.0.0.42 on the LAN, or 203.0.113.7.
  */
-import { test, after, afterEach } from "node:test";
+import { test, after, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import express from "express";
@@ -310,7 +310,17 @@ test("the real 2FA routes: a password step from the box mints 'dashboard onhost'
   await totpMod.enable2fa();
   const PW = "correct horse battery staple";
   await setPassword(PW);
-  const code = () => new OTPAuth.TOTP({ issuer: "Crow", label: "Crow's Nest", algorithm: "SHA1", digits: 6, period: 30, secret: OTPAuth.Secret.fromBase32(secret) }).generate();
+  // The login 2FA check records the time step it accepted in a replay guard (the sign-in form and
+  // the step-up gate share one), so the SAME 6-digit code can never sign in twice in one 30-second
+  // step. This test mints four logins, so each successful one takes a code from a LATER step: one
+  // test clock drives both the server's Date.now and OTPAuth's generate(), and an offset moves the
+  // code and the guard together. "000000" stays wrong at every offset.
+  const realNow = Date.now.bind(Date);
+  let clockOffset = 0;
+  const clockNow = () => realNow() + clockOffset;
+  /** The next 30-second step: call before every successful login's code. */
+  const advanceStep = () => { clockOffset += 30_000; };
+  const code = () => new OTPAuth.TOTP({ issuer: "Crow", label: "Crow's Nest", algorithm: "SHA1", digits: 6, period: 30, secret: OTPAuth.Secret.fromBase32(secret) }).generate({ timestamp: clockNow() });
   const app = express();
   app.use((req, res, next) => { res.redirectAfterPost = (url) => res.redirect(303, url); next(); });
   app.use(dashboardRouter((req, res, next) => next()));
@@ -319,6 +329,7 @@ test("the real 2FA routes: a password step from the box mints 'dashboard onhost'
   const scopesOf = async (tok) => (await db.execute({ sql: "SELECT scopes FROM oauth_tokens WHERE token = ?", args: [hash(tok)] })).rows[0]?.scopes;
   const fromBox = serveHeaders("owner@example.invalid", "100.64.20.1");
   const fromLap = serveHeaders("owner@example.invalid", "100.64.20.9");
+  const clock = mock.method(Date, "now", clockNow);
   try {
     await withServer(app, async (port) => {
       const post = (path, headers, body, cookie = null) => request(port, { method: "POST", path, headers: { ...headers, "content-type": "application/x-www-form-urlencoded", ...(cookie ? { cookie } : {}) }, body: form(body) });
@@ -330,6 +341,7 @@ test("the real 2FA routes: a password step from the box mints 'dashboard onhost'
       };
       // Password on the box, code from the laptop.
       let p = await pending(fromBox);
+      advanceStep();
       let r = await post("/dashboard/login/2fa", fromLap, { totp_code: code() }, `crow_pending_2fa=${p}`);
       assert.equal(r.status, 303);
       assert.equal(await scopesOf(cookieOf(r, "crow_session")), "dashboard onhost");
@@ -338,18 +350,22 @@ test("the real 2FA routes: a password step from the box mints 'dashboard onhost'
       r = await post("/dashboard/login/2fa", fromLap, { totp_code: "000000" }, `crow_pending_2fa=${p}`);
       const retry = cookieOf(r, "crow_pending_2fa");
       assert.ok(retry && retry !== p, "a fresh pending token");
+      advanceStep();
       r = await post("/dashboard/login/2fa", fromLap, { totp_code: code() }, `crow_pending_2fa=${retry}`);
       assert.equal(await scopesOf(cookieOf(r, "crow_session")), "dashboard onhost");
       // Password on the laptop, code on the box: on-host too.
       p = await pending(fromLap);
+      advanceStep();
       r = await post("/dashboard/login/2fa", fromBox, { totp_code: code() }, `crow_pending_2fa=${p}`);
       assert.equal(await scopesOf(cookieOf(r, "crow_session")), "dashboard onhost");
       // Both steps on the laptop: a plain session.
       p = await pending(fromLap);
+      advanceStep();
       r = await post("/dashboard/login/2fa", fromLap, { totp_code: code() }, `crow_pending_2fa=${p}`);
       assert.equal(await scopesOf(cookieOf(r, "crow_session")), "dashboard");
     });
   } finally {
+    clock.mock.restore();
     await totpMod.disable2fa();
     await db.execute("DELETE FROM dashboard_settings WHERE key = 'password_hash'");
   }

@@ -19,6 +19,10 @@ export function _resetServiceCatalogForTest() {
   _defaultRegistry = null;
 }
 
+export function _setServiceCatalogForTest(registry) {
+  _defaultRegistry = registry;
+}
+
 export function isServiceManifest(manifest) {
   const c = manifest && manifest.connect;
   return !!c && typeof c === "object" && !Array.isArray(c);
@@ -43,6 +47,10 @@ function toEntry(m) {
     requiresBins: [...(m.requires?.bins || [])],
     method: c.method,
     group: c.group,
+    // A panel-only service (connect.method "panel"): connected inside its own bundle panel, and
+    // its secrets' names are declared here instead of as fields.
+    panelRoute: c.panel_route || null,
+    panelSecrets: [...(c.panel_secrets || [])],
     fields: c.fields || [],
     steps: c.steps || [],
     stepLinks: c.step_links || {},
@@ -68,6 +76,16 @@ export function serviceCatalog({ registry } = {}) {
 
 export function serviceById(id, opts) {
   return serviceCatalog(opts).find((s) => s.id === id) || null;
+}
+
+/**
+ * Whether a service is connected only inside its own bundle panel (connect.method "panel"): never
+ * by the generic Connect screen, and never through a child of Crow's own.
+ * @param {object|null} service a service-catalog entry
+ * @returns {boolean}
+ */
+export function isPanelService(service) {
+  return !!service && service.method === "panel";
 }
 
 /** Label -> block-name slug: ascii lowercase, dashes, capped at 16 (I10). */

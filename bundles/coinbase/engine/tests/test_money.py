@@ -1,3 +1,4 @@
+import dataclasses
 from decimal import Decimal as D
 
 import pytest
@@ -135,6 +136,142 @@ def test_round_trip_profit_is_positive_at_2_5pct():
     cost = G.buy_cost(size, lv[-1], FEE)
     profit = G.realized_on_sell(size, G.sell_net(size, lv[0], FEE), cost / size)
     assert D("0.2") < profit < D("0.25")  # ~2.5% - 1% fees on ~15 USDC
+
+
+def test_spec_from_api_equity_fields():
+    """An equity spec carries the four equity flags; a crypto spec keeps the defaults."""
+    base = {
+        "product_id": "NVDA-USD",
+        "price_increment": "0.01",
+        "base_increment": "0.00001",
+        "quote_increment": "0.01",
+        "base_min_size": "0.00001",
+        "quote_min_size": "0.01",
+    }
+    details = {
+        "fractionable": True,
+        "fractional_notional_min_size": "1",
+        "trading_halted": "false",
+        "liquidate_only": True,
+    }
+
+    spec = G.ProductSpec.from_api(
+        {**base, "product_type": "EQUITY", "equity_product_details": details}
+    )
+    assert spec.product_type == "EQUITY"
+    assert spec.fractionable is True
+    assert spec.fractional_notional_min_size == D("1")
+    assert isinstance(spec.fractional_notional_min_size, D)
+    assert spec.trading_halted is False  # the string "false" is a bool here
+    assert spec.liquidate_only is True
+
+    # The same four keys at the top level parse to the same spec when there is
+    # no equity_product_details dict to read instead.
+    top_level = G.ProductSpec.from_api(
+        {**base, "product_type": "EQUITY", **details}
+    )
+    assert top_level == spec
+
+    # Case does not matter for a boolean given as text.
+    mixed = G.ProductSpec.from_api(
+        {
+            **base,
+            "product_type": "EQUITY",
+            "equity_product_details": {
+                "fractionable": "TRUE",
+                "fractional_notional_min_size": "2.5",
+                "trading_halted": "False",
+                "liquidate_only": False,
+            },
+        }
+    )
+    assert mixed.fractionable is True
+    assert mixed.fractional_notional_min_size == D("2.5")
+    assert mixed.trading_halted is False
+    assert mixed.liquidate_only is False
+
+    # A crypto product that says nothing about equities keeps every default.
+    crypto = G.ProductSpec.from_api(
+        {
+            "product_id": "XRP-USDC",
+            "price_increment": "0.0001",
+            "base_increment": "0.000001",
+            "quote_increment": "0.0001",
+            "base_min_size": "0.000001",
+            "quote_min_size": "1",
+        }
+    )
+    assert crypto.product_type == "SPOT"
+    assert crypto.fractionable is True  # a missing SPOT fractionable stays True
+    assert crypto.fractional_notional_min_size is None
+    assert crypto.trading_halted is False
+    assert crypto.liquidate_only is False
+
+    # An equity spec that does not say is not fractionable: the conservative read.
+    silent = G.ProductSpec.from_api({**base, "product_type": "EQUITY"})
+    assert silent.fractionable is False
+    assert silent.fractional_notional_min_size is None
+    assert silent.trading_halted is False
+    assert silent.liquidate_only is False
+
+    # An unrecognised boolean is refused rather than guessed, in either place.
+    with pytest.raises(ValueError):
+        G.ProductSpec.from_api(
+            {**base, "product_type": "EQUITY", "trading_halted": "maybe"}
+        )
+    with pytest.raises(ValueError):
+        G.ProductSpec.from_api(
+            {
+                **base,
+                "product_type": "EQUITY",
+                "equity_product_details": {"liquidate_only": "maybe"},
+            }
+        )
+
+
+def test_fee_rate_for():
+    """Equities pay no maker fee here; crypto keeps the rate it was given."""
+    equity = G.ProductSpec.from_api(
+        {
+            "product_id": "NVDA-USD",
+            "price_increment": "0.01",
+            "base_increment": "0.00001",
+            "quote_increment": "0.01",
+            "base_min_size": "0.00001",
+            "quote_min_size": "0.01",
+            "product_type": "EQUITY",
+        }
+    )
+    rate = D("0.006")
+
+    equity_rate = G.fee_rate_for(equity, rate)
+    assert equity_rate == D(0)
+    assert isinstance(equity_rate, D)
+
+    assert G.fee_rate_for(SPEC, rate) == D("0.006")
+    assert G.fee_rate_for(SPEC, rate) == rate
+    assert isinstance(G.fee_rate_for(SPEC, rate), D)
+
+
+def test_fee_rate_for_type():
+    """The kind alone answers the fee, and `fee_rate_for` agrees with it."""
+    rate = D("0.006")
+
+    # An equity pays nothing; anything else pays the configured crypto rate.
+    assert G.fee_rate_for_type("EQUITY", rate) == D(0)
+    assert isinstance(G.fee_rate_for_type("EQUITY", rate), D)
+    assert G.fee_rate_for_type("SPOT", rate) == rate
+    assert isinstance(G.fee_rate_for_type("SPOT", rate), D)
+
+    # The kind is read case-insensitively, with padding stripped.
+    assert G.fee_rate_for_type("equity", rate) == D(0)
+    assert G.fee_rate_for_type("Equity ", rate) == D(0)
+    assert G.fee_rate_for_type(" spot", rate) == rate
+
+    # The spec form and the kind form are the same answer, every spelling.
+    for product_type in ("SPOT", "EQUITY", "spot", "equity", " Equity "):
+        spec = dataclasses.replace(SPEC, product_type=product_type)
+        assert G.fee_rate_for(spec, rate) == G.fee_rate_for_type(product_type, rate)
 
 
 def test_realized_on_sell_keywords_name_quote_and_base():

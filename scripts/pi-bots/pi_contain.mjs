@@ -422,6 +422,11 @@ export function makeBindPolicy({ home, crowHome, crowHomeReal, dataDir, appRoot,
   const instanceSecrets = [];
   if (crowHome) {
     for (const n of ["secrets", "env", "peer-tokens.json", "android-keystore", ".keystore-env"]) instanceSecrets.push(join(crowHome, n));
+    // A bundle's install token folder is a secret too, and it is NOT a
+    // top-level name: `<crowHome>/<id>` is otherwise an ordinary data sibling,
+    // so the refusal has to name the nested folder itself. Only the token's own
+    // folder is listed — the rest of `<crowHome>/<id>` stays bindable.
+    instanceSecrets.push(join(crowHome, "coinbase", "install"));
     try { for (const e of readdirSync(crowHome)) if (/-token$/.test(e)) instanceSecrets.push(join(crowHome, e)); } catch {}
   }
   const never = [...neverBound(home), ...instanceSecrets].map((p) => (exists(p) ? (() => { try { return realpathSync(p); } catch { return p; } })() : p));

@@ -370,6 +370,7 @@ export default defineConfig({
           { text: 'Extensions', link: '/guide/extensions' },
           { text: 'Auto-Update', link: '/guide/auto-update' },
           { text: 'Tax Filing Assistant', link: '/guide/tax-filing' },
+          { text: 'Trading (Coinbase, beta)', link: '/guide/trading' },
           { text: 'Browser Automation', link: '/guide/browser-automation' },
           { text: 'Multi-Instance Chaining', link: '/guide/instances' },
           { text: 'Satellite Servers', link: '/guide/satellites' },

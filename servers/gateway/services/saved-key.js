@@ -34,6 +34,7 @@
  */
 
 import { auditLog } from "../../db.js";
+import { isPanelService } from "../../shared/service-catalog.js";
 import { ensureKeychainTable, isSystemBundleId, rememberExtensionSecret } from "../keychain/store.js";
 
 /** The label shape of a remembered key: the service, then the field it fills. */
@@ -56,7 +57,8 @@ function entryIdOf(wrote) {
  * @returns {boolean}
  */
 export function isOneClickEligible(service) {
-  if (!service || service.crowWide) return false;
+  // A panel-only service is connected in its own panel, so there is no one-click connect for it.
+  if (!service || service.crowWide || isPanelService(service)) return false;
   const fields = Array.isArray(service.fields) ? service.fields : [];
   return fields.length > 0 && fields.every((f) => f && f.kind === "secret");
 }

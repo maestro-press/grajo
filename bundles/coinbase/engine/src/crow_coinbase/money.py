@@ -26,9 +26,28 @@ class ProductSpec:
     quote_increment: Decimal
     base_min_size: Decimal
     quote_min_size: Decimal
+    product_type: str = "SPOT"
+    fractionable: bool = True
+    fractional_notional_min_size: Optional[Decimal] = None
+    trading_halted: bool = False
+    liquidate_only: bool = False
 
     @classmethod
     def from_api(cls, p: dict) -> "ProductSpec":
+        product_type = p.get("product_type") or "SPOT"
+        # An equity product may carry its equity flags either in a nested
+        # details object or beside the tick sizes; the nested one wins when it
+        # is there, so a stale top-level copy cannot contradict it.
+        details = p.get("equity_product_details")
+        src = details if isinstance(details, dict) else p
+        if "fractionable" in src:
+            fractionable = _as_bool("fractionable", src["fractionable"])
+        else:
+            # An equity product that does not say is not fractionable: a
+            # fractional order against a whole-share-only listing is refused,
+            # so the safe read is the one that assumes the restriction.
+            fractionable = not _is_equity(product_type)
+        notional_min = src.get("fractional_notional_min_size")
         return cls(
             product_id=p["product_id"],
             price_increment=D(str(p["price_increment"])),
@@ -36,7 +55,37 @@ class ProductSpec:
             quote_increment=D(str(p["quote_increment"])),
             base_min_size=D(str(p["base_min_size"])),
             quote_min_size=D(str(p["quote_min_size"])),
+            product_type=product_type,
+            fractionable=fractionable,
+            fractional_notional_min_size=(
+                None if notional_min is None else D(str(notional_min))
+            ),
+            trading_halted=_flag(src, "trading_halted"),
+            liquidate_only=_flag(src, "liquidate_only"),
         )
+
+
+def _is_equity(product_type: str) -> bool:
+    return str(product_type).strip().upper() == "EQUITY"
+
+
+def _as_bool(key: str, value: object) -> bool:
+    """A JSON boolean, or the same as text: the API is not consistent."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text == "true":
+            return True
+        if text == "false":
+            return False
+    raise ValueError(f"{key}: expected a boolean, got {value!r}")
+
+
+def _flag(src: dict, key: str) -> bool:
+    """A boolean equity flag, absent meaning off."""
+    value = src.get(key)
+    return False if value is None else _as_bool(key, value)
 
 
 # ---------------------------------------------------------------- rounding
@@ -55,6 +104,23 @@ def round_to(x: Decimal, inc: Decimal) -> Decimal:
 
 
 # ---------------------------------------------------------------- fees / guard
+
+
+def fee_rate_for_type(product_type: str, crypto_fee_rate: Decimal) -> Decimal:
+    """The maker fee a product kind pays: none for an EQUITY, else the crypto rate.
+
+    The kind is read case-insensitively with padding stripped, so a spec that
+    came back as "equity" or " Equity " is the same answer.  This is the one
+    place the rule lives; `fee_rate_for` is the spec-shaped spelling of it.
+    """
+    if _is_equity(product_type):
+        return D(0)
+    return crypto_fee_rate
+
+
+def fee_rate_for(spec: ProductSpec, crypto_fee_rate: Decimal) -> Decimal:
+    """The maker fee this product pays: none for an equity, else the configured rate."""
+    return fee_rate_for_type(spec.product_type, crypto_fee_rate)
 
 
 def required_step_pct(

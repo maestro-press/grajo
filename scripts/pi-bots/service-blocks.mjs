@@ -108,13 +108,18 @@ export function readProjectConnectionsSync(conn, projectId) {
   if (projectId == null || !conn) return [];
   try {
     return conn.prepare(
-      "SELECT uuid, service_id, bundle_id, account_label, label_slug, status, last_error FROM service_connections " +
+      "SELECT uuid, service_id, bundle_id, method, account_label, label_slug, status, last_error FROM service_connections " +
       "WHERE project_id = ? AND (status = 'active' OR (status = 'error' AND last_error = 'child_unavailable')) " +
       "AND owner_contact_id IS NULL " +
+      // A panel-only connection (method 'panel') is connected in its own bundle panel and never
+      // starts a child of Crow's, so no bot is ever offered it. Read from the row's own method
+      // column: this module runs on bot hosts and imports no gateway code.
+      "AND (method IS NULL OR method != 'panel') " +
       "AND project_id IN (SELECT id FROM project_spaces WHERE status != 'archived' AND archived_at IS NULL) " +
       "ORDER BY service_id, label_slug, id",
     ).all(Number(projectId)).map((r) => ({
-      uuid: r.uuid, serviceId: r.service_id, bundleId: r.bundle_id ?? null, accountLabel: r.account_label,
+      uuid: r.uuid, serviceId: r.service_id, bundleId: r.bundle_id ?? null, method: r.method ?? null,
+      accountLabel: r.account_label,
       labelSlug: r.label_slug, blockName: `${r.service_id}-${r.label_slug}`,
       status: r.status, lastError: r.last_error ?? null,
     }));
@@ -149,10 +154,10 @@ export function selectedServiceIds(def, connections, { crowHome, repoSkillsDir }
   return out;
 }
 
-/** The connections that may be offered at all: selected, bound as the owner connected them, not sensitive. */
+/** The connections that may be offered at all: selected, bound as the owner connected them, not sensitive, never a panel one. */
 export function offerableConnections(def, connections, { crowHome, repoSkillsDir } = {}) {
   const selected = selectedServiceIds(def, connections, { crowHome, repoSkillsDir });
-  return (connections || []).filter((c) => selected.has(c.serviceId)
+  return (connections || []).filter((c) => c.method !== "panel" && selected.has(c.serviceId)
     && connectionBindingOk(c, { crowHome }) && !isSensitiveConnection(c, { crowHome }));
 }
 

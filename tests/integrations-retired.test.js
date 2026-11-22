@@ -10,6 +10,7 @@ import { join } from "node:path";
 import {
   legacyEnvSources, isLegacyConfiguredAddon, legacyIntegrationsView,
 } from "../servers/gateway/services/legacy-sources.js";
+import { serviceCatalog, isPanelService } from "../servers/shared/service-catalog.js";
 import { crowServerCatalog } from "../scripts/pi-bots/crow-server-catalog.mjs";
 
 const REPO_ROOT = join(import.meta.dirname, "..");
@@ -171,6 +172,24 @@ test("no dead cards", () => {
   const gh = legacyIntegrationsView(undefined, { GITHUB_PERSONAL_ACCESS_TOKEN: "x" }).find((c) => c.id === "github");
   assert.equal(gh.configured, true);
   assert.equal(gh.keyUrl, "https://github.com/settings/tokens");
+});
+
+test("a panel-only service gets no Integrations card", () => {
+  // A panel-only service is connected inside its own bundle panel and never starts a child of
+  // Crow's, so this list has nothing to offer for it: a card here would be an empty card.
+  const catalog = serviceCatalog();
+  const panelIds = catalog.filter((s) => isPanelService(s)).map((s) => s.id);
+  assert.ok(panelIds.includes("coinbase"), "the catalog has the panel-only service this list must skip");
+
+  const ids = legacyIntegrationsView().map((c) => c.id);
+  for (const id of panelIds) assert.equal(ids.includes(id), false, `${id} is panel-only and has no card`);
+
+  // Every card that is still offered names a service Crow can start a child for.
+  for (const id of ids) {
+    const service = catalog.find((s) => s.id === id);
+    if (!service) continue; // env-configured Google
+    assert.equal(isPanelService(service), false, `${id} is not panel-only`);
+  }
 });
 
 test("getProxyStatus keeps the card shape", async () => {

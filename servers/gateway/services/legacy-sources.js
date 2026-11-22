@@ -8,7 +8,7 @@
  *
  * Pure: never spawns a child and never writes a file.
  */
-import { serviceCatalog, renderDerivedEnv } from "../../shared/service-catalog.js";
+import { serviceCatalog, renderDerivedEnv, isPanelService } from "../../shared/service-catalog.js";
 import { entryConfiguredNames } from "../../shared/addon-secrets.js";
 import { docsUrl } from "../dashboard/shared/components.js";
 
@@ -140,13 +140,15 @@ export function addonDerivedEnv(id, entryEnv, catalog = serviceCatalog(), env = 
 
 /**
  * The Settings → Integrations cards, in the old getProxyStatus card shape
- * (without the live status fields getProxyStatus adds): every service, then
- * env-configured Google.
+ * (without the live status fields getProxyStatus adds): every service Crow can
+ * still start a child for, then env-configured Google. A panel-only service is
+ * connected inside its own bundle panel and never starts a child of Crow's, so
+ * it has no card here (an empty card would offer nothing to fill in).
  *
  * Deleted by PR 4 (Home migration); the google-workspace entry by PR 6.
  */
 export function legacyIntegrationsView(catalog = serviceCatalog(), env = process.env) {
-  const cards = catalog.map((service) => ({
+  const cards = catalog.filter((s) => !isPanelService(s)).map((service) => ({
     id: service.id,
     name: service.name,
     description: service.description,

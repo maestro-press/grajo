@@ -67,7 +67,7 @@ const STATIC_KEYS = [
   "services.add.title", "services.add.search", "services.add.searchPlaceholder", "services.add.browse",
   "services.add.connect", "services.add.install", "services.add.useSaved", "services.add.typeKey",
   "services.connect.for", "services.connect.label", "services.connect.labelHelp", "services.connect.labelDefault",
-  "services.connect.labelHere", "services.connect.submit",
+  "services.connect.labelHere", "services.connect.submit", "services.panelLink",
   "services.error.generic", "common.close", "common.back",
   "services.install.step1", "services.install.step1Help", "services.install.step2", "services.install.step2Help",
   "services.install.submit", "services.install.footnote", "extensions.binsNotTrusted",
@@ -77,6 +77,11 @@ const STATIC_KEYS = [
   ...ERROR_CODES.map((c) => `services.error.${c}`),
   ...STATUSES.map((s) => `services.status.${s}`),
 ];
+
+/** A panel route the client may link to: a bundle panel lives under /dashboard/, never at a "//host". */
+function safePanelRoute(route) {
+  return typeof route === "string" && route.indexOf("/dashboard/") === 0 && route.charAt(1) !== "/";
+}
 
 /**
  * What the client needs, from loadServicesPage's payload: the project, botsLive, the catalog
@@ -103,6 +108,9 @@ export function projectServicesData(page, lang = "en") {
         labelFrom: c.labelFrom || null,
         ...(c.found === true ? { found: true } : {}),
         ...(c.savedKey === true ? { savedKey: true } : {}),   // one click: the key is already saved
+        // A panel-only service's card: the connect view links to its own panel instead of a form.
+        // Only a bundle panel route is carried: one under /dashboard/, never a "//host" path.
+        ...(safePanelRoute(c.panelRoute) ? { panelRoute: c.panelRoute } : {}),
         fields: (c.fields || []).map((f) => ({ name: f.name, kind: f.kind, labelKey: f.labelKey || null, helpKey: f.helpKey || null })),
         steps: [...(c.steps || [])],
         stepLinks: { ...(c.stepLinks || {}) },
@@ -582,6 +590,17 @@ export function projectServicesClientJs() {
     var mine = ++view;
     clearKids(sheet);
     head(svc.name, true);
+    // A panel-only service is connected in its own bundle panel: the sheet shows ONE link there, with
+    // no inputs, no Connect and test button and no POST. The link opens in the same tab, and only a
+    // bundle panel route is linked: one under /dashboard/, never a "//host" path.
+    var panelRoute = typeof svc.panelRoute === 'string' && svc.panelRoute.indexOf('/dashboard/') === 0 && svc.panelRoute.charAt(1) !== '/' ? svc.panelRoute : '';
+    if (panelRoute) {
+      var panelLink = el('a', 'svc-panel-link', fillOnce(T('services.panelLink'), { service: svc.name }));
+      panelLink.setAttribute('href', panelRoute);
+      sheet.appendChild(panelLink);
+      showSheet();
+      return;
+    }
     var form = el('form', 'svc-connect');
     form.setAttribute('method', 'post');
     form.setAttribute('novalidate', '');

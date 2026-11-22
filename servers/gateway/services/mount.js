@@ -43,6 +43,7 @@
 import { createDbClient as defaultCreateDbClient } from "../../db.js";
 import { resolveCrowHome } from "../../shared/crow-home.js";
 import { getConnection, servableConnection } from "../../shared/service-connections.js";
+import { serviceById, isPanelService } from "../../shared/service-catalog.js";
 import { connectionBindingOk, isSensitiveConnection } from "../../shared/service-sensitivity.js";
 import { mountLoopbackMcp } from "../loopback-tool-mount.js";
 import { SERVICES_TOKEN } from "../local-token.js";
@@ -128,6 +129,11 @@ export async function authorizeServiceCall(db, actor, uuid, { crowHome = resolve
     // The row's service_id picks the selection, the child and the sensitivity: only the one the
     // owner connected counts.
     if (!connectionBindingOk(connection, { crowHome })) return bindingMismatch();
+    // 3b. A panel-only service is connected inside its own bundle panel and never has a child of
+    // Crow's, so nothing on this mount serves it. An explicit rule, independent of whether the
+    // service happens to be sensitive (an open, unlocked panel service would otherwise pass 7).
+    const panelService = serviceById(connection.serviceId);
+    if (panelService && isPanelService(panelService)) return refuse("not_granted");
     // 4. one project: the def's project is the authority; a session must agree with it.
     if (actor.defProjectId == null || Number(actor.defProjectId) !== connection.projectId) return refuse("wrong_project");
     if (actor.scope === "session" && (actor.sessionProjectId == null || Number(actor.sessionProjectId) !== connection.projectId)) return refuse("wrong_project");

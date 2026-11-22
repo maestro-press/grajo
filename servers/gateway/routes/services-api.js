@@ -47,7 +47,7 @@ import { realpathSync } from "node:fs";
 
 import { createDbClient } from "../../db.js";
 import { resolveCrowHome } from "../../shared/crow-home.js";
-import { serviceById, serviceCatalog } from "../../shared/service-catalog.js";
+import { serviceById, serviceCatalog, isPanelService } from "../../shared/service-catalog.js";
 import {
   CONNECTION_ERROR_CLASSES, ConnectionError, RESERVED_BLOCK_NAMES, checkLabelFree, connectionDisplayStatus,
   createConnection, disconnectConnection, getConnection, listConnections, otherProjectServiceIds, projectsUsingBundle, recordTest,
@@ -159,10 +159,19 @@ function serviceCard(s, installed, savedKeyIds) {
     installed: installed.has(s.bundleId),
     labelFrom: s.labelFrom || null,        // the connect sheet suggests the account name the same way
     ...(savedKeyIds.has(s.id) ? { savedKey: true } : {}),   // one click: its key is already saved
+    // A panel-only service is connected in its own bundle panel: the sheet links there instead of
+    // carrying inputs. Any other card carries no route at all, and neither does a route outside
+    // /dashboard/ (a bundle panel lives there; a //host path is never linked).
+    ...(isPanelService(s) && safePanelRoute(s.panelRoute) ? { panelRoute: s.panelRoute } : {}),
     fields: (s.fields || []).map((f) => ({ name: f.name, kind: f.kind, labelKey: f.label_key || null, helpKey: f.help_key || null })),
     steps: [...(s.steps || [])],
     stepLinks: { ...(s.stepLinks || {}) },
   };
+}
+
+/** A panel route the card may carry: a bundle panel lives under /dashboard/, never at a //authority. */
+function safePanelRoute(route) {
+  return typeof route === "string" && route.startsWith("/dashboard/") && route.charAt(1) !== "/";
 }
 
 /**
@@ -334,6 +343,9 @@ export function servicesApiRouter({
     return res.status(code === "unknown_project" ? 404 : 400).json({ error: code, ...extra });
   };
 
+  /** A panel-only service is connected in its own bundle panel; every generic path refuses it the same way. */
+  const panelOnly = (res) => res.status(400).json({ ok: false, error: "PANEL_ONLY", code: "PANEL_ONLY", message: "Connect this in its own panel" });
+
   /** Whether this request is the owner's. Never a reason to refuse a read: it only decides the one-click flag. */
   const isOwner = async (db, req) => {
     try { return (await ownerCheck(db, req)) === true; } catch { return false; }
@@ -366,6 +378,9 @@ export function servicesApiRouter({
     const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {};
     const service = typeof body.serviceId === "string" && body.serviceId ? serviceById(body.serviceId) : null;
     if (!service || service.crowWide) return fail(res, "unknown_service");
+    // Before anything else (notably before isOneClickEligible): a panel service is connected in
+    // its own bundle panel, with neither typed values nor a saved key.
+    if (isPanelService(service)) return panelOnly(res);
     if (!installed().has(service.bundleId)) return fail(res, "not_installed");
     // Opting into the saved key is exact: the flag itself must be true, and it never travels with
     // typed values, so a saved key can't be combined with anything a caller chose.
@@ -493,6 +508,7 @@ export function servicesApiRouter({
     const conn = await ownConnection(req, res, db);
     if (!conn) return;
     const service = serviceById(conn.serviceId);
+    if (service && isPanelService(service)) return panelOnly(res);
     if (!service || service.crowWide) return res.status(400).json({ error: "unknown_service" });
     if (!installed().has(service.bundleId)) return res.status(400).json({ error: "not_installed" });
     const secretNames = service.fields.filter((f) => f.kind === "secret").map((f) => f.name);
@@ -518,6 +534,10 @@ export function servicesApiRouter({
   router.post(`${SERVICES_API_BASE}/connection/:uuid/disconnect`, ownerOnly(async (req, res, db) => {
     const conn = await ownConnection(req, res, db, { allowDisconnected: true });
     if (!conn) return;
+    // A panel connection's secrets are its own bundle panel's to release: nothing is stopped and
+    // the row stays active (the bundle's own disconnect does it).
+    const panelService = serviceById(conn.serviceId);
+    if (panelService && isPanelService(panelService)) return panelOnly(res);
     // Idempotent. The secrets stay in the keychain as 'disconnected' (never served, still masked;
     // the keychain page deletes them for good), and the masking hash stays recorded.
     await disconnectConnection(db, conn.uuid, { actor: "local" });
@@ -532,6 +552,9 @@ export function servicesApiRouter({
   router.post(`${SERVICES_API_BASE}/connection/:uuid/restart`, ownerOnly(async (req, res, db) => {
     const conn = await ownConnection(req, res, db);
     if (!conn) return;
+    // Nothing to restart: a panel service has no child of Crow's.
+    const restartService = serviceById(conn.serviceId);
+    if (restartService && isPanelService(restartService)) return panelOnly(res);
     await stopChild(conn.uuid);
     resetChildFailures(conn.uuid);
     try {
@@ -560,6 +583,10 @@ export function servicesApiRouter({
     if (typeof body.sensitive !== "boolean") return res.status(400).json({ error: "bad_value" });
     const conn = await ownConnection(req, res, db);
     if (!conn) return;
+    // A panel connection's secrets stay with its own bundle panel: nothing here may be revealed
+    // or re-classified, so the switch refuses it like every other generic path.
+    const panelService = serviceById(conn.serviceId);
+    if (panelService && isPanelService(panelService)) return panelOnly(res);
     let after;
     try {
       after = setSensitivityOverride(conn, body.sensitive, { crowHome: home() });

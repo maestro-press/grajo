@@ -85,7 +85,7 @@ def test_value_unstarted_raises_keyerror(store):
         b.vs_hold("nobody", D("100"), PRICE)
 
     # Nothing was written for the owner that was never started.
-    assert store.get("benchmark:nobody") is None
+    assert store.get("bench:dry:nobody") is None
 
 
 BAD_START_VALUES = [
@@ -117,7 +117,7 @@ def test_start_rejects_bad_values_and_writes_nothing(store, case, base, quote, p
         b.start(OWNER, base, quote, price)
 
     # The refused start stored nothing: the owner is still unstarted.
-    assert store.get("benchmark:b1") is None
+    assert store.get("bench:dry:b1") is None
     with pytest.raises(KeyError):
         b.value(OWNER, PRICE)
 
@@ -142,7 +142,7 @@ def test_start_allows_zero(store, case, base, quote, price):
 
     b.start(OWNER, base, quote, price)
 
-    record = store.get("benchmark:b1")
+    record = store.get("bench:dry:b1")
     assert record is not None
     assert D(record["base"]) == D(base)
     assert D(record["quote"]) == D(quote)
@@ -150,6 +150,36 @@ def test_start_allows_zero(store, case, base, quote, price):
 
     assert b.value(OWNER, PRICE) == D(base) * PRICE + D(quote)
     assert b.vs_hold(OWNER, D("5"), PRICE) == D("5") - (D(base) * PRICE + D(quote))
+
+
+def test_legacy_record_is_the_dry_baseline_and_never_the_live_one(store):
+    """A P1 `benchmark:<owner>` record still reads as the dry book's baseline."""
+    store.put(
+        "benchmark:b1",
+        {"base": str(BASE), "quote": str(QUOTE), "price": str(PRICE)},
+    )
+    b = Benchmark(store)
+
+    # The dry book falls back to the legacy record...
+    assert b.value(OWNER, PRICE) == BASE * PRICE + QUOTE
+    assert b.vs_hold(OWNER, D("0"), PRICE) == -(BASE * PRICE + QUOTE)
+    # ... and the live book never does: it has its own baseline or none.
+    with pytest.raises(KeyError):
+        b.value(OWNER, PRICE, book="live")
+    with pytest.raises(KeyError):
+        b.vs_hold(OWNER, D("100"), PRICE, book="live")
+
+    # A start is a no-op while the legacy record is the dry baseline.
+    b.start(OWNER, D("999"), D("999"), D("999"))
+    assert store.get("bench:dry:b1") is None
+    assert b.value(OWNER, PRICE) == BASE * PRICE + QUOTE
+
+    # Forgetting clears both dry records, so a later start takes a fresh mix.
+    b.forget(OWNER, "dry")
+    assert store.get("benchmark:b1") is None
+    assert store.get("bench:dry:b1") is None
+    b.start(OWNER, D("2"), D("3"), D("4"))
+    assert b.value(OWNER, PRICE) == D("2") * PRICE + D("3")
 
 
 def test_benchmark_persists_across_store_reopen(tmp_path):

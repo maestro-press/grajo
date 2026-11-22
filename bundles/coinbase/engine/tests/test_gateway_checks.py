@@ -8,7 +8,8 @@ rather than timestamps: those tests hand `SnapshotCache` a mutable clock.
 
 The gateway holds an `exchange` for Task 3c; `check()` must never call it, so a
 `RecordingExchange` records any attribute access and every refusal asserts the
-list is still empty.
+list is still empty.  A refused live route is answered before either book is
+read, so the live exchange must record no call either.
 """
 
 import logging
@@ -17,6 +18,7 @@ from decimal import Decimal as D
 
 import pytest
 
+from crow_coinbase.books import BookRouter
 from crow_coinbase.gateway import (
     BAD_INTENT,
     CLOCK_SKEW,
@@ -25,6 +27,7 @@ from crow_coinbase.gateway import (
     HALTED,
     INSUFFICIENT_HOLDING,
     LIVE_DISABLED,
+    LIVE_LOCKED,
     NOT_OWNER,
     ORDER_TOO_LARGE,
     OWNER_PAUSED,
@@ -86,6 +89,18 @@ class RecordingExchange:
             return None
 
         return record
+
+
+class FakeLiveExchange:
+    """The live book's one read: crypto totals per currency, and a call count."""
+
+    def __init__(self, totals):
+        self.totals = dict(totals)
+        self.calls = 0
+
+    def crypto_totals(self):
+        self.calls += 1
+        return dict(self.totals)
 
 
 def store_at(
@@ -253,6 +268,7 @@ def seed_order(
         price,
         size,
         status=status,
+        book="dry",
     )
     return cid
 
@@ -408,27 +424,57 @@ def test_halted(store):
     assert store.hwm("b1") is None
 
 
-def test_live_disabled(store):
+def test_live_disabled(store, make_store):
     exchange = RecordingExchange()
+    live_exchange = FakeLiveExchange({QUOTE: D("100"), BASE: D("50")})
 
+    # A live route while the live switch is off (its default) is refused, and no
+    # exchange object is touched at all.
     live = make_gateway(
-        store, exchange=exchange, route_for=lambda owner: "live", live_enabled=False
+        store,
+        exchange=exchange,
+        books=BookRouter(exchange, live_exchange),
+        route_for=lambda owner: "live",
     )
     assert live.check("bot", "b1", place()) == LIVE_DISABLED
     assert exchange.calls == []
-
-    # The same intent on the same live route passes that check once enabled.
-    live_ok = make_gateway(
-        store, exchange=exchange, route_for=lambda owner: "live", live_enabled=True
-    )
-    assert live_ok.check("bot", "b1", place()) is None
+    assert live_exchange.calls == 0
 
     dry = make_gateway(store, exchange=exchange, route_for=lambda owner: "dry")
     assert dry.check("bot", "b1", place()) is None
 
-    # The default route is dry even with live disabled.
+    # The default route is the bot row's own mode, and this is a dry bot: a dry
+    # route is never refused for liveness.
     default = make_gateway(store, exchange=exchange)
     assert default.check("bot", "b1", place()) is None
+    assert exchange.calls == []
+
+    # With the switch on but no live exchange wired, a live route is locked —
+    # never rerouted onto the dry book.
+    store.put("live_enabled", True)
+    locked = make_gateway(
+        store, exchange=exchange, route_for=lambda owner: "live"
+    )
+    assert locked.check("bot", "b1", place()) == LIVE_LOCKED
+    assert exchange.calls == []
+
+    # Switch on and a live exchange wired: the same intent passes the checks of
+    # its own book (the live book's capital and its totals), and the dry route
+    # keeps passing beside it.
+    s = make_store("live-ok.db")
+    s.put("live_enabled", True)
+    s.set_bot_book(
+        "b1",
+        mode="live",
+        capital_quote=D("100"),
+        capital_base=D("50"),
+        live_capital_quote=D("100"),
+        live_capital_base=D("50"),
+    )
+    live_exchange = FakeLiveExchange({QUOTE: D("100"), BASE: D("50")})
+    books = BookRouter(exchange, live_exchange)
+    ok = make_gateway(s, exchange=exchange, books=books)
+    assert ok.check("bot", "b1", place()) is None
     assert exchange.calls == []
 
 
@@ -1014,7 +1060,6 @@ def test_cancel_skips_halt_and_caps(store):
         exchange=exchange,
         is_halted=lambda: True,
         route_for=lambda owner: "live",
-        live_enabled=False,
     )
     assert halted.check("bot", "b1", place()) == HALTED
     assert halted.check("bot", "b1", cancel(cid)) is None
@@ -1035,9 +1080,11 @@ def test_ai_uses_ai_caps(store, make_store):
     exchange = RecordingExchange()
     gw = make_gateway(store, exchange=exchange)
 
+    # The measurement is read off `evaluate()`: the approval-free chain, which is
+    # the question a preview asks.  `check()` also runs the AI's approval step.
     # 40 * 0.95 = 38: over ai_max_order_usd (25), inside bot_max_order_usd (50).
     ai_big = place(size=D("40"))
-    assert gw.check("ai", "ai", ai_big, product=PRODUCT) == ORDER_TOO_LARGE
+    assert gw.evaluate("ai", "ai", ai_big, PRODUCT)[0] == ORDER_TOO_LARGE
     assert gw.check("bot", "b1", ai_big) is None
     assert exchange.calls == []
 
@@ -1049,7 +1096,7 @@ def test_ai_uses_ai_caps(store, make_store):
     assert daily_caps.daily_notional(None) == D("41")
     assert daily_caps.daily_notional("ai") == D("41")
     # 41 + 9.5 = 50.5 > 50.
-    assert gw_daily.check("ai", "ai", place(), product=PRODUCT) == DAILY_CAP
+    assert gw_daily.evaluate("ai", "ai", place(), PRODUCT)[0] == DAILY_CAP
 
     # Bot-source orders spend the global budget but not the ai one.
     mixed = make_store("ai-mixed.db")
@@ -1060,7 +1107,7 @@ def test_ai_uses_ai_caps(store, make_store):
     assert mixed_caps.daily_notional(None) == D("60")
     # 60 + 9.5 = 69.5 is under the global cap, so the first refusal is the ai
     # owner's empty holding.
-    assert gw_mixed.check("ai", "ai", place(), product=PRODUCT) == (
+    assert gw_mixed.evaluate("ai", "ai", place(), PRODUCT)[0] == (
         INSUFFICIENT_HOLDING
     )
 
@@ -1071,7 +1118,7 @@ def test_ai_uses_ai_caps(store, make_store):
     gw_spent = make_gateway(spent, caps=spent_caps, exchange=exchange)
     assert spent_caps.daily_notional("ai") == D("0")
     # 195 + 9.5 = 204.5 > 200.
-    assert gw_spent.check("ai", "ai", place(), product=PRODUCT) == DAILY_CAP
+    assert gw_spent.evaluate("ai", "ai", place(), PRODUCT)[0] == DAILY_CAP
 
     # The ai orders-per-hour cap (10) trips on the 11th, with the global one (30)
     # nowhere near it.
@@ -1083,7 +1130,7 @@ def test_ai_uses_ai_caps(store, make_store):
     assert hourly_caps.orders_last_hour("ai") == 10
     assert hourly_caps.orders_last_hour(None) == 10
     assert hourly_caps.daily_notional(None) == D("10")
-    assert gw_hourly.check("ai", "ai", place(), product=PRODUCT) == RATE_CAP
+    assert gw_hourly.evaluate("ai", "ai", place(), PRODUCT)[0] == RATE_CAP
 
     assert exchange.calls == []
 
@@ -1102,7 +1149,7 @@ def test_ai_rate_cap_trips_while_global_has_room(make_store):
     # Ten of thirty: the global count still has plenty of room, so the refusal
     # can only be the ai owner's own cap.
     assert caps.orders_last_hour(None) + 1 <= 30
-    assert gw.check("ai", "ai", place(), product=PRODUCT) == RATE_CAP
+    assert gw.evaluate("ai", "ai", place(), PRODUCT)[0] == RATE_CAP
 
     assert exchange.calls == []
 
@@ -1117,7 +1164,6 @@ def _chain_halted_live(store, make_store):
         exchange=exchange,
         is_halted=lambda: True,
         route_for=lambda owner: "live",
-        live_enabled=False,
     )
     return gw, place(), None, exchange
 
@@ -1129,7 +1175,18 @@ def _chain_live_product(store, make_store):
         env={PRODUCTS: "BTC-USDC"},
         exchange=exchange,
         route_for=lambda owner: "live",
-        live_enabled=False,
+    )
+    return gw, place(), None, exchange
+
+
+def _chain_live_locked_product(store, make_store):
+    exchange = RecordingExchange()
+    store.put("live_enabled", True)  # the switch is on; no live exchange is wired
+    gw = make_gateway(
+        store,
+        env={PRODUCTS: "BTC-USDC"},
+        exchange=exchange,
+        route_for=lambda owner: "live",
     )
     return gw, place(), None, exchange
 
@@ -1222,6 +1279,7 @@ def _chain_unallocated_drawdown(store, make_store):
 CHAIN_CASES = (
     ("halted_before_live_disabled", _chain_halted_live, HALTED),
     ("live_disabled_before_product", _chain_live_product, LIVE_DISABLED),
+    ("live_locked_before_product", _chain_live_locked_product, LIVE_LOCKED),
     ("product_before_owner_paused", _chain_product_paused, PRODUCT_NOT_ALLOWED),
     ("owner_paused_before_stale", _chain_paused_stale, OWNER_PAUSED),
     ("stale_before_skew", _chain_stale_skew, STALE_MARKET),
@@ -1251,7 +1309,6 @@ def test_wrong_owner_sits_between_bad_intent_and_halted(store):
         exchange=exchange,
         is_halted=lambda: True,
         route_for=lambda owner: "live",
-        live_enabled=False,
     )
 
     # Halted, live-disabled and unbound at once: the owner binding is answered

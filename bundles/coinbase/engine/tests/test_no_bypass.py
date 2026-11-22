@@ -1,12 +1,13 @@
 """tests/test_no_bypass.py: the AST guard on the exchange's write surface.
 
-`Exchange` exposes five methods that move money on the real account:
-`place_limit`, `cancel`, `deposit`, `limit_order_gtc` and `cancel_orders`.  Two
-files may reach them: `gateway.py` (the single gate every intent passes, the
-only place an order is placed or cancelled) and `exchange.py` (the adapters that
-implement them).  Every other module in the package has to go through the
-gateway, so a stray `ex.place_limit(...)` in an api, reconcile or runner module
-is a bypass and this scan reports it.
+`Exchange` exposes six methods that move money on the real account:
+`place_limit`, `place_equity_limit`, `cancel`, `deposit`, `limit_order_gtc` and
+`cancel_orders`.  Three files may reach them: `gateway.py` (the single gate
+every intent passes, the only place an order is placed or cancelled),
+`exchange.py` (the adapters that implement them) and `router.py` (which forwards
+a call to the adapter that owns the product).  Every other module in the package
+has to go through the gateway or the router, so a stray `ex.place_limit(...)` in
+an api, reconcile or runner module is a bypass and this scan reports it.
 
 The scan is static: `scan_source(relative_path, source)` parses the text with
 `ast` and returns finding strings, and it imports nothing from the package (it
@@ -17,13 +18,14 @@ gateway, and one called `exchange.py` is not the adapter.
 
 * `WRITE_NAMES` as an `ast.Attribute` (`ex.cancel(...)`) or as a bare
   `ast.Name` (`place_limit(...)`) is a finding unless the whole relative path is
-  `gateway.py`/`exchange.py`; in `watchdog.py` only `cancel` is allowed,
-  because the watchdog takes orders off the book and never puts them on.
+  `gateway.py`/`exchange.py`/`router.py`; in `watchdog.py` only `cancel` is
+  allowed, because the watchdog takes orders off the book and never puts them
+  on.
 * A string constant (`getattr(ex, "place_limit")`, `{"place_limit": ...}`) is a
   finding on those same terms for every write name but `cancel`.  Outside the
-  two write files, `place_limit`, `deposit`, `limit_order_gtc` and
-  `cancel_orders` are write names wherever they are spelled as a string, with
-  no exemptions.
+  three write files, `place_limit`, `place_equity_limit`, `deposit`,
+  `limit_order_gtc` and `cancel_orders` are write names wherever they are
+  spelled as a string, with no exemptions.
 * The string `cancel` is different: it is ordinary vocabulary as well as a
   method name — an intent's action, a watchdog policy — so the bare string is a
   finding only where it would dispatch the method.  That is a positional
@@ -44,12 +46,17 @@ gateway, and one called `exchange.py` is not the adapter.
   each is a finding in every file but `gateway.py`.
 * `client` as an attribute (`ex.client.get_accounts()`, `self.client`) is the
   SDK client's own name, so it is a finding outside `exchange.py`.
-* Every SDK order method but one is off limits in every file, the two write
-  files included: an attribute or a bare name starting with `create_order`,
-  `market_order`, `limit_order`, `stop_limit`, `trigger_bracket`, `edit_order`,
-  `close_position` or `preview_` is a finding, with the single exemption of the
-  exact name `limit_order_gtc` inside `exchange.py`.  Only attributes and names
-  are scanned, so `exchange.py`'s `"preview_failure_reason"` string constant — a
+* Every SDK order method is off limits in every file, the write files included:
+  an attribute or a bare name starting with `create_order`, `market_order`,
+  `limit_order`, `stop_limit`, `trigger_bracket`, `edit_order`,
+  `close_position` or `preview_` is a finding.  There are two exemptions, each
+  bound to a lexical location inside `exchange.py`: the exact name
+  `limit_order_gtc` (the crypto write path) and `create_order`, which may only
+  be called from inside `class LiveExchange` > `def place_equity_limit`.  A
+  method of that name on any other class, or the same call made from
+  `place_limit`, is a finding, so the equity request cannot be smuggled into the
+  crypto path or into a helper beside it.  Only attributes and names are
+  scanned, so `exchange.py`'s `"preview_failure_reason"` string constant — a
   string, not a call — stays quiet.
 * Universal, in every file including the two write files: `getattr`/`setattr`/
   `delattr`/`vars` whose first argument is the name `self`, any `__dict__`
@@ -69,10 +76,10 @@ comparing `intent.action == "cancel"` or a grid building
 
 The real-tree test walks `src/crow_coinbase/**/*.py`, scans each file under its
 path relative to the package root, and asserts every file comes back with no
-findings, and that `gateway.py` and `exchange.py` are among the relative paths
-scanned (so an empty or mis-rooted glob cannot pass).  The parametrized tests
-feed `scan_source` snippets: each bypass snippet has to produce at least one
-finding, and the allowed snippets have to produce none.
+findings, and that `gateway.py`, `exchange.py` and `router.py` are among the
+relative paths scanned (so an empty or mis-rooted glob cannot pass).  The
+parametrized tests feed `scan_source` snippets: each bypass snippet has to
+produce at least one finding, and the allowed snippets have to produce none.
 """
 
 from __future__ import annotations
@@ -86,6 +93,7 @@ import pytest
 WRITE_NAMES = frozenset(
     {
         "place_limit",
+        "place_equity_limit",
         "cancel",
         "deposit",
         "limit_order_gtc",
@@ -93,7 +101,7 @@ WRITE_NAMES = frozenset(
     }
 )
 # The only files that may reach the write surface, by path from the package root.
-WRITE_ALLOWED_FILES = frozenset({"gateway.py", "exchange.py"})
+WRITE_ALLOWED_FILES = frozenset({"gateway.py", "exchange.py", "router.py"})
 # The watchdog may take orders off the book, never put them on.
 WATCHDOG_FILE = "watchdog.py"
 WATCHDOG_WRITE_NAMES = frozenset({"cancel"})
@@ -106,7 +114,7 @@ GATEWAY_FILE = "gateway.py"
 GATEWAY_PRIVATE_NAMES = frozenset(
     {"_send", "_submit_place", "_adopt", "_evaluate_place"}
 )
-# The SDK's other order entry points.  The one the adapter needs,
+# The SDK's other order entry points.  The one the adapter needs for crypto,
 # `limit_order_gtc`, is exempted by name inside exchange.py alone.
 SDK_ORDER_PREFIXES = (
     "create_order",
@@ -119,6 +127,10 @@ SDK_ORDER_PREFIXES = (
     "preview_",
 )
 SDK_ALLOWED_ORDER_NAME = "limit_order_gtc"
+# `create_order` is the equity path's one SDK call: allowed in exchange.py only,
+# and only lexically inside this method of this class.
+SDK_EQUITY_ORDER_NAME = "create_order"
+SDK_EQUITY_ORDER_SITE = ("place_equity_limit", "LiveExchange")
 # Builtins that read or rebind attributes by name.
 SELF_INSPECTION_BUILTINS = frozenset({"getattr", "setattr", "delattr", "vars"})
 # Builtins that build code or imports at runtime.
@@ -170,15 +182,49 @@ def _is_importlib_module(module: str) -> bool:
     return module == "importlib" or module.startswith("importlib.")
 
 
-def _is_sdk_order_name(name: str, relative: str) -> bool:
+def _is_sdk_order_name(
+    name: str, relative: str, enclosing: tuple[str, ...] = ()
+) -> bool:
     """True when *name* is an SDK order method this package must not reach.
 
-    Every SDK order entry point is refused in every file; the adapter's own
-    `limit_order_gtc` is the one exemption, and only inside `exchange.py`.
+    Every SDK order entry point is refused in every file.  Two exemptions, each
+    only inside `exchange.py`: `limit_order_gtc`, the crypto write path, and
+    `create_order`, which is the equity path's call and may only appear lexically
+    inside `LiveExchange.place_equity_limit`.  *enclosing* is the node's
+    surroundings, innermost first, as `_enclosing_names` reports them.
     """
-    if name == SDK_ALLOWED_ORDER_NAME and relative in COINBASE_ALLOWED_FILES:
-        return False
+    if relative in COINBASE_ALLOWED_FILES:
+        if name == SDK_ALLOWED_ORDER_NAME:
+            return False
+        site = enclosing[: len(SDK_EQUITY_ORDER_SITE)]
+        if name == SDK_EQUITY_ORDER_NAME and site == SDK_EQUITY_ORDER_SITE:
+            return False
     return name.startswith(SDK_ORDER_PREFIXES)
+
+
+def _enclosing_names(tree: ast.AST) -> dict[int, tuple[str, ...]]:
+    """Node id -> the function and class names it sits inside, innermost first.
+
+    A call written in `LiveExchange.place_equity_limit` maps to
+    `("place_equity_limit", "LiveExchange")`; the same call in a module-level
+    helper maps to `("helper",)`.  That is what lets the equity exemption be a
+    location rather than a method name.
+    """
+    out: dict[int, tuple[str, ...]] = {}
+    stack: list[str] = []
+
+    def walk(node: ast.AST) -> None:
+        out[id(node)] = tuple(reversed(stack))
+        push = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        if push:
+            stack.append(node.name)
+        for child in ast.iter_child_nodes(node):
+            walk(child)
+        if push:
+            stack.pop()
+
+    walk(tree)
+    return out
 
 
 def _lookup_arguments(tree: ast.AST) -> set[int]:
@@ -211,6 +257,7 @@ def scan_source(filename: str, source: str) -> list[str]:
     relative = Path(filename).as_posix()
     tree = ast.parse(source, filename=relative)
     lookup_arguments = _lookup_arguments(tree)
+    enclosing = _enclosing_names(tree)
     findings: list[str] = []
 
     def add(node: ast.AST, code: str, detail: str) -> None:
@@ -226,6 +273,7 @@ def scan_source(filename: str, source: str) -> list[str]:
     client_detail = "SDK client outside " + sdk_files
 
     for node in ast.walk(tree):
+        site = enclosing.get(id(node), ())
         if isinstance(node, ast.Attribute):
             if node.attr in WRITE_NAMES and not write_allowed(node.attr):
                 add(node, "WRITE_ACCESS", f"{node.attr} reached from {relative}")
@@ -233,7 +281,7 @@ def scan_source(filename: str, source: str) -> list[str]:
                 add(node, "PRIVATE_STEP", f"{node.attr} reached from {relative}")
             if node.attr == "client" and relative not in COINBASE_ALLOWED_FILES:
                 add(node, "SDK_CLIENT", client_detail)
-            if _is_sdk_order_name(node.attr, relative):
+            if _is_sdk_order_name(node.attr, relative, site):
                 add(node, "SDK_ORDER", f"SDK order method {node.attr} in {relative}")
             if node.attr == "__dict__":
                 add(node, "DICT_ACCESS", "__dict__ attribute access")
@@ -249,7 +297,7 @@ def scan_source(filename: str, source: str) -> list[str]:
                     "PRIVATE_STEP",
                     f"{node.id} used as a bare name in {relative}",
                 )
-            if _is_sdk_order_name(node.id, relative):
+            if _is_sdk_order_name(node.id, relative, site):
                 add(node, "SDK_ORDER", f"SDK order name {node.id} in {relative}")
             if node.id == "RESTClient" and relative not in COINBASE_ALLOWED_FILES:
                 add(node, "REST_CLIENT", sdk_detail)
@@ -329,6 +377,8 @@ def test_real_tree_has_no_write_bypass():
     # An empty or mis-rooted glob would make the findings assertion vacuous.
     assert "gateway.py" in scanned, f"gateway.py not scanned; saw {sorted(scanned)}"
     assert "exchange.py" in scanned, f"exchange.py not scanned; saw {sorted(scanned)}"
+    assert "router.py" in scanned, f"router.py not scanned; saw {sorted(scanned)}"
+    assert "books.py" in scanned, f"books.py not scanned; saw {sorted(scanned)}"
 
     assert findings == [], "\n".join(findings)
 
@@ -558,6 +608,16 @@ NEGATIVE_CASES = [
         ),
         id="watchdog-methodcaller-by-name",
     ),
+    pytest.param(
+        "books.py",
+        _module(
+            """
+            def place(ex, cid, product, side, size, price):
+                return ex.place_limit(cid, product, side, size, price)
+            """
+        ),
+        id="place_limit-in-books",
+    ),
     # ---- the allow rules are keyed on the whole relative path, not the basename
     pytest.param(
         "strategies/gateway.py",
@@ -713,6 +773,124 @@ NEGATIVE_CASES = [
             """
         ),
         id="sdk-close_position-in-exchange",
+    ),
+    # ---- the equity write surface: a write name of its own, one allowed file set
+    pytest.param(
+        "runner.py",
+        _module(
+            """
+            def place_equity(ex, cid, product, side, size, price):
+                return ex.place_equity_limit(cid, product, side, size, price)
+            """
+        ),
+        id="place_equity_limit-in-runner",
+    ),
+    pytest.param(
+        "api.py",
+        _module(
+            """
+            def place_equity(ex, cid, product, side, size, price):
+                return ex.place_equity_limit(cid, product, side, size, price)
+            """
+        ),
+        id="place_equity_limit-in-api",
+    ),
+    pytest.param(
+        "watchdog.py",
+        _module(
+            """
+            def place_equity(ex, cid, product, side, size, price):
+                return ex.place_equity_limit(cid, product, side, size, price)
+            """
+        ),
+        id="place_equity_limit-in-watchdog",
+    ),
+    pytest.param(
+        "api.py",
+        _module(
+            """
+            def place_equity(ex, cid):
+                return getattr(ex, "place_equity_limit")(cid)
+            """
+        ),
+        id="getattr-string-place_equity_limit-in-api",
+    ),
+    # ---- create_order: allowed only inside LiveExchange.place_equity_limit
+    pytest.param(
+        "exchange.py",
+        _module(
+            """
+            class LiveExchange:
+                def place_limit(self, cid, product, side, size, price):
+                    return self.client.create_order(
+                        client_order_id=cid, product_id=product, side=side
+                    ).to_dict()
+            """
+        ),
+        id="sdk-create_order-in-the-crypto-path",
+    ),
+    pytest.param(
+        "exchange.py",
+        _module(
+            """
+            class Other:
+                def place_equity_limit(self, cid, product, side, size, price):
+                    return self.client.create_order(
+                        client_order_id=cid, product_id=product, side=side
+                    ).to_dict()
+            """
+        ),
+        id="sdk-create_order-from-a-same-named-method-elsewhere",
+    ),
+    pytest.param(
+        "gateway.py",
+        _module(
+            """
+            def place(x, cid):
+                return x.create_order(client_order_id=cid)
+            """
+        ),
+        id="sdk-create_order-in-gateway",
+    ),
+    pytest.param(
+        "router.py",
+        _module(
+            """
+            def place(x, cid):
+                return x.create_order(client_order_id=cid)
+            """
+        ),
+        id="sdk-create_order-in-router",
+    ),
+    pytest.param(
+        "runner.py",
+        _module(
+            """
+            def place(x, cid):
+                return x.create_order(client_order_id=cid)
+            """
+        ),
+        id="sdk-create_order-in-runner",
+    ),
+    pytest.param(
+        "router.py",
+        _module(
+            """
+            class ExchangeRouter:
+                def accounts(self):
+                    return self.crypto.client.get_accounts().to_dict()
+            """
+        ),
+        id="sdk-client-in-router",
+    ),
+    pytest.param(
+        "router.py",
+        _module(
+            """
+            from coinbase.rest import RESTClient
+            """
+        ),
+        id="coinbase-import-in-router",
     ),
 ]
 
@@ -888,6 +1066,62 @@ ALLOWED_CASES = [
             """
         ),
         id="clean-api-module",
+    ),
+    # ---- the equity write path: one SDK call, in one place
+    pytest.param(
+        "exchange.py",
+        _module(
+            """
+            class LiveExchange:
+                def place_equity_limit(self, cid, product, side, size, price):
+                    return self.client.create_order(
+                        client_order_id=cid,
+                        product_id=product,
+                        side=side,
+                        order_configuration={
+                            "limit_limit_gtc": {
+                                "base_size": format(size, "f"),
+                                "limit_price": format(price, "f"),
+                            }
+                        },
+                        equity_order_metadata={
+                            "equity_trading_session": "EQUITY_TRADING_SESSION_NORMAL",
+                            "displayed_order_config": "LIMIT_GFD",
+                        },
+                    ).to_dict()
+            """
+        ),
+        id="exchange-equity-create_order",
+    ),
+    pytest.param(
+        "gateway.py",
+        _module(
+            """
+            def place_equity(self, cid, product, side, size, price):
+                return self.exchange.place_equity_limit(cid, product, side, size, price)
+            """
+        ),
+        id="gateway-place_equity_limit",
+    ),
+    pytest.param(
+        "router.py",
+        _module(
+            """
+            class ExchangeRouter:
+                def place_limit(self, cid, product, side, size, price):
+                    return self.crypto.place_limit(cid, product, side, size, price)
+
+                def place_equity_limit(self, cid, product, side, size, price):
+                    return self.equity.place_equity_limit(cid, product, side, size, price)
+
+                def cancel(self, ids):
+                    return self.crypto.cancel(ids)
+
+                def seed(self, currency, amount):
+                    return self.crypto.deposit(currency, amount, "seed")
+            """
+        ),
+        id="router-forwards-the-write-surface",
     ),
 ]
 

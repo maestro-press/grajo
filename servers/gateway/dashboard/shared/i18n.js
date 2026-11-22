@@ -5381,6 +5381,8 @@ export const translations = {
   "services.add.install": { en: "Install", es: "Instalar" },
   "services.add.typeKey": { en: "Type a key", es: "Escribir una clave" },
   "services.add.useSaved": { en: "Use saved key", es: "Usar la clave guardada" },
+  // A panel-only service (connect.method "panel"): the connect sheet offers one link to its own panel.
+  "services.panelLink": { en: "Connect in {service}", es: "Conectar en {service}" },
   "services.connect.for": { en: "For: {project} · Only your bots use it", es: "Para: {project} · Solo tus bots lo usan" },
   "services.connect.label": { en: "Account name", es: "Nombre de la cuenta" },
   "services.connect.labelHelp": { en: "Bots see this name, for example \"work\" or \"personal\".", es: "Los bots ven este nombre, por ejemplo \"trabajo\" o \"personal\"." },

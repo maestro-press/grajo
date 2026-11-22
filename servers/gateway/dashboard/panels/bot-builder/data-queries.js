@@ -29,7 +29,7 @@ import { normalizeSkillName } from "../../../../../scripts/pi-bots/skill_proposa
 import { piModelsFileKeys } from "../../../../../scripts/pi-bots/pi-model-catalog.mjs";
 import { piSpawnTarget, readPiModelsJson } from "../../../../../scripts/pi-bots/pi_provider_id.mjs";
 import { tasksDbPath, botsWorkspaceRoot } from "../../../../../scripts/pi-bots/instance-paths.mjs";
-import { serviceCatalog } from "../../../../shared/service-catalog.js";
+import { serviceCatalog, isPanelService } from "../../../../shared/service-catalog.js";
 import { connectionsFor, listConnections } from "../../../../shared/service-connections.js";
 import { connectionBindingOk, isSensitiveConnection } from "../../../../shared/service-sensitivity.js";
 import { ensureChild, listableConnection, serviceTools } from "../../../services/children.js";
@@ -193,11 +193,15 @@ export async function connectedServiceSources({ db, projectId, crowHome, started
   if (db == null || projectId == null) return [];
   // The mount serves an active row, or an 'error' row a start retries (listableConnection).
   // connectionsFor sees only active rows, so read the project's and keep both kinds.
-  const conns = (await listConnections(db, { projectId, ownerContactId: null })).filter((c) => listableConnection(c));
+  // A panel-only service is connected in its own bundle panel and never starts a child of Crow's,
+  // so it is never a builder source (its secrets are not read here either).
+  const panelIds = new Set(serviceCatalog().filter(isPanelService).map((s) => s.id));
+  const conns = (await listConnections(db, { projectId, ownerContactId: null }))
+    .filter((c) => listableConnection(c) && !panelIds.has(c.serviceId));
   const present = new Set(conns.map((c) => c.serviceId));
   const out = [];
   for (const service of serviceCatalog()) {
-    if (!present.has(service.id)) continue;
+    if (!present.has(service.id) || isPanelService(service)) continue;
     const r = await serviceToolsForBuilder(db, { serviceId: service.id, projectId, crowHome, started });
     out.push({
       server: service.id, name: service.name, group: "services", connected: true,

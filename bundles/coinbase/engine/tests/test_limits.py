@@ -7,7 +7,11 @@ from decimal import Decimal as D
 
 import pytest
 
-from crow_coinbase.limits import CapWindow, Limits
+from crow_coinbase.limits import (
+    CapWindow,
+    Limits,
+    validate_product_types,
+)
 from crow_coinbase.store import (
     CANCELLED,
     FAILED,
@@ -31,7 +35,14 @@ MAX_BOT_CAPITAL = "CROW_COINBASE_MAX_BOT_CAPITAL_USD"
 AI_MAX_ORDER = "CROW_COINBASE_AI_MAX_ORDER_USD"
 AI_DAILY = "CROW_COINBASE_AI_DAILY_NOTIONAL_USD"
 AI_ORDERS_HOUR = "CROW_COINBASE_AI_ORDERS_PER_HOUR"
+AI_CAPITAL = "CROW_COINBASE_AI_CAPITAL_USD"
 WATCHDOG = "CROW_COINBASE_WATCHDOG_POLICY"
+EQUITY_PRODUCTS = "CROW_COINBASE_EQUITY_PRODUCTS"
+EQUITY_MAX_ORDER = "CROW_COINBASE_EQUITY_MAX_ORDER_USD"
+EQUITY_DAILY = "CROW_COINBASE_EQUITY_DAILY_NOTIONAL_USD"
+EQUITY_AI_CAPITAL = "CROW_COINBASE_EQUITY_AI_CAPITAL_USD"
+EQUITY_DRAWDOWN_ALERT = "CROW_COINBASE_EQUITY_DRAWDOWN_ALERT_PCT"
+EQUITY_LIVE = "CROW_COINBASE_EQUITY_LIVE"
 
 ENV_NAMES = (
     POLL,
@@ -45,7 +56,14 @@ ENV_NAMES = (
     AI_MAX_ORDER,
     AI_DAILY,
     AI_ORDERS_HOUR,
+    AI_CAPITAL,
     WATCHDOG,
+    EQUITY_PRODUCTS,
+    EQUITY_MAX_ORDER,
+    EQUITY_DAILY,
+    EQUITY_AI_CAPITAL,
+    EQUITY_DRAWDOWN_ALERT,
+    EQUITY_LIVE,
 )
 
 
@@ -95,6 +113,7 @@ def add(
     status=OPEN,
     source="bot",
     owner="b1",
+    product=PRODUCT,
 ):
     """Insert one order row and pin its created_at to *created_at*.
 
@@ -106,12 +125,13 @@ def add(
         cid,
         owner,
         source,
-        PRODUCT,
+        product,
         side,
         level=0,
         price=price,
         size=size,
         status=status,
+        book="dry",
     )
     store.conn().execute(
         "UPDATE orders SET created_at=? WHERE client_order_id=?", (created_at, cid)
@@ -156,6 +176,9 @@ def test_defaults_from_env():
     assert limits.ai_orders_per_hour == 10
     assert isinstance(limits.ai_orders_per_hour, int)
 
+    assert limits.ai_capital_usd == D("25")
+    assert isinstance(limits.ai_capital_usd, D)
+
     assert limits.watchdog_policy == "leave"
     assert isinstance(limits.watchdog_policy, str)
 
@@ -183,6 +206,7 @@ def test_env_overrides_parse():
             AI_MAX_ORDER: "5",
             AI_DAILY: "12",
             AI_ORDERS_HOUR: "4",
+            AI_CAPITAL: "15",
             WATCHDOG: "cancel",
         }
     )
@@ -220,6 +244,9 @@ def test_env_overrides_parse():
 
     assert limits.ai_orders_per_hour == 4
     assert isinstance(limits.ai_orders_per_hour, int)
+
+    assert limits.ai_capital_usd == D("15")
+    assert isinstance(limits.ai_capital_usd, D)
 
     assert limits.watchdog_policy == "cancel"
 
@@ -276,6 +303,9 @@ BAD_VALUES = (
     (AI_MAX_ORDER, "abc"),
     (AI_DAILY, "0"),
     (AI_ORDERS_HOUR, "0"),
+    (AI_CAPITAL, "-1"),
+    (AI_CAPITAL, "abc"),
+    (AI_CAPITAL, "Infinity"),
     (WATCHDOG, "kill"),
 )
 
@@ -296,6 +326,249 @@ def test_usd_quoted_products_are_valid():
     limits = Limits.from_env({PRODUCTS: "BTC-USD,ETH-USDC"})
 
     assert limits.products == ("BTC-USD", "ETH-USDC")
+
+
+def test_equity_defaults():
+    limits = Limits.from_env({})
+
+    # No equity products are configured until the operator names some.
+    assert limits.equity_products == ()
+    assert isinstance(limits.equity_products, tuple)
+
+    assert limits.equity_max_order_usd == D("100")
+    assert isinstance(limits.equity_max_order_usd, D)
+
+    assert limits.equity_daily_notional_usd == D("200")
+    assert isinstance(limits.equity_daily_notional_usd, D)
+
+    assert limits.equity_ai_capital_usd == D("0")
+    assert isinstance(limits.equity_ai_capital_usd, D)
+
+    assert limits.equity_drawdown_alert_pct == D("20")
+    assert isinstance(limits.equity_drawdown_alert_pct, D)
+
+    # No equity orders leave the box unless these are turned on deliberately.
+    assert limits.equity_live is False
+    assert isinstance(limits.equity_live, bool)
+
+    # The bare instance is the all-defaults one, the same as an empty mapping.
+    assert Limits() == limits
+    assert Limits.from_env({name: "" for name in ENV_NAMES}) == limits
+
+
+def test_equity_products_parse():
+    limits = Limits.from_env({EQUITY_PRODUCTS: "NVDA-USD,VOO-USD,AMD-USD"})
+
+    assert limits.equity_products == ("NVDA-USD", "VOO-USD", "AMD-USD")
+    assert isinstance(limits.equity_products, tuple)
+    assert "AMD-USD" in limits.equity_products
+
+    # Padding around each entry is stripped, the order is kept.
+    padded = Limits.from_env({EQUITY_PRODUCTS: " NVDA-USD , VOO-USD "})
+    assert padded.equity_products == ("NVDA-USD", "VOO-USD")
+
+    # One entry is a one-element tuple, not a string.
+    single = Limits.from_env({EQUITY_PRODUCTS: "NVDA-USD"})
+    assert single.equity_products == ("NVDA-USD",)
+    assert isinstance(single.equity_products, tuple)
+
+    # Each of these is refused, and the message names the variable.
+    for text in (
+        "NVDA-USDC",  # an equity product is quoted in USD
+        "nvda-usd",  # lower-case
+        "BRK.B-USD",  # a ticker carries no punctuation
+        "NVDA-USD,NVDA-USD",  # listed twice
+        "TOOLONGX-USD",  # 7 characters: too long for a ticker
+    ):
+        with pytest.raises(ValueError) as err:
+            Limits.from_env({EQUITY_PRODUCTS: text})
+        assert EQUITY_PRODUCTS in str(err.value)
+
+    # The crypto and equity lists may not describe the same instrument, whether
+    # the id matches outright or only collides on the base asset.
+    for env in (
+        {PRODUCTS: "NVDA-USD,BTC-USDC", EQUITY_PRODUCTS: "NVDA-USD"},
+        {PRODUCTS: "BTC-USDC", EQUITY_PRODUCTS: "BTC-USD"},
+        {EQUITY_PRODUCTS: "XRP-USD"},  # XRP-USDC is in the crypto defaults
+    ):
+        with pytest.raises(ValueError) as err:
+            Limits.from_env(env)
+        assert EQUITY_PRODUCTS in str(err.value)
+
+
+class FakeSpec:
+    """A product spec stub: the one field the type guard reads is the kind."""
+
+    def __init__(self, product_type):
+        self.product_type = product_type
+
+
+def spec_for_types(table):
+    """A `spec_for` answering from a product id -> product_type table."""
+
+    def spec_for(product):
+        return FakeSpec(table[product])
+
+    return spec_for
+
+
+def test_validate_product_types_accepts_a_matching_pair():
+    spec_for = spec_for_types({"XRP-USDC": "SPOT", "NVDA-USD": "EQUITY"})
+
+    assert validate_product_types(("XRP-USDC",), ("NVDA-USD",), spec_for) is None
+
+    # Two empty lists are a valid configuration: nothing listed, nothing wrong.
+    assert validate_product_types((), (), spec_for) is None
+
+
+def test_validate_product_types_refuses_an_equity_in_the_crypto_list():
+    # NVDA-USD is a well-formed pair, so the env parser accepts it; what makes it
+    # wrong is the product's kind, and the type guard is what reads the kind.
+    limits = Limits.from_env({PRODUCTS: "NVDA-USD"})
+    assert limits.products == ("NVDA-USD",)
+
+    spec_for = spec_for_types({"NVDA-USD": "EQUITY", "XRP-USDC": "SPOT"})
+    with pytest.raises(ValueError) as err:
+        validate_product_types(limits.products, limits.equity_products, spec_for)
+    assert "NVDA-USD" in str(err.value)
+
+    # Beside a crypto product too: the equity entry is the one refused.
+    with pytest.raises(ValueError) as err:
+        validate_product_types(("XRP-USDC", "NVDA-USD"), (), spec_for)
+    assert "NVDA-USD" in str(err.value)
+
+
+def test_validate_product_types_refuses_a_spot_in_the_equity_list():
+    spec_for = spec_for_types({"NVDA-USD": "EQUITY", "XRP-USDC": "SPOT"})
+
+    with pytest.raises(ValueError) as err:
+        validate_product_types((), ("NVDA-USD", "XRP-USDC"), spec_for)
+    assert "XRP-USDC" in str(err.value)
+
+    # The equity list alone is enough; no crypto list is needed to catch it.
+    with pytest.raises(ValueError) as err:
+        validate_product_types((), ("XRP-USDC",), spec_for)
+    assert "XRP-USDC" in str(err.value)
+
+
+def test_validate_product_types_reads_the_kind_case_insensitively():
+    # Padding and case in the kind do not matter: " spot " is still SPOT.
+    padded = spec_for_types({"XRP-USDC": " spot ", "nvda-usd": "Equity"})
+    assert validate_product_types(("XRP-USDC",), ("nvda-usd",), padded) is None
+
+    wrong_crypto = spec_for_types({"XRP-USDC": "equity"})
+    with pytest.raises(ValueError) as err:
+        validate_product_types(("XRP-USDC",), (), wrong_crypto)
+    assert "XRP-USDC" in str(err.value)
+
+    wrong_equity = spec_for_types({"NVDA-USD": " Spos "})
+    with pytest.raises(ValueError) as err:
+        validate_product_types((), ("NVDA-USD",), wrong_equity)
+    assert "NVDA-USD" in str(err.value)
+
+
+def test_equity_money_fields():
+    limits = Limits.from_env(
+        {
+            EQUITY_MAX_ORDER: "150",
+            EQUITY_DAILY: "250",
+            EQUITY_AI_CAPITAL: "75.5",
+            EQUITY_DRAWDOWN_ALERT: "10",
+        }
+    )
+
+    assert limits.equity_max_order_usd == D("150")
+    assert isinstance(limits.equity_max_order_usd, D)
+    assert not isinstance(limits.equity_max_order_usd, float)
+
+    assert limits.equity_daily_notional_usd == D("250")
+    assert isinstance(limits.equity_daily_notional_usd, D)
+
+    assert limits.equity_ai_capital_usd == D("75.5")
+    assert isinstance(limits.equity_ai_capital_usd, D)
+
+    assert limits.equity_drawdown_alert_pct == D("10")
+    assert isinstance(limits.equity_drawdown_alert_pct, D)
+
+    # Zero equity capital is valid: the AI simply has nothing to spend.
+    broke = Limits.from_env({EQUITY_AI_CAPITAL: "0"})
+    assert broke.equity_ai_capital_usd == D("0")
+    assert isinstance(broke.equity_ai_capital_usd, D)
+
+    # A 100% drawdown alert is the top of the range and is accepted.
+    top = Limits.from_env({EQUITY_DRAWDOWN_ALERT: "100"})
+    assert top.equity_drawdown_alert_pct == D("100")
+    assert isinstance(top.equity_drawdown_alert_pct, D)
+
+    # Each bad value is refused, and the message names the variable.
+    for name, text in (
+        (EQUITY_MAX_ORDER, "0"),
+        (EQUITY_MAX_ORDER, "-1"),
+        (EQUITY_MAX_ORDER, "NaN"),
+        (EQUITY_DAILY, "0"),
+        (EQUITY_AI_CAPITAL, "-1"),
+        (EQUITY_AI_CAPITAL, "Infinity"),
+        (EQUITY_AI_CAPITAL, "abc"),
+        (EQUITY_DRAWDOWN_ALERT, "0"),
+        (EQUITY_DRAWDOWN_ALERT, "101"),
+    ):
+        with pytest.raises(ValueError) as err:
+            Limits.from_env({name: text})
+        assert name in str(err.value)
+
+
+def test_equity_live_bool():
+    for text in (
+        "true",
+        "TRUE",
+        "True",
+        " true ",
+        "\ttrue\n",
+        "1",
+        "yes",
+        "YEs",
+        "on",
+        "ON ",
+        " On ",
+    ):
+        assert Limits.from_env({EQUITY_LIVE: text}).equity_live is True
+
+    for text in (
+        "false",
+        "FALSE",
+        "False",
+        " false ",
+        "\tfalse\n",
+        "0",
+        "no",
+        "nO",
+        "off",
+        "OFF ",
+        " Off ",
+    ):
+        assert Limits.from_env({EQUITY_LIVE: text}).equity_live is False
+
+    # Blank means the default, which is off.
+    assert Limits.from_env({EQUITY_LIVE: ""}).equity_live is False
+    assert Limits.from_env({EQUITY_LIVE: "   "}).equity_live is False
+
+    for text in ("maybe", "2"):
+        with pytest.raises(ValueError) as err:
+            Limits.from_env({EQUITY_LIVE: text})
+        assert EQUITY_LIVE in str(err.value)
+
+
+def test_is_equity_tradable():
+    limits = Limits.from_env({PRODUCTS: "BTC-USDC", EQUITY_PRODUCTS: "NVDA-USD"})
+
+    assert limits.is_equity("NVDA-USD") is True
+    assert limits.is_equity("BTC-USDC") is False
+
+    # Tradable is the union of the two lists, and nothing else.
+    assert limits.tradable("NVDA-USD") is True
+    assert limits.tradable("BTC-USDC") is True
+    assert limits.tradable("VOO-USD") is False
+    assert limits.tradable("ETH-USDC") is False
 
 
 def test_daily_resets_at_utc_midnight(store, chicago_tz):
@@ -459,6 +732,60 @@ def test_source_filtering_separates_bot_from_ai(store):
     assert isinstance(window.daily_notional("nobody"), D)
     assert window.orders_last_hour("nobody") == 0
     assert isinstance(window.orders_last_hour("nobody"), int)
+
+
+def test_daily_notional_filters(store):
+    t = utc(2026, 3, 10, 12, 0, 0)
+    add(store, 1, t, price=D("2"), size=D("10"), product="XRP-USDC")  # 20
+    add(store, 2, t, price=D("5"), size=D("4"), product="NVDA-USD")  # 20
+    add(store, 3, t, price=D("10"), size=D("1"), product="NVDA-USD")  # 10
+
+    window, _ = window_at(store, t)
+
+    # No filter is the unchanged read: every product's notional.
+    total = window.daily_notional(None)
+    assert total == D("50")
+    assert isinstance(total, D)
+
+    equities = window.daily_notional(None, products=("NVDA-USD",))
+    assert equities == D("30")
+    assert isinstance(equities, D)
+
+    # Any collection of products works, tuple or not.
+    assert window.daily_notional(None, products=["XRP-USDC"]) == D("20")
+    assert isinstance(window.daily_notional(None, products=["XRP-USDC"]), D)
+
+    # Excluding takes the other side: the equity spend leaves the crypto budget.
+    assert window.daily_notional(None, exclude_products={"NVDA-USD"}) == D("20")
+    nothing_left = window.daily_notional(
+        None, exclude_products={"NVDA-USD", "XRP-USDC"}
+    )
+    assert nothing_left == D("0")
+    assert isinstance(nothing_left, D)
+
+    # An empty collection matches nothing: it is a filter, not "no filter".
+    empty = window.daily_notional(None, products=())
+    assert empty == D("0")
+    assert isinstance(empty, D)
+
+    # The source filter still applies beside the product ones.
+    add(
+        store,
+        4,
+        t,
+        price=D("7"),
+        size=D("1"),
+        product="NVDA-USD",
+        source="ai",
+        owner="ai",
+    )  # 7
+
+    assert window.daily_notional("ai", products=("NVDA-USD",)) == D("7")
+    assert window.daily_notional("ai") == D("7")
+    assert window.daily_notional(None) == D("57")
+    assert window.daily_notional(None, products=("NVDA-USD",)) == D("37")
+    assert window.daily_notional("bot", products=["NVDA-USD"]) == D("30")
+    assert window.daily_notional("bot", exclude_products=["NVDA-USD"]) == D("20")
 
 
 def test_caps_survive_restart(tmp_path):

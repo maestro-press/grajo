@@ -64,7 +64,7 @@ import { gatewayListenPort } from "../listen-port.js";
 import { addonWallMode } from "../../../scripts/addon-sandbox/spawn.mjs";
 import { AddonStdioTransport } from "../../../scripts/addon-sandbox/transport.mjs";
 import { createWallContext } from "../../../scripts/addon-sandbox/gateway-wall.mjs";
-import { serviceById, renderDerivedEnv } from "../../shared/service-catalog.js";
+import { serviceById, isPanelService, renderDerivedEnv } from "../../shared/service-catalog.js";
 import { listConnections, recordChildFailure, recordChildRecovered, servableConnection } from "../../shared/service-connections.js";
 import { connectionBindingOk, isSensitiveConnection, verifyConnectionFingerprints } from "../../shared/service-sensitivity.js";
 import { redactAcross, redactSecrets, redactThenTruncate, MIN_SECRET_LENGTH } from "../../shared/redact-secrets.js";
@@ -75,7 +75,7 @@ import { folderRefusal } from "./connect-test.js";
 import { readToolCache, sanitizeToolsForCache, writeToolCache } from "./tool-cache.js";
 import { loopbackErrorText } from "../loopback-tool-mount.js";
 
-export const CHILD_ERROR_CODES = Object.freeze(new Set(["not_installed", "not_active", "child_unavailable", "busy"]));
+export const CHILD_ERROR_CODES = Object.freeze(new Set(["not_installed", "not_active", "child_unavailable", "busy", "panel_only"]));
 
 export class ChildError extends Error {
   constructor(code) {
@@ -770,6 +770,9 @@ export async function ensureChild(db, uuid, { key, crowHome = resolveCrowHome(),
   }
   const service = serviceById(conn.serviceId);
   if (!service || service.crowWide) throw new ChildError("not_installed");
+  // A panel-only service is connected inside its own bundle panel: Crow never reads its secrets
+  // and never starts a process for it.
+  if (isPanelService(service)) throw new ChildError("panel_only");
   // An 'error' row: a transient child failure is retried once its cooldown is over; a folder
   // refused at spawn only on the owner's Restart; a failed live test never here.
   if (conn.status === "error" && !retryableClasses(service, repair).includes(conn.lastError)) throw new ChildError("not_active");
@@ -896,7 +899,13 @@ export function listableConnection(conn) {
 export async function offerableProjectConnections(db, projectId) {
   if (projectId == null) return [];
   return (await listConnections(db, { projectId: Number(projectId), ownerContactId: null }))
-    .filter((c) => c.status === "active" || listableConnection(c));
+    .filter((c) => c.status === "active" || listableConnection(c))
+    // A panel-only service never starts a child of Crow's, so no bot, chat or mount may be offered
+    // it (its secrets stay with its own panel). An unknown service is left as it was.
+    .filter((c) => {
+      const service = serviceById(c.serviceId);
+      return !(service && isPanelService(service));
+    });
 }
 
 /**
@@ -907,6 +916,10 @@ export async function offerableProjectConnections(db, projectId) {
 export async function listedTools(db, uuid, { crowHome = resolveCrowHome() } = {}) {
   const conn = await servableConnection(db, uuid, { allowError: true });
   if (!listableConnection(conn)) return null;
+  // A panel-only connection is connected inside its own bundle panel and has no child of Crow's:
+  // its tools are never listed for a bot or the chat (an explicit rule, not only the sensitivity one).
+  const svc = serviceById(conn.serviceId);
+  if (svc && isPanelService(svc)) return null;
   // Review I2: the bot-facing feed (Tasks 18-20) never lists a sensitive or mismatched connection.
   if (!connectionBindingOk(conn, { crowHome }) || isSensitiveConnection(conn, { crowHome })) return null;
   return serviceTools(conn.serviceId, { crowHome });

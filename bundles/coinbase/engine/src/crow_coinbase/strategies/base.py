@@ -34,7 +34,8 @@ class OrderIntent:
     A place intent carries `side`, `size` and `limit_price` (`level` is the grid
     level it belongs to).  A cancel intent carries `cancel_cid` only.
     `consumes_fill` marks the fill this re-place answers, so the loop can retire
-    it exactly once.
+    it exactly once.  `approval_id` names the owner's approved preview an `ai`
+    order goes out under (`ai_orders.py`); a bot never sets it.
     """
 
     action: Literal["place", "cancel"]
@@ -45,6 +46,7 @@ class OrderIntent:
     cancel_cid: Optional[str]
     reason: str
     consumes_fill: Optional[str] = None
+    approval_id: Optional[str] = None
 
 
 @dataclass(frozen=True)

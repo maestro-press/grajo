@@ -195,11 +195,21 @@
     },
     "connect": {
       "type": "object",
-      "required": ["method", "group", "fields", "steps"],
+      "required": ["method", "group"],
+      "if": { "properties": { "method": { "const": "panel" } }, "required": ["method"] },
+      "then": { "required": ["panel_route", "panel_secrets"] },
+      "else": { "required": ["fields", "steps"] },
       "additionalProperties": false,
       "properties": {
-        "method": { "type": "string", "enum": ["token", "oauth", "toggle", "folder"] },
+        "method": { "type": "string", "enum": ["token", "oauth", "toggle", "folder", "panel"] },
         "group": { "type": "string", "enum": ["network", "signin", "paste", "builtin"] },
+        "panel_route": { "type": "string", "maxLength": 256, "pattern": "^/dashboard/[A-Za-z0-9/_\\-.]*$" },
+        "panel_secrets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$" }
+        },
         "fields": {
           "type": "array",
           "items": {

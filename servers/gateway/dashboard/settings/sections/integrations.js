@@ -11,7 +11,7 @@ import { servicesUiEnabled } from "../../../services/ui-flag.js";
 import { listConnections } from "../../../../shared/service-connections.js";
 import { serviceSecretKeys } from "../../../keychain/store.js";
 import { childState, childStderr } from "../../../services/children.js";
-import { serviceById } from "../../../../shared/service-catalog.js";
+import { serviceById, isPanelService } from "../../../../shared/service-catalog.js";
 import { connectionSensitivity, readConnectionBindings, readSensitivityOverrides } from "../../../../shared/service-sensitivity.js";
 import { isLocalPasswordSessionOn } from "../../local-session.js";
 
@@ -144,6 +144,10 @@ async function movedHtml({ scope, db, lang, owner = false }) {
       const overrides = readSensitivityOverrides();
       const bindings = readConnectionBindings();
       for (const c of await listConnections(db, {})) {
+        // A panel-only service is connected in its own bundle panel: it has no child to restart and
+        // no place in this list.
+        const svc = serviceById(c.serviceId);
+        if (svc && isPanelService(svc)) continue;
         const keys = [...(await serviceSecretKeys(db, c.uuid))].sort();
         conns += connectionRow(c, keys, lang, overrides, bindings, owner);
       }

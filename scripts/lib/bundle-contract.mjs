@@ -496,11 +496,25 @@ function validateConnect(manifest) {
   const envVars = Array.isArray(manifest.env_vars) ? manifest.env_vars : [];
   const fields = Array.isArray(c.fields) ? c.fields : [];
   const names = new Set(fields.map((f) => f.name));
+  const isPanel = c.method === "panel";
   if (names.size !== fields.length) errors.push("connect.fields has duplicate field names");
   for (const f of fields) {
     const ev = envVars.find((v) => v && v.name === f.name);
     if (!ev) errors.push(`connect.fields ${f.name} must name a declared env_vars entry`);
     else if (f.kind === "secret" && ev.secret !== true) errors.push(`connect.fields ${f.name}: kind "secret" needs an env_vars entry with secret: true`);
+  }
+  // method "panel": the service is connected in its own bundle panel. It has no fields (its secret
+  // NAMES are panel_secrets, which are keychain rows and not env vars), and no test, derived env,
+  // discovery or oauth of its own. Every other method keeps its rules exactly as they were.
+  if (isPanel) {
+    if (fields.length > 0) errors.push("connect: method panel has no fields (its secret names are panel_secrets)");
+    if (c.test !== undefined) errors.push("connect.test is not allowed with method panel");
+    if (c.derived_env !== undefined) errors.push("connect.derived_env is not allowed with method panel");
+    if (c.discover !== undefined) errors.push("connect.discover is not allowed with method panel");
+    if (c.oauth !== undefined) errors.push("connect.oauth is only allowed with method oauth");
+  } else {
+    if (c.panel_route !== undefined) errors.push("connect.panel_route is only for method panel");
+    if (c.panel_secrets !== undefined) errors.push("connect.panel_secrets is only for method panel");
   }
   if (c.method === "toggle" && fields.length > 0) errors.push("connect: method toggle has no fields");
   if (c.legacy_enable_env !== undefined && c.method !== "toggle") errors.push("connect.legacy_enable_env is only for method toggle");

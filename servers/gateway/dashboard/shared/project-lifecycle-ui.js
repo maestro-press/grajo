@@ -148,6 +148,11 @@ export async function deleteConfirmHtml(db, req, project, lang, { urls, error = 
     if (b.code === "shared") {
       msg = fill("projLife.blockedShared", lang, { who: whoText(b.detail, lang) });
       fix = `<a class="pl-link" href="/dashboard/projects?view=${Number(project.id)}&amp;tab=members" data-pl-fix="sharing">${escapeHtml(t("projLife.goSharing", lang))}</a>`;
+    } else if (b.code === "panel_connected") {
+      // A panel-only connection is disconnected in its own bundle panel: the lifecycle's detail is
+      // that sentence (a service name, never a uuid or a value) and is shown as it is.
+      msg = typeof b.detail === "string" ? b.detail : "";
+      fix = "";
     } else {
       msg = fill("projLife.blockedBots", lang, { bots: (b.detail?.bots || []).join(", ") });
       // The Bots section (and Move) lives on the project home, which only serves a live project.

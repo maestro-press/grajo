@@ -12,7 +12,7 @@ const LEGACY_NOTION = { OPENAPI_MCP_HEADERS: "{\"Authorization\":\"Bearer ntn_ab
 test("catalog reads the registry bundles", () => {
   _resetServiceCatalogForTest();
   const cat = serviceCatalog();
-  assert.equal(cat.length, 11);
+  assert.equal(cat.length, 12);
   const names = cat.map((s) => s.name);
   assert.deepEqual(names, [...names].sort((a, b) => a.localeCompare(b)));
   const ha = serviceById("home-assistant");
@@ -22,6 +22,13 @@ test("catalog reads the registry bundles", () => {
   assert.equal(serviceById("arxiv").crowWide, true);
   assert.equal(serviceById("github").crowWide, false);
   assert.equal(serviceById("funkwhale"), null);
+  const coinbase = serviceById("coinbase");
+  assert.notEqual(coinbase, null);
+  assert.equal(coinbase.method, "panel");
+  assert.equal(coinbase.panelRoute, "/dashboard/coinbase");
+  assert.deepEqual(coinbase.panelSecrets, ["COINBASE_KEY_NAME", "COINBASE_PRIVATE_KEY", "COINBASE_APPROVE_SECRET"]);
+  assert.deepEqual(coinbase.fields, []);
+  assert.equal(coinbase.crowWide, false);
 });
 
 test("isServiceManifest and injected registry", () => {

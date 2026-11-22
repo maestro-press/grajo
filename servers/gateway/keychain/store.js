@@ -15,6 +15,7 @@
  */
 import { timingSafeEqual } from "node:crypto";
 import { sealSecret, openSecret } from "../../sharing/secret-box.js";
+import { serviceById, isPanelService } from "../../shared/service-catalog.js";
 import { KEYCHAIN_DDL, KEYCHAIN_CONNECTION_COLUMN, KEYCHAIN_SERVICE_INDEX_DDL } from "./schema.js";
 import { keychainKeyState, createKeychainKey, KeychainKeyInvalidError } from "./key.js";
 
@@ -583,15 +584,49 @@ export async function reactivateBundleEntries(db, bundleId, envKeys) {
   return n + svc.rowsAffected;
 }
 
-/** Every READABLE entry with its plaintext, for the user's passphrase-encrypted Export. */
+/** Every READABLE entry with its plaintext, for the user's passphrase-encrypted Export. A panel-only
+ *  connection's secret is its own bundle panel's and never leaves here. */
 export async function exportableEntries(db, key) {
   requireKey(key);
   const out = [];
   for (const e of await listEntries(db, { keyId: key.id })) {
     if (!e.readable) continue;
+    if (e.kind === "service" && await isPanelConnectionSecret(db, e)) continue;
     out.push({ kind: e.kind, label: e.label, bundle_id: e.bundle_id, env_key: e.env_key, username: e.username, url: e.url, origin: e.origin, status: e.status, connection_uuid: e.connection_uuid || null, secret: await openEntrySecret(db, key, e.id) });
   }
   return out;
+}
+
+/**
+ * Is this a keychain kind 'service' row a panel-only service (connect.method "panel") owns? Such
+ * a secret is read only by its own bundle panel (service-connections.js panelSecretsFor), so the
+ * keychain UI neither reveals, copies, vault-saves nor exports it.
+ *
+ * It fails CLOSED: the row's OWN bundle id answers first, so a panel bundle's secret is still a
+ * panel's when its connection row is gone (an orphaned row) or when the row was re-pointed at a
+ * connection that is not a panel one. Then the connection row (when the row names one): its own
+ * `method` column first, the catalog for an older row.
+ * @param {object} db
+ * @param {{connection_uuid?: string|null, bundle_id?: string|null}|string} entry the keychain entry
+ *   (its connection_uuid and bundle_id); a bare uuid is read as before, without the bundle check
+ * @returns {Promise<boolean>}
+ */
+export async function isPanelConnectionSecret(db, entry) {
+  const e = typeof entry === "string" ? { connection_uuid: entry } : (entry || {});
+  const bundleId = typeof e.bundle_id === "string" ? e.bundle_id : "";
+  if (bundleId) {
+    const owner = serviceById(bundleId);
+    if (owner && isPanelService(owner)) return true;
+  }
+  const connectionUuid = e.connection_uuid;
+  if (typeof connectionUuid !== "string" || connectionUuid === "") return false;
+  const hasTable = (await db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'service_connections'")).rows.length > 0;
+  if (!hasTable) return false;
+  const r = (await db.execute({ sql: "SELECT service_id, method FROM service_connections WHERE uuid = ?", args: [connectionUuid] })).rows[0];
+  if (!r) return false;
+  if (r.method === "panel") return true;
+  const service = serviceById(r.service_id);
+  return !!service && isPanelService(service);
 }
 
 /**

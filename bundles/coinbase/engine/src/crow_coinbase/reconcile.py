@@ -24,15 +24,20 @@ there is no id to remember it by), one naming another order id, and one for
 another product (the last two once per trade id).  Ids that do not start with
 `cb-` are somebody else's orders and are never adopted or touched.
 
+One cycle works on ONE book (`books.py`): the rows it reads, adopts, settles and
+books are that book's rows alone, and the exchange it is given has to be that
+book's exchange — a dry cycle against the simulator, a live cycle against the
+real account, never one against the other.
+
 The `now` passed in is epoch seconds on the same clock as `time.time()`, because
 a row's `created_at` is stamped with `time.time()` and the two are subtracted.
 
 Nothing here writes to the exchange.  A kill is the gateway's `cancel_all`, run
 after the rows are settled so their state is recorded first, and only for a halt
-or for an owner whose bot row says STOPPED; an orphan waits for a halt.  A
-failing list call propagates (an empty book must not be assumed), while a failing
-per-order read is a warning that skips that one row for the cycle and retries it
-on the next one.
+of that book (its own, or the global kill that halts both) or for an owner whose
+bot row says STOPPED; an orphan waits for a halt.  A failing list call propagates
+(an empty book must not be assumed), while a failing per-order read is a warning
+that skips that one row for the cycle and retries it on the next one.
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from . import money, records
+from .books import BOOKS, DRY
 from .exchange import PermanentError, TransientError
 from .store import (
     CANCELLED,
@@ -116,7 +122,7 @@ def reconcile(
     gateway: Any = None,
     *,
     trades_csv: Path | None = None,
-    mode: str = "dry",
+    book: str = DRY,
 ) -> ReconcileReport:
     """Bring the store's order rows up to date with the exchange, once.
 
@@ -125,8 +131,17 @@ def reconcile(
     subtracted.  It decides only whether a row which never reached the exchange
     may be given up on.  `gateway` is the kill path: with none, live orders are
     left resting.  `trades_csv` defaults to the file beside the database, and
-    `mode` is stamped into every row written there.
+    `book` names the book this cycle is about: only that book's rows are read,
+    adopted or settled, only that book's fills are booked, and it is written as
+    the mode column of every `trades.csv` row.
+
+    *exchange* has to be that book's own exchange.  Reconcile never picks one:
+    the caller passes the simulator for the dry book and the live account for the
+    live one, so a dry row can never be settled from the real account's answer or
+    the other way round.
     """
+    if book not in BOOKS:
+        raise ValueError(f"unknown book: {book!r}")
     csv_path = (
         Path(trades_csv)
         if trades_csv is not None
@@ -138,15 +153,17 @@ def reconcile(
     # Rows this cycle wrote, so a row adopted and then settled in the same cycle
     # is counted once rather than once per write.
     touched: set[str] = set()
-    _settle_live(store, exchange, open_list, now, new_fills, touched)
-    _adopt_unknown(store, open_list, new_fills, touched)
-    _book_fills(store, exchange, csv_path, mode)
+    _settle_live(store, exchange, open_list, now, new_fills, touched, book)
+    _adopt_unknown(store, open_list, new_fills, touched, book)
+    _book_fills(store, exchange, csv_path, book)
     if gateway is not None:
-        _kill_gap(store, gateway, open_list)
+        _kill_gap(store, gateway, open_list, book)
 
     orphans = [
         row["client_order_id"]
-        for row in store.orders(owner="orphan", statuses=LIVE_STATUSES)
+        for row in store.orders(
+            owner="orphan", statuses=LIVE_STATUSES, book=book
+        )
     ]
     return ReconcileReport(updated=len(touched), orphans=orphans, new_fills=new_fills)
 
@@ -177,8 +194,12 @@ def _settle_live(
     now: float,
     new_fills: dict[str, list[dict]],
     touched: set[str],
+    book: str,
 ) -> None:
-    """Settle every live row from the exchange, adding each changed row to *touched*.
+    """Settle every live row of *book* from the exchange, adding each change to *touched*.
+
+    Only that book's rows are read, so a dry cycle cannot settle a live row (or
+    the reverse) from an answer about another account.
 
     A row in the open list takes that snapshot.  A row the list omits is read on
     its own: with an order id it is never given up on, however old (a lost answer
@@ -187,7 +208,7 @@ def _settle_live(
     FAILED.  One row's read failing skips that row alone.  Each row adds at most
     one entry, so a row settled in several places is still one changed row.
     """
-    for row in store.orders(statuses=LIVE_STATUSES):
+    for row in store.orders(statuses=LIVE_STATUSES, book=book):
         cid = row["client_order_id"]
         snap = open_list.get(cid)
         if snap is None:
@@ -227,7 +248,9 @@ def _absent_snapshot(
     order_id = row["order_id"]
     if order_id:
         return _read(
-            store, f"order {order_id}", lambda: exchange.get_order(order_id)
+            store,
+            f"order {order_id}",
+            lambda: exchange.get_order(order_id, row["product"]),
         )
     answered, snap = _read(
         store,
@@ -330,8 +353,9 @@ def _adopt_unknown(
     open_list: dict[str, dict],
     new_fills: dict,
     touched: set[str],
+    book: str,
 ) -> None:
-    """Give a row to every one of our open orders the store has never seen.
+    """Give a row to every one of our open orders on *book* the store has never seen.
 
     The owner comes from the id when it is `ai` or a bot row exists; anything else
     is an orphan (the bot is gone), which the halt branch alone may sweep.  The
@@ -364,6 +388,7 @@ def _adopt_unknown(
             status=OPEN,
             order_id=snap.get("order_id"),
             note="adopted orphan" if orphan else "adopted",
+            book=book,
         )
         touched.add(cid)
         row = store.order(cid)
@@ -392,8 +417,8 @@ def _shape_of(cid: str, snap: dict) -> tuple[str, int]:
 # ---------------------------------------------------------------- fills
 
 
-def _book_fills(store: Store, exchange: Any, trades_csv: Path, mode: str) -> None:
-    """Book the fills behind every filled row: `trades.csv`, then the database.
+def _book_fills(store: Store, exchange: Any, trades_csv: Path, book: str) -> None:
+    """Book the fills behind every filled row of *book*: `trades.csv`, then the database.
 
     A row is skipped once `fills_ok` says its booked FILL sizes match the
     `filled_size` the exchange reported, so a cycle over an unchanged book writes
@@ -405,7 +430,7 @@ def _book_fills(store: Store, exchange: Any, trades_csv: Path, mode: str) -> Non
     `/export/fills.csv`, built from the database with one row per booked fill:
     this file is a convenience copy that can in principle lag behind it.
     """
-    for row in store.orders(statuses=FILLABLE_STATUSES):
+    for row in store.orders(statuses=FILLABLE_STATUSES, book=book):
         if row["filled_size"] <= 0 or row["fills_ok"]:
             continue
         order_id = row["order_id"]
@@ -413,17 +438,19 @@ def _book_fills(store: Store, exchange: Any, trades_csv: Path, mode: str) -> Non
             continue
         cid = row["client_order_id"]
         answered, fills = _read(
-            store, f"fills for {order_id}", lambda: exchange.fills(order_id)
+            store,
+            f"fills for {order_id}",
+            lambda: exchange.fills(order_id, row["product"]),
         )
         if not answered:
             continue
         for fill in fills or []:
-            _book_fill(store, row, fill, trades_csv, mode)
+            _book_fill(store, row, fill, trades_csv, book)
         if _recorded_fill_size(store, cid) >= row["filled_size"]:
             store.update_order(cid, fills_ok=1)
 
 
-def _book_fill(store: Store, row: dict, fill: dict, trades_csv: Path, mode: str) -> None:
+def _book_fill(store: Store, row: dict, fill: dict, trades_csv: Path, book: str) -> None:
     """Book one exchange fill, unless it is already booked or belongs elsewhere.
 
     A fill with no `trade_id` cannot be booked and cannot be remembered either,
@@ -468,8 +495,8 @@ def _book_fill(store: Store, row: dict, fill: dict, trades_csv: Path, mode: str)
         )
         return
     if not records.has_trade(trades_csv, trade_id):
-        records.append_fill(trades_csv, product, fill, cid, mode)
-    store.record_fill(fill, cid)
+        records.append_fill(trades_csv, product, fill, cid, book)
+    store.record_fill(fill, cid, book=book)
 
 
 def _warn_unbooked(store: Store, trade_id: str, message: str) -> None:
@@ -505,34 +532,45 @@ def _recorded_fill_size(store: Store, cid: str) -> Decimal:
 # ---------------------------------------------------------------- kill path
 
 
-def _kill_gap(store: Store, gateway: Any, open_list: dict[str, dict]) -> None:
-    """Sweep live orders off the book, through the gateway and nothing else.
+def _kill_gap(store: Store, gateway: Any, open_list: dict[str, dict], book: str) -> None:
+    """Sweep *book*'s live orders off the book, through the gateway and nothing else.
 
-    A halt sweeps every `cb-` order, orphans and the `ai` owner included;
-    otherwise only an owner whose bot row says STOPPED is swept.  This runs after
-    the rows are settled, so each row already records the state the exchange had
-    before the sweep, and the next cycle settles them from the exchange itself.  A
-    failing sweep is recorded as an error and the cycle still returns.
+    A halt OF THAT BOOK — its own drawdown stop, or the global kill that halts
+    both books — sweeps every `cb-` order of that book, orphans and the `ai` owner
+    included, and the sweep names the book so the other book's resting orders are
+    left where they are.  Otherwise only an owner whose bot row says STOPPED is
+    swept.  This runs after the rows are settled, so each row already records the
+    state the exchange had before the sweep, and the next cycle settles them from
+    the exchange itself.  A failing sweep is recorded as an error and the cycle
+    still returns.  The sweep names the book, so a dry cycle never asks the gateway
+    to take anything off the live account.
     """
     if not open_list:
         return
-    if gateway.is_halted():
-        _sweep(store, gateway, "all", None)
+    if gateway.is_halted(book):
+        _sweep(store, gateway, "all", None, book)
         return
     for owner in _owners_of(store, open_list):
         bot = store.get_bot(owner)
         if bot is not None and bot["status"] == STOPPED:
-            _sweep(store, gateway, "owner", owner)
+            _sweep(store, gateway, "owner", owner, book)
 
 
-def _sweep(store: Store, gateway: Any, scope: str, owner: Optional[str]) -> None:
-    """One gateway sweep; its exception is recorded, never raised."""
+def _sweep(
+    store: Store, gateway: Any, scope: str, owner: Optional[str], book: str
+) -> None:
+    """One gateway sweep of *book*; its exception is recorded, never raised.
+
+    The record is an `alert` and carries the error's text: an order the kill path
+    could not take off the book is something a reader has to act on, and the
+    exchange's own words are what says which call refused it.
+    """
     try:
-        gateway.cancel_all(scope=scope, owner=owner)
+        gateway.cancel_all(scope=scope, owner=owner, book=book)
     except Exception as error:  # noqa: BLE001 - a kill path may not abort the cycle
         message = f"sweep {scope} {owner or '-'} failed: {error}"
         log.error(message)
-        store.event("error", message)
+        store.event("error", message, kind="alert")
 
 
 def _owners_of(store: Store, open_list: dict[str, dict]) -> list[str]:

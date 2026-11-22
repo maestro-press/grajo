@@ -1,0 +1,61 @@
+{
+  "description": "MAC test vectors. signature = hex(HMAC_SHA256(utf8(key), string_to_sign)); string_to_sign = method LF path_with_query LF ts LF nonce LF hex(sha256(body bytes)). body is the UTF-8 text of the request body. Computed with Python stdlib hmac/hashlib, independent of crow_coinbase.auth.",
+  "key": "vector-key-synthetic-not-a-secret-0001",
+  "vectors": [
+    {
+      "name": "empty body, no query",
+      "method": "POST",
+      "path_with_query": "/lease",
+      "ts": "1700000000",
+      "nonce": "abcdefghijklmnop0001",
+      "body": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "string_to_sign": "POST\n/lease\n1700000000\nabcdefghijklmnop0001\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "signature": "4e73d29fc5aa697bbba7b5306841534d7b83d42d2f1c2423d02ee3daced7dbe7"
+    },
+    {
+      "name": "json body",
+      "method": "POST",
+      "path_with_query": "/lease/cursor",
+      "ts": "1700000001",
+      "nonce": "abcdefghijklmnop0002",
+      "body": "{\"cursor\":42}",
+      "body_sha256": "08f3500a26626a71b24de9e16c160382ba41270645626cea76c43aac6d2c0ab1",
+      "string_to_sign": "POST\n/lease/cursor\n1700000001\nabcdefghijklmnop0002\n08f3500a26626a71b24de9e16c160382ba41270645626cea76c43aac6d2c0ab1",
+      "signature": "8ad7c211b35b4bc9f3c5370eb9347c9030661134c0aca78b426e0c3e9840ac0e"
+    },
+    {
+      "name": "query string kept in path",
+      "method": "POST",
+      "path_with_query": "/halt/clear?book=live",
+      "ts": "1700000002",
+      "nonce": "abcdefghijklmnop0003",
+      "body": "{\"acknowledge_rebase\":true}",
+      "body_sha256": "ce0f4d2d368c04651cfaf3d82539a4c36795849ad5fbd9ae5691da56cbc10d86",
+      "string_to_sign": "POST\n/halt/clear?book=live\n1700000002\nabcdefghijklmnop0003\nce0f4d2d368c04651cfaf3d82539a4c36795849ad5fbd9ae5691da56cbc10d86",
+      "signature": "d52ff8327a2f87077efb917610a0e684d3de5d01048215a470f2efce69e975f9"
+    },
+    {
+      "name": "non-ascii body is hashed as utf-8 bytes",
+      "method": "POST",
+      "path_with_query": "/bots/grid-1/mode",
+      "ts": "1700000003",
+      "nonce": "abcdefghijklmnop0004",
+      "body": "{\"note\":\"caf\u00e9 \u2713\"}",
+      "body_sha256": "9e43e5636553d8b51e38c500a373d54574970efd052973228cd148091ca56ed6",
+      "string_to_sign": "POST\n/bots/grid-1/mode\n1700000003\nabcdefghijklmnop0004\n9e43e5636553d8b51e38c500a373d54574970efd052973228cd148091ca56ed6",
+      "signature": "5c96de9d48c76ca23f44eb153d7ca83483456f03a284cddc5f2fac981de8b6f6"
+    },
+    {
+      "name": "method is part of the signed text",
+      "method": "DELETE",
+      "path_with_query": "/credentials",
+      "ts": "1700000004",
+      "nonce": "abcdefghijklmnop0005",
+      "body": "",
+      "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "string_to_sign": "DELETE\n/credentials\n1700000004\nabcdefghijklmnop0005\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "signature": "939af05c398e4bee64d83a199b84ab729768e8b4e1dc8eba71ec2f7cd0e93f22"
+    }
+  ]
+}

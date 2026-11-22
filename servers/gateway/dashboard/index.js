@@ -68,6 +68,9 @@ import { csrfMiddleware, csrfRefusal, csrfTokenForRequest } from "./shared/csrf.
 import { createOAuthConsentRouter, isConsentNext } from "../oauth-consent.js";
 import secretSubmitRouter from "../routes/secret-submit.js";
 import { twoFactorSetupGate } from "./two-factor-setup-gate.js";
+// The sign-in form's code is checked against the step-up gate's one remembered time step, so a
+// code accepted here cannot step up a write afterwards (and the other way round).
+import { verifyLoginTotp } from "./step-up.js";
 import federationRouterFactory from "../routes/federation.js";
 import federationResolveRouterFactory from "../routes/federation-resolve.js";
 import { getTrustedInstances } from "./panels/nest/data-queries.js";
@@ -380,7 +383,7 @@ export default function dashboardRouter(mcpAuthMiddleware, { renderLayout: rende
 
     const { totp_code, trust_device } = req.body;
     const secret = await getTotpSecret();
-    if (!secret || !verifyTotp(totp_code, secret)) {
+    if (!secret || !(await verifyLoginTotp(totp_code, secret))) {
       // Re-create pending token for retry, preserving any SSO context.
       const newToken = await createPending2faToken(retryPendingCtx(ssoCtx, onHost, consentNext));
       const secure = process.env.CROW_HOSTED || process.env.NODE_ENV === "production";

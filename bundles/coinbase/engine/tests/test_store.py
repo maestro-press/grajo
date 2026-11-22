@@ -1,4 +1,4 @@
-"""store.py: the SQLite system of record. Schema v1, WAL, explicit transactions."""
+"""store.py: the SQLite system of record. Schema v2, WAL, explicit transactions."""
 
 import sqlite3
 import threading
@@ -41,6 +41,7 @@ ORDER_COLUMNS = {
     "opposite",
     "fills_ok",
     "note",
+    "book",
 }
 
 BOT_COLUMNS = {
@@ -54,6 +55,9 @@ BOT_COLUMNS = {
     "status",
     "init_done",
     "created_at",
+    "mode",
+    "live_capital_quote",
+    "live_capital_base",
 }
 
 # Same idea for the fills table: including the extra product / trade_type columns.
@@ -70,6 +74,7 @@ FILL_COLUMNS = {
     "recorded_at",
     "product",
     "trade_type",
+    "book",
 }
 
 
@@ -159,7 +164,7 @@ def test_create_bot_round_trips(store):
     assert [b["id"] for b in store.list_bots()] == ["b1", "b2"]
 
 
-def test_reopen_idempotent_schema_v1(tmp_path):
+def test_reopen_idempotent_schema_v2(tmp_path):
     path = tmp_path / "s.db"
     first = Store(path)
     first.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
@@ -168,12 +173,12 @@ def test_reopen_idempotent_schema_v1(tmp_path):
     second = Store(path)
     try:
         assert second.get_bot("b1")["id"] == "b1"
-        assert second.schema_version() == 1
+        assert second.schema_version() == 2
 
         versions = second.conn().execute(
             "SELECT version FROM schema_version"
         ).fetchall()
-        assert len(versions) == 1 and versions[0][0] == 1
+        assert len(versions) == 1 and versions[0][0] == 2
 
         order_cols = set(columns(second, "orders"))
         assert ORDER_COLUMNS <= order_cols, sorted(ORDER_COLUMNS - order_cols)
@@ -385,18 +390,21 @@ def test_concurrent_begin_immediate_writers_both_succeed(store):
 def test_record_fill_exactly_once(store):
     store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
     cid = ocid("b1", 1)
-    store.insert_order(cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN)
+    store.insert_order(
+        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry"
+    )
     f = fill("t1", "BUY", "4", "1", "0.02")
 
-    assert store.record_fill(f, cid) is True
-    assert store.record_fill(f, cid) is False  # duplicate trade_id: nothing written
+    assert store.record_fill(f, cid, book="dry") is True
+    # duplicate trade_id: nothing written
+    assert store.record_fill(f, cid, book="dry") is False
 
     assert store.has_fill("t1") is True
     assert store.has_fill("t2") is False
 
     rows = store.conn().execute(
         "SELECT trade_id, order_id, client_order_id, owner, side, size, price, "
-        "commission, trade_time, product, trade_type FROM fills"
+        "commission, trade_time, product, trade_type, book FROM fills"
     ).fetchall()
     assert len(rows) == 1
     row = rows[0]
@@ -411,6 +419,7 @@ def test_record_fill_exactly_once(store):
     assert row["trade_time"] == "2026-01-01T00:00:00Z"
     assert row["product"] == XRP  # absent from the fill dict: the order's product
     assert row["trade_type"] is None  # absent from the fill dict
+    assert row["book"] == "dry"  # the book the order row is on
 
     # Booking a fill leaves the order's own totals alone.
     o = store.order(cid)
@@ -423,11 +432,13 @@ def test_record_fill_exactly_once(store):
 def test_record_fill_stores_fill_product_and_trade_type(store):
     store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
     cid = ocid("b1", 1)
-    store.insert_order(cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN)
+    store.insert_order(
+        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry"
+    )
 
     # The fill's product must match the order's: a fill belongs to its order.
     f = fill("t1", "BUY", "4", "1", "0.02", product=XRP, trade_type="FILL")
-    assert store.record_fill(f, cid) is True
+    assert store.record_fill(f, cid, book="dry") is True
 
     row = store.conn().execute(
         "SELECT product, trade_type FROM fills WHERE trade_id=?", ("t1",)
@@ -439,10 +450,14 @@ def test_record_fill_stores_fill_product_and_trade_type(store):
 def test_record_fill_rejects_product_mismatch(store):
     store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
     cid = ocid("b1", 1)
-    store.insert_order(cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN)
+    store.insert_order(
+        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry"
+    )
 
     with pytest.raises(ValueError):
-        store.record_fill(fill("t1", "BUY", "4", "1", "0.02", product=BTC), cid)
+        store.record_fill(
+            fill("t1", "BUY", "4", "1", "0.02", product=BTC), cid, book="dry"
+        )
 
     assert store.has_fill("t1") is False
     assert store.conn().execute("SELECT COUNT(*) FROM fills").fetchone()[0] == 0
@@ -452,13 +467,15 @@ def test_record_fill_rejects_product_mismatch(store):
 def test_record_fill_never_touches_order_totals(store):
     store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
     cid = ocid("b1", 1)
-    store.insert_order(cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN)
+    store.insert_order(
+        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry"
+    )
     store.update_order(cid, filled_size=D("4"), filled_value=D("4"), fees=D("0.02"))
 
     # The same trade arrives again through the reconcile loop (or the stream).
     f = fill("t1", "BUY", "4", "1", "0.02")
-    assert store.record_fill(f, cid) is True
-    assert store.record_fill(f, cid) is False
+    assert store.record_fill(f, cid, book="dry") is True
+    assert store.record_fill(f, cid, book="dry") is False
 
     o = store.order(cid)
     assert o["filled_size"] == D("4")
@@ -469,7 +486,9 @@ def test_record_fill_never_touches_order_totals(store):
 
 def test_record_fill_unknown_cid_writes_nothing(store):
     with pytest.raises(KeyError):
-        store.record_fill(fill("t1", "BUY", "1", "1", "0"), "missing-cid")
+        store.record_fill(
+            fill("t1", "BUY", "1", "1", "0"), "missing-cid", book="dry"
+        )
 
     assert store.has_fill("t1") is False
     assert store.conn().execute("SELECT COUNT(*) FROM fills").fetchone()[0] == 0
@@ -478,10 +497,15 @@ def test_record_fill_unknown_cid_writes_nothing(store):
 def test_record_fill_keeps_owner_after_bot_row_deleted(store):
     store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
     cid = ocid("b1", 1)
-    store.insert_order(cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN)
+    store.insert_order(
+        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry"
+    )
     store.conn().execute("DELETE FROM bots WHERE id=?", ("b1",))
 
-    assert store.record_fill(fill("t1", "BUY", "4", "1", "0.02"), cid) is True
+    assert (
+        store.record_fill(fill("t1", "BUY", "4", "1", "0.02"), cid, book="dry")
+        is True
+    )
 
     row = store.conn().execute(
         "SELECT owner FROM fills WHERE trade_id=?", ("t1",)
@@ -494,7 +518,9 @@ def test_update_order_sets_absolute_fill_totals(store):
     """filled_size / filled_value / fees mirror the exchange: absolute, not deltas."""
     store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
     cid = ocid("b1", 1)
-    store.insert_order(cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN)
+    store.insert_order(
+        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry"
+    )
 
     store.update_order(cid, filled_size=D("3"), filled_value=D("3"), fees=D("0.01"))
     store.update_order(cid, filled_size=D("7"), filled_value=D("9"), fees=D("0.03"))
@@ -509,7 +535,9 @@ def test_update_order_sets_absolute_fill_totals(store):
 def test_update_order_rejects_unknown_column(store):
     store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
     cid = ocid("b1", 1)
-    store.insert_order(cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN)
+    store.insert_order(
+        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry"
+    )
 
     with pytest.raises(ValueError):
         store.update_order(cid, bogus=1)
@@ -531,32 +559,38 @@ def test_insert_order_requires_cb_owner_prefix(store):
     for bad in ("B-1", "cb-b2-B-1", "b1-B-1", ""):  # other owner, no `cb-`
         with pytest.raises(ValueError):
             store.insert_order(
-                bad, "b1", "grid", XRP, "BUY", -1, D("1"), D("1"), status=OPEN
+                bad, "b1", "grid", XRP, "BUY", -1, D("1"), D("1"), status=OPEN,
+                book="dry",
             )
 
     # Orphan orders are exempt from the owner part of the id, not from `cb-`.
     with pytest.raises(ValueError):
         store.insert_order(
-            "0xdeadbeef", "orphan", "reconcile", XRP, "BUY", -1, D("1"), D("1")
+            "0xdeadbeef", "orphan", "reconcile", XRP, "BUY", -1, D("1"), D("1"),
+            book="dry",
         )
 
     assert store.orders() == []  # a rejected id leaves no row behind
 
     orphan_cid = "cb-b9-B-1-000000000001"  # a bot that no longer exists
     store.insert_order(
-        orphan_cid, "orphan", "reconcile", XRP, "BUY", -1, D("1"), D("1")
+        orphan_cid, "orphan", "reconcile", XRP, "BUY", -1, D("1"), D("1"),
+        book="dry",
     )
     assert store.order(orphan_cid)["owner"] == "orphan"
 
     store.insert_order(
-        ocid("b1", 1), "b1", "grid", XRP, "BUY", -1, D("1"), D("1"), status=OPEN
+        ocid("b1", 1), "b1", "grid", XRP, "BUY", -1, D("1"), D("1"), status=OPEN,
+        book="dry",
     )
     assert store.order(ocid("b1", 1))["owner"] == "b1"
 
 
 def test_orphan_order_accepts_any_cb_cid(store):
     cid = "cb-gone1-S-2-000000000002"  # no bot "gone1" any more; id is still ours
-    store.insert_order(cid, "orphan", "reconcile", XRP, "SELL", 2, D("2"), D("3"))
+    store.insert_order(
+        cid, "orphan", "reconcile", XRP, "SELL", 2, D("2"), D("3"), book="dry"
+    )
 
     o = store.order(cid)
     assert o["client_order_id"] == cid
@@ -574,7 +608,7 @@ def test_newer_schema_version_refused(tmp_path):
 
     raw = sqlite3.connect(path)
     try:
-        raw.execute("UPDATE schema_version SET version=2")
+        raw.execute("UPDATE schema_version SET version=3")
         raw.commit()
     finally:
         raw.close()
@@ -582,8 +616,8 @@ def test_newer_schema_version_refused(tmp_path):
     with pytest.raises(RuntimeError) as err:
         Store(path)
     message = str(err.value)
+    assert "3" in message
     assert "2" in message
-    assert "1" in message
 
 
 def test_order_round_trip_columns(store):
@@ -604,9 +638,11 @@ def test_order_round_trip_columns(store):
         consumes_fill="fill-t1",
         basis_per_base=D("0.99"),
         note="post-only",
+        book="dry",
     )
     store.insert_order(
-        cid3, "b1", "grid", XRP, "BUY", -2, D("0.95"), D("5"), status=PENDING_SUBMIT
+        cid3, "b1", "grid", XRP, "BUY", -2, D("0.95"), D("5"),
+        status=PENDING_SUBMIT, book="dry",
     )
 
     o = store.order(cid2)
@@ -630,6 +666,7 @@ def test_order_round_trip_columns(store):
     assert o["opposite"] == 0
     assert not o["fills_ok"]
     assert o["note"] == "post-only"
+    assert o["book"] == "dry"
     assert o["updated_at"] >= o["created_at"]
 
     assert store.order("missing") is None

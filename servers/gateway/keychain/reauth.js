@@ -7,6 +7,11 @@
  * With dashboard 2FA on, ONLY a TOTP code counts; otherwise the dashboard password.
  * With neither (Casey Q6), method() is "none" and nothing can be granted — no bypass.
  * A gateway restart forgets everything, which only means "ask again".
+ *
+ * `verify(token, { ..., grant: false })` checks the same proof and counts the same failures, but
+ * leaves no grant behind: a caller that only needs "is this the owner, right now" (the Trading
+ * panel's Connect and Disconnect) must not leave the keychain open for reveal, copy or export.
+ * The default is `grant: true`, so every existing caller is unchanged.
  */
 import { createHash } from "node:crypto";
 
@@ -37,7 +42,7 @@ export function createReauthGate({
     return recentFailures.length >= globalMaxFailures ? recentFailures[0] + globalWindowMs : 0;
   }
 
-  async function verify(token, { password, totp_code } = {}) {
+  async function verify(token, { password, totp_code, grant = true } = {}) {
     if (!token) return { ok: false, error: "No dashboard session." };
     const m = await method();
     if (m === "none") return { ok: false, unavailable: true, method: m, error: "Set a dashboard password or two-factor authentication first." };
@@ -73,8 +78,9 @@ export function createReauthGate({
     if (i >= 0) recentFailures.splice(i, 1);
     const cur = failures.get(k);
     if (lockedByMe || !cur || cur.lockedUntil === 0) failures.delete(k);
-    grants.set(k, t + ttlMs);
-    return { ok: true, method: m, expires_at: t + ttlMs };
+    const wantsGrant = grant !== false;
+    if (wantsGrant) grants.set(k, t + ttlMs);
+    return { ok: true, method: m, expires_at: wantsGrant ? t + ttlMs : null };
   }
 
   function isGranted(token) {

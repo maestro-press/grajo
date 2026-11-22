@@ -19,8 +19,8 @@ book.
 
 `main` is called with the same fakes, an injected `sleep` and an injected clock,
 so no real exchange is built and no real second goes by.  The live switch is the
-piece the environment itself controls, and every value this build cannot honour
-has to answer the refusal code before the data directory is touched.
+piece the environment itself controls, and every value it cannot read has to
+answer the refusal code before the data directory is touched.
 
 The one test that uses the real dry-run exchange opens `Store` twice on one file
 — once as the engine side the orders are placed from, once as the file `main`
@@ -858,12 +858,12 @@ def test_policy_and_threshold_validation(tmp_path):
 # ---------------------------------------------------------------- main
 
 
-def test_main_refuses_live_exit_3(tmp_path):
-    """Every live switch this build cannot honour ends before the disk is touched."""
+def test_main_refuses_unrecognised_live_exit_3(tmp_path):
+    """Only a live value this build cannot read ends before the disk is touched."""
     factory = Factory(cb_orders_exchange())
     sleeps = []
 
-    for value in ("true", "1", "yes", "maybe"):
+    for value in ("maybe", "2", "banana"):
         env = {"CROW_COINBASE_LIVE": value, "CROW_COINBASE_DATA_DIR": str(tmp_path)}
         code = main(env, exchange_factory=factory, sleep=sleeps.append, max_checks=1)
         assert code == REFUSED
@@ -871,20 +871,23 @@ def test_main_refuses_live_exit_3(tmp_path):
         assert factory.calls == 0
     assert sleeps == []
 
-    # The offline switch runs the loop, one check and one sleep per pass.
-    t = [NOW]
-    write_heartbeat(tmp_path, t[0])
-    env = {"CROW_COINBASE_LIVE": "false", "CROW_COINBASE_DATA_DIR": str(tmp_path)}
-    code = main(
-        env,
-        exchange_factory=factory,
-        sleep=sleeps.append,
-        now=lambda: t[0],
-        max_checks=2,
-    )
-    assert code == 0
-    assert sleeps == [60, 60]
-    assert factory.calls == 0
+    # Every value the build does read runs the loop, `true` included: one check
+    # and one sleep per pass, and a fresh heartbeat builds no exchange.
+    for value in ("false", "true", "1", "0", "yes", "off", ""):
+        t = [NOW]
+        write_heartbeat(tmp_path, t[0])
+        env = {"CROW_COINBASE_LIVE": value, "CROW_COINBASE_DATA_DIR": str(tmp_path)}
+        sleeps.clear()
+        code = main(
+            env,
+            exchange_factory=factory,
+            sleep=sleeps.append,
+            now=lambda: t[0],
+            max_checks=2,
+        )
+        assert code == 0, value
+        assert sleeps == [60, 60], value
+        assert factory.calls == 0
 
 
 def test_main_cancels_on_stale_with_cancel_policy(tmp_path):
@@ -950,6 +953,7 @@ def test_main_cancel_sweep_with_real_dry_exchange_and_reconcile(tmp_path, monkey
             D("10"),
             status=OPEN,
             order_id=placed["order_id"],
+            book="dry",
         )
 
     # Somebody else's order on the same simulated account, written straight in:
@@ -1049,12 +1053,12 @@ def test_main_failure_streak_resets(tmp_path, monkeypatch):
 
 @pytest.mark.filterwarnings("ignore")  # runpy re-imports a module already loaded
 def test_module_runs_as_main(tmp_path, monkeypatch):
-    """The module is a process: it refuses a live switch through sys.exit(3)."""
+    """The module is a process: it refuses a bad live value through sys.exit(3)."""
     source = Path(watchdog_module.__file__).read_text()
     assert 'if __name__ == "__main__":' in source
     assert "sys.exit(main())" in source
 
-    monkeypatch.setenv("CROW_COINBASE_LIVE", "true")
+    monkeypatch.setenv("CROW_COINBASE_LIVE", "maybe")
     monkeypatch.setenv("CROW_COINBASE_DATA_DIR", str(tmp_path))
     with pytest.raises(SystemExit) as exit_code:
         runpy.run_module("crow_coinbase.watchdog", run_name="__main__")

@@ -38,12 +38,23 @@ import pytest
 from fastapi.testclient import TestClient
 
 import crow_coinbase.api as api_module
+import crow_coinbase.__main__ as main_module
 from crow_coinbase import records
 from crow_coinbase.__main__ import _run_runner, build_app, main
+from crow_coinbase.books import APPROVAL_INVALID
 from crow_coinbase.gateway import HALTED, NOT_BOT_OWNERS, PORTFOLIO_OWNER
 from crow_coinbase.money import ProductSpec
 from crow_coinbase.runner import StartupRefused
-from crow_coinbase.store import ACTIVE, BOT_ID_RE, OPEN, PAUSED, STOPPED
+from crow_coinbase.store import (
+    ACTIVE,
+    BOT_ID_RE,
+    CANCELLED,
+    FILLED,
+    OPEN,
+    PAUSED,
+    PENDING_SUBMIT,
+    STOPPED,
+)
 from crow_coinbase.strategies.base import MarketSnapshot, OrderIntent
 
 # 32+ characters, the shortest token the engine starts with.  Test data only.
@@ -147,18 +158,34 @@ class Harness:
     books: Books
 
 
+def _open_approval_create_app(**kwargs):
+    """`create_app` with the approval rail open (the handlers are what is under test)."""
+    kwargs.setdefault("require_privileged", lambda request: None)
+    return api_module.create_app(**kwargs)
+
+
 def make_engine(root, *, now=time.time, env=None):
-    """Build the real engine on a temporary data dir, with the outside world faked."""
+    """Build the real engine on a temporary data dir, with the outside world faked.
+
+    The privileged routes (`/bots/{id}/mode`, `/switches`, `/halt/clear`) are
+    reached through their handlers here, so the app is built with an approval
+    that accepts: deny-by-default is covered by `test_books.py`.
+    """
     data_dir = Path(root)
     data_dir.mkdir(parents=True, exist_ok=True)
     books = Books()
-    engine = build_app(
-        dict(ENV) if env is None else dict(env),
-        data_dir=data_dir,
-        market_for=books.market_for,
-        spec_for=lambda product: SPEC,
-        now=now,
-    )
+    real_create_app = main_module.create_app
+    main_module.create_app = _open_approval_create_app
+    try:
+        engine = build_app(
+            dict(ENV) if env is None else dict(env),
+            data_dir=data_dir,
+            market_for=books.market_for,
+            spec_for=lambda product: SPEC,
+            now=now,
+        )
+    finally:
+        main_module.create_app = real_create_app
     return Harness(engine, books)
 
 
@@ -232,6 +259,7 @@ ROUTES = [
     ("GET", "/status"),
     ("GET", "/balances"),
     ("GET", "/bots"),
+    ("GET", "/orders"),
     ("GET", "/pnl"),
     ("GET", "/export/fills.csv"),
     ("GET", "/bots/b1/fills"),
@@ -283,7 +311,7 @@ def test_routes_require_token(engine, method, path):
     with raw_api(engine) as client:
         health = client.get("/health")
         assert health.status_code == 200
-        assert set(health.json()) == {"ok", "live_enabled", "heartbeat_age_s"}
+        assert set(health.json()) == HEALTH_KEYS
 
         for headers in BAD_HEADERS:
             response = send(client, method, path, headers)
@@ -530,6 +558,8 @@ def test_create_bot_validation_rejects_bad_id_product_params_fee_guard_and_over_
     assert D(balances["unallocated"]["USDC"]) == D("0")
     assert D(balances["unallocated"]["XRP"]) == D("0")
     assert balances["owners"][BOT]["product"] == PRODUCT
+    # The live book reports whether it has an exchange at all, and no numbers.
+    assert balances["live"] == {"available": False}
 
 
 def test_bot_id_reuse_refused(engine, client):
@@ -542,8 +572,12 @@ def test_bot_id_reuse_refused(engine, client):
     engine.store.update_hwm("ghost", D("1"))
     assert client.post("/bots", json=dict(CREATE_BODY, id="ghost")).status_code == 409
 
-    engine.store.put("benchmark:ghost2", None)
+    engine.store.put("bench:dry:ghost2", None)
     assert client.post("/bots", json=dict(CREATE_BODY, id="ghost2")).status_code == 409
+
+    # A P1 benchmark record still counts as a history this id belongs to.
+    engine.store.put("benchmark:ghost4", None)
+    assert client.post("/bots", json=dict(CREATE_BODY, id="ghost4")).status_code == 409
 
     engine.store.insert_order(
         "cb-ghost3-B-1-000000000001",
@@ -555,6 +589,7 @@ def test_bot_id_reuse_refused(engine, client):
         D("0.9852"),
         D("10"),
         status=OPEN,
+        book="dry",
     )
     assert client.post("/bots", json=dict(CREATE_BODY, id="ghost3")).status_code == 409
 
@@ -1019,13 +1054,13 @@ def test_halt_clear_without_the_acknowledgement_writes_nothing(engine, client):
     assert engine.gateway.is_halted() is True
 
 
-def test_halt_clear_with_unknown_equity_answers_503(engine, client):
-    """An unpriced portfolio cannot be re-based, so the halt stays."""
+def test_halt_clear_with_unknown_equity_resets_the_mark(engine, client):
+    """A book that cannot be priced is cleared with its mark reset, not blocked."""
     assert client.post("/bots", json=CREATE_BODY).status_code == 201
     engine.runner.cycle()
     engine.gateway.halt("held by the test")
     mark = engine.store.hwm(PORTFOLIO_OWNER)
-    rows_before = book_rows(engine)
+    assert mark is not None
 
     # A crossed book is unusable, which is what makes the equity unknown.
     engine.gateway.snapshots.put(
@@ -1036,12 +1071,17 @@ def test_halt_clear_with_unknown_equity_answers_503(engine, client):
     assert engine.gateway.portfolio_equity() is None
 
     response = client.post("/halt/clear", json=ACK)
-    assert response.status_code == 503, response.text
-    assert "equity" in detail_text(response).lower()
-    assert engine.gateway.is_halted() is True
-    assert engine.store.get("halted") is not None
-    assert engine.store.hwm(PORTFOLIO_OWNER) == mark
-    assert book_rows(engine) == rows_before
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["halted"] is False
+    # The entry is still there and says null: no number was written for a book
+    # nothing could price.
+    assert body["rebased"] == {f"{PORTFOLIO_OWNER}:dry": None}
+    # The mark is reset rather than left at the value the stop fired on, so the
+    # next priced cycle ratchets a fresh one.
+    assert engine.store.hwm(PORTFOLIO_OWNER) is None
+    assert engine.store.get("halted") is None
+    assert engine.gateway.is_halted() is False
 
 
 def test_halt_clear_rebases_and_reinitialises_every_grid(engine, client):
@@ -1075,7 +1115,7 @@ def test_halt_clear_rebases_and_reinitialises_every_grid(engine, client):
     assert cleared.status_code == 200, cleared.text
     body = cleared.json()
     assert body["halted"] is False
-    assert body["rebased"] == {PORTFOLIO_OWNER: str(equity)}
+    assert str(equity) in body["rebased"].values()
     # The grid that is not stopped re-initialises; a stopped grid and a
     # rebalancer have no grid to lay.
     assert body["reinitialised"] == [BOT]
@@ -1229,7 +1269,15 @@ def test_create_bot_prices_before_the_transaction(tmp_path):
 # ---------------------------------------------------------------- health
 
 
-HEALTH_KEYS = {"ok", "live_enabled", "heartbeat_age_s"}
+# The `/health` body: the cycle's own three keys, then whether the owner's
+# credentials are in place and whether a pin exists at all.
+HEALTH_KEYS = {
+    "ok",
+    "live_enabled",
+    "heartbeat_age_s",
+    "credentials",
+    "pinned",
+}
 LEAK_WORDS = ("balance", "USDC", "totals", "b1")
 
 
@@ -1252,6 +1300,10 @@ def test_health_no_balances_and_503_when_stale(tmp_path):
         assert inside_grace.json()["ok"] is True
         assert inside_grace.json()["live_enabled"] is False
         assert inside_grace.json()["heartbeat_age_s"] is None
+        # No key has been connected on this engine, so there is nothing to trade
+        # the live book with and no pin to keep.
+        assert inside_grace.json()["credentials"] == "not_ready"
+        assert inside_grace.json()["pinned"] is False
         assert leaked(inside_grace.text) == []
 
         clock[0] = 1000.0 + 130.0  # past the 120 s startup grace
@@ -1555,7 +1607,7 @@ def test_startup_checks_failure_exits_3(tmp_path):
 
     live_env = dict(
         ENV,
-        CROW_COINBASE_LIVE="true",
+        CROW_COINBASE_LIVE="maybe",
         CROW_COINBASE_DATA_DIR=str(tmp_path / "live"),
     )
     live_served = []
@@ -1689,7 +1741,8 @@ def test_pnl_shape(engine, client):
     body = client.get("/pnl").json()
     assert list(body["bots"]) == [BOT]
     entry = body["bots"][BOT]
-    assert set(entry) == {"realized", "fees", "equity", "vs_hold"}
+    assert set(entry) == {"realized", "fees", "equity", "vs_hold", "mode"}
+    assert entry["mode"] == "dry"
     # A grid bot with no sell yet keeps a decimal string, not null.
     assert entry["realized"] == "0"
     assert D(entry["fees"]) == D("0")
@@ -1789,4 +1842,727 @@ def test_status_and_bots_shape(engine, client):
     assert row["params"]["step_pct"] == "1.5"
     assert row["capital_quote"] == "60"
     assert row["capital_base"] == "30"
+    # A new bot is always a dry bot, with no live capital of its own yet.
+    assert row["mode"] == "dry"
+    assert row["live_capital_quote"] is None
+    assert row["live_capital_base"] is None
     assert isinstance(row["created_at"], (int, float))
+
+
+# ---------------------------------------------------------------- status additions
+
+# The whole `/status` body: the keys it always reported, and the three it gained
+# beside them.  Written out here so a dropped or renamed key fails a test rather
+# than slipping past it.
+STATUS_KEYS = {
+    "halted",
+    "halted_books",
+    "halt_reason",
+    "halt_reasons",
+    "heartbeat",
+    "bots",
+    "recent_alerts",
+    "live_switches",
+    "drawdown",
+    "products",
+}
+
+# The three keys a book's own drawdown carries.
+DRAWDOWN_KEYS = {"equity", "hwm", "pct"}
+NULL_DRAWDOWN = {"equity": None, "hwm": None, "pct": None}
+
+
+def drawdown_of(client):
+    """The `/status` drawdown, one entry per book."""
+    return client.get("/status").json()["drawdown"]
+
+
+def test_status_reports_switches_and_ceiling(engine, client, tmp_path):
+    """`live_switches` is exactly the switches' own snapshot, ceiling included."""
+    fresh = client.get("/status").json()["live_switches"]
+    assert fresh == {
+        "live_enabled": False,
+        "ai_live_enabled": False,
+        "ceiling": True,
+    }
+    assert fresh == engine.gateway.switches.snapshot()
+
+    # Flipped through the route the rest of the surface uses, the report follows.
+    assert client.post("/switches", json={"live_enabled": True}).status_code == 200
+    assert client.get("/status").json()["live_switches"] == {
+        "live_enabled": True,
+        "ai_live_enabled": False,
+        "ceiling": True,
+    }
+    assert (
+        client.post(
+            "/switches", json={"live_enabled": False, "ai_live_enabled": True}
+        ).status_code
+        == 200
+    )
+    flipped = client.get("/status").json()["live_switches"]
+    assert flipped == {
+        "live_enabled": False,
+        "ai_live_enabled": True,
+        "ceiling": True,
+    }
+    assert flipped == engine.gateway.switches.snapshot()
+
+    # The ceiling is the environment's and not a switch: an engine started under a
+    # ceiling that forbids live reports it, with both switches still off under it.
+    forbidden = make_engine(
+        tmp_path / "ceiling-off", env=dict(ENV, CROW_COINBASE_LIVE="false")
+    ).engine
+    with api(forbidden) as ceilingless:
+        reported = ceilingless.get("/status").json()["live_switches"]
+    assert reported == {
+        "live_enabled": False,
+        "ai_live_enabled": False,
+        "ceiling": False,
+    }
+    assert reported == forbidden.gateway.switches.snapshot()
+
+
+def test_status_drawdown_per_book(engine, client):
+    """Each book's drawdown comes from its own mark: strings, never floats."""
+    funded = dict(CREATE_BODY, capital_quote="85", capital_base="0")
+    assert client.post("/bots", json=funded).status_code == 201
+    price_at(engine, "0.99", "1.00")
+    assert engine.gateway.portfolio_equity("dry") == D("85")
+
+    books = drawdown_of(client)
+    assert set(books) == {"dry", "live"}
+    for book in ("dry", "live"):
+        assert set(books[book]) == DRAWDOWN_KEYS, book
+    # The dry book is priced; no mark has been written for it yet, so there is no
+    # ratio to report.
+    initial = books["dry"]
+    assert isinstance(initial["equity"], str)
+    assert D(initial["equity"]) == D("85")
+    assert initial["hwm"] is None
+    assert initial["pct"] is None
+    # No bot trades the live book, so it reports no equity at all — and no mark.
+    assert books["live"] == NULL_DRAWDOWN
+
+    # A mark above the book's own equity: (100 - 85) / 100 is 15 per cent.
+    engine.store.update_hwm(PORTFOLIO_OWNER, D("100"))
+    assert engine.store.hwm(PORTFOLIO_OWNER) == D("100")
+    marked = drawdown_of(client)["dry"]
+    assert isinstance(marked["equity"], str)
+    assert D(marked["equity"]) == D("85")
+    assert isinstance(marked["hwm"], str)
+    assert D(marked["hwm"]) == D("100")
+    assert isinstance(marked["pct"], str)
+    assert D(marked["pct"]) == D("15")
+
+    # Equity at or above the mark is no drawdown at all.
+    engine.store.reset_hwm(PORTFOLIO_OWNER, "dry")
+    engine.store.update_hwm(PORTFOLIO_OWNER, D("50"))
+    at_mark = drawdown_of(client)["dry"]
+    assert D(at_mark["hwm"]) == D("50")
+    assert isinstance(at_mark["pct"], str)
+    assert D(at_mark["pct"]) == D("0")
+
+    # A book nothing can price reports no equity and no ratio; the mark it holds
+    # is still reported as stored.
+    engine.gateway.snapshots.put(
+        MarketSnapshot(
+            PRODUCT, D("1.02"), D("1.00"), D("1.00"), D("1.02"), time.time()
+        )
+    )
+    assert engine.gateway.portfolio_equity("dry") is None
+    unpriced = drawdown_of(client)["dry"]
+    assert unpriced["equity"] is None
+    assert D(unpriced["hwm"]) == D("50")
+    assert unpriced["pct"] is None
+    assert drawdown_of(client)["live"] == NULL_DRAWDOWN
+
+
+def test_status_products_listed(engine, client):
+    """The crypto products the engine may trade, as the plain strings they are."""
+    products = client.get("/status").json()["products"]
+    assert products == ["XRP-USDC", "BTC-USDC"]
+    assert all(isinstance(product, str) for product in products)
+    assert products == list(engine.limits.products)
+
+
+def test_status_existing_keys_unchanged(engine, client):
+    """The three new keys arrived beside every key the body already carried."""
+    assert client.post("/bots", json=CREATE_BODY).status_code == 201
+
+    status = client.get("/status").json()
+    assert set(status) == STATUS_KEYS
+
+    assert status["halted"] is False
+    assert status["halted_books"] == {"dry": False, "live": False}
+    assert status["halt_reason"] is None
+    assert status["halt_reasons"] == {"dry": None, "live": None}
+    assert status["heartbeat"] is None
+    assert [bot["id"] for bot in status["bots"]] == [BOT]
+    assert set(status["bots"][0]) == {
+        "id",
+        "product",
+        "strategy",
+        "status",
+        "init_done",
+    }
+    assert status["recent_alerts"] == []
+
+
+# ---------------------------------------------------------------- GET /orders
+
+# The fields one resting order is reported with, and nothing else: no exchange
+# order id, no note, no fill figures.
+ORDER_KEYS = {
+    "client_order_id",
+    "bot",
+    "product",
+    "side",
+    "size",
+    "price",
+    "status",
+    "created_at",
+    "book",
+}
+
+
+def place_order(
+    store,
+    cid,
+    *,
+    status,
+    book,
+    created_at,
+    side="BUY",
+    size="10",
+    price="0.9852",
+):
+    """One order row through the store's own writer, stamped by the test."""
+    store.insert_order(
+        cid,
+        BOT,
+        "bot",
+        PRODUCT,
+        side,
+        -1,
+        D(price),
+        D(size),
+        status=status,
+        book=book,
+    )
+    store.update_order(cid, created_at=created_at)
+
+
+def test_orders_lists_only_resting(engine, client):
+    """Only the resting rows are listed, oldest first, one book at a time."""
+    assert client.post("/bots", json=CREATE_BODY).status_code == 201
+    store = engine.store
+
+    # The ids sort in the opposite order to the stamps, so a listing that sorted
+    # by id alone would answer these in a different order.
+    oldest_dry = "cb-b1-B-1-000000000009"
+    resting_live = "cb-b1-S-1-000000000007"
+    newest_dry = "cb-b1-B-1-000000000001"
+    filled = "cb-b1-B-1-000000000005"
+    cancelled = "cb-b1-S-1-000000000003"
+
+    place_order(store, oldest_dry, status=OPEN, book="dry", created_at=1000.0)
+    place_order(
+        store,
+        resting_live,
+        status=PENDING_SUBMIT,
+        book="live",
+        created_at=1500.0,
+        side="SELL",
+        size="4",
+        price="1.0024",
+    )
+    place_order(store, newest_dry, status=OPEN, book="dry", created_at=2000.0)
+    place_order(store, filled, status=FILLED, book="dry", created_at=500.0)
+    place_order(store, cancelled, status=CANCELLED, book="dry", created_at=600.0)
+
+    both = client.get("/orders")
+    assert both.status_code == 200, both.text
+    listed = both.json()
+    assert [entry["client_order_id"] for entry in listed] == [
+        oldest_dry,
+        resting_live,
+        newest_dry,
+    ]
+
+    entry = listed[0]
+    assert set(entry) == ORDER_KEYS
+    assert entry["bot"] == BOT
+    assert entry["product"] == PRODUCT
+    assert entry["side"] == "BUY"
+    assert isinstance(entry["size"], str) and entry["size"] == "10"
+    assert isinstance(entry["price"], str) and entry["price"] == "0.9852"
+    assert entry["status"] == OPEN
+    assert entry["book"] == "dry"
+    assert isinstance(entry["created_at"], float)
+    assert entry["created_at"] == 1000.0
+
+    pending = listed[1]
+    assert set(pending) == ORDER_KEYS
+    assert pending["bot"] == BOT
+    assert pending["side"] == "SELL"
+    assert pending["size"] == "4"
+    assert pending["price"] == "1.0024"
+    assert pending["status"] == PENDING_SUBMIT
+    assert pending["book"] == "live"
+    assert pending["created_at"] == 1500.0
+
+    # A book filters to its own rows; no book at all is both books.
+    dry_only = client.get("/orders", params={"book": "dry"})
+    assert dry_only.status_code == 200, dry_only.text
+    assert [item["client_order_id"] for item in dry_only.json()] == [
+        oldest_dry,
+        newest_dry,
+    ]
+    assert {item["book"] for item in dry_only.json()} == {"dry"}
+
+    live_only = client.get("/orders", params={"book": "live"})
+    assert live_only.status_code == 200, live_only.text
+    assert [item["client_order_id"] for item in live_only.json()] == [resting_live]
+    assert live_only.json()[0]["book"] == "live"
+
+    # A filled or cancelled row is never one of them, whichever book was asked for.
+    for response in (both, dry_only, live_only):
+        listed_ids = {item["client_order_id"] for item in response.json()}
+        assert filled not in listed_ids
+        assert cancelled not in listed_ids
+
+    # The route reads the books; it does not settle or sweep anything.
+    assert {row["client_order_id"] for row in store.orders()} == {
+        oldest_dry,
+        resting_live,
+        newest_dry,
+        filled,
+        cancelled,
+    }
+
+
+def test_orders_bad_book_refused(engine, client):
+    """A book this engine does not know is the surface's own `422 INVALID`."""
+    for value in ("weekly", "both", "futures"):
+        response = client.get("/orders", params={"book": value})
+        assert response.status_code == 422, f"{value}: {response.text}"
+        body = response.json()
+        assert body.get("code") == "INVALID", f"{value}: {body}"
+        fields = body.get("fields")
+        assert isinstance(fields, list) and fields, f"{value}: {body}"
+        assert any("book" in str(field) for field in fields), f"{value}: {body}"
+        assert value not in response.text, f"{value}: the refusal echoed it"
+
+    assert engine.store.orders() == []
+
+
+def test_orders_requires_bearer(engine):
+    """Without the bearer token the listing is the uniform 401."""
+    with raw_api(engine) as anonymous:
+        assert anonymous.get("/status").status_code == 401
+        for headers in BAD_HEADERS:
+            extra = {} if headers is None else {"headers": headers}
+            response = anonymous.get("/orders", **extra)
+            assert response.status_code == 401, headers
+            assert response.json() == {"detail": "unauthorized"}
+            assert response.headers.get("www-authenticate") == "Bearer"
+
+
+def test_orders_and_status_are_not_privileged(engine, client):
+    """A MAC-less bearer call is enough: neither read asks the approval rail.
+
+    The app below is built with the surface's own deny-by-default approval, so a
+    privileged route really is refused there — which is what makes the two reads
+    about their own dependencies rather than about the test's open approval.
+    """
+    assert client.post("/bots", json=CREATE_BODY).status_code == 201
+    place_order(
+        engine.store,
+        "cb-b1-B-1-000000000002",
+        status=OPEN,
+        book="dry",
+        created_at=1000.0,
+    )
+
+    with TestClient(probe_app(engine, lambda product: D("1"))) as closed:
+        closed.headers.update(HEADERS)
+        refused = closed.post("/switches", json={"live_enabled": True})
+        assert refused.status_code == 403, refused.text
+        assert refused.json()["detail"] == APPROVAL_INVALID
+
+        status = closed.get("/status")
+        assert status.status_code == 200, status.text
+        assert set(status.json()) == STATUS_KEYS
+
+        orders = closed.get("/orders")
+        assert orders.status_code == 200, orders.text
+        assert [entry["client_order_id"] for entry in orders.json()] == [
+            "cb-b1-B-1-000000000002"
+        ]
+
+
+# ---------------------------------------------------------------- POST /bots: limits
+
+
+def seed_bot(engine, bot_id, *, age_s=0.0, stopped=False):
+    """One bot row through the store's own writer, stamped *age_s* seconds ago.
+
+    The capital is small and valid for the table's own checks, and no dry seed is
+    applied: such a row only fills the surface's limits.  Its `created_at` is
+    moved back by hand, because `create_bot` stamps the wall clock and the hourly
+    window is measured against it.
+    """
+    engine.store.create_bot(bot_id, PRODUCT, "grid", GRID_PARAMS, D("1"), D("0"))
+    if stopped:
+        engine.store.set_bot_status(bot_id, STOPPED)
+    engine.store.conn().execute(
+        "UPDATE bots SET created_at=? WHERE id=?",
+        (time.time() - age_s, bot_id),
+    )
+
+
+def seed_bots(engine, ids, *, age_s=0.0, stopped=()):
+    for bot_id in ids:
+        seed_bot(engine, bot_id, age_s=age_s, stopped=bot_id in stopped)
+
+
+def test_create_bot_refused_at_open_bot_limit(engine, client):
+    """Twenty bots that are not STOPPED are the open-bot ceiling.
+
+    Their rows are stamped well past the hour, so the rolling create window is
+    clear and what refuses the request is the open-bot count alone.  The refusal
+    comes before the body is looked at and writes nothing: no bot row and no dry
+    seed.  A body this engine would answer 422 for is refused the same way while
+    the ceiling holds, and stopping one bot makes room for a create again.
+    """
+    seed_bots(engine, [f"a{n}" for n in range(1, 21)], age_s=7200.0)
+    bots_before = count_rows(engine, "bots")
+    assert bots_before == 20
+    assert count_rows(engine, "sim_balances") == 0
+
+    refused = client.post("/bots", json=CREATE_BODY)
+    assert refused.status_code == 429, refused.text
+    detail = detail_text(refused)
+    assert detail.startswith("BOT_LIMIT"), detail
+    assert "Too many bots are running. Stop one before creating another." in detail
+
+    assert count_rows(engine, "bots") == bots_before
+    assert count_rows(engine, "sim_balances") == 0
+    assert count_rows(engine, "sim_deposits") == 0
+    assert engine.store.get_bot(BOT) is None
+
+    # The ceiling is read before the body is validated: a product this engine
+    # does not carry is not the refusal that comes back.
+    invalid = client.post("/bots", json=dict(CREATE_BODY, product="DOGE-USDC"))
+    assert invalid.status_code == 429, invalid.text
+    assert detail_text(invalid).startswith("BOT_LIMIT")
+    assert count_rows(engine, "bots") == bots_before
+
+    assert client.post("/bots/a1/stop").status_code == 200
+    assert engine.store.get_bot("a1")["status"] == STOPPED
+
+    created = client.post("/bots", json=CREATE_BODY)
+    assert created.status_code == 201, created.text
+    assert created.json()["id"] == BOT
+    assert count_rows(engine, "bots") == bots_before + 1
+    assert engine.store.get_bot(BOT)["status"] == ACTIVE
+
+
+def test_create_bot_refused_at_hourly_create_rate(engine, client):
+    """Ten rows created inside the hour refuse an eleventh, stopped or not.
+
+    Nine of the ten are STOPPED, so the open-bot ceiling is nowhere near: what
+    refuses is the rolling count of bots created in the last 3600 seconds, and
+    it does so before the body is looked at and without writing anything.  Once
+    those rows are two hours old the same body is a 201.
+    """
+    seed_bots(
+        engine,
+        [f"a{n}" for n in range(1, 11)],
+        stopped={f"a{n}" for n in range(1, 10)},
+    )
+    bots_before = count_rows(engine, "bots")
+    assert bots_before == 10
+    assert count_rows(engine, "sim_balances") == 0
+
+    refused = client.post("/bots", json=CREATE_BODY)
+    assert refused.status_code == 429, refused.text
+    detail = detail_text(refused)
+    assert detail.startswith("BOT_LIMIT"), detail
+    assert "Too many bots were created this hour. Try again later." in detail
+
+    assert count_rows(engine, "bots") == bots_before
+    assert count_rows(engine, "sim_balances") == 0
+    assert count_rows(engine, "sim_deposits") == 0
+    assert engine.store.get_bot(BOT) is None
+
+    invalid = client.post("/bots", json=dict(CREATE_BODY, product="DOGE-USDC"))
+    assert invalid.status_code == 429, invalid.text
+    assert detail_text(invalid).startswith("BOT_LIMIT")
+    assert count_rows(engine, "bots") == bots_before
+
+    # Two hours old is outside the window, and the whole ten are now there.
+    engine.store.conn().execute(
+        "UPDATE bots SET created_at=?", (time.time() - 7200.0,)
+    )
+
+    created = client.post("/bots", json=CREATE_BODY)
+    assert created.status_code == 201, created.text
+    assert created.json()["id"] == BOT
+    assert count_rows(engine, "bots") == bots_before + 1
+
+
+def test_create_bot_under_limits_unchanged(engine, client):
+    """Under both limits a create is the 201 it always was, and its refusals too.
+
+    Two bots are well inside the open-bot ceiling and the hourly window, and the
+    validation beside them is untouched: an unknown product is still 422 and a
+    reused id still 409, with nothing written by either.
+    """
+    assert api_module.MAX_OPEN_BOTS == 20
+    assert api_module.MAX_BOT_CREATES_PER_HOUR == 10
+
+    first = client.post("/bots", json=CREATE_BODY)
+    assert first.status_code == 201, first.text
+    second = client.post(
+        "/bots",
+        json=dict(CREATE_BODY, id="b2", capital_quote="40", capital_base="10"),
+    )
+    assert second.status_code == 201, second.text
+    assert [row["id"] for row in engine.store.list_bots()] == [BOT, "b2"]
+    assert engine.store.get_bot("b2")["status"] == ACTIVE
+    assert count_rows(engine, "sim_deposits") == 4
+
+    bad = client.post("/bots", json=dict(CREATE_BODY, id="b3", product="DOGE-USDC"))
+    assert bad.status_code == 422, bad.text
+    duplicate = client.post("/bots", json=CREATE_BODY)
+    assert duplicate.status_code == 409, duplicate.text
+    assert [row["id"] for row in engine.store.list_bots()] == [BOT, "b2"]
+    assert count_rows(engine, "sim_deposits") == 4
+
+
+# ---------------------------------------------------------------- GET /price
+
+# The whole `/price` body: the product the route answered for, its price as a
+# decimal string, and the snapshot's own stamp.  Written out here so a dropped or
+# renamed key fails a test rather than slipping past it.
+PRICE_KEYS = {"product", "price", "ts"}
+
+# The route's two refusals, word for word: a product off the allow-list, and a
+# product nothing can be priced for right now.  Both are plain sentences, and
+# neither carries anything the engine was told by whatever could not answer.
+UNKNOWN_PRODUCT = "That product is not one this engine trades."
+NO_PRICE = "No price is available for that product right now."
+
+
+def price_dependencies(app):
+    """The dependency names of the app's one `GET /price` route.
+
+    The same walk `test_privileged_auth.py` classifies its routes with, read off
+    the app itself: a route whose dependencies are the bearer check and nothing
+    else is one no approval gate can be asked for.
+    """
+    routes = [
+        route
+        for route in app.routes
+        if getattr(route, "path", "") == "/price"
+        and "GET" in (getattr(route, "methods", ()) or ())
+    ]
+    assert len(routes) == 1, f"the app carries no one GET /price route: {routes}"
+    return route_dependency_names(routes[0])
+
+
+def counted_engine(tmp_path, name):
+    """An engine whose market reads are counted, so a route that prices is caught.
+
+    `market_for` is the book every fallback price would come from, and the
+    surface's own `price_for` is the other way to a price: a route that answers
+    from anywhere but the snapshot cache has to reach one of them, and each
+    records that it was asked here.
+    """
+    books = Books()
+    calls = []
+    real_market_for = books.market_for
+
+    def counted_market_for(product):
+        calls.append(product)
+        return real_market_for(product)
+
+    data_dir = tmp_path / name
+    data_dir.mkdir(parents=True, exist_ok=True)
+    real_create_app = main_module.create_app
+    main_module.create_app = _open_approval_create_app
+    try:
+        engine = build_app(
+            dict(ENV),
+            data_dir=data_dir,
+            market_for=counted_market_for,
+            spec_for=lambda product: SPEC,
+        )
+    finally:
+        main_module.create_app = real_create_app
+    return Harness(engine, books), calls
+
+
+def test_price_returns_snapshot_ts(harness):
+    """A fresh snapshot is the answer: its own mid as a string, and its own stamp.
+
+    The market cache beside the engine answers 0.99/1.00, whose mid is 0.995, so
+    a price of exactly 1.00 can only have come from the snapshot this test puts
+    in the cache the way a cycle writes one.  `ts` is that snapshot's own stamp,
+    not the clock the request was read at.
+    """
+    engine = harness.engine
+    stamp = time.time() - 30.0
+    engine.gateway.snapshots.put(
+        MarketSnapshot(
+            PRODUCT, D("0.99"), D("1.01"), D("0.99"), D("1.01"), stamp
+        )
+    )
+
+    with api(engine) as client:
+        response = client.get("/price?product=XRP-USDC")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert set(body) == PRICE_KEYS, body
+    assert body["product"] == PRODUCT, body
+    assert isinstance(body["price"], str), body
+    assert D(body["price"]) == D("1.00"), body
+    assert D(body["price"]) != D("0.995"), "the book answered instead of the cache"
+    assert isinstance(body["ts"], (int, float)) and not isinstance(
+        body["ts"], bool
+    ), body
+    assert math.isfinite(body["ts"]), body
+    assert body["ts"] == stamp, "the answer carried the snapshot's stamp"
+    assert abs(body["ts"] - time.time()) > 5.0, "the answer carried the engine clock"
+
+
+def test_price_unknown_product_400(tmp_path):
+    """A product off the allow-list, and no product at all, are the same 400.
+
+    The price callable is one that records every product it is asked about and
+    then fails: the allow-list is checked first, so neither request reaches a
+    price at all — and nothing is written by either.
+    """
+    engine = make_engine(tmp_path / "unknown-product").engine
+    asked = []
+
+    def never_priced(product):
+        asked.append(product)
+        raise RuntimeError("a product this engine does not trade was priced")
+
+    with TestClient(probe_app(engine, never_priced)) as client:
+        client.headers.update(HEADERS)
+        for path in ("/price?product=DOGE-USDC", "/price"):
+            response = client.get(path)
+            assert response.status_code == 400, f"{path}: {response.text}"
+            assert response.json() == {"detail": UNKNOWN_PRODUCT}, (
+                f"{path}: {response.text}"
+            )
+
+    assert asked == [], asked
+    assert engine.store.list_bots() == []
+
+
+def test_price_needs_bearer(engine):
+    """Without the bearer token the read is the surface's uniform 401."""
+    with raw_api(engine) as anonymous:
+        for headers in BAD_HEADERS:
+            extra = {} if headers is None else {"headers": headers}
+            response = anonymous.get("/price?product=XRP-USDC", **extra)
+            assert response.status_code == 401, headers
+            assert response.json() == {"detail": "unauthorized"}
+            assert response.headers.get("www-authenticate") == "Bearer"
+
+        # With it, the same read is served from the snapshot a poll leaves behind.
+        price_at(engine, "0.99", "1.00")
+        served = anonymous.get("/price?product=XRP-USDC", headers=HEADERS)
+        assert served.status_code == 200, served.text
+        assert served.json()["product"] == PRODUCT
+
+
+def test_price_empty_cache_503_no_exchange_call(tmp_path):
+    """An empty cache is a plain 503, and no book or fallback price is asked at all.
+
+    The engine is built over a market cache that records every product it is
+    asked about, and the app's own `price_for` fails the test outright if the
+    route reaches it.  With no snapshot in the cache the route answers its own
+    sentence without either: the fallback price and the public book belong to
+    the routes that create a bot, not to this read.
+    """
+    harness, market_calls = counted_engine(tmp_path, "price-empty-cache")
+    engine = harness.engine
+    assert engine.gateway.snapshots.get(PRODUCT) is None
+
+    price_calls = []
+
+    def never_priced(product):
+        price_calls.append(product)
+        raise AssertionError("the price route asked for a price off the cache")
+
+    with TestClient(
+        probe_app(engine, never_priced), raise_server_exceptions=False
+    ) as client:
+        client.headers.update(HEADERS)
+        response = client.get("/price?product=XRP-USDC")
+
+    assert response.status_code == 503, response.text
+    assert response.json() == {"detail": NO_PRICE}, response.text
+    assert "exchange" not in response.text.lower()
+    assert price_calls == [], price_calls
+    assert market_calls == [], market_calls
+
+
+def test_price_stale_snapshot_503(harness):
+    """A snapshot past the staleness window is no price, over a readable book too.
+
+    The runner's mid applies the gateway's own usability rule, so an old snapshot
+    answers None just like a missing one: the read is a 503 rather than the book
+    the market cache beside the engine could still quote.
+    """
+    engine = harness.engine
+    stale = time.time() - 10_000
+    engine.gateway.snapshots.put(
+        MarketSnapshot(
+            PRODUCT, D("0.99"), D("1.01"), D("0.99"), D("1.01"), stale
+        )
+    )
+    assert (
+        engine.gateway._is_unusable(engine.gateway.snapshots.get(PRODUCT)) is True
+    )
+
+    with api(engine) as client:
+        response = client.get("/price?product=XRP-USDC")
+
+    assert response.status_code == 503, response.text
+    assert response.json() == {"detail": NO_PRICE}, response.text
+    assert engine.gateway.snapshots.get(PRODUCT).ts == stale
+
+
+def test_price_is_not_privileged(tmp_path):
+    """The read carries the bearer check alone: no MAC and no approval is enough.
+
+    The app is built over the engine's pieces with the surface's own
+    deny-by-default approval, so a privileged route really is refused there.  The
+    price read is served by that same app, which is what makes this about the
+    route's own dependencies rather than about an approval a test opened.
+    """
+    engine = make_engine(tmp_path / "price-auth").engine
+    price_at(engine, "0.99", "1.01")
+    app = probe_app(engine, lambda product: D("0.995"))
+    assert price_dependencies(app) == {"_check_token"}
+
+    with TestClient(app) as client:
+        client.headers.update(HEADERS)
+        refused = client.post("/switches", json={"live_enabled": True})
+        assert refused.status_code == 403, refused.text
+        assert refused.json()["detail"] == APPROVAL_INVALID
+
+        response = client.get("/price?product=XRP-USDC")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert set(body) == PRICE_KEYS, body
+        assert D(body["price"]) == D("1.00"), body
+        assert D(body["price"]) != D("0.995"), "the route priced off the fallback callable"

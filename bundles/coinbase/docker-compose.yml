@@ -1,25 +1,30 @@
-## Crow's Coinbase trading engine (P1: dry-run only).
+## Crow's Coinbase trading engine (P2: a dry book and a live book).
 ##
 ## Two services run the same image, built from ./engine:
 ##   coinbase-engine   - the order gateway and the bots, its API on loopback
 ##   coinbase-watchdog - follows the engine's heartbeat and applies CROW_COINBASE_WATCHDOG_POLICY (leave or cancel)
 ##
+## The engine always trades a dry book: orders are simulated against public market data.
+## It trades a live book only when the Trading page switches a bot onto it AND the live
+## ceiling (CROW_COINBASE_LIVE) allows it. That ceiling is on by default; set it to false
+## on a machine where no real money may ever be traded, whatever the panel says.
+##
 ## The engine's API is published on 127.0.0.1 only: Crow's MCP server and panel run on
 ## the host and reach it there. Keep this ports entry loopback.
 ##
-## Each service gets its own environment anchor. The engine currently takes none of the
-## account credentials: this release is dry-run only and reads none, so the exchange
-## credentials are not passed in this release and are added again in the live phase (P2).
-## The watchdog carries the configuration values it reads and nothing else, and it runs
-## with no network at all: switching the network namespace off leaves it with the shared
-## data volume, which is the only thing its cancel path touches.
+## Each service gets its own environment anchor. The engine takes no exchange credential
+## from the environment: the gateway pushes the account's credentials at runtime, and the
+## engine reads its install token from /run/secrets/install_token, a read-only bind mount
+## of <CROW_HOME>/coinbase/install that only the engine gets. The watchdog carries
+## the configuration values it reads and nothing else, and it runs with no network at all:
+## switching the network namespace off leaves it with the shared data volume, which is the
+## only thing its cancel path touches.
 
 x-coinbase-env: &env
-  # The exchange credentials are not passed in this release and are added again in the
-  # live phase (P2): every order here is simulated and no credential is read.
-  CROW_COINBASE_PORTFOLIO_ID: ${CROW_COINBASE_PORTFOLIO_ID:-}
+  # No exchange credential is in the environment: the gateway pushes it at runtime, and
+  # the install token is read from /run/secrets/install_token, never from a variable.
   CROW_COINBASE_ENGINE_TOKEN: ${CROW_COINBASE_ENGINE_TOKEN:?CROW_COINBASE_ENGINE_TOKEN is required}
-  CROW_COINBASE_LIVE: ${CROW_COINBASE_LIVE:-false}
+  CROW_COINBASE_LIVE: ${CROW_COINBASE_LIVE:-true}
   CROW_COINBASE_POLL_SECONDS: ${CROW_COINBASE_POLL_SECONDS:-60}
   CROW_COINBASE_MAKER_FEE_PCT: ${CROW_COINBASE_MAKER_FEE_PCT:-0.5}
   CROW_COINBASE_PRODUCTS: ${CROW_COINBASE_PRODUCTS:-BTC-USDC,ETH-USDC,XRP-USDC}
@@ -31,13 +36,17 @@ x-coinbase-env: &env
   CROW_COINBASE_AI_MAX_ORDER_USD: ${CROW_COINBASE_AI_MAX_ORDER_USD:-25}
   CROW_COINBASE_AI_DAILY_NOTIONAL_USD: ${CROW_COINBASE_AI_DAILY_NOTIONAL_USD:-50}
   CROW_COINBASE_AI_ORDERS_PER_HOUR: ${CROW_COINBASE_AI_ORDERS_PER_HOUR:-10}
+  CROW_COINBASE_AI_ORDER_MODE: ${CROW_COINBASE_AI_ORDER_MODE:-approve}
+  CROW_COINBASE_AI_PREVIEW_TTL_S: ${CROW_COINBASE_AI_PREVIEW_TTL_S:-900}
+  CROW_COINBASE_TRAIL_ALERT_DAYS: ${CROW_COINBASE_TRAIL_ALERT_DAYS:-7}
+  CROW_COINBASE_AI_CAPITAL_USD: ${CROW_COINBASE_AI_CAPITAL_USD:-25}
   CROW_COINBASE_WATCHDOG_POLICY: ${CROW_COINBASE_WATCHDOG_POLICY:-leave}
   CROW_COINBASE_DATA_DIR: /data
 
 # The watchdog reads the heartbeat file and the database under /data, so it takes the
 # configuration values and none of the credentials above.
 x-coinbase-watchdog-env: &watchdog_env
-  CROW_COINBASE_LIVE: ${CROW_COINBASE_LIVE:-false}
+  CROW_COINBASE_LIVE: ${CROW_COINBASE_LIVE:-true}
   CROW_COINBASE_POLL_SECONDS: ${CROW_COINBASE_POLL_SECONDS:-60}
   CROW_COINBASE_MAKER_FEE_PCT: ${CROW_COINBASE_MAKER_FEE_PCT:-0.5}
   CROW_COINBASE_PRODUCTS: ${CROW_COINBASE_PRODUCTS:-BTC-USDC,ETH-USDC,XRP-USDC}
@@ -63,6 +72,7 @@ services:
     environment: *env
     volumes:
       - coinbase-data:/data
+      - ${CROW_HOME:?CROW_HOME is required}/coinbase/install:/run/secrets:ro
     init: true
     mem_limit: 512m
     restart: unless-stopped

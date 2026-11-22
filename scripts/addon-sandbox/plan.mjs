@@ -73,8 +73,13 @@ const CROW_DB_KEEP = new Set(["crow.db", "crow.db-wal", "crow.db-shm", "crow.db-
 const PROXY_PORT = 39080;
 /** Where the door token appears inside the wall: bind DATA, never a file in a writable tree. */
 const DOOR_TOKEN_MOUNT = "/run/crow-addon/door-token";
-/** Crow-home entries that are never a bind source, whatever their owner says. */
-const CROW_HOME_SECRET_NAMES = ["secrets", "env", "peer-tokens.json", "identity.json", "android-keystore", ".keystore-env"];
+/**
+ * Crow-home entries that are never a bind source, whatever their owner says.
+ * Each name is joined onto the Crow home, so a nested entry is named with its
+ * folder (`coinbase/install`, a bundle's install token folder) — the rest of
+ * that bundle's own folder stays bindable.
+ */
+const CROW_HOME_SECRET_NAMES = ["secrets", "env", "peer-tokens.json", "identity.json", "android-keystore", ".keystore-env", "coinbase/install"];
 /**
  * Add-on-only secret file names masked in every path-bound tree. A generated
  * `.mcp.json` holds resolved secrets; the bots' plan has its own name set and is

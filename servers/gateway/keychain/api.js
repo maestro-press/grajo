@@ -10,15 +10,13 @@ import { recordCardSecret } from "../../shared/secret-values.js";
 import { Router } from "express";
 import { createDbClient, auditLog } from "../../db.js";
 import { createNotification } from "../../shared/notifications.js";
-import { verifyPassword } from "../dashboard/auth.js";
-import { is2faEnabled, getTotpSecret, verifyTotp } from "../dashboard/totp.js";
-import { createReauthGate } from "./reauth.js";
+import { sharedStepUpGate } from "../dashboard/step-up.js";
 import { isLocalPasswordSessionOn } from "../dashboard/local-session.js";
 import { loadKeychainKey } from "./key.js";
 import { sealExport, openExport, MIN_PASSPHRASE } from "./export.js";
 import {
   listEntries, getEntry, openEntrySecret, consumeFirstView, addManualSecret, deleteEntry,
-  exportableEntries, importEntries, ensureWriteKey,
+  exportableEntries, importEntries, ensureWriteKey, isPanelConnectionSecret,
 } from "./store.js";
 import { vaultwardenStatus, saveToVault } from "./vault-save.js";
 import { recordKeychainExport, recordKeychainImport, exportSnapshot } from "./reminder.js";
@@ -27,27 +25,13 @@ import { invalidateHealthCache } from "../dashboard/panels/nest/health-signals.j
 
 const BASE = "/dashboard/keychain/api";
 
-async function readPasswordHash() {
-  const db = createDbClient();
-  try {
-    const r = await db.execute("SELECT value FROM dashboard_settings WHERE key = 'password_hash'");
-    return r.rows[0]?.value || null;
-  } finally {
-    db.close();
-  }
-}
-
+/**
+ * The gate the keychain routes use when a caller does not inject one: the process-wide step-up
+ * gate, so a code accepted here and one accepted by any other panel are the same grant, and a
+ * replayed code is refused wherever it is replayed.
+ */
 export function defaultReauthGate() {
-  return createReauthGate({
-    is2faEnabled,
-    hasDashboardPassword: async () => !!(await readPasswordHash()),
-    verifyTotpCode: async (code) => verifyTotp(code, await getTotpSecret()),
-    verifyDashboardPassword: async (pw) => {
-      const stored = await readPasswordHash();
-      if (!stored || !pw) return false;
-      try { return await verifyPassword(pw, stored); } catch { return false; }
-    },
-  });
+  return sharedStepUpGate();
 }
 
 const auditDetails = (e) => ({ entry_id: e.id, label: e.label, bundle_id: e.bundle_id || null, env_key: e.env_key || null });
@@ -65,6 +49,8 @@ export function keyCreatedHook({ db, ip, audit = auditLog, notify = createNotifi
 }
 
 const KEY_MISSING = { code: "key_missing", error: "This password was saved under a keychain key that is not on this machine. Import an Export file to recover it, or delete it." };
+/** A project connection's secret of a panel-only service: its own bundle panel reads it, never this page. */
+const ADDON_MANAGED = { code: "addon_managed", error: "This secret is managed by its add-on" };
 
 export function keychainApiRouter({
   openDb = () => createDbClient(),
@@ -162,6 +148,9 @@ export function keychainApiRouter({
     const purpose = req.body?.purpose === "copy" ? "copy" : "reveal";
     const entry = await getEntry(db, Number(req.body?.id));
     if (!entry) return res.status(404).json({ error: "No such password." });
+    // A panel-only connection's secret is read by its own bundle panel: no reveal, no copy, and
+    // nothing audited as one.
+    if (entry.kind === "service" && await isPanelConnectionSecret(db, entry)) return res.status(403).json(ADDON_MANAGED);
     const secret = await openEntrySecret(db, readKey(), entry.id);
     await audit(db, purpose === "copy" ? "keychain_copy" : "keychain_reveal", { ip: req.ip, details: auditDetails(entry) });
     res.json({ secret });
@@ -305,6 +294,8 @@ export function keychainApiRouter({
     if (!email || !masterPassword) return res.status(400).json({ ok: false, reason: "Enter your vault email and master password." });
     const entry = await getEntry(db, Number(req.body?.id));
     if (!entry) return res.status(404).json({ ok: false, reason: "No such password." });
+    // Its own bundle panel owns a panel-only connection's secret: nothing is sent to a vault.
+    if (entry.kind === "service" && await isPanelConnectionSecret(db, entry)) return res.status(403).json(ADDON_MANAGED);
     const secret = await openEntrySecret(db, readKey(), entry.id);
     const out = await vault.save({
       cliPath: st.cliPath, serverUrl: st.serverUrl, email, masterPassword,

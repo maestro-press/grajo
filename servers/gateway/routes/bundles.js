@@ -4860,6 +4860,273 @@ export async function handleAddonWallRequest(req, res, { crowHome = CROW_HOME } 
   return res.json({ ok: out.ok === true, status: typeof out.status === "string" ? out.status : null });
 }
 
+/**
+ * Configure's env save, without a request or a response: everything POST /bundles/api/env
+ * decides and writes for ONE installed add-on. The route below only reads the body, asks
+ * `isLocalOwner(req)`, and sends back what this returns; no other route is involved.
+ *
+ * Every answer the route can give lives here — invalid id 400, not installed 404, env_vars
+ * not an object 400, invalid_env 400 (a bad name and a manifest pattern violation),
+ * folder_needs_owner 403, keychain/env_write 500, the 200 body, and the catch-all 500 — so
+ * the messages cannot drift from the ones the operator already knows.
+ *
+ * @param {string} bundleId
+ * @param {object} envVars   the submitted values; filtered and validated here, never trusted
+ * @param {{owner?: boolean, keychain?: any}} [opts]
+ *   owner:     this request is the owner at this machine's own dashboard (isLocalOwner)
+ *   keychain:  the request's `keychain` block (sanitizeKeychainRequest decides what it may do)
+ * @returns {Promise<{status: number, body: object}>} body = exactly the JSON the route sends
+ */
+export async function saveBundleEnv(bundleId, envVars, { owner = false, keychain } = {}) {
+  try {
+    if (!bundleId || !isValidBundleId(bundleId)) {
+      return { status: 400, body: { error: "Invalid bundle ID" } };
+    }
+
+    const bundleDir = join(BUNDLES_DIR, bundleId);
+    if (!existsSync(bundleDir)) {
+      return { status: 404, body: { error: `Bundle '${bundleId}' is not installed` } };
+    }
+
+    if (!envVars || typeof envVars !== "object") {
+      return { status: 400, body: { error: "env_vars must be an object" } };
+    }
+    // Generated secrets are never operator input — a request cannot rotate a DB
+    // password out from under its database.
+    envVars = stripGeneratedKeys(getInstalledFirstManifest(bundleId), envVars);
+    // Validate BEFORE writing either file, so the bundle .env and the gateway
+    // .env can never hold different copies of the same secret.
+    const badEnv = findInvalidEnv(envVars);
+    if (badEnv) {
+      return { status: 400, body: { code: "invalid_env", key: badEnv.key, error: `Environment variable '${badEnv.key}' ${badEnv.why}` } };
+    }
+    const badPattern = envPatternViolation(getInstalledFirstManifest(bundleId), envVars);
+    if (badPattern) {
+      return { status: 400, body: { code: "invalid_env", key: badPattern.key, error: `Environment variable '${badPattern.key}' ${badPattern.why}` } };
+    }
+
+    // Folders outside Crow's home (follow-up B): only the owner at this machine's own
+    // dashboard sets one; a peer's or a peer sign-in's request that tries is refused.
+    let folderKeys = new Set();
+    try { folderKeys = composeReferencedKeys(readFileSync(join(bundleDir, "docker-compose.yml"), "utf8")); } catch { /* no compose */ }
+    const homeForGrants = process.env.HOME || homedir();
+    const pathishKeys = Object.keys(envVars).filter((k) => folderKeys.has(k) && reachesHostPath(envVars[k]));
+    if (pathishKeys.length && !owner) {
+      return { status: 403, body: { code: "folder_needs_owner", key: pathishKeys[0], error: `Folder settings (${pathishKeys.join(", ")}) are set from this machine's own dashboard, signed in with its password.` } };
+    }
+
+    // One write section under the add-on's own lock (0.6.1): the previous_key read, the MCP
+    // entry, the .env, the folder grants and the keychain save must never interleave with
+    // another save of this add-on (a second Configure, an API-key card, an install).
+    const saved = await withAddonLock(bundleId, async () => {
+      // Read the existing .env. The save is LINE-PRESERVING (C4): only the submitted
+      // keys change; every other line (legacy values, comments) stays byte-for-byte.
+      const envPath = join(bundleDir, ".env");
+      const oldEnvText = existsSync(envPath) ? readFileSync(envPath, "utf8") : "";
+      const existing = parseEnvText(oldEnvText);
+
+      // env_vars[].previous_key (tax's encryption key): a key change that does not fill the
+      // previous-key slot itself keeps the outgoing key there, so returns saved with it stay
+      // readable. The outgoing key is the one the MCP child will start with (its entry, the
+      // gateway env, this .env). The slot always takes the key just replaced: the tax
+      // server moves every return to the current key when it starts, so an older key in
+      // the slot only still matters if it did not start since the last change — the
+      // warning (key names only) says so.
+      const keyWarnings = [];
+      // The `previous_key` slots THIS request made the server fill: those values are the
+      // server's, not the owner's, so they are never recorded as owner-entered.
+      const injectedSlots = [];
+      {
+        // The entry's own copy of the outgoing key may be SEALED (keychainEnv), and the .env
+        // alone is not authoritative: unseal it through the spawn's own paths — the same
+        // paths the child takes. A key that cannot be read contributes nothing here (the
+        // .env and the gateway env are still tried), and a slot that then cannot be filled
+        // is reported by NAME only.
+        const rawEntry = readJsonSafe(MCP_ADDONS_PATH, {})?.[bundleId] || null;
+        let entryEnv = {};
+        let entryUnreadable = false;
+        try {
+          entryEnv = (rawEntry ? hydrateAddonEntry(bundleId, rawEntry, { unsealer: "gateway", ...gatewayKeychainPaths() }) : null)?.env || {};
+        } catch (err) {
+          if (!(err instanceof AddonKeysUnavailableError)) throw err;
+          entryUnreadable = true;
+          console.warn(`[bundles] ${bundleId}: the saved keys could not be read from the keychain (${err.code}); previous-key slots are filled from the .env and the gateway env only`);
+        }
+        for (const v of getInstalledFirstManifest(bundleId)?.env_vars || []) {
+          const prev = v && typeof v.previous_key === "string" ? v.previous_key : null;
+          if (!prev || envVars[v.name] === undefined || envVars[v.name] === "" || envVars[prev] !== undefined) continue;
+          const next = String(envVars[v.name]);
+          const old = entryEnv[v.name] || process.env[v.name] || existing[v.name] || "";
+          if (!old || old === next) {
+            if (!old && entryUnreadable) keyWarnings.push(`${v.name}'s current key could not be read, so it was not kept in ${prev}.`);
+            continue;
+          }
+          const kept = entryEnv[prev] || process.env[prev] || existing[prev] || "";
+          envVars[prev] = old;
+          injectedSlots.push(prev);
+          if (kept && kept !== old && kept !== next) {
+            keyWarnings.push(`${prev} now holds the key you just replaced (it held an older one). Data still on that older key, only if the extension did not restart since the last change, opens only if you enter it in ${prev}.`);
+          }
+        }
+      }
+
+      // Keys whose value this save actually changes (names only, never values).
+      const changedKeys = Object.keys(envVars).filter((k) => {
+        const next = envVars[k];
+        if (next === undefined) return false;
+        return existing[k] === undefined ? String(next) !== "" : String(existing[k]) !== String(next);
+      });
+
+      // The MCP entry FIRST (1.5a). Its write is the one that can refuse on the keychain,
+      // and such a refusal must leave the .env byte-identical. It also means an unwritable
+      // mcp-addons.json now fails the whole save instead of leaving a stale entry beside a
+      // fresh .env: the two are one piece of state.
+      let mcpUpdated = false;
+      try {
+        mcpUpdated = await applyEnvToMcpAddons(bundleId, envVars, MCP_ADDONS_PATH, getInstalledFirstManifest(bundleId), {
+          edited: owner ? changedKeys : [],
+          injected: injectedSlots,
+          owner,
+        });
+      } catch (err) {
+        if (!isAddonKeychainSaveFailure(err)) throw err;
+        console.warn(`[bundles] ${bundleId}: the keychain would not take this save (${err?.code || err?.name || "error"}); nothing was written`);
+        return { keychainFailed: true };
+      }
+
+      // Then the .env. A failed write after a successful seal is NOT rolled back (review
+      // round 2, item 2 — accepted): the keychain and the entry hold the new value, the
+      // .env still holds the old one, and the answer is the existing env_write sentence.
+      // The operator's next save (or Restart's catch-up) rewrites the .env.
+      try {
+        Object.assign(existing, envVars); // the effective env after this save
+        writePrivateFile(envPath, updateEnvText(oldEnvText, envVars, { pathKeys: pathEnvKeys(getInstalledFirstManifest(bundleId)) }));
+      } catch (err) {
+        console.warn(`[bundles] ${bundleId}: the .env could not be written (${err?.code || "write"})`);
+        return { envWriteFailed: true };
+      }
+      const folderWarnings = [];
+      if (owner && folderKeys.size) {
+        // The owner typed these folders here: allow them (a default is not a choice). Only
+        // keys this save CHANGES: an unchanged value may have been written by something else
+        // (a hand edit, a CLI install, a container that can write the .env), and the form
+        // sends every filled field. A changed key the owner set to anything else loses its
+        // grant; an unchanged one keeps whatever it had.
+        const changed = new Set(changedKeys);
+        const man = getInstalledFirstManifest(bundleId);
+        let composeTextG = "";
+        try { composeTextG = readFileSync(join(bundleDir, "docker-compose.yml"), "utf8"); } catch { /* none */ }
+        let exampleEnv = {};
+        try { exampleEnv = parseEnvText(readFileSync(join(bundleDir, ".env.example"), "utf8")); } catch { /* none */ }
+        // The form prefills (and sends) the manifest default: a default or an example is never
+        // taken as the owner's choice, here as at install.
+        try { migrateGrants({ crowHome: CROW_HOME, dataDirs: dataDirsForGrants(), home: homeForGrants }); } catch { /* best-effort */ }
+        const refused = {};
+        const submittedChanged = Object.fromEntries(Object.entries(envVars).filter(([k]) => changed.has(k)));
+        const g = grantCandidates({ manifest: man, submitted: submittedChanged, composeText: composeTextG, exampleEnv, crowHome: CROW_HOME, dataDirs: dataDirsForGrants(), home: homeForGrants, appRoot: APP_ROOT, otherRoots: otherBundlesRoots(bundleId, { crowHome: CROW_HOME, home: homeForGrants }), refused });
+        await dropSharedFolderConflicts(bundleId, g, refused);
+        recordGrants(CROW_HOME, bundleId, g);
+        dropGrants(CROW_HOME, bundleId, [...changed].filter((k) => folderKeys.has(k) && !g[k]));
+        // Say why a folder this save names is still not allowed (Start would refuse it).
+        let ungranted = [];
+        try { ungranted = ungrantedFolderKeys(bundleId, { crowHome: CROW_HOME, dataDirs: dataDirsForGrants(), home: homeForGrants, bundleDir, appRoot: APP_ROOT }); } catch { /* none */ }
+        for (const k of ungranted) {
+          if (envVars[k] === undefined) continue;
+          const why = refused[k] || (changed.has(k)
+            ? "it can't be allowed"
+            : "it did not change in this save, and a folder is allowed only when you type it here (retype it, for example with a trailing /)");
+          folderWarnings.push(`${k} was saved, but its folder is not allowed, so the extension will not start with it: ${why}.`);
+        }
+      }
+      keyWarnings.push(...folderWarnings);
+      // The owner check made by the route (local password session, off-box).
+      const keychainReq = sanitizeKeychainRequest(keychain, { localSession: owner });
+      // keychain_configure:false fields (Workspace admin password): setup applied the stored value
+      // once and Configure cannot re-apply a new one, so never overwrite the stored copy here.
+      const noConfigureKc = new Set((getInstalledFirstManifest(bundleId)?.env_vars || []).filter((v) => v && v.keychain_configure === false).map((v) => v.name));
+      keychainReq.save = keychainReq.save.filter((k) => !noConfigureKc.has(k));
+      const kcLog = [];
+      const kc = keychainReq.save.length
+        ? await recordKeychainForInstall({ bundleId: bundleId, manifest: getInstalledFirstManifest(bundleId), env: existing, minted: {}, keychainReq, log: (m) => kcLog.push(m) })
+        : null;
+
+      // And the gateway's own env, exactly as install does for docker bundles:
+      // gateway-side panel routes read their config from process.env (the phone
+      // bundle's PHONE_RUNNER_SECRET), so a value entered here never reached them.
+      // Only keys the manifest declares — never arbitrary request keys.
+      const gatewayUpdated = propagateBundleEnvToGateway(bundleId, envVars);
+      return { mcpUpdated, gatewayUpdated, kc, kcLog, keyWarnings, changedKeys };
+    });
+    if (saved.keychainFailed) {
+      return { status: 500, body: { code: "keychain", error: ADDON_KEYS_SAVE_FAILED } };
+    }
+    if (saved.envWriteFailed) {
+      return { status: 500, body: { code: "env_write", error: API_KEY_SAVE_REFUSALS.env_write } };
+    }
+    const { mcpUpdated, gatewayUpdated, kc, kcLog, keyWarnings, changedKeys } = saved;
+    const needsRestart = mcpUpdated || gatewayUpdated;
+
+    // B4: a running container keeps the env it was created with. When the
+    // compose file consumes a key this save changed (minio's root creds: the
+    // gateway's copy moves, the container's does not), say so and name the
+    // keys; the client offers an explicit Restart (start with recreate:true →
+    // `up -d --force-recreate`). Nothing is restarted implicitly here.
+    let bundleRestartKeys = [];
+    const composePathForEnv = join(bundleDir, "docker-compose.yml");
+    if (changedKeys.length > 0 && existsSync(composePathForEnv)) {
+      try {
+        const consumed = composeConsumedKeys(readFileSync(composePathForEnv, "utf8"));
+        bundleRestartKeys = changedKeys.filter((k) => consumed.all || consumed.keys.has(k));
+      } catch { /* unreadable compose → no claim either way */ }
+    }
+    // Only a RUNNING container holds stale values. A stopped one picks the new
+    // .env up on its next start, and offering "Restart now" there would start
+    // a bundle the operator had stopped. Unknown (ps failed) → assume running:
+    // a needless warning beats a silently stale container.
+    let bundleRunning = false;
+    if (bundleRestartKeys.length > 0) {
+      bundleRunning = await composeServiceRunning(bundleDir);
+    }
+    const needsBundleRestart = bundleRestartKeys.length > 0 && bundleRunning;
+    const appliesOnNextStart = bundleRestartKeys.length > 0 && !bundleRunning;
+
+    // RE-DERIVE config state from the files we just wrote and hand it back: the
+    // client must not decide "configured" itself. submitConfigureOnly guards only
+    // the all-blank case and its `if (inp && inp.value)` accepts whitespace (which
+    // needsConfigKeys trims away), so filling 1 of 12 keys still 200s — a client
+    // that cleared its badge on any 200 would hide a still-unconfigured bundle.
+    // Key NAMES only; never values (D5).
+    let message = needsRestart
+      ? (mcpUpdated
+        ? "Environment variables saved — restart the gateway to apply them to the MCP server"
+        : "Environment variables saved — restart the gateway to apply them")
+      : "Environment variables saved";
+    if (needsBundleRestart) {
+      message += `. Restart the bundle to apply ${bundleRestartKeys.join(", ")} to its container — it keeps its old values until then`;
+    } else if (appliesOnNextStart) {
+      message += `. The bundle is not running; ${bundleRestartKeys.join(", ")} will apply on its next start`;
+    }
+    if (keyWarnings.length) message += `. ${keyWarnings.join(" ")}`;
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        message,
+        ...(keyWarnings.length ? { warnings: keyWarnings } : {}),
+        needs_restart: needsRestart,
+        needs_bundle_restart: needsBundleRestart,
+        applies_on_next_start: appliesOnNextStart,
+        bundle_restart_keys: bundleRestartKeys,
+        needs_config: needsConfigKeys(bundleId),
+        keychain: kc ? { saved: kc.saved, vault: kc.vault, messages: kcLog } : null,
+      },
+    };
+  } catch (err) {
+    console.warn(`[bundles] POST /bundles/api/env failed: ${err?.message || err}`);
+    return { status: 500, body: { error: `Failed to save environment: ${err?.message || err}` } };
+  }
+}
+
 export default function bundlesRouter() {
   // Folder grants (follow-up B): grandfather the folders installed extensions already use,
   // once, before any request.
@@ -6010,249 +6277,12 @@ export default function bundlesRouter() {
     // a rejected handler promise is an unhandled rejection, which the crash
     // guard re-throws and the gateway dies. Every throw becomes a 500 instead.
     try {
-      const { bundle_id } = req.body;
-      let { env_vars } = req.body;
-
-      if (!bundle_id || !isValidBundleId(bundle_id)) {
-        return res.status(400).json({ error: "Invalid bundle ID" });
-      }
-
-      const bundleDir = join(BUNDLES_DIR, bundle_id);
-      if (!existsSync(bundleDir)) {
-        return res.status(404).json({ error: `Bundle '${bundle_id}' is not installed` });
-      }
-
-      if (!env_vars || typeof env_vars !== "object") {
-        return res.status(400).json({ error: "env_vars must be an object" });
-      }
-      // Generated secrets are never operator input — a request cannot rotate a DB
-      // password out from under its database.
-      env_vars = stripGeneratedKeys(getInstalledFirstManifest(bundle_id), env_vars);
-      // Validate BEFORE writing either file, so the bundle .env and the gateway
-      // .env can never hold different copies of the same secret.
-      const badEnv = findInvalidEnv(env_vars);
-      if (badEnv) {
-        return res.status(400).json({ code: "invalid_env", key: badEnv.key, error: `Environment variable '${badEnv.key}' ${badEnv.why}` });
-      }
-      const badPattern = envPatternViolation(getInstalledFirstManifest(bundle_id), env_vars);
-      if (badPattern) {
-        return res.status(400).json({ code: "invalid_env", key: badPattern.key, error: `Environment variable '${badPattern.key}' ${badPattern.why}` });
-      }
-
-      // Folders outside Crow's home (follow-up B): only the owner at this machine's own
-      // dashboard sets one; a peer's or a peer sign-in's request that tries is refused.
-      const owner = await isLocalOwner(req);
-      let folderKeys = new Set();
-      try { folderKeys = composeReferencedKeys(readFileSync(join(bundleDir, "docker-compose.yml"), "utf8")); } catch { /* no compose */ }
-      const homeForGrants = process.env.HOME || homedir();
-      const pathishKeys = Object.keys(env_vars).filter((k) => folderKeys.has(k) && reachesHostPath(env_vars[k]));
-      if (pathishKeys.length && !owner) {
-        return res.status(403).json({ code: "folder_needs_owner", key: pathishKeys[0], error: `Folder settings (${pathishKeys.join(", ")}) are set from this machine's own dashboard, signed in with its password.` });
-      }
-
-      // One write section under the add-on's own lock (0.6.1): the previous_key read, the MCP
-      // entry, the .env, the folder grants and the keychain save must never interleave with
-      // another save of this add-on (a second Configure, an API-key card, an install).
-      const saved = await withAddonLock(bundle_id, async () => {
-        // Read the existing .env. The save is LINE-PRESERVING (C4): only the submitted
-        // keys change; every other line (legacy values, comments) stays byte-for-byte.
-        const envPath = join(bundleDir, ".env");
-        const oldEnvText = existsSync(envPath) ? readFileSync(envPath, "utf8") : "";
-        const existing = parseEnvText(oldEnvText);
-
-        // env_vars[].previous_key (tax's encryption key): a key change that does not fill the
-        // previous-key slot itself keeps the outgoing key there, so returns saved with it stay
-        // readable. The outgoing key is the one the MCP child will start with (its entry, the
-        // gateway env, this .env). The slot always takes the key just replaced: the tax
-        // server moves every return to the current key when it starts, so an older key in
-        // the slot only still matters if it did not start since the last change — the
-        // warning (key names only) says so.
-        const keyWarnings = [];
-        // The `previous_key` slots THIS request made the server fill: those values are the
-        // server's, not the owner's, so they are never recorded as owner-entered.
-        const injectedSlots = [];
-        {
-          // The entry's own copy of the outgoing key may be SEALED (keychainEnv), and the .env
-          // alone is not authoritative: unseal it through the spawn's own paths — the same
-          // paths the child takes. A key that cannot be read contributes nothing here (the
-          // .env and the gateway env are still tried), and a slot that then cannot be filled
-          // is reported by NAME only.
-          const rawEntry = readJsonSafe(MCP_ADDONS_PATH, {})?.[bundle_id] || null;
-          let entryEnv = {};
-          let entryUnreadable = false;
-          try {
-            entryEnv = (rawEntry ? hydrateAddonEntry(bundle_id, rawEntry, { unsealer: "gateway", ...gatewayKeychainPaths() }) : null)?.env || {};
-          } catch (err) {
-            if (!(err instanceof AddonKeysUnavailableError)) throw err;
-            entryUnreadable = true;
-            console.warn(`[bundles] ${bundle_id}: the saved keys could not be read from the keychain (${err.code}); previous-key slots are filled from the .env and the gateway env only`);
-          }
-          for (const v of getInstalledFirstManifest(bundle_id)?.env_vars || []) {
-            const prev = v && typeof v.previous_key === "string" ? v.previous_key : null;
-            if (!prev || env_vars[v.name] === undefined || env_vars[v.name] === "" || env_vars[prev] !== undefined) continue;
-            const next = String(env_vars[v.name]);
-            const old = entryEnv[v.name] || process.env[v.name] || existing[v.name] || "";
-            if (!old || old === next) {
-              if (!old && entryUnreadable) keyWarnings.push(`${v.name}'s current key could not be read, so it was not kept in ${prev}.`);
-              continue;
-            }
-            const kept = entryEnv[prev] || process.env[prev] || existing[prev] || "";
-            env_vars[prev] = old;
-            injectedSlots.push(prev);
-            if (kept && kept !== old && kept !== next) {
-              keyWarnings.push(`${prev} now holds the key you just replaced (it held an older one). Data still on that older key, only if the extension did not restart since the last change, opens only if you enter it in ${prev}.`);
-            }
-          }
-        }
-
-        // Keys whose value this save actually changes (names only, never values).
-        const changedKeys = Object.keys(env_vars).filter((k) => {
-          const next = env_vars[k];
-          if (next === undefined) return false;
-          return existing[k] === undefined ? String(next) !== "" : String(existing[k]) !== String(next);
-        });
-
-        // The MCP entry FIRST (1.5a). Its write is the one that can refuse on the keychain,
-        // and such a refusal must leave the .env byte-identical. It also means an unwritable
-        // mcp-addons.json now fails the whole save instead of leaving a stale entry beside a
-        // fresh .env: the two are one piece of state.
-        let mcpUpdated = false;
-        try {
-          mcpUpdated = await applyEnvToMcpAddons(bundle_id, env_vars, MCP_ADDONS_PATH, getInstalledFirstManifest(bundle_id), {
-            edited: owner ? changedKeys : [],
-            injected: injectedSlots,
-            owner,
-          });
-        } catch (err) {
-          if (!isAddonKeychainSaveFailure(err)) throw err;
-          console.warn(`[bundles] ${bundle_id}: the keychain would not take this save (${err?.code || err?.name || "error"}); nothing was written`);
-          return { keychainFailed: true };
-        }
-
-        // Then the .env. A failed write after a successful seal is NOT rolled back (review
-        // round 2, item 2 — accepted): the keychain and the entry hold the new value, the
-        // .env still holds the old one, and the answer is the existing env_write sentence.
-        // The operator's next save (or Restart's catch-up) rewrites the .env.
-        try {
-          Object.assign(existing, env_vars); // the effective env after this save
-          writePrivateFile(envPath, updateEnvText(oldEnvText, env_vars, { pathKeys: pathEnvKeys(getInstalledFirstManifest(bundle_id)) }));
-        } catch (err) {
-          console.warn(`[bundles] ${bundle_id}: the .env could not be written (${err?.code || "write"})`);
-          return { envWriteFailed: true };
-        }
-        const folderWarnings = [];
-        if (owner && folderKeys.size) {
-          // The owner typed these folders here: allow them (a default is not a choice). Only
-          // keys this save CHANGES: an unchanged value may have been written by something else
-          // (a hand edit, a CLI install, a container that can write the .env), and the form
-          // sends every filled field. A changed key the owner set to anything else loses its
-          // grant; an unchanged one keeps whatever it had.
-          const changed = new Set(changedKeys);
-          const man = getInstalledFirstManifest(bundle_id);
-          let composeTextG = "";
-          try { composeTextG = readFileSync(join(bundleDir, "docker-compose.yml"), "utf8"); } catch { /* none */ }
-          let exampleEnv = {};
-          try { exampleEnv = parseEnvText(readFileSync(join(bundleDir, ".env.example"), "utf8")); } catch { /* none */ }
-          // The form prefills (and sends) the manifest default: a default or an example is never
-          // taken as the owner's choice, here as at install.
-          try { migrateGrants({ crowHome: CROW_HOME, dataDirs: dataDirsForGrants(), home: homeForGrants }); } catch { /* best-effort */ }
-          const refused = {};
-          const submittedChanged = Object.fromEntries(Object.entries(env_vars).filter(([k]) => changed.has(k)));
-          const g = grantCandidates({ manifest: man, submitted: submittedChanged, composeText: composeTextG, exampleEnv, crowHome: CROW_HOME, dataDirs: dataDirsForGrants(), home: homeForGrants, appRoot: APP_ROOT, otherRoots: otherBundlesRoots(bundle_id, { crowHome: CROW_HOME, home: homeForGrants }), refused });
-          await dropSharedFolderConflicts(bundle_id, g, refused);
-          recordGrants(CROW_HOME, bundle_id, g);
-          dropGrants(CROW_HOME, bundle_id, [...changed].filter((k) => folderKeys.has(k) && !g[k]));
-          // Say why a folder this save names is still not allowed (Start would refuse it).
-          let ungranted = [];
-          try { ungranted = ungrantedFolderKeys(bundle_id, { crowHome: CROW_HOME, dataDirs: dataDirsForGrants(), home: homeForGrants, bundleDir, appRoot: APP_ROOT }); } catch { /* none */ }
-          for (const k of ungranted) {
-            if (env_vars[k] === undefined) continue;
-            const why = refused[k] || (changed.has(k)
-              ? "it can't be allowed"
-              : "it did not change in this save, and a folder is allowed only when you type it here (retype it, for example with a trailing /)");
-            folderWarnings.push(`${k} was saved, but its folder is not allowed, so the extension will not start with it: ${why}.`);
-          }
-        }
-        keyWarnings.push(...folderWarnings);
-        // The owner check made at the top of this route (local password session, off-box).
-        const keychainReq = sanitizeKeychainRequest(req.body?.keychain, { localSession: owner });
-        // keychain_configure:false fields (Workspace admin password): setup applied the stored value
-        // once and Configure cannot re-apply a new one, so never overwrite the stored copy here.
-        const noConfigureKc = new Set((getInstalledFirstManifest(bundle_id)?.env_vars || []).filter((v) => v && v.keychain_configure === false).map((v) => v.name));
-        keychainReq.save = keychainReq.save.filter((k) => !noConfigureKc.has(k));
-        const kcLog = [];
-        const kc = keychainReq.save.length
-          ? await recordKeychainForInstall({ bundleId: bundle_id, manifest: getInstalledFirstManifest(bundle_id), env: existing, minted: {}, keychainReq, log: (m) => kcLog.push(m) })
-          : null;
-
-        // And the gateway's own env, exactly as install does for docker bundles:
-        // gateway-side panel routes read their config from process.env (the phone
-        // bundle's PHONE_RUNNER_SECRET), so a value entered here never reached them.
-        // Only keys the manifest declares — never arbitrary request keys.
-        const gatewayUpdated = propagateBundleEnvToGateway(bundle_id, env_vars);
-        return { mcpUpdated, gatewayUpdated, kc, kcLog, keyWarnings, changedKeys };
+      const body = req.body || {};
+      const r = await saveBundleEnv(body.bundle_id, body.env_vars, {
+        owner: await isLocalOwner(req),
+        keychain: body.keychain,
       });
-      if (saved.keychainFailed) {
-        return res.status(500).json({ code: "keychain", error: ADDON_KEYS_SAVE_FAILED });
-      }
-      if (saved.envWriteFailed) {
-        return res.status(500).json({ code: "env_write", error: API_KEY_SAVE_REFUSALS.env_write });
-      }
-      const { mcpUpdated, gatewayUpdated, kc, kcLog, keyWarnings, changedKeys } = saved;
-      const needsRestart = mcpUpdated || gatewayUpdated;
-
-      // B4: a running container keeps the env it was created with. When the
-      // compose file consumes a key this save changed (minio's root creds: the
-      // gateway's copy moves, the container's does not), say so and name the
-      // keys; the client offers an explicit Restart (start with recreate:true →
-      // `up -d --force-recreate`). Nothing is restarted implicitly here.
-      let bundleRestartKeys = [];
-      const composePathForEnv = join(bundleDir, "docker-compose.yml");
-      if (changedKeys.length > 0 && existsSync(composePathForEnv)) {
-        try {
-          const consumed = composeConsumedKeys(readFileSync(composePathForEnv, "utf8"));
-          bundleRestartKeys = changedKeys.filter((k) => consumed.all || consumed.keys.has(k));
-        } catch { /* unreadable compose → no claim either way */ }
-      }
-      // Only a RUNNING container holds stale values. A stopped one picks the new
-      // .env up on its next start, and offering "Restart now" there would start
-      // a bundle the operator had stopped. Unknown (ps failed) → assume running:
-      // a needless warning beats a silently stale container.
-      let bundleRunning = false;
-      if (bundleRestartKeys.length > 0) {
-        bundleRunning = await composeServiceRunning(bundleDir);
-      }
-      const needsBundleRestart = bundleRestartKeys.length > 0 && bundleRunning;
-      const appliesOnNextStart = bundleRestartKeys.length > 0 && !bundleRunning;
-
-      // RE-DERIVE config state from the files we just wrote and hand it back: the
-      // client must not decide "configured" itself. submitConfigureOnly guards only
-      // the all-blank case and its `if (inp && inp.value)` accepts whitespace (which
-      // needsConfigKeys trims away), so filling 1 of 12 keys still 200s — a client
-      // that cleared its badge on any 200 would hide a still-unconfigured bundle.
-      // Key NAMES only; never values (D5).
-      let message = needsRestart
-        ? (mcpUpdated
-          ? "Environment variables saved — restart the gateway to apply them to the MCP server"
-          : "Environment variables saved — restart the gateway to apply them")
-        : "Environment variables saved";
-      if (needsBundleRestart) {
-        message += `. Restart the bundle to apply ${bundleRestartKeys.join(", ")} to its container — it keeps its old values until then`;
-      } else if (appliesOnNextStart) {
-        message += `. The bundle is not running; ${bundleRestartKeys.join(", ")} will apply on its next start`;
-      }
-      if (keyWarnings.length) message += `. ${keyWarnings.join(" ")}`;
-      res.json({
-        ok: true,
-        message,
-        ...(keyWarnings.length ? { warnings: keyWarnings } : {}),
-        needs_restart: needsRestart,
-        needs_bundle_restart: needsBundleRestart,
-        applies_on_next_start: appliesOnNextStart,
-        bundle_restart_keys: bundleRestartKeys,
-        needs_config: needsConfigKeys(bundle_id),
-        keychain: kc ? { saved: kc.saved, vault: kc.vault, messages: kcLog } : null,
-      });
+      res.status(r.status).json(r.body);
     } catch (err) {
       console.warn(`[bundles] POST /bundles/api/env failed: ${err?.message || err}`);
       if (!res.headersSent) res.status(500).json({ error: `Failed to save environment: ${err?.message || err}` });

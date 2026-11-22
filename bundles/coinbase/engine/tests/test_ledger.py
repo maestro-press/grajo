@@ -36,7 +36,8 @@ def make_bot(store, bot_id="b1", product=XRP, quote="100", base="0"):
 
 def place(store, cid, owner, side, price, size, product=XRP, level=0, status=OPEN):
     store.insert_order(
-        cid, owner, "grid", product, side, level, D(price), D(size), status=status
+        cid, owner, "grid", product, side, level, D(price), D(size), status=status,
+        book="dry",
     )
 
 

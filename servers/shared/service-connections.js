@@ -13,12 +13,17 @@
  * status (connectionDisplayStatus) adds not_tested and folds in "is the bundle installed".
  */
 import { randomUUID } from "node:crypto";
-import { serviceById, cleanLabel, labelSlug, blockNameFor } from "./service-catalog.js";
+import { serviceById, cleanLabel, labelSlug, blockNameFor, isPanelService } from "./service-catalog.js";
 import { appendAudit } from "./project-acl.js";
+import { recordServiceSecretValues } from "./secret-values.js";
+import {
+  connectionBindingOk, recordConnectionBinding, verifyConnectionFingerprints,
+} from "./service-sensitivity.js";
 import {
   saveServiceSecret as defaultSaveServiceSecret,
   deleteServiceSecrets as defaultDeleteServiceSecrets,
   disconnectServiceSecrets as defaultDisconnectServiceSecrets,
+  serviceSecretsFor,
   KeychainKeyMissingError,
 } from "../gateway/keychain/store.js";
 
@@ -59,7 +64,8 @@ export function notConnectedResult(serviceId, slug) {
 export const CONNECTION_ERROR_CLASSES = Object.freeze(new Set([
   "unreachable", "auth_failed", "timeout", "bad_address", "redirect", "unexpected_response",
   "forbidden_target", "not_found", "not_a_vault", "label_taken", "missing_field", "bad_value",
-  "not_installed", "unknown_service", "unknown_project", "child_unavailable", "busy",
+  "not_installed", "unknown_service", "unknown_project", "child_unavailable", "busy", "panel_only",
+  "fingerprint_mismatch",
 ]));
 
 export class ConnectionError extends Error {
@@ -92,9 +98,25 @@ function iso(v) {
   return d.toISOString();
 }
 
-/** Task 9's field rule, enforced here too (the store is the only writer): trimmed, ≤ 4096 chars, no control characters. */
-function cleanValue(v) {
+/**
+ * Task 9's field rule, enforced here too (the store is the only writer): trimmed, ≤ 4096 chars, no
+ * control characters. `multiline` (a panel-only service's secrets) additionally allows "\n" inside
+ * the value — a PEM key is a panel secret — after normalising CRLF to LF; every other control
+ * character (a lone "\r", NUL, a tab) is still refused, and the cap still counts the whole value.
+ */
+function cleanValue(v, { multiline = false } = {}) {
   if (typeof v !== "string") throw new ConnectionError("bad_value");
+  // A panel secret may span lines: CRLF is normalised to LF first, and every control character
+  // other than the LF inside it (a lone CR, NUL, a tab) is still refused — before trimming, so a
+  // lone CR is caught even at an end.
+  if (multiline) {
+    const norm = v.replace(/\r\n/g, "\n");
+    if (CONTROL_RE.test(norm.replace(/\n/g, ""))) throw new ConnectionError("bad_value");
+    const text = norm.trim();
+    if (text === "") throw new ConnectionError("missing_field");
+    if (text.length > VALUE_MAX) throw new ConnectionError("bad_value");
+    return text;
+  }
   const t = v.trim();
   if (t === "") throw new ConnectionError("missing_field");
   if (t.length > VALUE_MAX || CONTROL_RE.test(t)) throw new ConnectionError("bad_value");
@@ -260,6 +282,8 @@ export async function createConnection(
 ) {
   const service = typeof serviceId === "string" && serviceId ? serviceById(serviceId, _registryForTest ? { registry: _registryForTest } : undefined) : null;
   if (!service || service.crowWide) throw new ConnectionError("unknown_service");
+  // A panel-only service is connected by its own bundle panel (createPanelConnection), never here.
+  if (isPanelService(service)) throw new ConnectionError("panel_only");
   // Local user only (spec §6.6): nothing creates a contact-owned row yet.
   if (ownerContactId != null) throw new ConnectionError("bad_value");
   if (!AUDIT_ACTORS.has(actor)) throw new ConnectionError("bad_value");
@@ -314,6 +338,177 @@ export async function createConnection(
     payload: keySource === "saved" ? { service_id: service.id, key_source: "saved" } : { service_id: service.id },
   });
   return getConnection(db, uuid);
+}
+
+/**
+ * Creates a connection to a panel-only service (connect.method "panel"). Such a service is
+ * connected inside its own bundle panel, never by the generic Connect screen, and Crow never
+ * starts a child for it: its secrets are sealed once, for this connection (kind 'service', one
+ * row per declared `panel_secrets` name), and the panel reads them with panelSecretsFor.
+ *
+ * The flow is createConnection's — insert as 'error', save the secrets, flip to 'active', undo on
+ * any failure, one service.connect audit row that names the service only — with the panel rules:
+ * `secrets` carries exactly the service's declared names (an undeclared key is bad_value, a
+ * missing declared one missing_field), `config` must be empty (a panel connection stores no
+ * config text), and a service that is not a panel service is unknown_service. A value may span
+ * lines (a PEM key); every other control character is refused, as ever.
+ *
+ * After the row goes active it records the owner's BINDING and the two fingerprints, over the
+ * declared panel_secrets (service-sensitivity.js injectedFieldValues); a binding that cannot be
+ * written undoes the connection (secrets, then row) and throws, exactly as the connect route does.
+ * Each value's hash is recorded for masking BEFORE the first save (the route's order: a save that
+ * fails part way still leaves nothing unmasked), and the gateway's in-memory mask is refreshed
+ * after the row is active.
+ *
+ * Test seams (tests only): `saveServiceSecret`, `deleteServiceSecrets`, `_registryForTest`,
+ * `recordSecrets`, `refreshMasking`, `recordBinding`.
+ * @returns {Promise<Connection>} never a secret
+ */
+export async function createPanelConnection(
+  db,
+  { projectId, serviceId, accountLabel, config = {}, secrets = {} } = {},
+  {
+    key, actor = "local", reservedNames = new Set(),
+    saveServiceSecret = defaultSaveServiceSecret, deleteServiceSecrets = defaultDeleteServiceSecrets, _registryForTest,
+    crowHome, recordSecrets, refreshMasking, recordBinding = recordConnectionBinding,
+  } = {},
+) {
+  const service = typeof serviceId === "string" && serviceId ? serviceById(serviceId, _registryForTest ? { registry: _registryForTest } : undefined) : null;
+  if (!service || service.crowWide || !isPanelService(service)) throw new ConnectionError("unknown_service");
+  if (!AUDIT_ACTORS.has(actor)) throw new ConnectionError("bad_value");
+  await requireLiveProject(db, projectId);
+  const label = requireLabel(accountLabel);
+  if (config != null && (typeof config !== "object" || Array.isArray(config) || Object.keys(config).length > 0)) {
+    throw new ConnectionError("bad_value");
+  }
+  if (secrets == null) secrets = {};
+  if (typeof secrets !== "object" || Array.isArray(secrets)) throw new ConnectionError("bad_value");
+  const declared = Array.isArray(service.panelSecrets) ? service.panelSecrets : [];
+  for (const k of Object.keys(secrets)) {
+    if (!declared.includes(k)) throw new ConnectionError("bad_value");
+  }
+  const values = {};
+  for (const name of declared) {
+    if (!Object.hasOwn(secrets, name)) throw new ConnectionError("missing_field");
+    values[name] = cleanValue(secrets[name], { multiline: true });
+  }
+  const secretEntries = Object.entries(values);
+  if (secretEntries.length > 0 && (!key || typeof key.id !== "string" || !Buffer.isBuffer(key.seed))) {
+    throw new KeychainKeyMissingError();
+  }
+  await checkLabelFree(db, { projectId, serviceId: service.id, accountLabel: label, reservedNames });
+
+  const uuid = randomUUID();
+  try {
+    await db.execute({
+      sql: `INSERT INTO service_connections
+              (uuid, project_id, owner_contact_id, service_id, bundle_id, method, account_label, label_slug,
+               config, status, source_connection_id, last_error)
+            VALUES (?, ?, NULL, ?, ?, ?, ?, ?, NULL, 'error', NULL, 'child_unavailable')`,
+      args: [uuid, projectId, service.id, service.bundleId, service.method, label, labelSlug(label)],
+    });
+  } catch (err) {
+    if (isSlugConflict(err)) throw new ConnectionError("label_taken");
+    throw err;
+  }
+
+  const maskEnv = crowHome ? { ...process.env, CROW_HOME: crowHome } : process.env;
+  if (secretEntries.length > 0) {
+    // Masked from here on, even if the save below fails part way; disconnect never removes it.
+    try {
+      const record = recordSecrets || ((list) => recordServiceSecretValues(list, maskEnv));
+      record(secretEntries.map(([, secret]) => secret));
+    } catch { console.warn("[services] masking record not written"); }
+  }
+
+  let conn;
+  try {
+    for (const [envKey, secret] of secretEntries) {
+      await saveServiceSecret(db, key, {
+        connectionUuid: uuid,
+        bundleId: service.bundleId,
+        envKey,
+        label: `${service.name} — ${label} — ${envKey}`,
+        secret,
+      });
+    }
+    await db.execute({
+      sql: `UPDATE service_connections SET status = 'active', last_error = NULL, updated_at = datetime('now')
+            WHERE uuid = ?`,
+      args: [uuid],
+    });
+    conn = await getConnection(db, uuid);
+  } catch (err) {
+    await undoCreate(db, uuid, deleteServiceSecrets);
+    throw err;
+  }
+
+  // The owner's binding and both fingerprints, over the panel_secrets just sealed. A panel row is
+  // bound like any other, which is what lets the bot-facing refusals tell a panel service apart by
+  // rule rather than by an absent binding. If it cannot be written the connect did not happen.
+  try {
+    await recordBinding(conn, { crowHome, service, values: { config: {}, secrets: values } });
+  } catch {
+    console.error("[services] connection binding not written");
+    try { await rollbackNewConnection(db, uuid, { deleteServiceSecrets }); } catch { console.error("[services] connect rollback failed"); }
+    throw new Error("connection binding not written");
+  }
+
+  await appendAudit(db, {
+    project_id: projectId, actor_type: actor, action: "service.connect", target: uuid, payload: { service_id: service.id },
+  });
+  // This gateway's card and log masks change now, not at the next spawn.
+  try {
+    await (refreshMasking || (() => refreshGatewayMasking(maskEnv)))();
+  } catch { console.warn("[services] masking refresh failed"); }
+  return conn;
+}
+
+/**
+ * Re-collect this process's secret-value sets (secret-values-collect.js). Loaded here rather than
+ * imported, so no importer of this module pays for better-sqlite3 unless a panel connect runs.
+ */
+async function refreshGatewayMasking(env) {
+  const mod = await import("./secret-values-collect.js");
+  mod.refreshGatewaySecretValues({ env });
+}
+
+/**
+ * A panel-only connection's secrets, for its OWN bundle panel and nothing else: {NAME: plaintext}
+ * for every declared panel_secrets name, or a refusal (ConnectionError "fingerprint_mismatch",
+ * which never carries a value). It reads the connection row itself, by uuid (never a caller's copy
+ * of it), and answers only when ALL of these hold: the row exists, its service is a panel service,
+ * the row is bound to it (connectionBindingOk), the row is active, every declared name has a
+ * non-empty sealed value, and those values still match the fingerprints recorded at connect
+ * (verifyConnectionFingerprints) — a copied or rewritten sealed blob is refused, as is a uuid no
+ * row has. A keychain key that is missing on this machine stays KeychainKeyMissingError: the fault
+ * is the key, not the connection.
+ * @param {object} db
+ * @param {object} key the keychain key
+ * @param {string} connectionUuid the connection row's uuid
+ * @param {{crowHome?: string}} [opts]
+ * @returns {Promise<Object<string,string>>}
+ */
+export async function panelSecretsFor(db, key, connectionUuid, { crowHome } = {}) {
+  const mismatch = () => new ConnectionError("fingerprint_mismatch");
+  const conn = await getConnection(db, connectionUuid);
+  if (!conn) throw mismatch();
+  const service = typeof conn.serviceId === "string" ? serviceById(conn.serviceId) : null;
+  if (!service || !isPanelService(service)) throw mismatch();
+  const declared = Array.isArray(service.panelSecrets) ? service.panelSecrets : [];
+  if (declared.length === 0) throw mismatch();
+  if (conn.status !== "active") throw mismatch();
+  if (!connectionBindingOk(conn, { crowHome })) throw mismatch();
+  let secrets;
+  try {
+    secrets = await serviceSecretsFor(db, key, conn.uuid, { allowedKeys: declared });
+  } catch (err) {
+    if (err?.code === "KEYCHAIN_KEY_MISSING") throw err;
+    throw mismatch();
+  }
+  if (declared.some((name) => typeof secrets?.[name] !== "string" || secrets[name] === "")) throw mismatch();
+  if (!verifyConnectionFingerprints(conn, service, { config: {}, secrets }, { crowHome })) throw mismatch();
+  return secrets;
 }
 
 // Best-effort, silent: only a row that never went active is removed, secrets first.
@@ -499,9 +694,13 @@ export async function disconnectConnection(db, uuid, { actor = "local", disconne
  */
 export async function disconnectProjectConnections(db, projectId, { actor = "local" } = {}) {
   if (!AUDIT_ACTORS.has(actor)) throw new ConnectionError("bad_value");
-  const { rows } = await db.execute({ sql: "SELECT uuid, status FROM service_connections WHERE project_id = ? ORDER BY id", args: [projectId] });
+  const { rows } = await db.execute({ sql: "SELECT uuid, service_id, status FROM service_connections WHERE project_id = ? ORDER BY id", args: [projectId] });
   let disconnected = 0;
   for (const r of rows) {
+    // A panel-only connection is its own bundle panel's to disconnect: it is left active, and it
+    // is not counted.
+    const service = serviceById(r.service_id);
+    if (service && isPanelService(service)) continue;
     await disconnectConnection(db, r.uuid, { actor });
     if (r.status !== "disconnected") disconnected++;
   }

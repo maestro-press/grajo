@@ -48,6 +48,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { resolveCrowHome } from "./crow-home.js";
 import { anchoredPath, readSecretValuesFile, writeSecretValuesFile } from "./secret-values.js";
+import { isPanelService } from "./service-catalog.js";
 
 const S = (isDefault, locked) => Object.freeze({ default: isDefault, locked });
 
@@ -59,6 +60,9 @@ const S = (isDefault, locked) => Object.freeze({ default: isDefault, locked });
  */
 export const SERVICE_SENSITIVITY = Object.freeze({
   obsidian: S(true, true),
+  // The Trading panel's own service: its sealed key opens the live trading account, so it is
+  // private and locked like obsidian — never readable by a bot, never turnable-off.
+  coinbase: S(true, true),
   notion: S(true, false),
   discord: S(true, false),
   github: S(false, false),
@@ -163,10 +167,20 @@ function fingerprintKey(crowHome, { create = false } = {}) {
 /**
  * The field values a child gets, the way children.js connectionChildEnv builds them (a field's
  * secret value wins over a config value of the same name), split by the field's kind.
+ *
+ * A panel-only service declares no fields: its values are its `panel_secrets`, so those names are
+ * the fingerprint's secret part (none of them has a plain counterpart). Without this a panel
+ * connection's fingerprint would hash nothing at all.
  */
 export function injectedFieldValues(service, { config = {}, secrets = {} } = {}) {
   const secret = {};
   const plain = {};
+  if (isPanelService(service)) {
+    for (const n of Array.isArray(service.panelSecrets) ? service.panelSecrets : []) {
+      secret[n] = typeof secrets?.[n] === "string" ? secrets[n] : null;
+    }
+    return { secret, plain };
+  }
   for (const f of service?.fields || []) {
     const n = f.name;
     const v = typeof secrets?.[n] === "string" ? secrets[n] : typeof config?.[n] === "string" ? config[n] : null;

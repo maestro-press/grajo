@@ -111,8 +111,11 @@ class FakeExchange:
     evidence about an order and the tests need to model both cases.  `fail_get`
     names the ids whose `get_order` raises TransientError (an error for an
     unknown id is PermanentError 404, like the adapter's).  `fail_list` makes the
-    whole list call raise.  There is deliberately no place/cancel/deposit
-    method: reconcile may not write to the exchange, so a call would raise.
+    whole list call raise.  The per-order reads accept the optional product a
+    routed call passes as its second argument and record it in `get_products` /
+    `fill_products`, parallel to `get_calls` / `fill_calls`.  There is
+    deliberately no place/cancel/deposit method: reconcile may not write to the
+    exchange, so a call would raise.
     """
 
     def __init__(self, orders=(), fills_by_order=None, *, fail_get=(), fail_list=False,
@@ -126,8 +129,10 @@ class FakeExchange:
         self.hidden = set(hidden)
         self.list_calls = []
         self.get_calls = []
+        self.get_products = []
         self.find_calls = []
         self.fill_calls = []
+        self.fill_products = []
 
     def list_open_orders(self, product=None):
         self.list_calls.append(product)
@@ -139,8 +144,9 @@ class FakeExchange:
             if order["status"] == "OPEN" and order_id not in self.hidden
         ]
 
-    def get_order(self, order_id):
+    def get_order(self, order_id, product=None):
         self.get_calls.append(order_id)
+        self.get_products.append(product)
         if order_id in self.fail_get:
             raise TransientError(f"get_order {order_id}: 429 too many requests")
         order = self.orders.get(order_id)
@@ -155,23 +161,29 @@ class FakeExchange:
                 return dict(order)
         return None
 
-    def fills(self, order_id):
+    def fills(self, order_id, product=None):
         self.fill_calls.append(order_id)
+        self.fill_products.append(product)
         return [dict(f) for f in self.fills_by_order.get(order_id, [])]
 
 
 class FakeGateway:
-    """The kill path, recorded.  `halted` is settable, `boom` makes it raise."""
+    """The kill path, recorded.  `halted` is the global flag, `boom` makes it raise.
+
+    `is_halted` takes the book the reconcile's cycle is about, because reconcile
+    asks about that book's own halt as well as the global one; this fake has the
+    one flag, so a book halt is the same answer for every book.
+    """
 
     def __init__(self, *, halted=False, boom=None):
         self.halted = halted
         self.boom = boom
         self.calls = []
 
-    def is_halted(self):
+    def is_halted(self, book=None):
         return self.halted
 
-    def cancel_all(self, scope, owner=None):
+    def cancel_all(self, scope, owner=None, *, book=None):
         self.calls.append((scope, owner))
         if self.boom is not None:
             raise self.boom
@@ -214,6 +226,7 @@ def seed(
         D(size),
         status=status,
         order_id=order_id,
+        book="dry",
     )
     return cid
 
@@ -226,6 +239,7 @@ def sync(store, exchange, trades_csv, *, now=None, gateway=None):
         time.time() if now is None else now,
         gateway=gateway,
         trades_csv=trades_csv,
+        book="dry",
     )
 
 
@@ -421,6 +435,58 @@ def test_open_row_missing_from_list_settled_via_get_order(store, trades_csv):
     ]
 
 
+def test_reconcile_passes_row_product_to_get_order_and_fills(store, trades_csv):
+    """Each per-order read carries its own row's product, positionally.
+
+    The router needs the product to pick an adapter, so a per-order read that
+    arrives without one cannot be routed; the row it was made for already knows
+    it.
+    """
+    new_bot(store)
+    resting = seed(store, cid_for("b1", 1), "b1", status=OPEN, order_id="ex-a")
+    done = seed(
+        store,
+        cid_for("b1", 2),
+        "b1",
+        status=OPEN,
+        order_id="ex-b",
+        product="BTC-USDC",
+    )
+    exchange = FakeExchange(
+        [
+            snap("ex-a", resting, size="10"),  # the XRP-USDC row, left resting
+            snap(
+                "ex-b",
+                done,
+                product="BTC-USDC",
+                status="FILLED",
+                size="0.01",
+                filled_size="0.01",
+                filled_value="600",
+                total_fees="0",
+            ),
+        ],
+        fills_by_order={
+            "ex-b": [
+                trade_fill(
+                    "t-b", "ex-b", product="BTC-USDC", size="0.01", price="60000"
+                )
+            ]
+        },
+        hidden=["ex-a", "ex-b"],
+    )
+
+    sync(store, exchange, trades_csv)
+
+    assert dict(zip(exchange.get_calls, exchange.get_products)) == {
+        "ex-a": PRODUCT,
+        "ex-b": "BTC-USDC",
+    }
+    assert dict(zip(exchange.fill_calls, exchange.fill_products)) == {
+        "ex-b": "BTC-USDC"
+    }
+
+
 def test_external_cancel_and_orphans(store, trades_csv):
     """A cancel made in the exchange UI wins; a stranger's cb- order is adopted."""
     new_bot(store)
@@ -575,7 +641,7 @@ def test_fill_recorded_once_across_two_reconciles(store, trades_csv, monkeypatch
     # trades.csv row of its own.
     pre_cid = seed(store, cid_for("b1", 2), "b1", status=OPEN, order_id="ex-2")
     pre_fill = trade_fill("t-2", "ex-2", size="10", price="1.0")
-    store.record_fill(pre_fill, pre_cid)
+    store.record_fill(pre_fill, pre_cid, book="dry")
     exchange.orders["ex-2"] = snap(
         "ex-2", pre_cid, status="FILLED", filled_size="10", filled_value="10"
     )
@@ -599,7 +665,7 @@ def test_fill_recorded_once_across_two_reconciles(store, trades_csv, monkeypatch
 
     real_record_fill = store.record_fill
 
-    def broken(fill, cid):
+    def broken(fill, cid, book="dry"):
         raise RuntimeError("database went away after the CSV write")
 
     monkeypatch.setattr(store, "record_fill", broken)
@@ -631,7 +697,7 @@ def test_crash_between_csv_and_database_leaves_one_csv_row(
         hidden=["ex-1"],
     )
 
-    def broken(fill, cid):
+    def broken(fill, cid, book="dry"):
         raise RuntimeError("database went away after the CSV write")
 
     real_record_fill = store.record_fill

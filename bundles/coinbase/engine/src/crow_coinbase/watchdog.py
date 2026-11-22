@@ -41,8 +41,19 @@ answers "stale" as well, writes ONE error event for the episode — later failin
 passes in the same episode log the traceback but write no further event — and is
 retried by the next stale pass, however many have failed before it.
 
-`main` is the process entry point: it answers the refusal code for a live switch
-this build cannot honour, builds the store and the dry-run exchange over the data
+While live trading is allowed — the ceiling on and one of the owner's live
+switches on, read from the store on every pass — the policy does not apply at
+all: this process has no network and no credentials, so a sweep could not reach
+the real account, and pretending to have cancelled anything would be worse than
+saying nothing.  A `cancel` policy therefore degrades to `leave` for such a
+pass, and the alert it raises says what it did not do, in as many words: real
+Coinbase orders were NOT cancelled, and the bots are stopped in the Trading
+panel.  The watchdog keeps running either way (`main` does not refuse a live
+ceiling it can read): a stale engine while live trading is allowed is still
+first a thing the owner has to be told about.
+
+`main` is the process entry point: it answers the refusal code for a live
+ceiling it cannot read, builds the store and the dry-run exchange over the data
 directory, and reads the heartbeat once per poll interval.  A pass that raises is
 logged and the loop carries on, but `FAILURE_STREAK_LIMIT` raising passes in a row
 mean the loop itself is broken rather than one unlucky cycle: one error event for
@@ -61,9 +72,10 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Optional
 
+from .books import Switches
 from .exchange import DryRunExchange, MarketData
 from .limits import WATCHDOG_POLICIES, Limits
-from .runner import ENV_LIVE, LIVE_IN_P1, LIVE_OFF, LIVE_ON
+from .runner import ENV_LIVE, LIVE_OFF, LIVE_ON
 from .store import Store
 
 log = logging.getLogger("crow_coinbase.watchdog")
@@ -91,6 +103,19 @@ HEARTBEAT_NAME = "heartbeat"
 # The policy that acts on the book, as opposed to the one that only alerts.
 CANCEL_POLICY = "cancel"
 
+# The plain sentence a stale alert ends with while live trading is allowed: this
+# process has no network of its own, so the only honest thing it can say about a
+# real account is what it did NOT do, and where the owner has to go instead.
+LIVE_STALE_NOTE = (
+    "Real Coinbase orders were NOT cancelled (the watchdog has no network); "
+    "stop the bots in the Trading panel."
+)
+
+
+# The kind every event this module writes carries, so a reader can pick the
+# watchdog's own rows out of the feed without matching on a message.
+EVENT_KIND = "watchdog"
+
 
 def _positive_number(name: str, value: Any) -> float:
     """*value* as a finite float above zero, or a `ValueError` naming *name*."""
@@ -102,6 +127,23 @@ def _positive_number(name: str, value: Any) -> float:
             f"{name} must be a finite number greater than 0, got {value!r}"
         )
     return number
+
+
+def _record(store: Any, level: str, message: str) -> None:
+    """Write one event of this module's own kind through *store*.
+
+    The kind is handed to `Store.event` beside the level and the message.  A store
+    whose own `event` takes only those two — an older stand-in wrapped around the
+    engine's store, which is how one pass can be driven on its own — is still
+    written to rather than skipped: the event goes out untagged rather than not at
+    all, because an alert is worth more than its tag.  Nothing written here
+    carries a value of a request, a key or a token: a reason, a message and a
+    count.
+    """
+    try:
+        store.event(level, message, kind=EVENT_KIND)
+    except TypeError:
+        store.event(level, message)
 
 
 def cancel_all_cb_orders(exchange: Any, store: Optional[Store] = None) -> int:
@@ -123,7 +165,11 @@ def cancel_all_cb_orders(exchange: Any, store: Optional[Store] = None) -> int:
     if not ids:
         return 0
     if store is not None:
-        store.event("info", f"watchdog cancel requested for {len(ids)} cb- order(s)")
+        _record(
+            store,
+            "info",
+            f"watchdog cancel requested for {len(ids)} cb- order(s)",
+        )
     exchange.cancel(ids)
     return len(ids)
 
@@ -139,6 +185,11 @@ class Watchdog:
     `stale_after_s` seconds without a new heartbeat, and `now` is the clock the
     ages are measured with.
 
+    `env` is the environment the live ceiling is read from, and the owner's two
+    live switches are read from the same `store` on every pass, so whether live
+    trading is allowed is answered as of that pass and not as of construction: a
+    switch turned on after this watchdog started is seen by its next pass.
+
     `started` is the one clock reading the constructor takes: it is the moment the
     cold-start grace is measured from, and the earlier bound of a heartbeat's age.
     """
@@ -151,6 +202,7 @@ class Watchdog:
         policy: str,
         stale_after_s: float = 5 * 60,
         now: Callable[[], float] = time.time,
+        env: Optional[Mapping[str, str]] = None,
     ) -> None:
         if policy not in WATCHDOG_POLICIES:
             raise ValueError(
@@ -164,9 +216,24 @@ class Watchdog:
         self.policy = policy
         self.stale_after_s = _positive_number("stale_after_s", stale_after_s)
         self.now = now
+        self.switches = Switches(store, {} if env is None else env)
         self.started = now()
         # The exchange the sweeps use: built by the first sweep, then reused.
         self._exchange: Any = None
+
+    # ------------------------------------------------ live trading
+    def live_allowed(self) -> bool:
+        """Whether live trading is allowed right now: the ceiling and a switch.
+
+        The ceiling (`CROW_COINBASE_LIVE`) can forbid live whatever the switches
+        say, and every spelling of it this build cannot read is already treated as
+        off.  Above it, the owner's own switches (`live_enabled`,
+        `ai_live_enabled`) are read from the store on every call and are on only
+        when the stored value is exactly the JSON boolean true.
+        """
+        if not self.switches.ceiling:
+            return False
+        return self.switches.live_enabled() or self.switches.ai_live_enabled()
 
     # ------------------------------------------------ the heartbeat
     def stale_reason(self) -> Optional[str]:
@@ -264,6 +331,12 @@ class Watchdog:
         error event is written for it, a later failing pass in the same episode
         logs the traceback without writing another, and every stale pass sweeps
         again regardless.
+
+        While live trading is allowed there is no sweep at all, whatever the
+        policy says: this process cannot reach the real account, so the alert is
+        everything it does, and its message ends with the plain sentence saying
+        that no real order was cancelled and where the bots are stopped instead.
+        The pass answers "stale" and the loop keeps running.
         """
         reason, age = self._inspect()
         if reason is None:
@@ -271,19 +344,22 @@ class Watchdog:
                 self.store.put(KV_EPISODE, None)
             return "ok"
 
+        live = self.live_allowed()
         episode = self._episode()
         if not episode["alerted"]:
             episode["alerted"] = True
             message = f"engine heartbeat stale: {reason}"
+            if live:
+                message = f"{message} {LIVE_STALE_NOTE}"
             # The mark and the alert commit together or not at all: a mark left
             # behind by an alert that could not be written would swallow the one
             # alert this episode owes.
             with self.store.tx():
                 self.store.put(KV_EPISODE, episode)
-                self.store.event(ALERT_LEVEL, message)
+                _record(self.store, ALERT_LEVEL, message)
             log.error(message)
 
-        if self.policy != CANCEL_POLICY:
+        if live or self.policy != CANCEL_POLICY:
             return "stale"
 
         try:
@@ -298,7 +374,7 @@ class Watchdog:
                 # by an event that never landed.
                 with self.store.tx():
                     self.store.put(KV_EPISODE, episode)
-                    self.store.event("error", message)
+                    _record(self.store, "error", message)
             return "stale"
         return "acted" if requested else "stale"
 
@@ -364,7 +440,7 @@ def _give_up(store: Store, failures: int, error: Exception) -> int:
     message = f"watchdog stopping after {failures} failing passes in a row: {error}"
     log.error(message)
     try:
-        store.event("error", message)
+        _record(store, "error", message)
     except Exception as broken:  # noqa: BLE001 - the exit matters, not the record
         log.exception("watchdog could not record the streak: %s", broken)
     return EXIT_FAILED
@@ -380,7 +456,7 @@ def main(
 ) -> int:
     """Run the watchdog: the refusal code, then one pass per poll interval.
 
-    A live switch this build cannot honour answers `EXIT_REFUSED` before any file
+    A live ceiling this build cannot read answers `EXIT_REFUSED` before any file
     is opened, and so does a configuration the limits refuse.  Otherwise the
     store and the exchange factory are built over the data directory, the policy
     and the threshold are taken from `limits` (the threshold is
@@ -397,8 +473,13 @@ def main(
     source = os.environ if env is None else env
 
     switch = str(source.get(ENV_LIVE) or "").strip().lower()
-    if switch in LIVE_ON or switch not in LIVE_OFF:
-        log.error("%s=%r: %s", ENV_LIVE, switch, LIVE_IN_P1)
+    if switch not in LIVE_ON and switch not in LIVE_OFF:
+        log.error(
+            "%s=%r: unrecognised value; live is forbidden when the ceiling "
+            "cannot be read",
+            ENV_LIVE,
+            switch,
+        )
         return EXIT_REFUSED
 
     try:
@@ -419,6 +500,7 @@ def main(
         limits.watchdog_policy,
         stale_after_s=STALE_FACTOR * limits.poll_seconds,
         now=now,
+        env=source,
     )
 
     passes = 0

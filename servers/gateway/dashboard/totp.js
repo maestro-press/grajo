@@ -52,6 +52,50 @@ export async function generateQrDataUri(uri) {
 }
 
 /**
+ * The time-step counter a TOTP code matches, or null when it matches none.
+ *
+ * The counter is the one at `now` plus the step `validate()` reports, over the same
+ * previous/next-period window `verifyTotp` takes for clock skew. A caller that has to remember
+ * which code it already accepted needs the step, not the boolean: two codes can differ and still
+ * sit in one step's window, and the same code can never be valid twice once its step is recorded.
+ *
+ * Total on both arguments, like `verifyTotp`: a missing, empty or non-base32 argument answers
+ * null, never a throw.
+ *
+ * @param {string} token - 6-digit code from authenticator
+ * @param {string} secret - Base32-encoded secret
+ * @returns {number|null}
+ */
+export function verifyTotpStep(token, secret) {
+  if (typeof token !== "string" || token.trim() === "") return null;
+  if (typeof secret !== "string" || secret.trim() === "") return null;
+  let parsedSecret;
+  try {
+    parsedSecret = OTPAuth.Secret.fromBase32(secret);
+  } catch {
+    return null; // not base32 at all
+  }
+  const totp = new OTPAuth.TOTP({
+    issuer: "Crow",
+    label: "Crow's Nest",
+    algorithm: "SHA1",
+    digits: 6,
+    period: 30,
+    secret: parsedSecret,
+  });
+  let delta = null;
+  try {
+    // window: 1 allows previous + next 30-second period (clock skew tolerance)
+    delta = totp.validate({ token, window: 1 });
+  } catch {
+    return null;
+  }
+  if (delta === null || delta === undefined) return null;
+  const stepNow = Math.floor(Date.now() / 1000 / 30);
+  return stepNow + delta;
+}
+
+/**
  * Verify a TOTP code against a secret.
  *
  * Total on both arguments by design. Every caller passes at least one of them
@@ -67,25 +111,7 @@ export async function generateQrDataUri(uri) {
  * @returns {boolean}
  */
 export function verifyTotp(token, secret) {
-  if (typeof token !== "string" || token.trim() === "") return false;
-  if (typeof secret !== "string" || secret.trim() === "") return false;
-  let parsedSecret;
-  try {
-    parsedSecret = OTPAuth.Secret.fromBase32(secret);
-  } catch {
-    return false; // not base32 at all
-  }
-  const totp = new OTPAuth.TOTP({
-    issuer: "Crow",
-    label: "Crow's Nest",
-    algorithm: "SHA1",
-    digits: 6,
-    period: 30,
-    secret: parsedSecret,
-  });
-  // window: 1 allows previous + next 30-second period (clock skew tolerance)
-  const delta = totp.validate({ token, window: 1 });
-  return delta !== null;
+  return verifyTotpStep(token, secret) !== null;
 }
 
 // --- 2FA State (dashboard_settings KV) ---
