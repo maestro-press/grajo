@@ -5798,6 +5798,29 @@ export default function bundlesRouter() {
           }
         } catch { appendLog(job, "Note: could not clear its finish-setup notice"); }
 
+        // Its Fix-it cards about this bundle's own compose file, its bind drift and its
+        // running image are about an app that is gone (motionEye's "settings file has an
+        // update Crow did not apply" stayed pending after it was removed). The boot sweep
+        // in the bind-drift detector answers them on the next gateway start; this answers
+        // them now, so the Extensions page and the Attention sheet are clean as soon as
+        // this job reports. Never fails the uninstall.
+        try {
+          const { resolveCardsForBundle } = await import("../fix-it/detectors/bundle-bind-drift.js");
+          const fixIt = await import("../../shared/fix-it/store.js");
+          const cardsDb = createDbClient();
+          try {
+            // The detector-side helper takes the same store shape the detectors are
+            // handed (fix-it/index.js `boundStore`), bound here to this one client.
+            const cleared = await resolveCardsForBundle({
+              listBySource: (source) => fixIt.listBySource(cardsDb, source),
+              resolveByKey: (source, key) => fixIt.resolveByKey(cardsDb, source, key),
+            }, bundle_id);
+            if (cleared.length > 0) appendLog(job, `Cleared ${cleared.length} Fix-it card(s) about this extension`);
+          } finally {
+            cardsDb?.close();
+          }
+        } catch { appendLog(job, "Note: could not clear its Fix-it cards"); }
+
         let notifDb;
         try {
           notifDb = createDbClient();

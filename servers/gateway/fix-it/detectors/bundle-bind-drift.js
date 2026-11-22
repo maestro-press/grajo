@@ -54,6 +54,7 @@ import { dockerRunner, readInstalled } from "../../bundle-core.js";
 import { readComposeEdited, readComposeImageChange, readComposeNeedsConfig, readComposeState, sha256 } from "../../bundle-compose-state.js";
 import { isSatelliteEntry, BUNDLE_ID_RE } from "../../satellites/installs.js";
 import { ACTION_ID as RESTORE_COMPOSE_ACTION_ID, APPLY_UPDATE_ACTION_ID, LABEL as RESTORE_COMPOSE_LABEL } from "../remedies/restore-bundle-compose.js";
+import { SOURCE as BROWSER_IMAGE_STALE_SOURCE } from "./browser-image-stale.js";
 
 export const SOURCE = "bundle-bind-drift";
 export const COMPOSE_EDITED_SOURCE = "bundle-compose-edited";
@@ -71,6 +72,109 @@ export const DOCKER_INSPECT_TIMEOUT_MS = 20_000;
 
 /** One card key per bundle; a second key for the "the repo is tighter" card. */
 export const dedupKeyFor = (bundleId, kind = "") => (kind ? `bundle:${bundleId}:${kind}` : `bundle:${bundleId}`);
+
+/**
+ * The card sources whose dedup key names ONE bundle id (`bundle:<id>`, and the kinds
+ * `bundle:<id>:repo` / `bundle:<id>:image-stale`): the family an uninstall — or a boot
+ * pass over an id nobody has installed any more — has to answer. Five are this
+ * detector's own; the sixth is the browser add-on's stale-image card, which keys by its
+ * bundle id too and is about the INSTALLED copy's running container.
+ *
+ * The retired-bundle card is deliberately NOT here: it keys `retired:<id>`, not
+ * `bundle:<id>`, and its own detector already answers it the moment the bundle is gone.
+ */
+export const BUNDLE_CARD_SOURCES = Object.freeze([
+  SOURCE,
+  COMPOSE_EDITED_SOURCE,
+  REPO_DRIFT_SOURCE,
+  COMPOSE_NEEDS_CONFIG_SOURCE,
+  COMPOSE_IMAGE_CHANGE_SOURCE,
+  BROWSER_IMAGE_STALE_SOURCE,
+]);
+
+/**
+ * The bundle id a family card's dedup key names, or null when it names none that is a
+ * bundle id (`BUNDLE_ID_RE`) — a key is crow.db data, and an id from it reaches a
+ * `join`: a value that is not a plain bundle id answers nothing.
+ */
+export function bundleIdFromKey(key) {
+  if (typeof key !== "string") return null;
+  const m = /^bundle:([^:]+)(?::[^:]*)?$/.exec(key);
+  return m && BUNDLE_ID_RE.test(m[1]) ? m[1] : null;
+}
+
+/**
+ * Resolve every PENDING card in the family whose bundle id `wants(id)` accepts, and
+ * answer the keys it actually had pending (`[{ source, dedupKey }]`). One row's failed
+ * UPDATE never stops the rest of the pass.
+ */
+async function resolveFamilyCards(store, wants) {
+  const resolved = [];
+  if (typeof store?.listBySource !== "function") return resolved;
+  for (const source of BUNDLE_CARD_SOURCES) {
+    // A store that cannot be read is the caller's to log (nothing here is guessing):
+    // the boot pass isolates it, the uninstall route turns it into one log line.
+    const items = await store.listBySource(source);
+    for (const item of items || []) {
+      if (item?.status && item.status !== "pending") continue;
+      const id = bundleIdFromKey(item?.dedupKey);
+      if (!id || !wants(id)) continue;
+      try {
+        await store.resolveByKey(source, item.dedupKey);
+        resolved.push({ source, dedupKey: item.dedupKey });
+      } catch { /* one row's failure never stops the pass */ }
+    }
+  }
+  return resolved;
+}
+
+/**
+ * Answer every pending card this family holds about ONE bundle. The uninstall route
+ * calls it right after the record is gone (routes/bundles.js), so the Attention sheet
+ * does not keep asking about an app that was just removed. An id that is not a bundle
+ * id answers nothing, and never throws.
+ */
+export async function resolveCardsForBundle(store, bundleId) {
+  if (typeof bundleId !== "string" || !BUNDLE_ID_RE.test(bundleId)) return [];
+  return resolveFamilyCards(store, (id) => id === bundleId);
+}
+
+/**
+ * This instance's installed ids, or null when installed.json cannot be read AT ALL.
+ * `readInstalled()` answers `[]` for both "nothing is installed" and "unreadable JSON",
+ * and the sweep must never take the second for the first — that would resolve every
+ * bundle's cards in one pass. A missing file counts as unreadable here for the same
+ * reason (a home Crow has not written yet says nothing about what is installed).
+ * Satellite entries are installed entries: their ids are taken as they are.
+ */
+function installedIdsOrNull(path) {
+  let raw;
+  try { raw = readFileSync(path, "utf8"); } catch { return null; }
+  let data;
+  try { data = JSON.parse(raw); } catch { return null; }
+  const list = Array.isArray(data)
+    ? data
+    : data && typeof data === "object"
+      ? Object.entries(data).map(([id, v]) => ({ id, ...(v && typeof v === "object" ? v : {}) }))
+      : null;
+  if (!list) return null;
+  return new Set(list.map((rec) => (typeof rec === "string" ? rec : rec?.id)).filter((id) => typeof id === "string"));
+}
+
+/**
+ * Resolve the family's pending cards for every bundle this instance no longer has.
+ * The per-bundle loop in check() only ever visits INSTALLED bundles, so without this an
+ * id that was uninstalled (or removed by hand) is never revisited and its card stays
+ * pending forever. An unreadable installed.json skips the sweep entirely.
+ */
+async function sweepUninstalledCards(store, { installedPath, log }) {
+  const installedIds = installedIdsOrNull(installedPath);
+  if (!installedIds) {
+    log.warn("[fix-it] bundle card sweep skipped: installed.json could not be read (the bundle cards were left as they are)");
+    return [];
+  }
+  return resolveFamilyCards(store, (id) => !installedIds.has(id));
+}
 
 /** The card's title, for the bundle's display name. */
 export function driftTitle(name) {
@@ -280,9 +384,16 @@ export default {
    * once the condition is gone. Never throws into boot (runBootChecks isolates a
    * detector, but a broken docker must not even log per bundle).
    *
+   * Before any of that, one sweep answers the family's pending cards for every bundle
+   * installed.json no longer lists: the loop below only visits INSTALLED bundles, so an
+   * uninstalled id would otherwise keep its card forever (an uninstall answers them
+   * itself too, routes/bundles.js `resolveCardsForBundle`; this is the catch-up for a
+   * card left by an older Crow, a crash, or a bundle removed by hand).
+   *
    * `opts`: { crowHome, bundlesDir, repoBundlesDir, installedPath, runner, log, only } —
    * the last limits the pass to those bundle ids (the Start route passes the one bundle
-   * it just restarted), so answering a card does not re-inspect every other bundle.
+   * it just restarted), so answering a card does not re-inspect — or sweep — every other
+   * bundle.
    */
   async check(store, opts = {}) {
     const crowHome = opts.crowHome || CROW_HOME;
@@ -291,8 +402,17 @@ export default {
     const runner = opts.runner || dockerRunner();
     const log = opts.log || console;
     const only = opts.only ? new Set(Array.isArray(opts.only) ? opts.only : [opts.only]) : null;
-    const installed = readInstalled(opts.installedPath || join(crowHome, "installed.json"));
+    const installedPath = opts.installedPath || join(crowHome, "installed.json");
+    const installed = readInstalled(installedPath);
     const linkRemedy = { actionId: REMEDY_ACTION_ID, kind: "link", label: "Open Extensions" };
+
+    // ── the bundles that are GONE: see the doc comment above. A pass for one bundle
+    //    never sweeps, and the sweep is isolated like every other boot-time decision.
+    let swept = [];
+    if (!only) {
+      try { swept = await sweepUninstalledCards(store, { installedPath, log }); }
+      catch (err) { log.warn(`[fix-it] bundle card sweep skipped: ${err?.message || err}`); }
+    }
 
     let dockerFailed = false;
     const cards = [];
@@ -448,6 +568,6 @@ export default {
     if (dockerFailed) {
       log.warn("[fix-it] bundle bind check skipped: docker is not reachable (the restart-to-apply cards were left as they are)");
     }
-    return { cards };
+    return { cards, swept };
   },
 };
