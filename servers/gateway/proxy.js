@@ -307,6 +307,25 @@ export function reportWallFailure(id, { refused = false, wall = null, transport 
   }
 }
 
+/** The card-clearing side of a walled connect: fix-it's own resolve, on a client of its own. */
+function realResolveWallCard(db, id) {
+  return import("./fix-it/index.js").then((m) => m.resolveAddonWallCard(db, id));
+}
+
+/**
+ * Clear the pending wall card for one add-on that now runs INSIDE its wall,
+ * fire-and-forget: never throws and never blocks a connect. `id` is this proxy's
+ * own connect id (the function's parameter), never a value read from crow.db.
+ */
+export function resolveWallCard(id) {
+  let db = null;
+  try { db = createDbClient(); } catch { return; }
+  Promise.resolve()
+    .then(() => dep("resolveWallCard", realResolveWallCard)(db, id))
+    .catch((err) => console.warn(`  [proxy] addon ${id}: the Fix-it card could not be cleared — ${err?.message || err}`))
+    .finally(() => { try { db.close(); } catch { /* already closed */ } });
+}
+
 /**
  * The environment connectToServer() gives a child. A data backend brings its own
  * allowlisted base env, and a built-in integration gets the add-on base
@@ -805,7 +824,11 @@ export async function connectAddonServer(id, config) {
     }, wall));
 
     // It runs walled now: the failure the owner may still be looking at is over.
-    if (wall && wall.walled) clearWallFailures(id);
+    if (wall && wall.walled) {
+      clearWallFailures(id);
+      // …and so is the Fix-it card it raised: it answers itself.
+      resolveWallCard(id);
+    }
     const connectedAt = Date.now();
 
     // This connection's own entry: a later reconnect replaces the map's entry,

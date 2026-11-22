@@ -134,6 +134,20 @@ export function clearWallFailures(id) {
   dropRecord(ref);
 }
 
+/**
+ * `{ ref, reason }` for the add-on's live record, or null when it has none — the
+ * pair a caller re-emits to reopen that failure's card. The record's ref never
+ * leaves this module except through a read like this one.
+ */
+export function liveWallFailureFor(id) {
+  if (typeof id !== "string" || !id) return null;
+  const ref = liveRef.get(id);
+  if (!ref) return null;
+  const record = records.get(ref);
+  if (!record) return null;
+  return { ref, reason: record.reason };
+}
+
 /** Empty every map (tests, and a simulated restart). */
 export function _resetWallFailuresForTest() {
   records.clear();

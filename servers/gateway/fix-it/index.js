@@ -51,7 +51,7 @@ import removeRetiredBundle, {
   label as removeRetiredLabel,
 } from "./remedies/remove-retired-bundle.js";
 import removeBotSharing, { ACTION_ID as REMOVE_BOT_SHARING_ACTION, label as removeBotSharingLabel } from "./remedies/remove-bot-sharing.js";
-import { wallFailureByItemId } from "../../../scripts/addon-sandbox/failures.mjs";
+import { CARD_DEDUP_PREFIX, liveWallFailureFor, wallFailureByItemId } from "../../../scripts/addon-sandbox/failures.mjs";
 import { returnTargetOf, returnUrl } from "./flash.js";
 import { recordSuppressedRequest } from "./peer-card-counters.js";
 import { CARD_ACTION_IDS } from "./peer-card-policy.js";
@@ -149,6 +149,32 @@ export const LINK_REMEDIES = Object.freeze({
 
 /** A bot id a Bot Builder link may name (the same shape the panel routes accept). */
 const LINK_BOT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+
+/** An add-on id is one lowercase slug (the same shape the wall detector accepts). */
+const ADDON_ID_RE = /^[a-z0-9][a-z0-9-]*$/;
+
+/**
+ * Answer the pending wall card for one add-on that now runs INSIDE its wall. The
+ * proxy calls this after a walled connect, with its own connect id — never a value
+ * read from crow.db — so only the card that id names is resolved, and only from the
+ * add-on wall source. Never throws (it runs off the connect path).
+ *
+ * A record still live AFTER that resolve is necessarily newer than the connect:
+ * the connect cleared the old one synchronously, before the resolve reached here.
+ * Resolving alone would therefore hide the newer failure's card, so it is raised
+ * again — the detector's upsert reopens the same item id, and its binding accepts
+ * the same item for the same record.
+ */
+export async function resolveAddonWallCard(db, id) {
+  if (typeof id !== "string" || !ADDON_ID_RE.test(id)) return;
+  try {
+    await store.resolveByKey(db, ADDON_WALL_SOURCE, CARD_DEDUP_PREFIX + id);
+    const live = liveWallFailureFor(id);
+    if (live) await emitFixIt(db, "addon-wall-failed", { id, reason: live.reason, ref: live.ref });
+  } catch (err) {
+    console.warn(`[fix-it] add-on wall card could not be resolved: ${err?.message || err}`);
+  }
+}
 
 /**
  * A link remedy that needs a PER-BOT destination: the Bot Builder page, with the bot the card is

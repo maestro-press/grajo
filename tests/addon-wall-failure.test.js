@@ -886,3 +886,289 @@ test("Keep it off spends the record: a card set back to pending can no longer un
   if (before === null) assert.equal(after, null);
   else assert.deepEqual(after, before, "addon-walls.json is byte-identical");
 });
+
+// ---- a card clears itself once the add-on runs inside its wall ----
+
+/** A real failure record, its card, and the ref the card answers with. */
+async function seedCard(id) {
+  const reason = "stopped with exit code 7";
+  const ref = failures.recordWallFailure(id, reason);
+  await fixIt.emitFixIt(db, "addon-wall-failed", { id, reason, ref });
+  const card = await waitForCard("addon-wall:" + id);
+  return { card, ref };
+}
+
+/** The proxy deps for a connect that goes all the way inside its wall. */
+function walledDeps(id, env = {}) {
+  return {
+    addonWallMode: () => ({ mode: "walled", reason: null, source: "walled" }),
+    startAddonWall: async () => ({
+      walled: true,
+      tier: "walled",
+      cmd: process.execPath,
+      args: [TINY_SERVER_PATH],
+      env: { ...process.env, ...env },
+      stdioExtra: [],
+      relay: null,
+      profile: { id, network: { internet: false, hosts: [] } },
+      cleanup: () => {},
+    }),
+  };
+}
+
+test("a walled connect after a failure resolves the card and drops the record", async () => {
+  const { card, ref } = await seedCard("steady");
+  assert.equal(failures.wallFailureByRef(ref)?.id, "steady", "the record is live before the connect");
+
+  // A card of ANOTHER source may carry the same dedup key: the connect resolves
+  // its own source only, so this one stays open.
+  await db.execute({
+    sql: `INSERT INTO fix_it_items (source, dedup_key, title, why, severity, remedies, context)
+          VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    args: ["other-source", "addon-wall:steady", "Something else", "not this add-on", "warn", "[]", null],
+  });
+  const { rows } = await db.execute({
+    sql: "SELECT id FROM fix_it_items WHERE source = ? AND dedup_key = ?",
+    args: ["other-source", "addon-wall:steady"],
+  });
+  const otherId = Number(rows[0].id);
+
+  proxy._setProxyDepsForTest(walledDeps("steady"));
+  await proxy.connectAddonServer("steady", { command: "node", args: ["server/index.js"] });
+  assert.equal(proxy.connectedServers.get("steady")?.status, "connected", "the add-on runs inside its wall");
+
+  await waitFor(async () => (await store.getItem(db, card.id))?.status === "resolved", 5000, "the card the connect resolved");
+  assert.equal(failures.wallFailureByRef(ref), null, "the failure record is dropped");
+  assert.equal(failures.wallFailureByItemId(card.id), null, "the card's record is gone");
+  assert.equal((await store.getItem(db, otherId)).status, "pending", "another source's card is untouched");
+
+  await proxy.disconnectAddonServer("steady");
+});
+
+test("an unwalled connect does not resolve the card", async () => {
+  const { card, ref } = await seedCard("steady");
+  // The card-clearing seam is counted: an unwalled connect never reaches it.
+  const calls = [];
+  proxy._setProxyDepsForTest({
+    addonWallMode: () => ({ mode: "walled", reason: null, source: "walled" }),
+    startAddonWall: async () => ({
+      walled: false,
+      tier: "nnp",
+      cmd: process.execPath,
+      args: [TINY_SERVER_PATH],
+      env: { ...process.env },
+      reason: "bubblewrap (bwrap) is not installed",
+    }),
+    resolveWallCard: () => { calls.push(1); },
+  });
+
+  await proxy.connectAddonServer("steady", { command: "node", args: ["server/index.js"] });
+  assert.equal(proxy.connectedServers.get("steady")?.status, "connected", "the add-on runs at the weaker tier");
+  await new Promise((r) => setTimeout(r, 300));
+
+  assert.equal(calls.length, 0, "the card-clear was never called");
+  assert.equal((await store.getItem(db, card.id)).status, "pending", "the card is still open");
+  assert.equal(failures.wallFailureByRef(ref)?.id, "steady", "the record is still live");
+  assert.equal(failures.wallFailureByItemId(card.id)?.id, "steady", "the card still answers with a record");
+
+  await proxy.disconnectAddonServer("steady");
+});
+
+test("a still-failing add-on keeps its card", async () => {
+  // (a) The connect resolves the card, then the child crashes: the card comes back.
+  const { card: first, ref: firstRef } = await seedCard("crashy");
+  proxy._setProxyDepsForTest(walledDeps("crashy", { CRASH_AFTER_LIST: "1" }));
+  await proxy.connectAddonServer("crashy", { command: "node", args: ["server/index.js"] });
+  // The connect answered the card; the crash's card comes back 2 s later.
+  await waitFor(async () => (await store.getItem(db, first.id))?.status === "resolved", 1500, "the connect to resolve the card");
+
+  let card = null;
+  let record = null;
+  await waitFor(async () => {
+    card = (await store.listPending(db)).find((i) => i.dedupKey === "addon-wall:crashy") || null;
+    if (!card) return false;
+    record = failures.wallFailureByItemId(card.id);
+    // The crash's own record: the one the connect dropped is gone.
+    return !!record && /stopped with exit code 7/.test(record.reason) && failures.wallFailureByRef(firstRef) === null;
+  }, 10000, "the card the crash raised again");
+
+  assert.equal(card.id, first.id, "one card for one add-on");
+  assert.equal(proxy.connectedServers.get("crashy")?.status, "error", "the entry says it is not running");
+  await proxy.disconnectAddonServer("crashy");
+
+  // (b) A wall whose child never starts: the card was never resolved, and the
+  // failed connect backs it with a live record.
+  const { card: browserCard } = await seedCard("browser");
+  proxy._setProxyDepsForTest({
+    addonWallMode: () => ({ mode: "walled", reason: null, source: "walled" }),
+    startAddonWall: async () => ({
+      walled: true,
+      tier: "walled",
+      cmd: join(HOME, "no-such-binary"),
+      args: [],
+      env: { ...process.env },
+      stdioExtra: [],
+      relay: null,
+      profile: { id: "browser", network: { internet: false, hosts: [] } },
+      cleanup: () => {},
+    }),
+  });
+
+  await proxy.connectAddonServer("browser", { command: "node", args: ["server/index.js"] });
+  await new Promise((r) => setTimeout(r, 500));
+
+  const pending = (await store.listPending(db)).find((i) => i.dedupKey === "addon-wall:browser");
+  assert.ok(pending, "the card is still open");
+  assert.equal(pending.id, browserCard.id, "the same card");
+  assert.ok(failures.wallFailureByItemId(pending.id), "a live record still backs it");
+
+  await proxy.disconnectAddonServer("browser");
+});
+
+test("a dead-record card offers only Keep it off, in the Nest and in the Attention sheet", async () => {
+  const { card } = await seedCard("browser");
+  failures._resetWallFailuresForTest();
+  const req = { csrfToken: "tok" };
+
+  const nest = await fixIt.renderFixItCards(db, { lang: "en", req });
+  const sheet = await fixIt.renderFixItSheetCards(db, { lang: "en", req });
+  for (const [where, html] of [["the Nest", nest], ["the Attention sheet", sheet]]) {
+    assert.ok(html.includes(remedyMod.KEEP_OFF_LABEL), `${where} offers Keep it off`);
+    assert.equal(html.includes("without the wall"), false, `${where} offers no unwall`);
+  }
+
+  const models = await fixIt.fixItCardModels(db, { lang: "en" });
+  const model = models.find((m) => m.id === card.id);
+  assert.ok(model, "the card is in the model list");
+  assert.deepEqual(model.remedies.map((r) => r.actionId), ["addon-keep-off"], "exactly one remedy, Keep it off");
+
+  // Spanish: the dead card still offers no unwall.
+  const modelsEs = await fixIt.fixItCardModels(db, { lang: "es" });
+  const modelEs = modelsEs.find((m) => m.id === card.id);
+  assert.ok(modelEs, "the card is in the Spanish model list too");
+  assert.deepEqual(modelEs.remedies.map((r) => r.actionId), ["addon-keep-off"]);
+  assert.equal(modelEs.remedies.some((r) => r.actionId === "addon-unwall"), false, "no addon-unwall in Spanish");
+
+  const nestEs = await fixIt.renderFixItCards(db, { lang: "es", req });
+  const sheetEs = await fixIt.renderFixItSheetCards(db, { lang: "es", req });
+  for (const [where, html] of [["the Spanish Nest", nestEs], ["the Spanish Attention sheet", sheetEs]]) {
+    assert.equal(html.includes("addon-unwall"), false, `${where} carries no unwall action`);
+    assert.equal(html.includes(remedyMod.unwallLabel("browser", "es")), false, `${where} shows no unwall button`);
+    assert.match(html, /Mantenerlo apagado/, `${where} keeps "Keep it off" in Spanish`);
+  }
+});
+
+test("a live-record card still offers both", async () => {
+  const { card } = await seedCard("browser");
+
+  const models = await fixIt.fixItCardModels(db, { lang: "en" });
+  const model = models.find((m) => m.id === card.id);
+  assert.ok(model, "the card is in the model list");
+  assert.deepEqual(model.remedies.map((r) => r.actionId), ["addon-unwall", "addon-keep-off"]);
+
+  const req = { csrfToken: "tok" };
+  const nest = await fixIt.renderFixItCards(db, { lang: "en", req });
+  const sheet = await fixIt.renderFixItSheetCards(db, { lang: "en", req });
+  for (const [where, html] of [["the Nest", nest], ["the Attention sheet", sheet]]) {
+    assert.ok(html.includes(remedyMod.unwallLabel("browser")), `${where} offers the unwall built from the record`);
+    assert.ok(html.includes(remedyMod.KEEP_OFF_LABEL), `${where} offers Keep it off`);
+  }
+});
+
+test("a forged or resurrected card gains no unwall from a clean connect", async () => {
+  // A crow.db writer reopens the card the connect answered.
+  const { card, ref } = await seedCard("steady");
+  proxy._setProxyDepsForTest(walledDeps("steady"));
+  await proxy.connectAddonServer("steady", { command: "node", args: ["server/index.js"] });
+  await waitFor(async () => (await store.getItem(db, card.id))?.status === "resolved", 5000, "the card the connect resolved");
+
+  await db.execute({ sql: "UPDATE fix_it_items SET status = 'pending' WHERE id = ?", args: [card.id] });
+  const models = await fixIt.fixItCardModels(db, { lang: "en" });
+  const resurrected = models.find((m) => m.id === card.id);
+  assert.ok(resurrected, "the reopened card is pending again");
+  assert.deepEqual(resurrected.remedies.map((r) => r.actionId), ["addon-keep-off"], "no unwall without a record");
+
+  const reconnected = [];
+  remedyMod._setAddonUnwallDepsForTest({
+    crowHome: HOME,
+    reconnect: async (id) => { reconnected.push(id); return { ok: true, status: "connected" }; },
+  });
+  const before = wallsBytes();
+  assert.match(await clickRemedy(card.id), /flash=fixit_addon_stale/);
+  assert.deepEqual(reconnected, [], "nothing was connected again");
+  const after = wallsBytes();
+  if (before === null) assert.equal(after, null, "no wall file was created");
+  else assert.deepEqual(after, before, "addon-walls.json is byte-identical");
+  assert.equal(failures.wallFailureByRef(ref), null, "the record the connect dropped stays gone");
+
+  await proxy.disconnectAddonServer("steady");
+
+  // A forged card naming a ref no record answers: a clean connect of another
+  // add-on leaves it open, and its remedy is stale.
+  const forgedId = await insertCard("addon-wall:studio", { args: { ref: "0123456789abcdef0123456789abcdef" } });
+  proxy._setProxyDepsForTest(walledDeps("steady"));
+  await proxy.connectAddonServer("steady", { command: "node", args: ["server/index.js"] });
+  assert.equal((await store.getItem(db, forgedId)).status, "pending", "another add-on's card is untouched");
+
+  const beforeForged = wallsBytes();
+  assert.match(await clickRemedy(forgedId), /flash=fixit_addon_stale/);
+  assert.deepEqual(reconnected, [], "the forged card reconnects nothing");
+  const afterForged = wallsBytes();
+  if (beforeForged === null) assert.equal(afterForged, null, "no wall file was created");
+  else assert.deepEqual(afterForged, beforeForged, "addon-walls.json is byte-identical");
+
+  await proxy.disconnectAddonServer("steady");
+});
+
+// ---- a resolve that races a newer failure ----------------------------------
+
+test("a resolve that lands after a newer failure leaves that failure's card open", async () => {
+  const { card } = await seedCard("steady");
+
+  // What a walled connect did here: it cleared this add-on's older record
+  // synchronously, and a NEWER failure (the child it started crashed) landed
+  // while the resolve was still in flight. Resolving alone would hide it.
+  const ref2 = failures.recordWallFailure("steady", "stopped with exit code 7");
+  await fixIt.emitFixIt(db, "addon-wall-failed", { id: "steady", reason: "stopped with exit code 7", ref: ref2 });
+
+  await fixIt.resolveAddonWallCard(db, "steady");
+
+  const reopened = await store.getItem(db, card.id);
+  assert.equal(reopened.status, "pending", "the newer failure's card is open again");
+  assert.equal(failures.wallFailureByItemId(card.id)?.id, "steady", "the card still answers with its record");
+  assert.equal(failures.wallFailureByRef(ref2)?.id, "steady", "the newer record is the live one");
+});
+
+test("resolveAddonWallCard with no live record leaves the card resolved", async () => {
+  const { card } = await seedCard("steady");
+  failures.clearWallFailures("steady");
+
+  await fixIt.resolveAddonWallCard(db, "steady");
+
+  assert.equal((await store.getItem(db, card.id)).status, "resolved", "the card answers itself");
+  assert.equal(failures.wallFailureByItemId(card.id), null, "no record was raised again");
+});
+
+// ---- a card-clear that fails never breaks the connect that asked for it -----
+
+test("a failing card-clear never breaks a walled connect", async () => {
+  for (const [what, resolveWallCard] of [
+    ["a throw", () => { throw new Error("boom"); }],
+    ["a rejected promise", () => Promise.reject(new Error("boom"))],
+  ]) {
+    const { card } = await seedCard("steady");
+    const warns = [];
+    const origWarn = console.warn;
+    try {
+      console.warn = (...args) => { warns.push(args.map(String).join(" ")); };
+      proxy._setProxyDepsForTest({ ...walledDeps("steady"), resolveWallCard });
+      await proxy.connectAddonServer("steady", { command: "node", args: ["server/index.js"] });
+      assert.equal(proxy.connectedServers.get("steady")?.status, "connected", `${what}: the add-on runs inside its wall`);
+      await waitFor(() => warns.some((w) => w.includes("could not be cleared")), 5000, `${what}: the failed clear's warning`);
+    } finally {
+      console.warn = origWarn;
+    }
+    assert.equal((await store.getItem(db, card.id)).status, "pending", `${what}: the card the clear never answered stays open`);
+    await proxy.disconnectAddonServer("steady");
+  }
+});
