@@ -17,6 +17,7 @@
  */
 import { resolveCrowHome } from "../../../shared/crow-home.js";
 import { setWallMode } from "../../../shared/addon-walls-file.js";
+import { fill, t } from "../../dashboard/shared/i18n.js";
 import {
   CARD_DEDUP_PREFIX,
   clearWallFailures,
@@ -27,21 +28,21 @@ import {
 export const UNWALL_ACTION = "addon-unwall";
 export const KEEP_OFF_ACTION = "addon-keep-off";
 
-/** The "Keep it off" button's label (code-held, never the stored one). */
-export const KEEP_OFF_LABEL = "Keep it off";
+/** The "Keep it off" button's label (code-held, never the stored one), from the copy table. */
+export const KEEP_OFF_LABEL = t("fixit.addonWall.keepOff", "en");
 
-/** "Run <id> without the wall" — built from the live record only. */
-export function unwallLabel(id) {
-  return `Run ${id} without the wall`;
+/** "Run <id> without the wall" — built from the live record only, in the dashboard's language. */
+export function unwallLabel(id, lang = "en") {
+  return fill(t("fixit.addonWall.unwall", lang === "es" ? "es" : "en"), { id });
 }
 
 /** The flash the Nest page renders when the click answered nothing. */
 export const STALE_FLASH = "fixit_addon_stale";
-/** What the owner is told when the failure record is gone. */
-export const STALE_MESSAGE = "This failure is from before Crow last restarted; start the add-on again to see whether it still fails";
+/** What the owner is told when the failure record is gone (the copy table's value). */
+export const STALE_MESSAGE = t("fixit.addonWall.stale", "en");
 /** The flash the Nest page renders after the owner unwalled an add-on. */
 export const UNWALLED_FLASH = "fixit_addon_unwalled";
-export const UNWALLED_MESSAGE = "Done. That add-on now runs without its wall on this computer. You can wall it again on its page under Extensions.";
+export const UNWALLED_MESSAGE = t("fixit.flash.unwalledGeneric", "en");
 /** An add-on id a flash may name: one lowercase slug. */
 export const FLASH_ID_RE = /^[a-z0-9][a-z0-9-]*$/;
 
@@ -49,10 +50,11 @@ export const FLASH_ID_RE = /^[a-z0-9][a-z0-9-]*$/;
  * The unwall flash text: the add-on's id when the caller names one it may show,
  * else the generic line. The id is a query value, so it is re-checked here.
  */
-export function unwalledMessageFor(id) {
+export function unwalledMessageFor(id, lang = "en") {
+  const language = lang === "es" ? "es" : "en";
   return typeof id === "string" && FLASH_ID_RE.test(id)
-    ? `Done. ${id} now runs without its wall on this computer. You can wall it again on its page under Extensions.`
-    : UNWALLED_MESSAGE;
+    ? fill(t("fixit.flash.unwalled", language), { id })
+    : t("fixit.flash.unwalledGeneric", language);
 }
 /** Shown when the choice could not be saved. */
 export const SAVE_FAILED_MESSAGE = "Crow could not save that choice, so nothing was changed.";

@@ -16,6 +16,7 @@ import { Router } from "express";
 import { createDbClient } from "../../db.js";
 import { cleanupNotifications } from "../../shared/notifications.js";
 import { collectHealthSignals } from "../dashboard/panels/nest/health-signals.js";
+import * as fixItStore from "../../shared/fix-it/store.js";
 import { readSetting } from "../dashboard/settings/registry.js";
 import { SUPPORTED_LANGS } from "../dashboard/shared/i18n.js";
 
@@ -124,7 +125,10 @@ export default function notificationsRouter(dashboardAuth, { collectSignals = co
       }
 
       // Health issues the new shell's mascot sheet lists under "Needs attention"
-      // (the new-mode bird adds them to its badge; the classic bell ignores them).
+      // (the new-mode bird adds them to its badge; the classic bell ignores them),
+      // plus every pending Fix-it card — it is the same sheet, so it is the same
+      // number. Each half is read in its own try/catch: a broken signal reader must
+      // not zero the cards, and a broken card read must not zero the issues.
       let attention = 0;
       try {
         const setLang = await readSetting(db, "language");
@@ -132,6 +136,11 @@ export default function notificationsRouter(dashboardAuth, { collectSignals = co
         attention = ((await collectSignals(db, { lang })).issues || []).length;
       } catch {
         attention = 0;
+      }
+      try {
+        attention += (await fixItStore.listPending(db)).length;
+      } catch {
+        // The issue count stands on its own.
       }
 
       res.json({ count: rows[0].count, attention, health });

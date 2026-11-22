@@ -236,6 +236,145 @@ export function shellCss() {
   }
   body.shell .shell-attn-btn--quiet { color: var(--crow-text-secondary); }
   body.shell .shell-attn-heading { margin-top: 4px; }
+  /* ─── The sheet's own blocks: welcome, flash banner, Fix-it cards, signal
+     links, all-good and the collapsed status details. The sheet is 360-480 px
+     wide on a phone, so long words wrap and buttons wrap instead of pushing
+     the sheet sideways. ─── */
+  body.shell .shell-welcome { margin: 0 0 4px; }
+  body.shell .shell-welcome-greeting {
+    font-size: 1rem;
+    font-weight: 600;
+    line-height: 1.3;
+    color: var(--crow-text-primary);
+    overflow-wrap: break-word;
+  }
+  body.shell .shell-welcome-date {
+    font-size: 0.85rem;
+    color: var(--crow-text-secondary);
+    overflow-wrap: break-word;
+  }
+  body.shell .shell-attn-flash {
+    margin: 8px 0 0;
+    padding: 10px 12px;
+    border: 1px solid var(--crow-border);
+    border-left: 3px solid var(--crow-accent);
+    border-radius: var(--crow-radius-control);
+    background: var(--crow-bg-elevated);
+    color: var(--crow-text-primary);
+    font-size: 0.9rem;
+    line-height: 1.4;
+    overflow-wrap: break-word;
+  }
+  body.shell .shell-attn-flash--success { border-left-color: var(--crow-success); }
+  body.shell .shell-attn-flash--error { border-left-color: var(--crow-error); }
+  body.shell .shell-attn-flash--info { border-left-color: var(--crow-info); }
+  body.shell .shell-fixit-card {
+    margin: 8px 0 0;
+    padding: 12px;
+    border: 1px solid var(--crow-border);
+    border-left: 3px solid var(--crow-warning);
+    border-radius: var(--crow-radius-control);
+    background: var(--crow-bg-elevated);
+    overflow-wrap: break-word;
+  }
+  body.shell .shell-fixit-title {
+    font-weight: 600;
+    line-height: 1.3;
+    color: var(--crow-text-primary);
+    overflow-wrap: break-word;
+  }
+  body.shell .shell-fixit-count { font-size: 0.75rem; font-weight: 400; color: var(--crow-text-muted); }
+  body.shell .shell-fixit-why {
+    margin-top: 4px;
+    font-size: 0.9rem;
+    line-height: 1.4;
+    color: var(--crow-text-secondary);
+    overflow-wrap: break-word;
+  }
+  body.shell .shell-fixit-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  body.shell .shell-fixit-form { margin: 0; }
+  body.shell .shell-fixit-btn {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+    padding: 0 12px;
+    border: 1px solid var(--crow-border);
+    border-radius: var(--crow-radius-pill);
+    background: var(--crow-bg-surface);
+    color: var(--crow-text-primary);
+    font: inherit;
+    font-size: 0.9rem;
+    text-decoration: none;
+    cursor: pointer;
+    overflow-wrap: break-word;
+  }
+  body.shell .shell-fixit-btn:hover { border-color: var(--crow-accent); color: var(--crow-accent); }
+  body.shell .shell-fixit-btn--quiet { border-color: transparent; background: transparent; color: var(--crow-text-secondary); }
+  body.shell .shell-fixit-btn:disabled { opacity: 0.6; cursor: default; }
+  body.shell .shell-fixit-btn:focus-visible { outline: 2px solid var(--crow-accent); outline-offset: 2px; }
+  body.shell .shell-fixit-details { margin-top: 8px; }
+  body.shell .shell-fixit-details summary { color: var(--crow-text-muted); font-size: 0.8rem; cursor: pointer; }
+  body.shell .shell-fixit-detail {
+    margin-top: 4px;
+    font-size: 0.8rem;
+    color: var(--crow-text-muted);
+    overflow-wrap: break-word;
+  }
+  body.shell .shell-fixit-detail code { overflow-wrap: anywhere; }
+  body.shell .shell-attn-links { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+  body.shell .shell-attn-link {
+    color: var(--crow-text-primary);
+    line-height: 1.4;
+    overflow-wrap: break-word;
+  }
+  body.shell .shell-attn-allgood {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+    color: var(--crow-text-secondary);
+    overflow-wrap: break-word;
+  }
+  body.shell .shell-attn-allgood-dot {
+    width: 10px;
+    height: 10px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: var(--crow-success);
+  }
+  body.shell .shell-attn-details { margin: 8px 0 0; }
+  body.shell .shell-attn-details summary {
+    color: var(--crow-text-muted);
+    font-size: 0.8rem;
+    line-height: 1.4;
+    cursor: pointer;
+  }
+  body.shell .shell-attn-detail-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 8px;
+    margin-top: 8px;
+  }
+  body.shell .shell-attn-detail {
+    min-width: 0;
+    padding: 8px;
+    border: 1px solid var(--crow-border);
+    border-radius: var(--crow-radius-control);
+    background: var(--crow-bg-elevated);
+  }
+  body.shell .shell-attn-detail-label {
+    font-size: 0.75rem;
+    color: var(--crow-text-muted);
+    overflow-wrap: break-word;
+  }
+  body.shell .shell-attn-detail-value {
+    font-size: 0.9rem;
+    color: var(--crow-text-primary);
+    overflow-wrap: break-word;
+  }
+  body.shell .shell-attn-detail-value--ok { color: var(--crow-success); }
+  body.shell .shell-attn-detail-value--warn { color: var(--crow-warning); }
+  body.shell .shell-attn-detail-value--info { color: var(--crow-info); }
   /* The no-showModal fallback (open attribute only): pin the sheet on top. */
   body.shell .shell-sheet[open]:not(:modal) { position: fixed; inset: auto 0 0; z-index: 1200; }
   body.shell .shell-heading {

@@ -109,6 +109,7 @@ import { servicesUiEnabled } from "../services/ui-flag.js";
 import "../services/launcher-tile.js"; // registers the "Add a service" launcher tile
 import { serveArtifactPreview, serveWorkspacePreview, enablePreviews } from "../make/previews.js";
 import { handleFixItAction } from "../fix-it/index.js";
+import { returnTargetOf, returnUrl } from "../fix-it/flash.js";
 import bundlesRouterFactory from "../routes/bundles.js";
 import { keychainApiRouter } from "../keychain/api.js";
 import perchApiRouter from "../routes/perch.js";
@@ -1040,15 +1041,18 @@ export default function dashboardRouter(mcpAuthMiddleware, { renderLayout: rende
   // Health attention: the "This is expected" ack and the alert landing route.
   router.use(healthAttentionRouter({ createDbClient }));
 
-  // W3-3: "Run backup now" action — dashboard-authed, CSRF-protected
+  // W3-3: "Run backup now" action — dashboard-authed, CSRF-protected. The form's
+  // `return` field picks where the answer lands (the Attention sheet or the Nest),
+  // through the same code-held table every Fix-it click uses.
   router.post("/dashboard/nest/backup", async (req, res) => {
+    const target = returnTargetOf(req.body && req.body.return);
     try {
       const { runBackup } = await import("../routes/admin-backup.js");
       await runBackup();
-      res.redirectAfterPost("/dashboard/nest?flash=backup_ok");
+      res.redirectAfterPost(returnUrl(target, "backup_ok"));
     } catch (err) {
       console.error("[nest-backup] FAILED:", err.message);
-      res.redirectAfterPost("/dashboard/nest?flash=backup_fail");
+      res.redirectAfterPost(returnUrl(target, "backup_fail"));
     }
   });
 

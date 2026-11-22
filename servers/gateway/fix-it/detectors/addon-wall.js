@@ -13,10 +13,12 @@
  * remedy reads are the same pair.
  */
 import { CARD_DEDUP_PREFIX, bindWallFailureCard } from "../../../../scripts/addon-sandbox/failures.mjs";
+import { fill, t } from "../../dashboard/shared/i18n.js";
 
 export const SOURCE = "addon-wall";
 export const EVENT = "addon-wall-failed";
-export const TITLE = "An add-on could not run inside its wall";
+/** The card's title, from the dashboard's copy table (one source: the i18n key). */
+export const TITLE = t("fixit.addonWall.title", "en");
 /** The fallback reason when an event carries none. */
 export const DEFAULT_REASON = "could not run inside its wall";
 
@@ -25,9 +27,12 @@ const ADDON_ID_RE = /^[a-z0-9][a-z0-9-]*$/;
 /** A record ref is 16 random bytes, hex. */
 const REF_RE = /^[0-9a-f]{32}$/;
 
-/** The card's body line for `id` and `reason`. */
-export function whyText(id, reason) {
-  return `${id} ${reason}. It stays off until you choose.`;
+/**
+ * The card's body line for `id` and `reason`, in the dashboard's language. The
+ * sentence comes from the copy table; the id and the reason are values.
+ */
+export function whyText(id, reason, lang = "en") {
+  return fill(t("fixit.addonWall.why", lang === "es" ? "es" : "en"), { id, reason });
 }
 
 export default {

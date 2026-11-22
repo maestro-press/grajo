@@ -1,0 +1,305 @@
+<div class="nest-fixits" style="margin:0 1rem 1rem" aria-label="Things Crow noticed"><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">&lt;script&gt;alert('title')&lt;/script&gt; </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">&lt;script&gt;alert('why')&lt;/script&gt; Allow it for that device only?</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+    <input type="hidden" name="_csrf" value="tok">
+    <input type="hidden" name="action" value="remedy">
+    <input type="hidden" name="item_id" value="18">
+    <input type="hidden" name="action_id" value="expose-capability-30d">
+    <button type="submit" class="btn btn-secondary" data-fixit-kind="instant">Allow for 30 days</button>
+  </form>
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="18">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      <details style="margin-top:0.5rem"><summary style="cursor:pointer;color:var(--crow-text-muted);font-size:0.8rem">Technical details</summary>
+           <div style="font-size:0.8rem;color:var(--crow-text-muted);margin-top:0.3rem">Capability: <code>&lt;script&gt;alert('ctx')&lt;/script&gt;</code><br>Requesting instance: <code>peer-xss</code></div></details>
+    </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">Your other laptop tried to use Music, but it isn't shared with this device yet </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">Allowing it for that laptop only leaves your other Crows unchanged.</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+    <input type="hidden" name="_csrf" value="tok">
+    <input type="hidden" name="action" value="remedy">
+    <input type="hidden" name="item_id" value="17">
+    <input type="hidden" name="action_id" value="expose-capability-30d">
+    <button type="submit" class="btn btn-secondary" data-fixit-kind="confirm" disabled title="Coming soon">Allow for 30 days</button>
+  </form>
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="17">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      <details style="margin-top:0.5rem"><summary style="cursor:pointer;color:var(--crow-text-muted);font-size:0.8rem">Technical details</summary>
+           <div style="font-size:0.8rem;color:var(--crow-text-muted);margin-top:0.3rem">Capability: <code>funkwhale</code><br>Requesting instance: <code>peer-gated</code></div></details>
+    </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">Heron lost messaging: choose who it may message </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">Who this bot may write to. Every message it writes waits for you as a draft.</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <a class="btn btn-secondary" href="/dashboard/bot-builder?bot=heron&amp;tab=safety" data-fixit-link>Sharing</a><form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+    <input type="hidden" name="_csrf" value="tok">
+    <input type="hidden" name="action" value="remedy">
+    <input type="hidden" name="item_id" value="16">
+    <input type="hidden" name="action_id" value="bot-sharing-remove">
+    <button type="submit" class="btn btn-secondary" data-fixit-kind="instant">Remove messaging from this bot</button>
+  </form>
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="16">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      
+    </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">An add-on could not run inside its wall </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">This failure is from before Crow last restarted; start the add-on again to see whether it still fails</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+    <input type="hidden" name="_csrf" value="tok">
+    <input type="hidden" name="action" value="remedy">
+    <input type="hidden" name="item_id" value="15">
+    <input type="hidden" name="action_id" value="addon-keep-off">
+    <button type="submit" class="btn btn-secondary" data-fixit-kind="instant">Keep it off</button>
+  </form>
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="15">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      
+    </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">An add-on could not run inside its wall </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">browser tried to reach 192.0.2.9:80, which it is not set up for. It stays off until you choose.</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+    <input type="hidden" name="_csrf" value="tok">
+    <input type="hidden" name="action" value="remedy">
+    <input type="hidden" name="item_id" value="14">
+    <input type="hidden" name="action_id" value="addon-unwall">
+    <button type="submit" class="btn btn-secondary" data-fixit-kind="instant">Run browser without the wall</button>
+  </form><form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+    <input type="hidden" name="_csrf" value="tok">
+    <input type="hidden" name="action" value="remedy">
+    <input type="hidden" name="item_id" value="14">
+    <input type="hidden" name="action_id" value="addon-keep-off">
+    <button type="submit" class="btn btn-secondary" data-fixit-kind="instant">Keep it off</button>
+  </form>
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="14">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      
+    </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">The browser add-on is still running the old version </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">Crow updated the browser add-on, but the copy that is running is still the old one. Restart it to load the update. A restart cannot be undone, and the pages that are open in the browser now will close. Saved logins and cookies are kept.</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+    <input type="hidden" name="_csrf" value="tok">
+    <input type="hidden" name="action" value="remedy">
+    <input type="hidden" name="item_id" value="13">
+    <input type="hidden" name="action_id" value="restart-browser-addon">
+    <button type="submit" class="btn btn-secondary" data-fixit-kind="instant">Restart the browser add-on</button>
+  </form><a class="btn btn-secondary" href="/dashboard/extensions" data-fixit-link>Open Extensions</a>
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="13">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      
+    </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">AI Companion was retired </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">AI Companion is no longer part of Crow, but it is still installed on this Crow. Press &quot;Remove it&quot;: Crow runs its own uninstall path and keeps the add-on's data folder (your conversations, models and settings stay there). There is no undo beyond that.</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+    <input type="hidden" name="_csrf" value="tok">
+    <input type="hidden" name="action" value="remedy">
+    <input type="hidden" name="item_id" value="12">
+    <input type="hidden" name="action_id" value="remove-retired-bundle">
+    <button type="submit" class="btn btn-secondary" data-fixit-kind="instant">Remove it</button>
+  </form>
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="12">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      
+    </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">Audiobookshelf is still published to other devices </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">Audiobookshelf is published to other devices; Crow now ships it on this computer only. Restart won't change that while its compose file has local changes — see the other card.</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <a class="btn btn-secondary" href="/dashboard/extensions" data-fixit-link>Open Extensions</a>
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="11">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      
+    </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">Vikunja's settings file has an update Crow did not apply </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">Crow keeps Vikunja on its current settings because the update would also change its image (vikunja/vikunja:0.24.6 → vikunja/vikunja:0.25.1; it may be older than what is running). The update also tightens how Vikunja is published. Back up its data, then press 'Apply the update' to switch, or keep it as it is.</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+    <input type="hidden" name="_csrf" value="tok">
+    <input type="hidden" name="action" value="remedy">
+    <input type="hidden" name="item_id" value="10">
+    <input type="hidden" name="action_id" value="apply-bundle-compose-update">
+    <button type="submit" class="btn btn-secondary" data-fixit-kind="instant">Apply the update</button>
+  </form><a class="btn btn-secondary" href="/dashboard/extensions" data-fixit-link>Open Extensions</a>
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="10">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      
+    </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">Vikunja's settings file was not updated </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">Crow could not update Vikunja's settings file: it needs VIKUNJA_DB_PASSWORD set first (Configure on its Extensions card).</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <a class="btn btn-secondary" href="/dashboard/extensions" data-fixit-link>Open Extensions</a>
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="9">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      
+    </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">Changedetection.io's compose file has local changes </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">Changedetection.io's compose file has local changes, so Crow did not update it. Move your changes into docker-compose.override.yml and restore the compose file (a copy of the current one is kept as docker-compose.yml.bak when Crow restores it).</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+    <input type="hidden" name="_csrf" value="tok">
+    <input type="hidden" name="action" value="remedy">
+    <input type="hidden" name="item_id" value="8">
+    <input type="hidden" name="action_id" value="restore-bundle-compose">
+    <button type="submit" class="btn btn-secondary" data-fixit-kind="instant">Restore Crow's compose</button>
+  </form><a class="btn btn-secondary" href="/dashboard/extensions" data-fixit-link>Open Extensions</a>
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="8">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      
+    </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">Restart Audiobookshelf to apply its updated network settings </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">Audiobookshelf is still reachable on 0.0.0.0:13378 from other devices, but its settings now keep it on this computer only. Restart it on the Extensions page to apply them.</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <a class="btn btn-secondary" href="/dashboard/extensions" data-fixit-link>Open Extensions</a>
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="7">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      
+    </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">Data backends need approving again </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">2 data backend(s) were approved before Crow protected approvals with a key kept outside its database. They stay stopped until you approve them again on the Projects page.</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <a class="btn btn-secondary" href="/dashboard/projects" data-fixit-link>Open the Projects page</a>
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="6">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      
+    </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">The boot guard did not run <span style="font-size:0.7rem;color:var(--crow-text-muted)">×2</span></div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">This service is configured to roll back a Crow update that keeps crashing on startup (CROW_BOOT_GUARD=1), but the part that runs before every start did not run. Re-run the boot-guard install step for this service, then restart it.</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="4">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      
+    </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">This machine's Caddy admin API is open to any program on it </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">Caddy's admin API is on its default local address with no authentication, so any program or bot on this machine can rewrite the Caddy that fronts Crow. Crow does not run as root, so run this once on the server: sudo bash /srv/crow/scripts/fix-caddy-admin-socket.sh</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="3">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      <details style="margin-top:0.5rem"><summary style="cursor:pointer;color:var(--crow-text-muted);font-size:0.8rem">Technical details</summary>
+           <div style="font-size:0.8rem;color:var(--crow-text-muted);margin-top:0.3rem">Caddyfile: <code>/etc/caddy/Caddyfile</code></div></details>
+    </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">Visitors coming in through this machine's Caddy are being turned away </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">Caddy still hands them to the gateway over a loopback connection with its own forwarding header, which Crow cannot tell apart from any other program on this machine — so Crow's Nest refuses them. Crow does not run as root, so run this once on the server: sudo bash /srv/crow/scripts/fix-caddy-proxy-socket.sh</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="2">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      <details style="margin-top:0.5rem"><summary style="cursor:pointer;color:var(--crow-text-muted);font-size:0.8rem">Technical details</summary>
+           <div style="font-size:0.8rem;color:var(--crow-text-muted);margin-top:0.3rem">Caddyfile: <code>/etc/caddy/Caddyfile</code></div></details>
+    </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">Your alex's laptop tried to use Music, but it isn't shared with this device yet </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">Allow it for alex's laptop only — your other Crows stay unchanged, and the allowance can expire or be removed in Settings.</div>
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+    <input type="hidden" name="_csrf" value="tok">
+    <input type="hidden" name="action" value="remedy">
+    <input type="hidden" name="item_id" value="1">
+    <input type="hidden" name="action_id" value="expose-capability-30d">
+    <button type="submit" class="btn btn-secondary" data-fixit-kind="instant">Allow for 30 days</button>
+  </form><form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+    <input type="hidden" name="_csrf" value="tok">
+    <input type="hidden" name="action" value="remedy">
+    <input type="hidden" name="item_id" value="1">
+    <input type="hidden" name="action_id" value="expose-capability-7d">
+    <button type="submit" class="btn btn-secondary" data-fixit-kind="instant">Allow for 7 days</button>
+  </form><form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+    <input type="hidden" name="_csrf" value="tok">
+    <input type="hidden" name="action" value="remedy">
+    <input type="hidden" name="item_id" value="1">
+    <input type="hidden" name="action_id" value="expose-capability-forever">
+    <button type="submit" class="btn btn-secondary" data-fixit-kind="instant">Allow until I remove it</button>
+  </form>
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          <input type="hidden" name="_csrf" value="tok">
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="1">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
+        </form>
+      </div>
+      <details style="margin-top:0.5rem"><summary style="cursor:pointer;color:var(--crow-text-muted);font-size:0.8rem">Technical details</summary>
+           <div style="font-size:0.8rem;color:var(--crow-text-muted);margin-top:0.3rem">Capability: <code>funkwhale</code><br>Requesting instance: <code>peer-x</code></div></details>
+    </div></div>

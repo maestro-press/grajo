@@ -103,6 +103,9 @@ const IDENTICAL_OK = new Set([
   // Bot-engine uninstall blast-radius (C4 Task 10)
   "extensions.engineBlastItem", // "{name} ({types})" — pure template shape, no words to translate
   "perch.title", // a product name, identical in both languages
+  // Fix-it cards (Spanish approved 2026-11-21): this row names a file, so the
+  // label stays "Caddyfile:" in Spanish too.
+  "fixit.caddyfile",
   // Add a provider presets (roles phase 2b Task 12): provider names are proper nouns
   "providers.preset.openrouter",
   "providers.preset.anthropic",

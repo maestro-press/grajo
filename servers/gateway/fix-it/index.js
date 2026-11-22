@@ -1,8 +1,12 @@
 /**
  * Fix-it Cards — gateway wiring. Binds the pure registry + DB store to this
  * gateway: registers the v1 detector/remedy, exposes the fire-and-forget
- * `emitFixIt` chokepoints call, renders the nest card section, and serves the
- * remedy/dismiss POST action.
+ * `emitFixIt` chokepoints call, and serves the remedy/dismiss POST action.
+ *
+ * The cards themselves have ONE model (`fixItCardModels`) and two renderers:
+ * `renderFixItCards` (the classic Nest's Fix-it section, unchanged markup) and
+ * `renderFixItSheetCards` (the new shell's Attention sheet). Nothing but the
+ * markup differs between them.
  */
 import * as registry from "../../shared/fix-it/registry.js";
 import * as store from "../../shared/fix-it/store.js";
@@ -22,14 +26,12 @@ import sharingBotAclDetector, {
 } from "./detectors/sharing-bot-acl.js";
 import addonWallDetector, {
   SOURCE as ADDON_WALL_SOURCE,
-  TITLE as ADDON_WALL_TITLE,
   whyText as addonWallWhyText,
 } from "./detectors/addon-wall.js";
 import exposeCapabilityRemedy from "./remedies/expose-capability.js";
 import restoreBundleCompose, {
   ACTION_ID as RESTORE_COMPOSE_ACTION,
   APPLY_UPDATE_ACTION_ID as APPLY_COMPOSE_UPDATE_ACTION,
-  FLASH_KEY_RE as COMPOSE_FLASH_KEY_RE,
   NEEDS_KEY_FLASH,
   OWNER_ONLY_FLASH,
 } from "./remedies/restore-bundle-compose.js";
@@ -37,14 +39,10 @@ import restartBrowserAddon, {
   ACTION_ID as RESTART_BROWSER_ADDON_ACTION,
 } from "./remedies/restart-browser-addon.js";
 import addonUnwallRemedy, {
-  FLASH_ID_RE,
   KEEP_OFF_ACTION,
-  KEEP_OFF_LABEL,
-  STALE_MESSAGE as ADDON_WALL_STALE,
   UNWALL_ACTION,
-  UNWALLED_FLASH,
-  keepOffRemedy,
   unwallLabel,
+  keepOffRemedy,
 } from "./remedies/addon-unwall.js";
 import removeRetiredBundle, {
   ACTION_ID as REMOVE_RETIRED_ACTION,
@@ -54,6 +52,7 @@ import removeRetiredBundle, {
 } from "./remedies/remove-retired-bundle.js";
 import removeBotSharing, { ACTION_ID as REMOVE_BOT_SHARING_ACTION, label as removeBotSharingLabel } from "./remedies/remove-bot-sharing.js";
 import { wallFailureByItemId } from "../../../scripts/addon-sandbox/failures.mjs";
+import { returnTargetOf, returnUrl } from "./flash.js";
 import { recordSuppressedRequest } from "./peer-card-counters.js";
 import { CARD_ACTION_IDS } from "./peer-card-policy.js";
 import { createNotification } from "../../shared/notifications.js";
@@ -191,7 +190,7 @@ function boundStore(db) {
           await createNotification(db, {
             title: item.title, body: item.why || null,
             type: "system", source: "fix-it", priority: "high",
-            action_url: "/dashboard/nest?open=1",
+            action_url: "/dashboard/attention",
           });
         } catch (err) { console.warn("[fix-it] push failed:", err.message); }
       }
@@ -285,34 +284,78 @@ export async function runBootChecks(db, opts = {}) {
   for (const detector of BOOT_CHECK_DETECTORS) await runBootCheck(db, detector.source, opts);
 }
 
-function remedyButton(item, r, req) {
-  // A link entry is navigation only: nothing is posted, so no remedy runs. Its
-  // destination comes from LINK_REMEDIES, never from the stored entry.
-  if (r && r.kind === "link") {
-    const href = linkRemedyTarget(r);
-    if (!href) return "";
-    return `<a class="btn btn-secondary" href="${escapeHtml(href)}" data-fixit-link>${escapeHtml(r.label || "Open")}</a>`;
+/**
+ * One card model's remedy button (the Nest's markup). A link entry is navigation
+ * only: nothing is posted, so no remedy runs, and its destination came from
+ * LINK_REMEDIES (linkRemedyTarget), never from the stored entry.
+ *
+ * v1 ships only `instant`. A gated remedy renders disabled with a note so a
+ * destructive action can never be a careless one-tap (the framework enforces it
+ * here AND in handleFixItAction).
+ */
+function nestRemedyButton(itemId, r, req, lang) {
+  if (r.kind === "link") {
+    return `<a class="btn btn-secondary" href="${escapeHtml(r.href)}" data-fixit-link>${escapeHtml(r.label)}</a>`;
   }
-  const gated = r.kind === "confirm" || r.kind === "guided";
-  // v1 ships only `instant`. A gated remedy renders disabled with a note so a
-  // destructive action can never be a careless one-tap (framework enforces it
-  // here AND in handleFixItAction).
+  const gated = r.kind === "gated";
+  const gatedNote = gated ? ` disabled title="${escapeHtml(t("fixit.comingSoon", lang))}"` : "";
   return `<form method="POST" action="/dashboard/fix-it/action" style="display:inline">
     ${csrfInput(req)}
     <input type="hidden" name="action" value="remedy">
-    <input type="hidden" name="item_id" value="${escapeHtml(String(item.id))}">
+    <input type="hidden" name="item_id" value="${escapeHtml(String(itemId))}">
     <input type="hidden" name="action_id" value="${escapeHtml(r.actionId)}">
-    <button type="submit" class="btn btn-secondary" data-fixit-kind="${escapeHtml(r.kind || "instant")}"${gated ? " disabled title=\"Coming soon\"" : ""}>${escapeHtml(r.label || "Fix")}</button>
+    <button type="submit" class="btn btn-secondary" data-fixit-kind="${escapeHtml(r.gatedKind || "instant")}"${gatedNote}>${escapeHtml(r.label)}</button>
   </form>`;
 }
 
+/** `lang` as the copy table knows it. */
+const LANG = (lang) => (lang === "es" ? "es" : "en");
+
+/** The stored-row remedy, as a model entry (null when it can never render). */
+function storedRemedyModel(r, lang) {
+  if (!r || typeof r !== "object") return null;
+  if (r.kind === "link") {
+    // A link whose actionId this file does not hold has no destination and is
+    // not rendered at all — a stored href is never read.
+    const href = linkRemedyTarget(r);
+    if (!href) return null;
+    const label = typeof r.label === "string" && r.label ? r.label : t("fixit.open", lang);
+    return { kind: "link", label, href };
+  }
+  if (typeof r.actionId !== "string" || !r.actionId) return null;
+  const gated = r.kind === "confirm" || r.kind === "guided";
+  const label = typeof r.label === "string" && r.label ? r.label : t("fixit.fix", lang);
+  return gated
+    ? { kind: "gated", label, actionId: r.actionId, gatedKind: r.kind }
+    : { kind: "form", label, actionId: r.actionId };
+}
+
 /**
- * The parts one card shows. A "addon-wall" card never renders a stored title,
- * why, label or context: those are crow.db columns, and the eight add-ons that
- * share crow.db can write them. Everything comes from the live failure record
- * bound to this item, or from this file's constants.
+ * The Technical details rows of a stored card: the three context values the Nest
+ * has always shown, each with its label from the copy table. The values are
+ * crow.db data, so the renderers escape them.
  */
-function cardParts(item, req, lang) {
+function storedDetails(item, lang) {
+  const ctx = item.context || {};
+  const rows = [];
+  if (ctx.capability) rows.push({ label: t("fixit.capability", lang), code: String(ctx.capability) });
+  if (ctx.requestingInstance) rows.push({ label: t("fixit.requestingInstance", lang), code: String(ctx.requestingInstance) });
+  if (ctx.caddyfile) rows.push({ label: t("fixit.caddyfile", lang), code: String(ctx.caddyfile) });
+  return rows;
+}
+
+/**
+ * ONE card's model. Everything a card shows is decided here — including the three
+ * sources whose title, body and buttons are held in CODE (a retired bundle, an
+ * add-on that could not run inside its wall, a bot that lost its sharing): their
+ * rows are crow.db columns, and the eight add-ons that share crow.db can write
+ * them, so nothing stored is rendered for them.
+ *
+ * @returns {{id: number, count: number, title: string, why: string, remedies: Array<object>, details: Array<{label: string, code: string}>}}
+ */
+function cardModel(item, lang) {
+  const base = { id: item.id, count: item.count };
+
   if (item.source === RETIRED_BUNDLE_SOURCE) {
     // A retired bundle's card reads NOTHING from the stored row: the title, the body, the
     // button's label and the bundle's name all come from code (retired-bundles.js + this
@@ -321,32 +364,33 @@ function cardParts(item, req, lang) {
     // stored input — the id — selects a code-held entry, so a crow.db writer can raise no
     // card that names anything else.
     const id = typeof item.context?.bundle === "string" ? item.context.bundle : "";
-    const remedy = { actionId: REMOVE_RETIRED_ACTION, kind: "instant", label: removeRetiredLabel(lang), args: { bundle: id } };
     return {
+      ...base,
       title: retiredBundleTitle(id, lang),
       why: retiredBundleWhy(id, lang),
-      buttons: remedyButton(item, remedy, req),
-      details: "",
+      remedies: [{ kind: "form", label: removeRetiredLabel(lang), actionId: REMOVE_RETIRED_ACTION }],
+      details: [],
     };
   }
+
   if (item.source === ADDON_WALL_SOURCE) {
+    // The card is the LIVE failure record bound to this item, or nothing: a stored title,
+    // why, label or context is never rendered (see retired-bundle above).
     const record = wallFailureByItemId(Number(item.id));
-    const keepOff = { actionId: KEEP_OFF_ACTION, kind: "instant", label: KEEP_OFF_LABEL };
+    const keepOff = { kind: "form", label: t("fixit.addonWall.keepOff", lang), actionId: KEEP_OFF_ACTION };
     if (!record) {
       // No record: the card answers nothing, so it offers no fix at all.
-      return {
-        title: ADDON_WALL_TITLE,
-        why: ADDON_WALL_STALE,
-        buttons: remedyButton(item, keepOff, req),
-        details: "",
-      };
+      return { ...base, title: t("fixit.addonWall.title", lang), why: t("fixit.addonWall.stale", lang), remedies: [keepOff], details: [] };
     }
-    const unwall = { actionId: UNWALL_ACTION, kind: "instant", label: unwallLabel(record.id) };
     return {
-      title: ADDON_WALL_TITLE,
-      why: addonWallWhyText(record.id, record.reason),
-      buttons: remedyButton(item, unwall, req) + remedyButton(item, keepOff, req),
-      details: "",
+      ...base,
+      title: t("fixit.addonWall.title", lang),
+      why: addonWallWhyText(record.id, record.reason, lang),
+      remedies: [
+        { kind: "form", label: unwallLabel(record.id, lang), actionId: UNWALL_ACTION },
+        keepOff,
+      ],
+      details: [],
     };
   }
 
@@ -361,133 +405,184 @@ function cardParts(item, req, lang) {
     // string is treated as no id: the remedies then refuse, and the title falls back to no name.
     const bot = typeof item.context?.bot === "string" ? item.context.bot : "";
     const name = typeof item.context?.name === "string" ? item.context.name : "";
-    const openBuilder = {
-      actionId: OPEN_BOT_BUILDER_FOR_SHARING,
-      kind: "link",
-      label: t("botbuilder.sharing.heading", lang === "es" ? "es" : "en"),
-      args: { bot },
-    };
-    const removeMessaging = {
-      actionId: REMOVE_BOT_SHARING_ACTION,
-      kind: "instant",
-      label: removeBotSharingLabel(lang),
-      args: { bot },
-    };
+    const builderHref = linkRemedyTarget({ actionId: OPEN_BOT_BUILDER_FOR_SHARING, args: { bot } });
     return {
+      ...base,
       title: sharingCardTitle(name, bot, lang),
       why: sharingCardWhy(lang),
-      buttons: remedyButton(item, openBuilder, req) + remedyButton(item, removeMessaging, req),
-      details: "",
+      remedies: [
+        { kind: "link", label: t("botbuilder.sharing.heading", LANG(lang)), href: builderHref },
+        { kind: "form", label: removeBotSharingLabel(lang), actionId: REMOVE_BOT_SHARING_ACTION },
+      ],
+      details: [],
     };
   }
 
-  const remedyBtns = (item.remedies || []).map((r) => remedyButton(item, r, req)).join("");
-  const ctx = item.context || {};
-  const techRows = [];
-  if (ctx.capability) techRows.push(`Capability: <code>${escapeHtml(ctx.capability)}</code>`);
-  if (ctx.requestingInstance) techRows.push(`Requesting instance: <code>${escapeHtml(ctx.requestingInstance)}</code>`);
-  if (ctx.caddyfile) techRows.push(`Caddyfile: <code>${escapeHtml(ctx.caddyfile)}</code>`);
-  const details = techRows.length
-    ? `<details style="margin-top:0.5rem"><summary style="cursor:pointer;color:var(--crow-text-muted);font-size:0.8rem">Technical details</summary>
-           <div style="font-size:0.8rem;color:var(--crow-text-muted);margin-top:0.3rem">${techRows.join("<br>")}</div></details>`
-    : "";
-  return { title: item.title, why: item.why || "", buttons: remedyBtns, details };
-}
-
-/** Render the nest Fix-it card section (or "" when nothing pending). */
-export async function renderFixItCards(db, { lang, req } = {}) {
-  let items = [];
-  try { items = await store.listPending(db); } catch { return ""; }
-  if (!items.length) return "";
-
-  const cards = items.map((item) => {
-    const parts = cardParts(item, req, lang);
-    const countBadge = item.count > 1
-      ? `<span style="font-size:0.7rem;color:var(--crow-text-muted)">×${escapeHtml(String(item.count))}</span>` : "";
-    return `<div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
-      <div style="font-weight:600;margin-bottom:0.2rem">${escapeHtml(parts.title)} ${countBadge}</div>
-      ${parts.why ? `<div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">${escapeHtml(parts.why)}</div>` : ""}
-      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
-        ${parts.buttons}
-        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
-          ${csrfInput(req)}
-          <input type="hidden" name="action" value="dismiss">
-          <input type="hidden" name="item_id" value="${escapeHtml(String(item.id))}">
-          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">Not now</button>
-        </form>
-      </div>
-      ${parts.details}
-    </div>`;
-  }).join("");
-
-  return `<div class="nest-fixits" style="margin:0 1rem 1rem" aria-label="Things Crow noticed">${cards}</div>`;
+  const remedies = (item.remedies || []).map((r) => storedRemedyModel(r, lang)).filter(Boolean);
+  return { ...base, title: item.title, why: item.why || "", remedies, details: storedDetails(item, lang) };
 }
 
 /**
- * The query parameter a flash may carry besides its code: `&addon=<id>` for the
- * unwall flash, `&key=<KEY>` for a compose that needs a key set first. Both are
- * rendered on the next page, so both are re-checked here.
+ * Every pending card, as a plain model. This is the ONE place that holds card
+ * logic; the two renderers below only turn a model into markup.
+ *
+ * @returns {Promise<Array<object>>} [] when nothing is pending (or the read fails)
  */
-function flashParamQuery(flash, params) {
-  if (flash === UNWALLED_FLASH) {
-    const id = params && typeof params.addon === "string" ? params.addon : "";
-    return FLASH_ID_RE.test(id) ? `&addon=${encodeURIComponent(id)}` : "";
-  }
-  if (flash === NEEDS_KEY_FLASH) {
-    const key = params && typeof params.key === "string" ? params.key : "";
-    return COMPOSE_FLASH_KEY_RE.test(key) ? `&key=${encodeURIComponent(key)}` : "";
-  }
-  return "";
+export async function fixItCardModels(db, { lang = "en", req } = {}) {
+  void req;
+  let items = [];
+  try { items = await store.listPending(db); } catch { return []; }
+  const language = LANG(lang);
+  return items.map((item) => cardModel(item, language));
 }
 
-/** POST /dashboard/fix-it/action — remedy or dismiss. */
+/** One model as the Nest's card (byte-identical to what the Nest rendered before). */
+function nestCardHtml(card, req, lang) {
+  const countBadge = card.count > 1
+    ? `<span style="font-size:0.7rem;color:var(--crow-text-muted)">×${escapeHtml(String(card.count))}</span>` : "";
+  const buttons = card.remedies.map((r) => nestRemedyButton(card.id, r, req, lang)).join("");
+  const details = card.details.length
+    ? `<details style="margin-top:0.5rem"><summary style="cursor:pointer;color:var(--crow-text-muted);font-size:0.8rem">${escapeHtml(t("fixit.technicalDetails", lang))}</summary>
+           <div style="font-size:0.8rem;color:var(--crow-text-muted);margin-top:0.3rem">${card.details.map((d) => `${escapeHtml(d.label)} <code>${escapeHtml(d.code)}</code>`).join("<br>")}</div></details>`
+    : "";
+  return `<div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
+      <div style="font-weight:600;margin-bottom:0.2rem">${escapeHtml(card.title)} ${countBadge}</div>
+      ${card.why ? `<div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">${escapeHtml(card.why)}</div>` : ""}
+      <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+        ${buttons}
+        <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
+          ${csrfInput(req)}
+          <input type="hidden" name="action" value="dismiss">
+          <input type="hidden" name="item_id" value="${escapeHtml(String(card.id))}">
+          <button type="submit" class="btn btn-text" style="background:none;border:none;color:var(--crow-text-muted);cursor:pointer">${escapeHtml(t("fixit.notNow", lang))}</button>
+        </form>
+      </div>
+      ${details}
+    </div>`;
+}
+
+/** Render the nest Fix-it card section (or "" when nothing pending). */
+export async function renderFixItCards(db, { lang = "en", req } = {}) {
+  const language = LANG(lang);
+  const models = await fixItCardModels(db, { lang: language, req });
+  if (!models.length) return "";
+  const cards = models.map((card) => nestCardHtml(card, req, language)).join("");
+  return `<div class="nest-fixits" style="margin:0 1rem 1rem" aria-label="${escapeHtml(t("fixit.thingsNoticed", language))}">${cards}</div>`;
+}
+
+/**
+ * One model as an Attention-sheet card: the same title, ×N badge, why, remedies and
+ * Technical details, in the shell's own classes. Every form posts to
+ * /dashboard/fix-it/action with `return=sheet`; the shell client fills the empty
+ * `_csrf` on submit, like the sheet's other forms.
+ */
+function sheetRemedyHtml(card, r, lang) {
+  if (r.kind === "link") {
+    return `<a class="shell-fixit-btn" href="${escapeHtml(r.href)}" data-fixit-link>${escapeHtml(r.label)}</a>`;
+  }
+  const gated = r.kind === "gated";
+  const gatedNote = gated ? ` disabled title="${escapeHtml(t("fixit.comingSoon", lang))}"` : "";
+  return `<form class="shell-fixit-form" method="POST" action="/dashboard/fix-it/action">`
+    + `<input type="hidden" name="_csrf" value="">`
+    + `<input type="hidden" name="action" value="remedy">`
+    + `<input type="hidden" name="item_id" value="${escapeHtml(String(card.id))}">`
+    + `<input type="hidden" name="action_id" value="${escapeHtml(r.actionId)}">`
+    + `<input type="hidden" name="return" value="sheet">`
+    + `<button type="submit" class="shell-fixit-btn" data-fixit-kind="${escapeHtml(r.gatedKind || "instant")}"${gatedNote}>${escapeHtml(r.label)}</button>`
+    + `</form>`;
+}
+
+function sheetCardHtml(card, lang) {
+  const countBadge = card.count > 1 ? ` <span class="shell-fixit-count">×${escapeHtml(String(card.count))}</span>` : "";
+  const remedies = card.remedies.map((r) => sheetRemedyHtml(card, r, lang)).join("");
+  const details = card.details.length
+    ? `<details class="shell-fixit-details"><summary>${escapeHtml(t("fixit.technicalDetails", lang))}</summary>`
+      + card.details.map((d) => `<div class="shell-fixit-detail">${escapeHtml(d.label)} <code>${escapeHtml(d.code)}</code></div>`).join("")
+      + `</details>`
+    : "";
+  return `<div class="shell-fixit-card" data-fixit-item="${escapeHtml(String(card.id))}">`
+    + `<div class="shell-fixit-title">${escapeHtml(card.title)}${countBadge}</div>`
+    + (card.why ? `<div class="shell-fixit-why">${escapeHtml(card.why)}</div>` : "")
+    + `<div class="shell-fixit-actions">${remedies}`
+      + `<form class="shell-fixit-form" method="POST" action="/dashboard/fix-it/action">`
+        + `<input type="hidden" name="_csrf" value="">`
+        + `<input type="hidden" name="action" value="dismiss">`
+        + `<input type="hidden" name="item_id" value="${escapeHtml(String(card.id))}">`
+        + `<input type="hidden" name="return" value="sheet">`
+        + `<button type="submit" class="shell-fixit-btn shell-fixit-btn--quiet">${escapeHtml(t("fixit.notNow", lang))}</button>`
+      + `</form>`
+    + `</div>`
+    + details
+    + `</div>`;
+}
+
+/** Render the Attention sheet's Fix-it cards (or "" when nothing pending). */
+export async function renderFixItSheetCards(db, { lang = "en", req } = {}) {
+  const language = LANG(lang);
+  const models = await fixItCardModels(db, { lang: language, req });
+  if (!models.length) return "";
+  return models.map((card) => sheetCardHtml(card, language)).join("");
+}
+
+/**
+ * POST /dashboard/fix-it/action — remedy or dismiss. Every answer is a redirect to
+ * one of the two code-held targets (fix-it/flash.js: the Nest unless the form asked
+ * for the Attention sheet), carrying a flash code from FLASH_CODES.
+ *
+ * A click that resolved answers `fixit_done` — except a SHARING remedy (the
+ * expose-capability grant, which every Allow duration alias runs), whose flash stays
+ * `fixit_fixed`; a remedy that names its own allowed flash keeps it.
+ */
 export async function handleFixItAction(req, res, { db }) {
   wireFixIt();
   const body = req.body || {};
   const action = body.action;
   const itemId = Number(body.item_id);
+  const returnTo = (flash, params) =>
+    res.redirectAfterPost(returnUrl(returnTargetOf(body.return), flash, params));
   try {
     if (!Number.isInteger(itemId)) {
-      return res.redirectAfterPost("/dashboard/nest?flash=fixit_error");
+      return returnTo("fixit_error");
     }
     if (action === "dismiss") {
       await store.dismiss(db, itemId, 7);
-      return res.redirectAfterPost("/dashboard/nest?flash=fixit_dismissed");
+      return returnTo("fixit_dismissed");
     }
     if (action === "remedy") {
       const item = await store.getItem(db, itemId);
-      if (!item) return res.redirectAfterPost("/dashboard/nest?flash=fixit_error");
+      if (!item) return returnTo("fixit_error");
       // N1b-8 review round 1 (N2): only a card that is still open may run its
       // remedy. A stale page, a double submit or a replayed POST would
       // otherwise re-apply a fix the operator already answered (re-granting an
       // allowance, or granting one for a card they dismissed).
       if (item.status !== "pending") {
-        return res.redirectAfterPost("/dashboard/nest?flash=fixit_not_pending");
+        return returnTo("fixit_not_pending");
       }
       const entry = (item.remedies || []).find((r) => r.actionId === body.action_id);
-      if (!entry) return res.redirectAfterPost("/dashboard/nest?flash=fixit_error");
+      if (!entry) return returnTo("fixit_error");
       if (entry.kind && entry.kind !== "instant") {
         // v1 only runs instant remedies; confirm/guided are gated.
-        return res.redirectAfterPost("/dashboard/nest?flash=fixit_error");
+        return returnTo("fixit_error");
       }
       const fn = registry.getRemedy(entry.actionId);
-      if (!fn) return res.redirectAfterPost("/dashboard/nest?flash=fixit_error");
+      if (!fn) return returnTo("fixit_error");
       // `req` rides along for a remedy that must prove the OWNER at this machine's
       // dashboard (the compose restore): it is the request, never stored card data.
       const result = await fn(entry.args || {}, { db, item, req });
+      const ownFlash = result && typeof result.flash === "string" && REMEDY_FLASHES.includes(result.flash)
+        ? result.flash
+        : null;
       if (result && result.resolved) {
         await store.markResolved(db, itemId);
-        const done = typeof result.flash === "string" && REMEDY_FLASHES.includes(result.flash) ? result.flash : "fixit_fixed";
-        return res.redirectAfterPost(`/dashboard/nest?flash=${done}${flashParamQuery(done, result.flashParams)}`);
+        const done = ownFlash || (fn === exposeCapabilityRemedy ? "fixit_fixed" : "fixit_done");
+        return returnTo(done, result.flashParams);
       }
-      if (result && typeof result.flash === "string" && REMEDY_FLASHES.includes(result.flash)) {
-        return res.redirectAfterPost(`/dashboard/nest?flash=${result.flash}${flashParamQuery(result.flash, result.flashParams)}`);
-      }
-      return res.redirectAfterPost("/dashboard/nest?flash=fixit_error");
+      if (ownFlash) return returnTo(ownFlash, result.flashParams);
+      return returnTo("fixit_error");
     }
-    return res.redirectAfterPost("/dashboard/nest?flash=fixit_error");
+    return returnTo("fixit_error");
   } catch (err) {
     console.error("[fix-it] action failed:", err.message);
-    return res.redirectAfterPost("/dashboard/nest?flash=fixit_error");
+    return returnTo("fixit_error");
   }
 }

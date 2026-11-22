@@ -1208,7 +1208,7 @@ describe("the restart action", () => {
     const redirected = await click(item, { headers: { cookie: "crow_session=x" }, csrfToken: "t" });
 
     assert.deepEqual(calls, ["browser"], "one restart, for the browser bundle");
-    assert.match(redirected, /flash=fixit_fixed/);
+    assert.match(redirected, /flash=fixit_done/);
     assert.equal((await store.getItem(db, item.id)).status, "resolved");
   });
 

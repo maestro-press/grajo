@@ -46,6 +46,7 @@ import {
 import { missingRequiredComposeVars, parseDotEnv } from "../../compose-guard.js";
 import { BUNDLE_ID_RE } from "../../satellites/installs.js";
 import { isLocalPasswordSessionOn } from "../../dashboard/local-session.js";
+import { fill, t } from "../../dashboard/shared/i18n.js";
 
 export const ACTION_ID = "restore-bundle-compose";
 export const LABEL = "Restore Crow's compose";
@@ -55,19 +56,20 @@ export const APPLY_UPDATE_ACTION_ID = "apply-bundle-compose-update";
 /** The flash the Nest renders when the click was not the owner's own session. */
 export const OWNER_ONLY_FLASH = "fixit_owner_only";
 /** What the owner is told when someone else (a peer sign-in, no session) clicked. */
-export const OWNER_ONLY_MESSAGE = "Only the owner, signed in on this Crow, can do that.";
+export const OWNER_ONLY_MESSAGE = t("fixit.flash.ownerOnly", "en");
 /** The flash the Nest renders when the shipped compose needs a key set first. */
 export const NEEDS_KEY_FLASH = "fixit_compose_needs_key";
 /** The sentence for the key a flash may name (a query value, validated here). */
-export const NEEDS_KEY_MESSAGE = "set the key on the Extensions card first";
+export const NEEDS_KEY_MESSAGE = t("fixit.flash.needsKeyGeneric", "en");
 /** A key name a flash may name: one environment key, never anything else. */
 export const FLASH_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** `set <KEY> on the Extensions card first`, for a key name a flash may show. */
-export function needsKeyMessage(key) {
+export function needsKeyMessage(key, lang = "en") {
+  const language = lang === "es" ? "es" : "en";
   return typeof key === "string" && FLASH_KEY_RE.test(key)
-    ? `set ${key} on the Extensions card first`
-    : NEEDS_KEY_MESSAGE;
+    ? fill(t("fixit.flash.needsKey", language), { key })
+    : t("fixit.flash.needsKeyGeneric", language);
 }
 
 const GONE = "Crow's copy of this compose file is not in this install, so nothing was changed.";

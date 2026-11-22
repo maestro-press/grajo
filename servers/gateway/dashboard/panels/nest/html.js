@@ -13,8 +13,7 @@ import { getAddonLogo } from "../../shared/logos.js";
 import { isSafeDestPath } from "../../../../shared/sso-ticket.js";
 import { appIconSvg } from "../../shared/app-icons.js";
 import { appTileLink } from "../../shared/app-link.js";
-import { STALE_FLASH, STALE_MESSAGE, UNWALLED_FLASH, unwalledMessageFor } from "../../../fix-it/remedies/addon-unwall.js";
-import { NEEDS_KEY_FLASH, needsKeyMessage, OWNER_ONLY_FLASH, OWNER_ONLY_MESSAGE } from "../../../fix-it/remedies/restore-bundle-compose.js";
+import { flashBanner } from "../../../fix-it/flash.js";
 
 // ─── Icons ───
 // One shared stroke set (shared/app-icons.js). Icon strings from manifests and
@@ -110,8 +109,29 @@ function buildPeerTileHref(gatewayUrl, hostname, pathname, port) {
 }
 
 /**
+ * The signal links the health strip draws: plain text plus one in-dashboard link
+ * each (the add-on walls card lists every add-on that is not walled and links to
+ * its Extensions entry). Only an in-page dashboard path is trusted here; anything
+ * else — a foreign URL, another protocol, `/\host` — is dropped. This is the ONE
+ * filter: the shell's Attention sheet draws its rows from it too.
+ *
+ * @param {{links?: Array<object>}|null} health
+ * @returns {Array<{text: string, label: string, href: string}>}
+ */
+export function healthLinkRows(health) {
+  return (Array.isArray(health && health.links) ? health.links : [])
+    .filter((l) => l && typeof l === "object" && typeof l.href === "string" && l.href.startsWith("/dashboard/"))
+    .map((l) => ({ text: String(l.text ?? ""), label: String(l.label ?? ""), href: l.href }));
+}
+
+/**
  * Render the health strip that appears above the panel grid.
  * Shown only when healthSignals is provided.
+ *
+ * The flash banner is the shared one (fix-it/flash.js flashBanner): the Nest draws
+ * the same tone and text the Attention sheet draws, in its own classes —
+ * `nest-flash--success`, `nest-flash--error`, and the plain `nest-flash` for a
+ * line that is neither (a removal that only started).
  *
  * @param {{ok: boolean, issues: Array, details: Array}|null} health
  * @param {string} lang
@@ -120,47 +140,20 @@ function buildPeerTileHref(gatewayUrl, hostname, pathname, port) {
  * @param {string|null} flashKey — the env key a compose flash may name (re-checked)
  */
 function buildHealthStrip(health, lang, flash, flashAddon = null, flashKey = null) {
-  // Flash banner (shown after POST backup redirect)
+  // Flash banner (shown after POST backup / Fix-it redirect)
   let flashHtml = "";
-  if (flash === "backup_ok") {
-    flashHtml = `<div class="nest-flash nest-flash--success">${escapeHtml(t("health.backupDone", lang))}</div>`;
-  } else if (flash === "backup_fail") {
-    flashHtml = `<div class="nest-flash nest-flash--error">${escapeHtml(t("health.backupFailed", lang))}</div>`;
-  } else if (flash === "fixit_fixed") {
-    flashHtml = `<div class="nest-flash nest-flash--success">Done — it's shared now.</div>`;
-  } else if (flash === "fixit_dismissed") {
-    flashHtml = `<div class="nest-flash nest-flash--success">Dismissed for now.</div>`;
-  } else if (flash === "fixit_retired_removed") {
-    flashHtml = `<div class="nest-flash nest-flash--success">${escapeHtml(t("health.retiredRemoved", lang))}</div>`;
-  } else if (flash === "fixit_retired_removing") {
-    // Started, not done: no success styling, and no claim that anything was removed yet.
-    flashHtml = `<div class="nest-flash">${escapeHtml(t("health.retiredRemoving", lang))}</div>`;
-  } else if (flash === "fixit_error") {
-    flashHtml = `<div class="nest-flash nest-flash--error">Couldn't apply that fix.</div>`;
-  } else if (flash === "fixit_not_pending") {
-    flashHtml = `<div class="nest-flash nest-flash--error">That card isn't open any more — nothing was changed.</div>`;
-  } else if (flash === UNWALLED_FLASH) {
-    flashHtml = `<div class="nest-flash nest-flash--success">${escapeHtml(unwalledMessageFor(flashAddon))}</div>`;
-  } else if (flash === STALE_FLASH) {
-    flashHtml = `<div class="nest-flash nest-flash--error">${escapeHtml(STALE_MESSAGE)}</div>`;
-  } else if (flash === OWNER_ONLY_FLASH) {
-    flashHtml = `<div class="nest-flash nest-flash--error">${escapeHtml(OWNER_ONLY_MESSAGE)}</div>`;
-  } else if (flash === NEEDS_KEY_FLASH) {
-    flashHtml = `<div class="nest-flash nest-flash--error">${escapeHtml(needsKeyMessage(flashKey))}</div>`;
+  const banner = flashBanner(flash || null, lang, { addon: flashAddon, key: flashKey });
+  if (banner) {
+    const tone = banner.tone === "success" ? " nest-flash--success" : banner.tone === "error" ? " nest-flash--error" : "";
+    flashHtml = `<div class="nest-flash${tone}">${escapeHtml(banner.text)}</div>`;
   }
 
   if (!health) return flashHtml;
 
-  // A signal's own rows: plain text plus a link each (the add-on walls card lists
-  // every add-on that is not walled and links to its Extensions entry). Rendered
-  // whatever the strip's overall state is — an add-on the owner left unwalled is
-  // not a fault, but it is still the thing they may want to open. Only an
-  // in-page dashboard link is trusted here; anything else is dropped.
-  const linksHtml = (Array.isArray(health.links) ? health.links : [])
-    .filter((l) => l && typeof l === "object" && typeof l.href === "string" && l.href.startsWith("/dashboard/"))
+  const linksHtml = healthLinkRows(health)
     .map((l) => {
-      const text = escapeHtml(String(l.text ?? ""));
-      const label = escapeHtml(String(l.label ?? ""));
+      const text = escapeHtml(l.text);
+      const label = escapeHtml(l.label);
       const href = escapeHtml(l.href);
       const anchor = label ? ` <a class="nest-health-issue-action" href="${href}">${label}</a>` : "";
       return `<div class="nest-health-link-row"><span class="nest-health-issue-label">${text}</span>${anchor}</div>`;

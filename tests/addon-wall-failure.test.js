@@ -874,7 +874,7 @@ test("Keep it off spends the record: a card set back to pending can no longer un
   await fixIt.emitFixIt(db, "addon-wall-failed", { id: "browser", reason: "stopped with exit code 3", ref });
   const card = await waitForCard("addon-wall:browser");
   const before = wallsBytes();
-  assert.match(await clickRemedy(card.id, "addon-keep-off"), /flash=fixit_fixed/);
+  assert.match(await clickRemedy(card.id, "addon-keep-off"), /flash=fixit_done/);
   assert.equal(failures.wallFailureByItemId(card.id), null, "the record is gone");
   // A crow.db writer reopens the answered card.
   await db.execute({ sql: "UPDATE fix_it_items SET status = 'pending' WHERE id = ?", args: [card.id] });

@@ -11,6 +11,80 @@
  *   tJs("notif.no_notifications", "es")  // → JS-safe escaped string (for JS string contexts)
  */
 
+/**
+ * The Fix-it card copy (one card model, two renderers: the Nest's Fix-it section
+ * and the shell's Attention sheet). `en` is exactly what the cards rendered
+ * before the copy moved here; `es` is the operator-approved Spanish, keyed in
+ * this same order. Both sides are hand-written, and a key with no approved
+ * Spanish throws while this module loads.
+ */
+const FIXIT_CARD_COPY_EN = {
+  "fixit.notNow": "Not now",
+  "fixit.comingSoon": "Coming soon",
+  "fixit.technicalDetails": "Technical details",
+  "fixit.capability": "Capability:",
+  "fixit.requestingInstance": "Requesting instance:",
+  "fixit.caddyfile": "Caddyfile:",
+  "fixit.thingsNoticed": "Things Crow noticed",
+  "fixit.fix": "Fix",
+  "fixit.open": "Open",
+  "fixit.flash.fixed": "Done — it's shared now.",
+  "fixit.flash.done": "Done.",
+  "fixit.flash.dismissed": "Dismissed for now.",
+  "fixit.flash.error": "Couldn't apply that fix.",
+  "fixit.flash.notPending": "That card isn't open any more — nothing was changed.",
+  "fixit.flash.ownerOnly": "Only the owner, signed in on this Crow, can do that.",
+  "fixit.flash.needsKey": "set {key} on the Extensions card first",
+  "fixit.flash.needsKeyGeneric": "set the key on the Extensions card first",
+  "fixit.flash.unwalled": "Done. {id} now runs without its wall on this computer. You can wall it again on its page under Extensions.",
+  "fixit.flash.unwalledGeneric": "Done. That add-on now runs without its wall on this computer. You can wall it again on its page under Extensions.",
+  "fixit.addonWall.title": "An add-on could not run inside its wall",
+  "fixit.addonWall.why": "{id} {reason}. It stays off until you choose.",
+  "fixit.addonWall.stale": "This failure is from before Crow last restarted; start the add-on again to see whether it still fails",
+  "fixit.addonWall.keepOff": "Keep it off",
+  "fixit.addonWall.unwall": "Run {id} without the wall",
+};
+
+/**
+ * The operator-approved Spanish strings, keyed and ordered exactly like the
+ * English table above. Every key must be here: a missing one throws while this
+ * module loads, so a half-translated card can never ship.
+ */
+const FIXIT_CARD_COPY_ES_APPROVED = Object.freeze({
+  "fixit.notNow": "Ahora no",
+  "fixit.comingSoon": "Próximamente",
+  "fixit.technicalDetails": "Detalles técnicos",
+  "fixit.capability": "Capacidad:",
+  "fixit.requestingInstance": "Instancia que lo pide:",
+  "fixit.caddyfile": "Caddyfile:",
+  "fixit.thingsNoticed": "Cosas que Crow notó",
+  "fixit.fix": "Arreglar",
+  "fixit.open": "Abrir",
+  "fixit.flash.fixed": "Listo: ya está compartido.",
+  "fixit.flash.done": "Listo.",
+  "fixit.flash.dismissed": "Descartado por ahora.",
+  "fixit.flash.error": "No se pudo aplicar esa corrección.",
+  "fixit.flash.notPending": "Esa tarjeta ya no está abierta: no se cambió nada.",
+  "fixit.flash.ownerOnly": "Solo el propietario, con la sesión iniciada en este Crow, puede hacer eso.",
+  "fixit.flash.needsKey": "primero configura {key} en la tarjeta de Extensiones",
+  "fixit.flash.needsKeyGeneric": "primero configura la clave en la tarjeta de Extensiones",
+  "fixit.flash.unwalled": "Listo. {id} ahora se ejecuta sin su aislamiento en este equipo. Puedes volver a aislarlo en su página, en Extensiones.",
+  "fixit.flash.unwalledGeneric": "Listo. Ese complemento ahora se ejecuta sin su aislamiento en este equipo. Puedes volver a aislarlo en su página, en Extensiones.",
+  "fixit.addonWall.title": "Un complemento no pudo ejecutarse dentro de su aislamiento",
+  "fixit.addonWall.why": "{id} {reason}. Seguirá apagado hasta que decidas.",
+  "fixit.addonWall.stale": "Este fallo es de antes del último reinicio de Crow; vuelve a iniciar el complemento para ver si sigue fallando",
+  "fixit.addonWall.keepOff": "Mantenerlo apagado",
+  "fixit.addonWall.unwall": "Ejecutar {id} sin aislamiento",
+});
+
+const FIXIT_CARD_COPY = Object.fromEntries(Object.entries(FIXIT_CARD_COPY_EN).map(([key, en]) => {
+  const es = FIXIT_CARD_COPY_ES_APPROVED[key];
+  if (typeof es !== "string" || es.length === 0) {
+    throw new Error(`The Fix-it card copy has no approved Spanish for "${key}"`);
+  }
+  return [key, { en, es }];
+}));
+
 export const translations = {
   // ─── Nav & Layout ───
   "nav.logout": { en: "Logout", es: "Cerrar sesión" },
@@ -613,6 +687,12 @@ export const translations = {
   // (fix-it/detectors/retired-bundle.js): a row anything can write is never rendered.
   "health.retiredRemove": { en: "Remove it", es: "Quitarlo" },
   "health.stripLabel": { en: "System status", es: "Estado del sistema" },
+
+  // ─── Fix-it cards ───
+  // The card copy (see FIXIT_CARD_COPY_EN at the top of this file): the two
+  // renderers, the detectors/remedies that render code-held cards, and the flash
+  // banners all read these, so the Nest's own markup keeps its exact English.
+  ...FIXIT_CARD_COPY,
 
   // ─── Onboarding first-success (W3-3) ───
   "onboarding.firstMemory.title": { en: "Store a memory", es: "Guarda un recuerdo" },

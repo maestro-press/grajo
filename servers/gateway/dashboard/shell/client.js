@@ -115,6 +115,21 @@ export function shellClientJs() {
       if (attnSlot) {
         var attnDlg = attnSlot.closest('dialog');
         var attnSeq = 0;
+        // A Fix-it click or a backup sends the owner back here with ?flash= (and
+        // the add-on or key a flash may name). Those three params ride along to
+        // the fragment — page params only, never one the client invents — until
+        // the sheet is closed once, so the banner is shown once and not again on
+        // every reopen. Read now: ?sheet=attention is dropped below.
+        var attnFlashAlive = true;
+        var attnFlashQuery = (function () {
+          var names = ['flash', 'addon', 'key'];
+          var parts = [];
+          for (var q = 0; q < names.length; q++) {
+            var m = new RegExp('[?&]' + names[q] + '=([^&]*)').exec(location.search || '');
+            if (m) parts.push(names[q] + '=' + m[1]);
+          }
+          return parts.length ? '&' + parts.join('&') : '';
+        })();
         // "This is expected" returns to the page the user is on, with the sheet open.
         var fixAttnBack = function () {
           var back = location.pathname;
@@ -128,7 +143,8 @@ export function shellClientJs() {
         };
         var loadAttention = function () {
           var mine = ++attnSeq;
-          fetch('/dashboard/attention/fragment', { credentials: 'same-origin', cache: 'no-store' })
+          var url = '/dashboard/attention/fragment' + (attnFlashAlive ? attnFlashQuery : '');
+          fetch(url, { credentials: 'same-origin', cache: 'no-store' })
             .then(function (r) { return r.ok ? r.text() : null; })
             .then(function (html) {
               if (mine !== attnSeq || html === null) return;
@@ -146,8 +162,14 @@ export function shellClientJs() {
         };
         (window.requestIdleCallback || function (fn) { setTimeout(fn, 200); })(loadAttention);
         if (attnDlg && typeof MutationObserver === 'function') {
-          new MutationObserver(function () { if (attnDlg.open) loadAttention(); })
-            .observe(attnDlg, { attributes: true, attributeFilter: ['open'] });
+          new MutationObserver(function () {
+            if (attnDlg.open) loadAttention();
+            // Closed once: the flash has had its showing.
+            else attnFlashAlive = false;
+          }).observe(attnDlg, { attributes: true, attributeFilter: ['open'] });
+        }
+        if (attnDlg && typeof attnDlg.addEventListener === 'function') {
+          attnDlg.addEventListener('close', function () { attnFlashAlive = false; });
         }
         if (/[?&]sheet=attention(&|$)/.test(location.search)) {
           var attnBtn = attnDlg ? document.querySelector('[data-shell-tray][aria-controls="' + attnDlg.id + '"]') : null;
@@ -155,6 +177,11 @@ export function shellClientJs() {
           try {
             var attnUrl = new URL(location.href);
             attnUrl.searchParams.delete('sheet');
+            // The flash belongs to this one showing: a reload or Back must not
+            // draw it again.
+            attnUrl.searchParams.delete('flash');
+            attnUrl.searchParams.delete('addon');
+            attnUrl.searchParams.delete('key');
             history.replaceState(history.state, '', attnUrl.pathname + attnUrl.search + attnUrl.hash);
           } catch (e) {}
         }

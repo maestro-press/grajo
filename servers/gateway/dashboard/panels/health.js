@@ -17,8 +17,9 @@ import { SUPPORTED_LANGS } from "../shared/i18n.js";
 import { resolveRequestMode, safeReturnPath } from "../shell/request.js";
 import { getInstance, getOrCreateLocalInstanceId } from "../../instance-registry.js";
 import { t } from "../shared/i18n.js";
-import { attentionGroupHtml } from "../shell/attention.js";
-import { renderFixItCards } from "../../fix-it/index.js";
+import { attentionSheetHtml } from "../shell/attention.js";
+import { renderFixItCards, renderFixItSheetCards } from "../../fix-it/index.js";
+import { flashBanner, parseFlashQuery } from "../../fix-it/flash.js";
 
 async function resolveLocalInstanceName(db, lang) {
   try {
@@ -60,8 +61,13 @@ const ATTENTION_FALLBACK = "/dashboard/attention";
  *   GET  /dashboard/attention/fragment - the sheet's "Needs attention" group.
  *   GET  /dashboard/attention   - where alert notifications land: the sheet in
  *                                 new mode, the nest's health card in classic.
+ *
+ * `collectSignals` is injectable (the second argument, or the property of the
+ * first) exactly as notificationsRouter's is, so a test can fix the health half
+ * of a fragment without running the real probes. Production passes neither.
  */
-export function healthAttentionRouter({ createDbClient }) {
+export function healthAttentionRouter({ createDbClient, collectSignals } = {}, injected = {}) {
+  const readSignals = injected.collectSignals || collectSignals || collectHealthSignals;
   const router = Router();
 
   router.post("/dashboard/health/ack", async (req, res) => {
@@ -90,23 +96,49 @@ export function healthAttentionRouter({ createDbClient }) {
     return res.redirect(303, back === "/dashboard/perch" && raw !== "/dashboard/perch" ? ATTENTION_FALLBACK : back);
   });
 
-  // The sheet's "Needs attention" group, loaded each time the sheet opens.
+  // The sheet's body, loaded each time the sheet opens: welcome, flash, Fix-it
+  // cards, the "Needs attention" group, signal links, all-good and the collapsed
+  // status details. Each of the three data sources (health signals, Fix-it cards,
+  // the flash) fails on its own — a broken one is left out, never a 500.
   router.get("/dashboard/attention/fragment", async (req, res) => {
     const db = createDbClient();
-    let issues = [];
     let lang = "en";
+    let health = null;
+    let issues = [];
+    let fixItHtml = "";
+    let flash = null;
     try {
       // The layout's language: the per-instance "language" setting.
-      const setLang = await readSetting(db, "language");
-      if (SUPPORTED_LANGS.includes(setLang)) lang = setLang;
-      issues = (await collectHealthSignals(db, { lang })).issues || [];
-    } catch {
-      issues = [];
+      try {
+        const setLang = await readSetting(db, "language");
+        if (SUPPORTED_LANGS.includes(setLang)) lang = setLang;
+      } catch { /* the default stays */ }
+      try {
+        const signals = await readSignals(db, { lang });
+        health = signals && typeof signals === "object" ? signals : null;
+        issues = Array.isArray(health && health.issues) ? health.issues : [];
+      } catch {
+        health = null;
+        issues = [];
+      }
+      try {
+        fixItHtml = await renderFixItSheetCards(db, { lang, req });
+      } catch {
+        fixItHtml = "";
+      }
+      // ?flash, ?addon and ?key: parseFlashQuery accepts only a known code and
+      // string parameters; the banner helper re-checks the two parameters.
+      try {
+        const q = parseFlashQuery(req.query);
+        flash = flashBanner(q.flash, lang, { addon: q.addon, key: q.key });
+      } catch {
+        flash = null;
+      }
     } finally {
       db.close();
     }
     res.set("Cache-Control", "no-store");
-    res.type("text/html").send(attentionGroupHtml(issues, lang));
+    res.type("text/html").send(attentionSheetHtml({ lang, health, issues, fixItHtml, flash }));
   });
 
   router.get("/dashboard/attention", async (req, res) => {
@@ -226,14 +258,10 @@ export default {
     } catch {}
 
     // Flash param from post-backup / fix-it redirects, with the add-on an unwall
-    // flash may name and the env key a compose flash may name (the Nest re-checks
-    // both before it renders them).
-    const flash = (typeof req.query?.flash === "string" &&
-      ["backup_ok", "backup_fail", "fixit_fixed", "fixit_dismissed", "fixit_error", "fixit_not_pending", "fixit_addon_stale", "fixit_addon_unwalled", "fixit_owner_only", "fixit_compose_needs_key", "fixit_retired_removed", "fixit_retired_removing"].includes(req.query.flash))
-      ? req.query.flash
-      : null;
-    const flashAddon = typeof req.query?.addon === "string" ? req.query.addon : null;
-    const flashKey = typeof req.query?.key === "string" ? req.query.key : null;
+    // flash may name and the env key a compose flash may name. parseFlashQuery
+    // accepts only a known code and string parameters; the strip re-checks the
+    // two parameters before it renders them.
+    const { flash, addon: flashAddon, key: flashKey } = parseFlashQuery(req.query);
 
     const css = nestCSS();
     const html = buildNestHTML({ ...data, healthSignals, flash, flashAddon, flashKey, fixItHtml }, lang);
