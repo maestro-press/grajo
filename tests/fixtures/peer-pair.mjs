@@ -21,7 +21,7 @@
  * hand-inserted except where a test says so (the legacy trusted=0 shape).
  */
 import { spawn, execFile, execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, copyFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, copyFileSync, rmSync, openSync, writeSync, closeSync, unlinkSync, renameSync, linkSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, request } from "node:http";
@@ -56,13 +56,242 @@ function probe(port) {
     s.listen(port, "0.0.0.0", () => s.close(() => resolve(true)));
   });
 }
-async function freePort() {
+
+// ---- cross-process port reservation ---------------------------------------
+//
+// A probe alone is not enough. An instance that has already SERVED cannot move
+// its port (its peers hold it), so across a pairing reboot its port sits
+// unbound while the child restarts — and a brief bind-probe in another test
+// file, in another suite run on the same box, or another gateway's listen
+// finds it free and takes it. CI's E-F7 lost a reboot to exactly that
+// (EADDRINUSE on 0.0.0.0:<the peer's port>).
+//
+// So a picked port is RESERVED in a directory shared by every process on the
+// box: a file named after the port, created O_EXCL, holding the owning pid.
+// A probe follows the lock (never the other way round), so no other reserving
+// process can pick the port in the window between the probe and this
+// instance's listen. The lock is held for the instance's whole life, across
+// every reboot and stop, and released at teardown (or on process exit for a
+// test file that never got that far).
+//
+// A lock left behind by a process that is GONE is reclaimed: a live pid means
+// the port is held, a dead pid (ESRCH) means the owner died holding it, and an
+// unreadable file is reclaimed once it is old enough that no writer can still
+// be between open() and write().
+//
+// Two more shapes read as stale. A lock naming THIS pid that this process does
+// not hold (not in heldPortLocks) is not ours — a leftover from an earlier run
+// that had our pid — so it is reclaimable, not "live self". And a lock older
+// than PORT_LOCK_MAX_AGE_MS is stale whatever its pid says: on a persistent box
+// pids are handed out again, so past that age "the pid is alive" stops meaning
+// "the owner still holds this port".
+//
+// Reclaiming is a RENAME, never an unlink+create: two processes that read the
+// same stale lock would both unlink it, both recreate it, and both come away
+// believing they own the port. rename(2) is atomic and exactly one reclaimer
+// wins it; the loser gets ENOENT and treats the port as taken this round.
+//
+// A rename is atomic but it is NOT conditional: a reclaimer that stalls between
+// its own stale check and its rename can therefore rename away a lock another
+// reclaimer has created in the meantime — one belonging to a LIVE owner. So the
+// winner re-reads what it moved (recheckStashedLock) and, when it turns out not
+// to be stale, puts it back with link(2) (which fails EEXIST instead of
+// overwriting) and reports that it lost the port this round.
+const PORT_UNREADABLE_STALE_MS = 10 * 60_000;
+const PORT_LOCK_MAX_AGE_MS = 6 * 60 * 60_000;
+const heldPortLocks = new Set();
+let portReservation = true;
+
+/** Only the control test turns this off: it must prove the sharing is what refuses. */
+export function _setPortReservation(enabled) { portReservation = !!enabled; }
+
+/**
+ * The shared lock directory (CROW_TEST_PORTS_DIR overrides it for a test that
+ * wants its own). The default is PER UID: the directory is created 0700, so a
+ * single shared os.tmpdir() path would leave every other user on the box with
+ * EACCES on a directory they can neither read nor use.
+ */
+export function portReservationDir() {
+  return process.env.CROW_TEST_PORTS_DIR || join(tmpdir(), `crow-test-ports-${process.getuid?.() ?? "u"}`);
+}
+
+function lockPath(port) { return join(portReservationDir(), String(port)); }
+
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (err) { return err.code === "EPERM"; }
+}
+
+function lockPid(path) {
+  try {
+    const n = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
+    return Number.isInteger(n) && n > 0 ? n : null;
+  } catch { return null; }
+}
+
+/**
+ * Is this lock file's owner gone (so the port may be taken from it)?
+ *
+ * `ownPath` is the lock path this file stands for when it has been moved aside
+ * under another name (a reclaim's stash): "a pid that looks like ours" is only
+ * stale when we do not hold THAT port, and the stash is not a port's lock path.
+ */
+function staleLock(path, ownPath = path) {
+  let age = null;
+  try { age = Date.now() - statSync(path).mtimeMs; } catch { return false; } // gone already: nothing to reclaim
+  if (age > PORT_LOCK_MAX_AGE_MS) return true; // too old to trust its pid (reuse on a persistent box)
+  const pid = lockPid(path);
+  if (pid === null) return age > PORT_UNREADABLE_STALE_MS; // no writer can still be between open() and write()
+  if (pid === process.pid) return !heldPortLocks.has(ownPath); // a leftover/looked-like-us pid, not a lock we hold
+  return !pidAlive(pid);
+}
+
+/**
+ * The name a reclaim moves a lock to. Only this process uses it (pid + random),
+ * and it is never a lock path: on disk a lock path is only ever absent or a lock.
+ */
+export function lockStashPath(path) {
+  return `${path}.reclaim.${process.pid}.${randomBytes(4).toString("hex")}`;
+}
+
+/**
+ * The second half of a reclaim: decide what the renamed file (`stash`) was, and
+ * report whether THIS call won the port.
+ *
+ * The rename was atomic but not conditional, so what landed in the stash may be
+ * a FRESH lock of a LIVE owner — one another reclaimer created after this one's
+ * stale check and before its rename (the stalled-reclaimer race). So the stash
+ * is re-read and the stale rule re-applied to it, age and pid, from its own
+ * bytes and mtime (rename preserves both):
+ *
+ * - still stale: it was the dead lock this call set out to reclaim. Drop it and
+ *   win (`true`); the caller recreates the lock.
+ * - NOT stale: it is somebody's live lock. Put it back with link(2), which
+ *   fails EEXIST rather than overwriting a lock created while the stash was
+ *   held, drop the stash and report a loss (`false`) — the port is taken this
+ *   round. The stash is never left behind either way.
+ */
+export function recheckStashedLock(path, stash) {
+  if (!staleLock(stash, path)) {
+    try {
+      linkSync(stash, path); // EEXIST instead of overwriting: restore, never clobber
+    } catch (err) {
+      // EEXIST: a lock reappeared at the path meanwhile (that owner keeps it).
+      // ENOENT: the stash is already gone; there is nothing to put back.
+      if (err.code !== "EEXIST" && err.code !== "ENOENT") throw err;
+    }
+    try { unlinkSync(stash); } catch { /* already gone */ }
+    return false;
+  }
+  try { unlinkSync(stash); } catch { /* already gone */ }
+  return true;
+}
+
+/**
+ * Take a stale lock out of the way, and report whether THIS call won it.
+ *
+ * The lock is renamed to a name only this process can be using: of N reclaimers
+ * racing on the same stale lock exactly one wins the rename, the rest get ENOENT
+ * (the path is gone) and must treat the port as taken this round — the winner is
+ * about to recreate it. The renamed file is not unlinked on trust, though: a
+ * reclaimer that stalled before its rename may have moved a LIVE owner's fresh
+ * lock aside, so recheckStashedLock re-applies the stale rule to it and puts it
+ * back when it turns out to be fresh (see above).
+ */
+export function reclaimStaleLock(path) {
+  const stash = lockStashPath(path);
+  try {
+    renameSync(path, stash);
+  } catch (err) {
+    if (err.code === "ENOENT") return false; // another reclaimer renamed it first
+    throw err;
+  }
+  return recheckStashedLock(path, stash);
+}
+
+/**
+ * Reserve ONE port for this process. `false` when another process holds it (or
+ * a fresh lock file cannot be read yet); a stale lock — a dead owner, a pid that
+ * looks like ours but that we do not hold, or a lock past the age cap — is
+ * reclaimed by winning a rename, and the reservation retried once. A reclaim
+ * this call LOST is `false`: another process owns the port for this round. With
+ * the reservation switched off this is a plain `true` — no lock file, nothing shared.
+ */
+export function tryReserve(port, { reclaimed = false } = {}) {
+  if (!portReservation) return true;
+  const dir = portReservationDir();
+  const path = lockPath(port);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    const fd = openSync(path, "wx", 0o600);
+    try { writeSync(fd, `${process.pid}\n`); } finally { closeSync(fd); }
+    heldPortLocks.add(path);
+    return true;
+  } catch (err) {
+    if (err.code !== "EEXIST") throw err;
+  }
+  if (reclaimed || !staleLock(path)) return false;
+  // Only the winner of the rename may recreate the lock; a loser is not a
+  // second owner of the same port, it is somebody who lost the race.
+  if (!reclaimStaleLock(path)) return false;
+  return tryReserve(port, { reclaimed: true });
+}
+
+/** Give up a port this process reserved (a lock this process never took is left alone). */
+export function releasePort(port) {
+  if (port === undefined || port === null) return;
+  const path = lockPath(port);
+  if (!heldPortLocks.delete(path)) return;
+  try { unlinkSync(path); } catch { /* already gone */ }
+}
+
+// A test file that dies without a teardown (a failed assertion, a SIGTERM) must
+// not leave its ports looking held to the next run on the box.
+process.once("exit", () => {
+  for (const path of heldPortLocks) { try { unlinkSync(path); } catch { /* gone */ } }
+});
+
+/** A free gateway port, reserved for this process (see tryReserve). The caller owns the lock. */
+export async function reservePort() {
   const hi = Math.min(ephemeralLow(), 32768);
   for (let i = 0; i < 200; i++) {
     const port = PORT_LO + Math.floor(Math.random() * (hi - PORT_LO));
+    if (!tryReserve(port)) continue; // held by another process
     if (await probe(port)) return port;
+    releasePort(port); // bound by something that never reserved it
   }
   throw new Error("peer-pair: no free port below the ephemeral range");
+}
+
+// ---- boot attempts against one port ---------------------------------------
+
+/**
+ * Backoff for a SERVED instance that meets EADDRINUSE on reboot: one retry per
+ * entry, same port each time (peers know it, so it cannot move).
+ */
+export const REBOOT_PORT_RETRY_DELAYS = [250, 500, 1_000, 2_000, 2_000];
+
+/**
+ * Run boot attempts against ONE port.
+ *
+ * `start()` performs one attempt and resolves to `{ addrInUse: true }` when the
+ * child died because the port was taken, `{ ok: true }` when it came up, and
+ * throws (or resolves anything else) for a real failure.
+ *
+ * An instance that has never served may move its port — no peer, row or relay
+ * knows it yet — so the attempt is handed back to the caller, which picks a new
+ * one. An instance that HAS served cannot: it retries the SAME port with
+ * backoff, one retry per entry in `delays`. That covers a transient holder (a
+ * dying gateway child, another process's probe); a port held for the whole
+ * window comes back as `addrInUse` and the caller reports it as such.
+ */
+export async function bootWithPortRetry({ start, served = false, delays = REBOOT_PORT_RETRY_DELAYS, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
+  for (let attempt = 1; ; attempt++) {
+    const outcome = { ...(await start()), attempts: attempt };
+    if (!outcome.addrInUse || !served) return outcome;
+    const delay = delays[attempt - 1];
+    if (delay === undefined) return outcome;
+    await sleep(delay);
+  }
 }
 
 const SCRUB = ["CROW_HOME", "CROW_DATA_DIR", "CROW_DB_PATH", "CROW_BACKUP_DIR", "CROW_INSTANCES_JSON_PATH", "CROW_REFCOUNT_PATH",
@@ -136,6 +365,10 @@ export class Instance {
     this.tokensPath = join(this.dir, "secrets", "peer-tokens.json");
     this.log = "";
     this.child = null;
+    // The ports THIS instance reserved (not merely the port it is using: a test
+    // may point `port` at another instance's port, which is that instance's
+    // lock). Released at cleanup, not at stop — see tryReserve.
+    this._reservedPorts = new Set();
   }
 
   get env() {
@@ -176,7 +409,8 @@ export class Instance {
   }
 
   async init({ seedFrom = null } = {}) {
-    this.port = await freePort();
+    this.port = await reservePort();
+    this._reservedPorts.add(this.port);
     execFileSync(process.execPath, ["scripts/init-db.js"], { env: this.env, cwd: REPO, stdio: "pipe" });
     this.sql(`INSERT INTO crow_instances (id, name, crow_id, gateway_url, tailscale_ip, status) VALUES (?, ?, ?, ?, ?, 'active')`,
       [this.id, this.name, this.id, `http://${this.ip}:${this.port}`, this.ip]);
@@ -208,6 +442,33 @@ export class Instance {
   async boot({ otc = null, extraEnv = {}, repo = null } = {}) {
     await this.stop();
     if (repo) this.repo = repo;
+    const outcome = await bootWithPortRetry({
+      served: !!this.served,
+      delays: this.portRetryDelays || REBOOT_PORT_RETRY_DELAYS,
+      start: () => this._bootAttempt({ otc, extraEnv }),
+    });
+    if (outcome.addrInUse) {
+      // Served: its port is in every peer's rows and every relay here, so it
+      // cannot move. A holder that outlasted the backoff is not this fixture's
+      // transient case and must read as exactly that, not as a bare exit.
+      if (this.served) {
+        throw new Error(`${this.name}: port ${this.port} is held by another process (reboot after serving cannot move ports)\n${this.log.slice(-3000)}`);
+      }
+      // Never served: no peer, row or relay knows its port yet, so move it and
+      // boot again.
+      if ((this._portRetries = (this._portRetries || 0) + 1) <= 3) {
+        await this.movePort();
+        return this.boot({ otc, extraEnv, repo });
+      }
+      throw new Error(`${this.name}: gateway exited during boot\n${this.log.slice(-3000)}`);
+    }
+    this.served = true;
+    if (!this.relays) this.relays = new Map();
+    return this;
+  }
+
+  /** One spawn + wait against the current port: `{ ok: true }` or `{ addrInUse: true }`; anything else throws. */
+  async _bootAttempt({ otc, extraEnv }) {
     const env = { ...this.env, ...(this.sync ? { CROW_DISABLE_INSTANCE_SYNC: "0" } : {}), ...extraEnv };
     if (otc) Object.assign(env, { CROW_ENROLL_ENABLED: "1", CROW_ENROLL_OTC: otc });
     this.log = "";
@@ -222,12 +483,7 @@ export class Instance {
       const done = await Promise.race([exited.then(() => true), new Promise((r) => setTimeout(() => r(false), 250))]);
       if (done) {
         this.child = null;
-        // Port taken by someone else before this instance ever served: no
-        // peer, row or relay knows its port yet, so move it and boot again.
-        if (/EADDRINUSE/.test(this.log) && !this.served && (this._portRetries = (this._portRetries || 0) + 1) <= 3) {
-          await this.movePort();
-          return this.boot({ otc, extraEnv, repo });
-        }
+        if (/EADDRINUSE/.test(this.log)) return { addrInUse: true };
         throw new Error(`${this.name}: gateway exited during boot\n${this.log.slice(-3000)}`);
       }
       // Ready only once THIS child has bound the port (its listen callback
@@ -239,14 +495,18 @@ export class Instance {
         if (r.status === 200) break;
       } catch { /* not up yet */ }
     }
-    this.served = true;
-    if (!this.relays) this.relays = new Map();
-    return this;
+    return { ok: true };
   }
 
-  /** A fresh port for an instance that has never served (its self row follows). */
+  /** A fresh reserved port for an instance that has never served (its self row follows). */
   async movePort() {
-    this.port = await freePort();
+    const previous = this.port;
+    this.port = await reservePort();
+    this._reservedPorts.add(this.port);
+    // Only the port this instance reserved is ours to give back (a test may
+    // have pointed `port` at another instance's); the new lock is taken BEFORE
+    // the old one is released, so there is no window in which we hold neither.
+    if (this._reservedPorts.delete(previous)) releasePort(previous);
     this.sql("UPDATE crow_instances SET gateway_url = ? WHERE id = ?", [`http://${this.ip}:${this.port}`, this.id]);
   }
 
@@ -271,6 +531,11 @@ export class Instance {
   async cleanup() {
     await this.stop();
     for (const r of this.relays?.values() || []) { r.closeAllConnections?.(); await new Promise((res) => r.close(res)); }
+    // The port lock is held for the instance's whole life (every stop and
+    // reboot, or a peer's reboot would hand the port to another test): it is
+    // released here, at teardown, and nowhere else.
+    for (const port of this._reservedPorts) releasePort(port);
+    this._reservedPorts.clear();
     rmSync(this.dir, { recursive: true, force: true });
   }
 
