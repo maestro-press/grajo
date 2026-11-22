@@ -560,9 +560,9 @@ test("a draft mail_alerts block naming another account than the report's sender 
   assert.deepEqual(folders, [], "no mailbox was read");
 });
 
-/* ------------------------------------------- one read of the revisions for a whole run */
+/* ------------------------------------------- one paged pass over the revisions for a whole run */
 
-test("a preview reads the report's revisions once, however many gated blocks it has", async () => {
+test("a preview pages the report's revisions once, however many gated blocks it has", async () => {
   const db = await freshDb();
   // Both blocks are bot-introduced, so both are gated and both need the owner-history answer.
   const report = await prepare(db, { recipe: { blocks: [FEED_BLOCK] }, authorKind: "bot" });
@@ -572,15 +572,15 @@ test("a preview reads the report's revisions once, however many gated blocks it 
   await botSaveRecipe(db, deps, { reportId: report.id, recipe: { blocks: [FEED_BLOCK, second] } });
 
   const execute = db.execute.bind(db);
-  let chainReads = 0;
-  let authorReads = 0;
+  let revisionReads = 0;
+  let readsHashColumn = 0;
   db.execute = async (arg) => {
     const sql = typeof arg === "string" ? arg : arg && arg.sql;
     if (typeof sql === "string" && sql.includes("report_recipe_revisions") && sql.includes("rev <=")) {
-      // The owner-history pass reads `rev, author_kind, recipe_json`; the author-seal pass reads the
-      // recipe text beside the hash column. One of each, for the whole run.
-      if (sql.includes("recipe_hash")) authorReads += 1;
-      else chainReads += 1;
+      // The owner-history pass reads the revision rows in keyset pages and carries `recipe_hash` in the
+      // same SELECT, so the per-row seal check needs no second pass over the same rows.
+      revisionReads += 1;
+      if (sql.includes("recipe_hash")) readsHashColumn += 1;
     }
     return execute(arg);
   };
@@ -593,8 +593,8 @@ test("a preview reads the report's revisions once, however many gated blocks it 
   } finally {
     db.execute = execute;
   }
-  assert.equal(chainReads, 1, "one read of the report's revisions for the whole run");
-  assert.equal(authorReads, 1, "one author-seal read for the whole run");
+  assert.equal(revisionReads, 1, "one page of the report's revisions for the whole run, not one read per block");
+  assert.equal(readsHashColumn, 1, "and that one page carries what the owner-seal check needs");
 });
 
 /* ------------------------------------------------- the gate follows the content, not the author */

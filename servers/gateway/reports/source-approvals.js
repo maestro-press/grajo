@@ -93,7 +93,7 @@ import { createHash } from "node:crypto";
 import { approvalInternals, verifyLive } from "./approvals.js";
 import { BLOCK_ID_RE, BLOCKS } from "./blocks/index.js";
 import { canonicalJson } from "./recipe-hash.js";
-import { ownerSealedRevisions } from "./revision-author.js";
+import { authorKeyOf, ownerAuthorStates, verifyOwnerRevisionRow } from "./revision-author.js";
 import { approvalSeal, newApprovalNonce, verifyApprovalSeal } from "./seal.js";
 import { senderSealVerifies } from "./sender-seal.js";
 import { getRevision, getState, recordAudit, setState } from "./store.js";
@@ -448,9 +448,12 @@ export function chainKeyOf(blockId, settingsHash) {
   return `${blockId}${ANSWER_SEP}${text(settingsHash)}`;
 }
 
+/** How many revision rows one keyset page of the owner-history pass reads (a report's history only grows). */
+const OWNER_CHAIN_PAGE_ROWS = 200;
+
 /**
  * Every (block id, settings hash) pair the report's revisions still carry at `headRev`, with the answer
- * rule (c) gives it, from ONE pass over the report's revisions.
+ * rule (c) gives it, from ONE paged pass over the report's revisions.
  *
  * The answer for a pair is whether an unbroken OWNER-introduced run of revisions carries that block id at
  * that settings hash from the revision that started the run up to and including `headRev`. A revision
@@ -464,7 +467,7 @@ export function chainKeyOf(blockId, settingsHash) {
  *   - an owner's re-add after a bot removed the block is ungated again, because that re-add is the
  *     owner putting the content there.
  *
- * WHAT "OWNER-WRITTEN" MEANS: the revision carries a sealed author proof (`ownerSealedRevisions`,
+ * WHAT "OWNER-WRITTEN" MEANS: the revision carries a sealed author proof (`verifyOwnerRevisionRow`,
  * revision-author.js): the `author_kind` column says `owner`, the `revision_author:<rev>` state row holds a
  * nonce and a seal, the revision's own recipe body recomputes to its `recipe_hash` column, and the seal
  * verifies over the report, the revision and that hash under the keychain seed. A row whose column was
@@ -481,14 +484,19 @@ export function chainKeyOf(blockId, settingsHash) {
  * number does not follow the one before it (the first row must be revision 1) means a revision between
  * them is gone, so a run that looked unbroken is not one. A deleted revision therefore breaks the chain
  * exactly where a revision nobody can read would, and only a revision that is itself owner-written can
- * start a run after the hole.
+ * start a run after the hole. The keyset-paged read carries both the block state and the previous revision
+ * number across pages, so a hole is a hole wherever it falls — including exactly on a page boundary.
  *
- * ONE READ, then a lookup: only one hash per block id can be carried at the head revision (a revision
- * holds one block per id), so one pass tracks `block id -> {hash, chain}` and the map holds the answer
- * for each pair that survived. A run of a recipe asks this ONCE and reuses the map for every gated block
- * (`isSourceApprovedForBot`'s `gate`), rather than reading every revision again per block.
+ * PAGED, then a lookup: only one hash per block id can be carried at the head revision (a revision holds
+ * one block per id), so the pass tracks `block id -> {hash, chain}` across the pages and the map holds the
+ * answer for each pair that survived. The pages are read with keyset pagination (`rev > ? AND rev <= ?
+ * ORDER BY rev ASC LIMIT 200`) rather than one unbounded read, because a report's history only grows; the
+ * `revision_author:` state rows are still read in ONE query up front (they are small: two short hex
+ * strings per sealed revision), and each page's owner-seal answer is computed from the rows that page
+ * already read, so no revision row is read twice. A run of a recipe asks this ONCE and reuses the map for
+ * every gated block (`isSourceApprovedForBot`'s `gate`), rather than paging the revisions again per block.
  *
- * Never throws: a revision that cannot be read ends the run at that revision, a read the database refuses
+ * Never throws: a revision that cannot be read ends the run at that revision, a page the database refuses
  * is no chain at all (an empty map answers `false` for every pair), and a seed that cannot be loaded
  * leaves no revision proved, so every pair is gated.
  *
@@ -502,74 +510,107 @@ export async function ownerChainAnswers(db, reportId, headRev, deps) {
   const answers = new Map();
   if (typeof reportId !== "string" || !reportId) return answers;
   if (!Number.isInteger(headRev) || headRev < 1) return answers;
-  let rows;
-  try {
-    ({ rows } = await db.execute({
-      sql: `SELECT rev, author_kind, recipe_json FROM report_recipe_revisions
-             WHERE report_id = ? AND rev <= ? ORDER BY rev ASC`,
-      args: [reportId, headRev],
-    }));
-  } catch {
-    return answers;
-  }
-  const sealedOwnerRevs = await ownerSealedRevisions(db, await seedOrNull(deps), reportId, headRev);
+  const seed = await seedOrNull(deps);
+  // `revision_author:` rows only, in one read: the page loop below needs each revision's proof beside the
+  // revision row, and a missing or unreadable value proves nothing (verifyOwnerRevisionRow's answer).
+  const authorStateRows = await ownerAuthorStates(db, reportId);
   /** block id -> {hash, chain}: the state the last revision carrying that id left behind. */
   const carried = new Map();
   /** The revision number the previous row carried: 0 before the first one, so a first row must be 1. */
   let previousRev = 0;
-  for (const row of rows) {
-    const rev = Number(row.rev);
-    // A number that does not follow the previous row's is a hole in the history (a revision deleted
-    // between two saves), and a hole ends every run: what the rows on either side of it carry is not one
-    // unbroken stretch of revisions.
-    if (!Number.isInteger(rev) || rev !== previousRev + 1) carried.clear();
-    if (Number.isInteger(rev)) previousRev = rev;
-    let blocks;
+  /** The last revision number read: the keyset the next page starts after. */
+  let after = 0;
+  for (;;) {
+    let rows;
     try {
-      blocks = JSON.parse(text(row.recipe_json))?.blocks;
+      ({ rows } = await db.execute({
+        sql: `SELECT rev, author_kind, recipe_json, recipe_hash FROM report_recipe_revisions
+               WHERE report_id = ? AND rev > ? AND rev <= ? ORDER BY rev ASC LIMIT ?`,
+        args: [reportId, after, headRev, OWNER_CHAIN_PAGE_ROWS],
+      }));
     } catch {
-      blocks = null;
+      // A read the database refuses is no chain at all: answer with the empty map, as the one-read version
+      // did, and never with the half of the history it did manage to see.
+      return new Map();
     }
-    const present = new Map();
-    if (Array.isArray(blocks)) {
-      for (const block of blocks) {
-        if (block == null || typeof block !== "object") continue;
-        const blockId = text(block.id);
-        if (!BLOCK_ID_RE.test(blockId)) continue;
-        try {
-          present.set(blockId, settingsHashOf(block));
-        } catch {
-          // A block whose settings canonical JSON cannot carry is not the one that was approved.
+    if (!Array.isArray(rows) || rows.length === 0) break;
+    for (const row of rows) {
+      const rev = Number(row.rev);
+      // A number that does not follow the previous row's is a hole in the history (a revision deleted
+      // between two saves), and a hole ends every run: what the rows on either side of it carry is not one
+      // unbroken stretch of revisions. `previousRev` crosses pages with `carried`.
+      if (!Number.isInteger(rev) || rev !== previousRev + 1) carried.clear();
+      if (Number.isInteger(rev)) previousRev = rev;
+      let blocks;
+      try {
+        blocks = JSON.parse(text(row.recipe_json))?.blocks;
+      } catch {
+        blocks = null;
+      }
+      const present = new Map();
+      if (Array.isArray(blocks)) {
+        for (const block of blocks) {
+          if (block == null || typeof block !== "object") continue;
+          const blockId = text(block.id);
+          if (!BLOCK_ID_RE.test(blockId)) continue;
+          try {
+            present.set(blockId, settingsHashOf(block));
+          } catch {
+            // A block whose settings canonical JSON cannot carry is not the one that was approved.
+          }
         }
       }
+      // A revision that does not carry an id at all ends that id's run.
+      for (const blockId of [...carried.keys()]) {
+        if (!present.has(blockId)) carried.delete(blockId);
+      }
+      // The revision that finds the id without these settings starts a run only when the OWNER wrote it,
+      // and "wrote it" means the revision carries a sealed author proof, never the author_kind column.
+      const ownerWrote = verifyOwnerRevisionRow(
+        seed, reportId, row, authorStateRows.get(authorKeyOf(rev)),
+      );
+      for (const [blockId, hash] of present) {
+        const prior = carried.get(blockId);
+        if (prior && prior.hash === hash) continue;
+        carried.set(blockId, { hash, chain: ownerWrote });
+      }
     }
-    // A revision that does not carry an id at all ends that id's run.
-    for (const blockId of [...carried.keys()]) {
-      if (!present.has(blockId)) carried.delete(blockId);
-    }
-    // The revision that finds the id without these settings starts a run only when the OWNER wrote it,
-    // and "wrote it" means the revision carries a sealed author proof, never the author_kind column.
-    const ownerWrote = sealedOwnerRevs.has(Number(row.rev));
-    for (const [blockId, hash] of present) {
-      const prior = carried.get(blockId);
-      if (prior && prior.hash === hash) continue;
-      carried.set(blockId, { hash, chain: ownerWrote });
-    }
+    const nextAfter = Number(rows[rows.length - 1].rev);
+    // A page that does not move the keyset forward ends the pass (a row this code cannot order by); the
+    // head revision ends it too, so a history whose last page is short is never read twice.
+    if (!Number.isInteger(nextAfter) || nextAfter <= after) break;
+    after = nextAfter;
+    if (after >= headRev) break;
   }
   for (const [blockId, state] of carried) answers.set(chainKeyOf(blockId, state.hash), state.chain === true);
   return answers;
 }
 
 /**
- * The continuity answers for one gated block: a caller's per-run map when it is one built for this exact
- * head revision, else a fresh single read.
+ * The continuity answers for one gated block: a caller's per-run map when it is one this module built for
+ * the revision it names, else a fresh paged read for that revision.
+ *
+ * The revision judged is the revision the gate CARRIES (`gate.headRev`) whenever it carries one, because
+ * that is the revision its map was built for — the run pinned it, and the report's head may have moved
+ * since. Only a gate with no revision number falls back to the report's `recipe_rev`.
  */
 async function chainAnswersFor(db, reportId, headRev, gate, deps) {
-  if (gate != null && typeof gate === "object" && gate.ownerChain instanceof Map
-    && Number(gate.headRev) === headRev) {
-    return gate.ownerChain;
+  const gateRev = gateHeadRevOf(gate);
+  if (gateRev !== null) {
+    if (gate.ownerChain instanceof Map) return gate.ownerChain;
+    return ownerChainAnswers(db, reportId, gateRev, deps);
   }
   return ownerChainAnswers(db, reportId, headRev, deps);
+}
+
+/**
+ * The revision a gate object names, or null: an integer revision number is the revision judged, and
+ * anything else is a gate this module cannot read (so the caller's own head revision answers instead).
+ */
+function gateHeadRevOf(gate) {
+  if (gate == null || typeof gate !== "object") return null;
+  const headRev = Number(gate.headRev);
+  return Number.isInteger(headRev) && headRev >= 1 ? headRev : null;
 }
 
 /**
@@ -582,8 +623,11 @@ async function chainAnswersFor(db, reportId, headRev, gate, deps) {
  * the row's sender only behind the owner's sender seal).
  *
  * `gate` is a caller's per-run continuity map (`{headRev, ownerChain}` from `ownerChainAnswers`), so a
- * run reads the report's revisions ONCE and asks this for every gated block in that run. A gate for
- * another head revision, or none at all, is a fresh single read for this block alone.
+ * run pages the report's revisions ONCE and asks this for every gated block in that run. When the gate
+ * carries an integer `headRev`, THAT is the revision judged — it is the revision the run executes (a
+ * preview pins it at run creation, and the report's head may have been saved again since), and its map
+ * is used as it is. Only a gate with no revision number (or none at all) falls back to the report's
+ * `recipe_rev`, in a fresh paged read for this block alone.
  *
  * Never throws: a report whose seal will not verify reads as "no live set", and a broken state row or a
  * revision read that fails reads as "not approved", which is the safe side to be wrong on.
@@ -604,7 +648,8 @@ export async function isSourceApprovedForBot(db, deps, report, block, gate = nul
     const sealed = live != null && sealedCovers(live.recipe, settingsHash);
     let ownerChain = false;
     if (!sealed) {
-      const headRev = Number(report?.recipe_rev);
+      // The revision judged: the one the gate names (the run executes that one), else the report's head.
+      const headRev = gateHeadRevOf(gate) ?? Number(report?.recipe_rev);
       if (typeof report?.id === "string" && BLOCK_ID_RE.test(blockId)
         && Number.isInteger(headRev) && headRev >= 1) {
         const answers = await chainAnswersFor(db, report.id, headRev, gate, deps);

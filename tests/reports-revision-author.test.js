@@ -20,21 +20,24 @@ process.env.CROW_TASKS_DB_PATH = join(root, "master", "tasks.db");
 mkdirSync(process.env.CROW_HOME, { recursive: true });
 const REPO = new URL("..", import.meta.url).pathname;
 const MASTER = join(root, "master", "crow.db");
+const HOME = process.env.CROW_HOME;
 
 const { createDbClient } = await import("../servers/db.js");
 const {
   approveGoLive, botSaveRecipe, ownerSaveRecipe, updateSettings, verifyLive,
 } = await import("../servers/gateway/reports/approvals.js");
 const {
-  REVISION_AUTHOR_PREFIX, ownerSealedRevisions, sealAuthorRevision,
+  REVISION_AUTHOR_PREFIX, authorKeyOf, ownerAuthorStates, ownerSealedRevisions,
+  sealAuthorRevision, verifyOwnerRevisionRow,
 } = await import("../servers/gateway/reports/revision-author.js");
 const { SENDER_SEAL_KEY, senderSealVerifies } = await import(
   "../servers/gateway/reports/sender-seal.js"
 );
 const { verifyApprovalSeal } = await import("../servers/gateway/reports/seal.js");
+const { approveHost, proposeHost } = await import("../servers/gateway/reports/steps.js");
 const {
-  approveSource, approvedSenderAccount, isSourceApprovedForBot, ownerChainAnswers, settingsHashOf,
-  verifySourceApproval, waitingForOkText,
+  approveSource, approvedSenderAccount, chainKeyOf, isSourceApprovedForBot, ownerChainAnswers,
+  settingsHashOf, verifySourceApproval, waitingForOkText,
 } = await import("../servers/gateway/reports/source-approvals.js");
 const { blockRegistry } = await import("../servers/gateway/reports/blocks/index.js");
 const { makeStateAccess, runRecipe } = await import(
@@ -180,6 +183,27 @@ async function queuePreview(db, reportId) {
     reportId, trigger: "preview", requestedBy: BOT,
   });
   return runId;
+}
+
+/** The guarded-request seam for a harness: every URL is recorded and answered with one JSON array. */
+function feedFetch(urls, items = [{ title: "one" }]) {
+  return async (url) => {
+    urls.push(url);
+    return {
+      final_url: url,
+      http_status: 200,
+      content_type: "application/json",
+      charset: "utf-8",
+      buffer: Buffer.from(JSON.stringify(items), "utf8"),
+    };
+  };
+}
+
+/** Approve one host for one report, through the reports steps module's own rail. */
+async function approveHostFor(db, reportId, host = "api.example.com") {
+  const deps = { loadSeed: () => ({ seed: SEED }), now: () => T0, crowHome: HOME };
+  await proposeHost(db, deps, { reportId, host });
+  await approveHost(db, deps, { reportId, host, actor: OWNER });
 }
 
 /** A mail seam that records the folder every read names and answers no messages. */
@@ -466,6 +490,280 @@ test("with no keychain seed no revision is proved and nothing throws", async () 
   assert.equal(await approvedSenderAccount(db, seedless, null, head), "");
   assert.deepEqual(await isSourceApprovedForBot(db, seedless, head, FEED_BLOCK),
     { ok: false, text: waitingForOkText("feed") });
+});
+
+/* -------------------------- the gate judges the revision the run actually executes */
+
+/**
+ * A PREVIEW PINS ITS REVISION: `startRun` records the report's head on the preview's run row, and `run.js`
+ * executes exactly that revision. A save after the preview was requested moves the report's head without
+ * moving what the run reads, so the gate has to judge the pinned revision — not the head it may no longer
+ * be — or an owner-chained block would wait for a save it never read, and a bot-introduced block would be
+ * waved through by an owner save it never read either.
+ */
+test("a preview pinned at rev N is judged at N, not at a head that moved on (an owner-chained block)", async () => {
+  const db = await freshDb();
+  const report = await prepare(db, { recipe: { blocks: [FEED_BLOCK] } });
+  await approveHostFor(db, report.id);
+  const deps = approvalDeps(report);
+
+  // The preview is requested while rev 1 — the owner's sealed revision carrying the feed block — is the
+  // head, so the run pins it.
+  const runId = await queuePreview(db, report.id);
+  assert.equal((await getRun(db, runId)).recipeRev, report.rev, "the run pinned the head it was asked on");
+
+  // A bot drops the feed block afterwards: the report's head is rev 2, and the run still reads rev 1.
+  const saved = await botSaveRecipe(db, deps, { reportId: report.id, recipe: { blocks: [FILTER_BLOCK] } });
+  assert.equal(saved.rev, report.rev + 1);
+  const head = await getReport(db, report.id);
+  assert.equal(Number(head.recipe_rev), saved.rev);
+  assert.deepEqual(
+    await isSourceApprovedForBot(db, deps, head, FEED_BLOCK),
+    { ok: false, text: waitingForOkText("feed") },
+    "judged at the moved head, the block has no owner history left",
+  );
+
+  // Judged at the revision this run executes, the block is content the owner put there and no revision it
+  // reads dropped, so it runs.
+  const urls = [];
+  const out = await executeRun(db, runDeps(deps, { testSeams: true, testFetch: feedFetch(urls) }), runId);
+  const row = await getRun(db, runId);
+  assert.deepEqual(out, { status: "ok", artifactVersion: null }, JSON.stringify(row.blockLog));
+  assert.deepEqual(row.blockLog.sourceErrors, []);
+  assert.deepEqual(urls, [FEED_BLOCK.settings.url], "the block read its one approved source");
+});
+
+test("a preview pinned at a bot's revision is judged as the bot's, even after the owner re-saves it", async () => {
+  const db = await freshDb();
+  const report = await prepare(db, { recipe: { blocks: [FILTER_BLOCK] } });
+  await approveHostFor(db, report.id);
+  const deps = approvalDeps(report);
+
+  // The bot introduces the feed block: rev 2, the revision the preview will pin.
+  const added = await botSaveRecipe(db, deps, {
+    reportId: report.id, recipe: { blocks: [FILTER_BLOCK, FEED_BLOCK] },
+  });
+  const runId = await queuePreview(db, report.id);
+  assert.equal((await getRun(db, runId)).recipeRev, added.rev);
+
+  // The owner drops the block and puts it back afterwards. At the head that re-add is an owner-written
+  // start of its own, but the revision this run executes is still the bot's, where the content arrived
+  // unapproved.
+  await ownerSaveRecipe(db, deps, {
+    reportId: report.id, recipe: { blocks: [FILTER_BLOCK] }, actor: OWNER,
+  });
+  await ownerSaveRecipe(db, deps, {
+    reportId: report.id, recipe: { blocks: [FILTER_BLOCK, FEED_BLOCK] }, actor: OWNER,
+  });
+  const head = await getReport(db, report.id);
+  assert.equal(Number(head.recipe_rev), added.rev + 2);
+  assert.deepEqual(await isSourceApprovedForBot(db, deps, head, FEED_BLOCK), { ok: true },
+    "judged at the head, the owner's own save is the start of an owner history");
+
+  // The gate's own revision is the revision it judges: a gate built for the bot's revision answers for the
+  // bot's revision even when the report row handed in is the later head.
+  const atBot = { headRev: added.rev, ownerChain: await ownerChainAnswers(db, report.id, added.rev, deps) };
+  const atHead = { headRev: Number(head.recipe_rev), ownerChain: await ownerChainAnswers(db, report.id, Number(head.recipe_rev), deps) };
+  assert.deepEqual(await isSourceApprovedForBot(db, deps, head, FEED_BLOCK, atBot),
+    { ok: false, text: waitingForOkText("feed") }, "the bot's revision is gated");
+  assert.deepEqual(await isSourceApprovedForBot(db, deps, head, FEED_BLOCK, atHead), { ok: true },
+    "the owner's revision is not");
+
+  const urls = [];
+  const out = await executeRun(db, runDeps(deps, { testSeams: true, testFetch: feedFetch(urls) }), runId);
+  assert.deepEqual(out, { status: "failed", artifactVersion: null });
+  assert.deepEqual((await getRun(db, runId)).blockLog.sourceErrors,
+    [{ source: "feed", message: waitingForOkText("feed") }]);
+  assert.deepEqual(urls, [], "the bot's block never read its source");
+});
+
+/* ------------------------------------- the owner history, in pages, over a long report life */
+
+/**
+ * The answers the OLD single-read pass gave, recomputed from the same rows: the reference the paged
+ * `ownerChainAnswers` has to match. `ownerSealedRevisions` is that old pass's own owner-seal reader, so
+ * this leans on nothing the paged version added.
+ */
+async function unpagedChainAnswers(db, reportId, headRev) {
+  const sealed = await ownerSealedRevisions(db, SEED, reportId, headRev);
+  const { rows } = await db.execute({
+    sql: `SELECT rev, recipe_json FROM report_recipe_revisions
+           WHERE report_id = ? AND rev <= ? ORDER BY rev ASC`,
+    args: [reportId, headRev],
+  });
+  const carried = new Map();
+  let previousRev = 0;
+  for (const row of rows) {
+    const rev = Number(row.rev);
+    if (!Number.isInteger(rev) || rev !== previousRev + 1) carried.clear();
+    if (Number.isInteger(rev)) previousRev = rev;
+    const present = new Map();
+    let blocks;
+    try {
+      blocks = JSON.parse(row.recipe_json)?.blocks;
+    } catch {
+      blocks = null;
+    }
+    for (const block of Array.isArray(blocks) ? blocks : []) {
+      if (block == null || typeof block !== "object") continue;
+      try {
+        present.set(String(block.id), settingsHashOf(block));
+      } catch {
+        // A block whose settings canonical JSON cannot carry is not in the map.
+      }
+    }
+    for (const blockId of [...carried.keys()]) if (!present.has(blockId)) carried.delete(blockId);
+    for (const [blockId, hash] of present) {
+      const prior = carried.get(blockId);
+      if (prior && prior.hash === hash) continue;
+      carried.set(blockId, { hash, chain: sealed.has(rev) });
+    }
+  }
+  const answers = new Map();
+  for (const [blockId, state] of carried) answers.set(chainKeyOf(blockId, state.hash), state.chain === true);
+  return answers;
+}
+
+/** Both maps' entries, sorted: two continuity answers that can be compared with `deepEqual`. */
+const sortedAnswers = (answers) => [...answers.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
+
+/** The feed block's key in a continuity map. */
+const feedKey = () => chainKeyOf(FEED_BLOCK.id, settingsHashOf(FEED_BLOCK));
+
+test("a multi-revision fixture answers the same paged as unpaged", async () => {
+  const db = await freshDb();
+  const report = await prepare(db, { recipe: { blocks: [FEED_BLOCK] } });
+  const deps = approvalDeps(report);
+  // rev 2: the bot keeps the feed block and adds a filter. rev 3: the bot drops the feed block. rev 4: the
+  // OWNER puts it back, so a new owner run starts there.
+  await botSaveRecipe(db, deps, { reportId: report.id, recipe: { blocks: [FEED_BLOCK, FILTER_BLOCK] } });
+  await botSaveRecipe(db, deps, { reportId: report.id, recipe: { blocks: [FILTER_BLOCK] } });
+  await ownerSaveRecipe(db, deps, {
+    reportId: report.id, recipe: { blocks: [FILTER_BLOCK, FEED_BLOCK] }, actor: OWNER,
+  });
+
+  for (const at of [1, 2, 3, 4]) {
+    assert.deepEqual(
+      sortedAnswers(await ownerChainAnswers(db, report.id, at, deps)),
+      sortedAnswers(await unpagedChainAnswers(db, report.id, at)),
+      `rev ${at}`,
+    );
+  }
+  assert.equal((await ownerChainAnswers(db, report.id, 2, deps)).get(feedKey()), true,
+    "a bot revision that leaves the owner's settings alone keeps the run alive");
+  assert.equal((await ownerChainAnswers(db, report.id, 3, deps)).has(feedKey()), false,
+    "the revision that dropped the block ends it, so the pair has no answer at all");
+  assert.equal((await ownerChainAnswers(db, report.id, 4, deps)).get(feedKey()), true,
+    "the owner's re-add starts a new run");
+});
+
+test("450 revisions are read a page at a time and still answer as the unpaged pass did", async () => {
+  const db = await freshDb();
+  const report = await prepare(db, { recipe: { blocks: [FEED_BLOCK] } });
+  const deps = approvalDeps(report);
+  // The owner's start is revision 1 and every revision after it carries the block unchanged, so the run
+  // spans three pages of 200 and the head is genuinely beyond them.
+  for (let rev = 2; rev <= 450; rev += 1) {
+    await botSaveRecipe(db, deps, { reportId: report.id, recipe: { blocks: [FEED_BLOCK] } });
+  }
+  assert.equal(Number((await getReport(db, report.id)).recipe_rev), 450);
+
+  for (const at of [1, 199, 200, 201, 250, 450]) {
+    const paged = await ownerChainAnswers(db, report.id, at, deps);
+    assert.deepEqual(sortedAnswers(paged), sortedAnswers(await unpagedChainAnswers(db, report.id, at)), `rev ${at}`);
+    assert.equal(paged.get(feedKey()), true, `rev ${at}: the owner's run survives every page boundary`);
+  }
+
+  // A revision deleted exactly where the first page ends is still a hole: the second page starts at 201,
+  // which does not follow the 199 the first page ended on.
+  await db.execute({
+    sql: "DELETE FROM report_recipe_revisions WHERE report_id = ? AND rev = 200",
+    args: [report.id],
+  });
+  const holed = await ownerChainAnswers(db, report.id, 450, deps);
+  assert.deepEqual(sortedAnswers(holed), sortedAnswers(await unpagedChainAnswers(db, report.id, 450)));
+  assert.equal(holed.get(feedKey()), false, "a hole on a page boundary ends every run");
+});
+
+/**
+ * A database handle that passes EVERY call through unchanged, except the one the paged owner-history
+ * pass uses for its pages: the second `execute` whose SQL selects from `report_recipe_revisions` with a
+ * LIMIT throws, as a database that refuses the read half way through would. Everything else (the
+ * `report_state` seal rows, the report row, a close) is the real handle's own answer.
+ */
+function dbWithFailingSecondPage(db) {
+  const PAGE_READ = /report_recipe_revisions[\s\S]*\bLIMIT\b/i;
+  let pageReads = 0;
+  const wrapped = {
+    ...db,
+    async execute(arg) {
+      const sql = typeof arg === "string" ? arg : arg?.sql;
+      if (typeof sql === "string" && PAGE_READ.test(sql)) {
+        pageReads += 1;
+        if (pageReads === 2) throw new Error("SQLITE_IOERR: the second page read was refused");
+      }
+      return db.execute(arg);
+    },
+  };
+  return { db: wrapped, pageReads: () => pageReads };
+}
+
+test("a page read the database refuses is no chain at all, never the first page's half-history", async () => {
+  const db = await freshDb();
+  const report = await prepare(db, { recipe: { blocks: [FEED_BLOCK] } });
+  const deps = approvalDeps(report);
+  // Revision 1 is the owner's own sealed save and every revision after it carries the feed block
+  // unchanged, so the FIRST page of 200 (revisions 1-200) already answers "the owner put these settings
+  // here" on its own. Nothing after it takes the block away, so a full read answers `true`.
+  for (let rev = 2; rev <= 260; rev += 1) {
+    await botSaveRecipe(db, deps, { reportId: report.id, recipe: { blocks: [FEED_BLOCK] } });
+  }
+  assert.equal(Number((await getReport(db, report.id)).recipe_rev), 260);
+
+  const readable = await ownerChainAnswers(db, report.id, 260, deps);
+  assert.equal(readable.get(feedKey()), true, "the control: every page readable, the owner's run survives");
+
+  // Page 2 is refused. Page 1 said yes and page 2 was never read: the answer is the empty map, not the
+  // half of the history the pass did manage to see.
+  const failing = dbWithFailingSecondPage(db);
+  const refused = await ownerChainAnswers(failing.db, report.id, 260, deps);
+  assert.equal(failing.pageReads(), 2, "the pass did ask for a second page");
+  assert.equal(refused.size, 0, "a refused page is no chain at all");
+  assert.notEqual(refused.get(feedKey()), true, "the pair answers false, not the first page's yes");
+
+  // And the gate reads that map as it reads any other missing answer: the source waits for the owner.
+  const head = await getReport(db, report.id);
+  assert.deepEqual(
+    await isSourceApprovedForBot(failing.db, deps, head, FEED_BLOCK, { headRev: 260, ownerChain: refused }),
+    { ok: false, text: waitingForOkText("feed") },
+  );
+});
+
+/* ------------------------------------------------------------ the per-row seal check */
+
+test("the extracted per-row owner-seal check answers what ownerSealedRevisions answers", async () => {
+  const db = await freshDb();
+  const report = await prepare(db, { recipe: { blocks: [FEED_BLOCK] } });
+  const row = await getRevision(db, report.id, report.rev);
+  const states = await ownerAuthorStates(db, report.id);
+  const value = states.get(authorKeyOf(report.rev));
+  assert.equal(typeof value, "string");
+  assert.equal(verifyOwnerRevisionRow(SEED, report.id, row, value), true);
+  assert.equal(verifyOwnerRevisionRow(SEED, report.id, row, null), false, "no seal row proves nothing");
+  assert.equal(
+    verifyOwnerRevisionRow(SEED, report.id, row, JSON.stringify({ nonce: "a".repeat(32), seal: "b".repeat(64) })),
+    false,
+    "a seal that does not verify proves nothing",
+  );
+  assert.equal(verifyOwnerRevisionRow(null, report.id, row, value), false, "no seed proves nothing");
+
+  const saved = await botSaveRecipe(db, approvalDeps(), {
+    reportId: report.id, recipe: { blocks: [FEED_BLOCK, FILTER_BLOCK] },
+  });
+  const botRow = await getRevision(db, report.id, saved.rev);
+  const botStates = await ownerAuthorStates(db, report.id);
+  assert.equal(verifyOwnerRevisionRow(SEED, report.id, botRow, botStates.get(authorKeyOf(saved.rev))), false,
+    "a bot's revision carries no seal to verify");
 });
 
 /* --------------------------------------------------- the mail account a block is measured against */

@@ -62,8 +62,14 @@ function isSeed(seed) {
   return seed instanceof Uint8Array && seed.length > 0;
 }
 
-/** The `report_state` key one revision's author seal lives under. */
-function authorKeyOf(rev) {
+/**
+ * The `report_state` key one revision's author seal lives under. Exported for a caller that reads the seal
+ * rows itself (`ownerChainAnswers` in source-approvals.js, which reads them once for a whole paged pass).
+ *
+ * @param {number|string} rev
+ * @returns {string}
+ */
+export function authorKeyOf(rev) {
   return `${REVISION_AUTHOR_PREFIX}${rev}`;
 }
 
@@ -93,13 +99,102 @@ export function sealAuthorRevision(seed, { reportId, rev, recipeHash: hash, auth
 }
 
 /**
+ * A report's revision-author seal rows, `revision_author:<rev>` -> its stored `value_json`.
+ *
+ * ONE read of the whole prefix: a revision's seal row is keyed by its own number, so the rows are a map
+ * rather than one query per revision. The prefix filter is repeated in JS (LIKE's `_` is a wildcard, so the
+ * statement's pattern can only narrow the read): a key the exact prefix does not start is not one of these.
+ * The rows are small (a 32-hex nonce and a 64-hex seal each), so a caller paging the revision rows can read
+ * them once for the whole pass instead of per page.
+ *
+ * Never throws: a read this database refuses leaves the map empty, which proves no revision.
+ *
+ * @param {object} db
+ * @param {string} reportId
+ * @returns {Promise<Map<string, string>>}
+ */
+export async function ownerAuthorStates(db, reportId) {
+  const states = new Map();
+  try {
+    if (typeof reportId !== "string" || !reportId) return states;
+    const stateRows = await db.execute({
+      sql: "SELECT key, value_json FROM report_state WHERE report_id = ? AND key LIKE ?",
+      args: [reportId, `${REVISION_AUTHOR_PREFIX}%`],
+    });
+    for (const row of stateRows.rows) {
+      const key = text(row.key);
+      if (!key.startsWith(REVISION_AUTHOR_PREFIX)) continue;
+      if (typeof row.value_json === "string") states.set(key, row.value_json);
+    }
+    return states;
+  } catch {
+    // A read this database refuses proves nothing: an empty map answers "not owner-written" for every row.
+    return new Map();
+  }
+}
+
+/**
+ * Is ONE revision row PROVABLY owner-written? The per-row half of `ownerSealedRevisions`, reusable by a
+ * caller that already holds the row and that revision's `revision_author:<rev>` value (`ownerChainAnswers`
+ * in source-approvals.js, which reads the revision rows in pages and the seal rows once).
+ *
+ * Every check has to hold: the row's `author_kind` is `owner`, the state value parses to a 32-hex nonce and
+ * a 64-hex seal, the row's `recipe_hash` column is 64 hex and EQUALS the hash recomputed from its own
+ * `recipe_json`, and the seal verifies over the report, the revision, that hash, `authorKind: "owner"` and
+ * the nonce under this keychain seed.
+ *
+ * Never throws: anything else (a missing value, a seed that is not bytes, an unreadable body) answers
+ * `false`, which is the side that gates the block.
+ *
+ * @param {Buffer|Uint8Array|null} seed the keychain key's seed, loaded by the caller; null means none
+ * @param {string} reportId
+ * @param {object} row a `report_recipe_revisions` row (`rev`, `author_kind`, `recipe_json`, `recipe_hash`)
+ * @param {string|null|undefined} stateValueJson that revision's `revision_author:<rev>` value_json
+ * @returns {boolean}
+ */
+export function verifyOwnerRevisionRow(seed, reportId, row, stateValueJson) {
+  try {
+    if (!isSeed(seed)) return false;
+    if (typeof reportId !== "string" || !reportId) return false;
+    if (row == null || typeof row !== "object") return false;
+    const rev = Number(row.rev);
+    if (!Number.isInteger(rev) || rev < 1) return false;
+    if (text(row.author_kind) !== "owner") return false;
+    if (typeof stateValueJson !== "string") return false;
+    let value;
+    try {
+      value = JSON.parse(stateValueJson);
+    } catch {
+      return false;
+    }
+    if (value == null || typeof value !== "object" || Array.isArray(value)) return false;
+    const nonce = text(value.nonce);
+    const seal = text(value.seal);
+    if (!NONCE_HEX.test(nonce) || !SEAL_HEX.test(seal)) return false;
+    const storedHash = text(row.recipe_hash);
+    if (!SEAL_HEX.test(storedHash)) return false;
+    let recomputed;
+    try {
+      recomputed = recipeHash(JSON.parse(text(row.recipe_json)));
+    } catch {
+      return false;
+    }
+    if (recomputed !== storedHash) return false;
+    const fields = {
+      reportId, rev, recipeHash: storedHash, authorKind: "owner", nonce,
+    };
+    return verifyApprovalSeal(AUTHOR_SEAL_KIND, fields, seal, seed) === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The revisions up to `upToRev` that are PROVABLY owner-written, as a set of revision numbers.
  *
- * One read of the revision rows and one read of the report's `revision_author:` state rows. A revision
- * counts only when every check holds: its `author_kind` is `owner`, its `revision_author:<rev>` value
- * parses to a 32-hex nonce and a 64-hex seal, its `recipe_hash` column is 64 hex and EQUALS the hash
- * recomputed from its own `recipe_json`, and the seal verifies over the report, the revision, that hash,
- * `authorKind: "owner"` and the nonce under this keychain seed.
+ * One read of the revision rows and one read of the report's `revision_author:` state rows, then one
+ * `verifyOwnerRevisionRow` per row. (`ownerChainAnswers` in source-approvals.js is the caller that pages
+ * the revision rows instead of reading them in one go; it shares the same per-row check.)
  *
  * Never throws: anything else (and any read the database refuses) leaves that revision out of the set.
  *
@@ -122,56 +217,11 @@ export async function ownerSealedRevisions(db, seed, reportId, upToRev) {
              WHERE report_id = ? AND rev <= ? ORDER BY rev ASC`,
       args: [reportId, head],
     });
-    const owners = [];
+    const states = await ownerAuthorStates(db, reportId);
     for (const row of revisions.rows) {
       const rev = Number(row.rev);
       if (!Number.isInteger(rev) || rev < 1) continue;
-      if (text(row.author_kind) !== "owner") continue;
-      owners.push({ rev, row });
-    }
-    if (!owners.length) return sealed;
-
-    // One read of the whole prefix: a revision's seal row is keyed by its own number, so the rows are a
-    // map rather than one query per revision. The prefix filter is repeated in JS (LIKE's `_` is a
-    // wildcard, so the statement's pattern can only narrow the read): a key the exact prefix does not
-    // start is not one of these.
-    const states = new Map();
-    const stateRows = await db.execute({
-      sql: "SELECT key, value_json FROM report_state WHERE report_id = ? AND key LIKE ?",
-      args: [reportId, `${REVISION_AUTHOR_PREFIX}%`],
-    });
-    for (const row of stateRows.rows) {
-      const key = text(row.key);
-      if (!key.startsWith(REVISION_AUTHOR_PREFIX)) continue;
-      if (typeof row.value_json === "string") states.set(key, row.value_json);
-    }
-
-    for (const { rev, row } of owners) {
-      const valueJson = states.get(authorKeyOf(rev));
-      if (typeof valueJson !== "string") continue;
-      let value;
-      try {
-        value = JSON.parse(valueJson);
-      } catch {
-        continue;
-      }
-      if (value == null || typeof value !== "object" || Array.isArray(value)) continue;
-      const nonce = text(value.nonce);
-      const seal = text(value.seal);
-      if (!NONCE_HEX.test(nonce) || !SEAL_HEX.test(seal)) continue;
-      const storedHash = text(row.recipe_hash);
-      if (!SEAL_HEX.test(storedHash)) continue;
-      let recomputed;
-      try {
-        recomputed = recipeHash(JSON.parse(text(row.recipe_json)));
-      } catch {
-        continue;
-      }
-      if (recomputed !== storedHash) continue;
-      const fields = {
-        reportId, rev, recipeHash: storedHash, authorKind: "owner", nonce,
-      };
-      if (verifyApprovalSeal(AUTHOR_SEAL_KIND, fields, seal, seed)) sealed.add(rev);
+      if (verifyOwnerRevisionRow(seed, reportId, row, states.get(authorKeyOf(rev)))) sealed.add(rev);
     }
     return sealed;
   } catch {

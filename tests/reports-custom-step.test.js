@@ -8,8 +8,9 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { EventEmitter } from "node:events";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 
@@ -25,7 +26,8 @@ const HOME = process.env.CROW_HOME;
 
 const { createDbClient } = await import("../servers/db.js");
 const { createReport } = await import("../servers/gateway/reports/store.js");
-const { approveStep, proposeStep, saveAsset } = await import("../servers/gateway/reports/steps.js");
+const { approveStep, proposeStep, saveAsset, verifyAssetOnDisk, listAssets } =
+  await import("../servers/gateway/reports/steps.js");
 const { getUsage } = await import("../servers/gateway/reports/caps.js");
 const { CLAIMED_BY_EXECUTOR } = await import("../servers/gateway/reports/claim-token.js");
 const { runCustomStepForReport, writeBundleDir } = await import("../servers/gateway/reports/custom-step.js");
@@ -183,6 +185,168 @@ test("an asset swapped on disk after approval is not run", async () => {
   assert.equal(runs.length, 0, "an asset the owner did not approve never reaches a run");
 });
 
+/* ------------------------------------- an asset path that is not a regular file */
+
+/**
+ * An approved step whose asset file is at `saved.sha256`, plus the recording runner stub: the same
+ * shape as `approvedFixture`, with the asset row and the file the owner approved.
+ */
+async function assetFixture(db) {
+  const reportId = await makeReport(db);
+  const saved = await saveAsset(db, deps(), { reportId, name: "ways.json", bytes: '[{"id":1}]' });
+  const step = await proposed(db, reportId, { assets: ["ways.json"] });
+  await approveStep(db, deps(), {
+    reportId, stepKey: "fetch", rev: step.rev, bundleHash: step.bundleHash, actor: OWNER,
+  });
+  const envDir = join(HOME, "reports", reportId, "env", "python");
+  mkdirSync(envDir, { recursive: true });
+  const runs = [];
+  const runDeps = deps({
+    ensureEnv: async () => ({ ok: true, dir: envDir, hash: "f".repeat(64), cacheDir: join(HOME, "cache"), built: false }),
+    runStep: async (args) => { runs.push(args); return { ok: true, output: { items: [] } }; },
+  });
+  const path = join(HOME, "reports", reportId, "assets", saved.sha256);
+  const row = { report_id: reportId, name: "ways.json", sha256: saved.sha256 };
+  return { reportId, saved, path, row, runDeps, runs };
+}
+
+/** Is `mkfifo` on this host? A host without it skips the FIFO test rather than failing it. */
+function hasMkfifo() {
+  const probe = join(root, "fifo-probe-" + process.pid);
+  try {
+    execFileSync("mkfifo", [probe], { stdio: "ignore" });
+  } catch (err) {
+    return !(err && err.code === "ENOENT");
+  } finally {
+    rmSync(probe, { force: true });
+  }
+  return true;
+}
+
+test("a FIFO at an asset's path is not read, and the step does not run", { timeout: 5000 }, async (t) => {
+  if (!hasMkfifo()) return t.skip("mkfifo is not available on this host");
+  const db = await freshDb();
+  const { reportId, path, row, runDeps, runs } = await assetFixture(db);
+  // The regular file the owner approved is replaced by a FIFO at the same path, so a plain
+  // readFileSync would block this process forever with no writer in sight.
+  rmSync(path, { force: true });
+  execFileSync("mkfifo", [path]);
+  assert.equal(statSync(path).isFIFO(), true, "the asset path is a FIFO");
+
+  assert.equal(await verifyAssetOnDisk(deps(), row), false, "a FIFO reads as changed, not as bytes");
+
+  const result = await runCustomStepForReport(db, runDeps, { report: { id: reportId }, stepKey: "fetch", trigger: "manual" });
+  assert.equal(result.ok, false);
+  // `runnableStep` re-checks the assets first, so the answer is the waiting sentence, not a run.
+  assert.equal(result.code, "step_waiting");
+  assert.equal(runs.length, 0, "nothing reached the runner");
+  assert.equal((await getUsage(db, reportId, DAY)).extraStepRuns, 0, "and no extra step run was spent");
+});
+
+test("a symlink at an asset's path reads as changed even when its target has the right bytes", async () => {
+  const db = await freshDb();
+  const { reportId, saved, path, row, runDeps, runs } = await assetFixture(db);
+  // The right bytes stay on disk, one name over; the asset path itself becomes a symlink to them.
+  const target = join(HOME, "reports", reportId, "assets", saved.sha256 + ".target");
+  renameSync(path, target);
+  symlinkSync(target, path);
+  assert.equal(readFileSync(path, "utf8"), '[{"id":1}]', "the link does resolve to the right bytes");
+
+  assert.equal(await verifyAssetOnDisk(deps(), row), false, "a symlink is never followed");
+  const listed = await listAssets(db, reportId, deps());
+  assert.equal(listed.find((asset) => asset.name === "ways.json").verified, false);
+
+  const result = await runCustomStepForReport(db, runDeps, { report: { id: reportId }, stepKey: "fetch", trigger: "manual" });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "step_waiting");
+  assert.equal(runs.length, 0, "a linked asset never reaches a run");
+  assert.equal((await getUsage(db, reportId, DAY)).extraStepRuns, 0, "and it spends nothing");
+});
+
+test("an unchanged regular asset still verifies true", async () => {
+  const db = await freshDb();
+  const { reportId, row } = await assetFixture(db);
+  assert.equal(await verifyAssetOnDisk(deps(), row), true);
+  const listed = await listAssets(db, reportId, deps());
+  assert.deepEqual(listed.map((asset) => [asset.name, asset.verified]), [["ways.json", true]]);
+});
+
+/* -------------------------------- an asset file that GREW between the fstat and the read */
+
+// `readAssetBytes` fstat's the opened handle and then reads ONE BYTE MORE than the size that fstat
+// named, so a file that grew after the fstat cannot hash equal to the row. The only moment that gap is
+// reachable from is between those two calls, which is what this seam reaches (the same
+// `node:fs` + syncBuiltinESMExports pattern tests/bot-git-spawn.test.js uses): the builtin's `openSync`
+// records the asset path's own descriptor, and `readSync` appends the extra byte — once, for that
+// descriptor — BEFORE it does the read the module already sized. No timer, no child process and no race:
+// the growth happens synchronously at the one read that follows the fstat.
+const fsCjs = createRequire(import.meta.url)("node:fs");
+const REAL_OPEN_SYNC = fsCjs.openSync;
+const REAL_READ_SYNC = fsCjs.readSync;
+const REAL_WRITE_SYNC = fsCjs.writeSync;
+const REAL_CLOSE_SYNC = fsCjs.closeSync;
+let growthSeam = null; // { path, fd, grew } while armed
+
+/** Grow `path` by one byte the next time its own opened descriptor is read. */
+function armGrowthSeam(path) {
+  growthSeam = { path, fd: null, grew: false };
+  fsCjs.openSync = function (p, ...rest) {
+    const fd = REAL_OPEN_SYNC.call(this, p, ...rest);
+    if (growthSeam !== null && String(p) === growthSeam.path) growthSeam.fd = fd;
+    return fd;
+  };
+  fsCjs.readSync = function (fd, buffer, ...rest) {
+    const seam = growthSeam;
+    if (seam !== null && !seam.grew && fd === seam.fd) {
+      seam.grew = true;
+      const appendFd = REAL_OPEN_SYNC.call(fsCjs, seam.path, "a");
+      try {
+        REAL_WRITE_SYNC.call(fsCjs, appendFd, "!");
+      } finally {
+        REAL_CLOSE_SYNC.call(fsCjs, appendFd);
+      }
+    }
+    return REAL_READ_SYNC.call(this, fd, buffer, ...rest);
+  };
+  syncBuiltinESMExports();
+}
+
+/** Put every `node:fs` name back, and answer with the seam it was armed with (or null). */
+function disarmGrowthSeam() {
+  if (growthSeam === null) return null;
+  const seam = growthSeam;
+  growthSeam = null;
+  fsCjs.openSync = REAL_OPEN_SYNC;
+  fsCjs.readSync = REAL_READ_SYNC;
+  syncBuiltinESMExports();
+  return seam;
+}
+
+after(disarmGrowthSeam);
+
+test("an asset file that grows between the fstat and the read cannot hash equal", async () => {
+  const db = await freshDb();
+  const { path, row } = await assetFixture(db);
+  const before = statSync(path).size;
+  assert.equal(await verifyAssetOnDisk(deps(), row), true,
+    "the unchanged file hashes equal, so the `false` below is about the growth and nothing else");
+
+  let verified;
+  let seam;
+  armGrowthSeam(path);
+  try {
+    // The whole read runs synchronously inside this call: fstat (the old size), then read (size + 1).
+    verified = await verifyAssetOnDisk(deps(), row);
+  } finally {
+    seam = disarmGrowthSeam();
+  }
+
+  assert.equal(seam.grew, true, "the byte was appended after the fstat and before the read");
+  assert.equal(statSync(path).size, before + 1, "the file is one byte longer than the fstat named");
+  assert.equal(verified, false,
+    "the size + 1 read carries the extra byte into the hash, so a file that grew never reads as unchanged");
+});
+
 /* ------------------------------------------------------------------------- the cap */
 
 test("the 11th extra step run of the day is refused, and the first ten are not", async () => {
@@ -266,6 +430,37 @@ test("a scheduled trigger does not count toward extra step runs", async () => {
   // A bot-requested preview is, exactly like a manual run.
   await runCustomStepForReport(db, runDeps, { report: { id: reportId }, stepKey: "fetch", trigger: "preview" });
   assert.equal((await getUsage(db, reportId, DAY)).extraStepRuns, 1);
+});
+
+/* ------------------------------------ the cap is taken only after the re-checks pass */
+
+test("a host whose seal no longer verifies is refused, and spends no extra step run", async () => {
+  const db = await freshDb();
+  const { reportId, runDeps, runs } = await approvedFixture(db);
+  // An `approved` row whose seal nothing signed: `runnableStep` does not read hosts, so this is the
+  // re-check's own refusal.
+  await db.execute({
+    sql: `INSERT INTO report_hosts (report_id, host, state, approval_nonce, approval_seal, approved_at, created_at)
+          VALUES (?, ?, 'approved', ?, ?, ?, ?)`,
+    args: [reportId, "fetch.example.test", "a".repeat(32), "b".repeat(64), T0, T0],
+  });
+  const result = await runCustomStepForReport(db, runDeps, { report: { id: reportId }, stepKey: "fetch", trigger: "manual" });
+  assert.deepEqual(result, { ok: false, code: "host_unverified", error: "host_unverified" });
+  assert.equal(runs.length, 0, "the step never ran");
+  assert.equal((await getUsage(db, reportId, DAY)).extraStepRuns, 0,
+    "a step its own re-check refuses spends nothing");
+});
+
+test("a run that passes every re-check spends exactly one extra step run, and the schedule spends none", async () => {
+  const db = await freshDb();
+  const { reportId, runDeps, runs } = await approvedFixture(db);
+  const manual = await runCustomStepForReport(db, runDeps, { report: { id: reportId }, stepKey: "fetch", trigger: "manual" });
+  assert.equal(manual.ok, true, JSON.stringify(manual));
+  assert.equal((await getUsage(db, reportId, DAY)).extraStepRuns, 1);
+  const scheduled = await runCustomStepForReport(db, runDeps, { report: { id: reportId }, stepKey: "fetch", trigger: "schedule" });
+  assert.equal(scheduled.ok, true, JSON.stringify(scheduled));
+  assert.equal((await getUsage(db, reportId, DAY)).extraStepRuns, 1, "the schedule spent nothing of its own");
+  assert.equal(runs.length, 2);
 });
 
 /* ------------------------------------------------------------------ the bundle dir */

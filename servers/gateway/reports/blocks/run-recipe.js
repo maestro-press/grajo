@@ -28,9 +28,9 @@
  *
  * `ctx` is what one block gets: `{db, deps, report, run, live, block, blockId, getState, setState,
  * fetch, mail, workspaceDir, log, extraStepClaim, extraStepClaimToken, sources}`.
- *   - `run` is the SERVER-SIDE run row the engine was handed (its `trigger` decides cap spending, and
- *     its `requestedBy` and the revision rows decide whether a block is gated). No recipe field can
- *     supply or override it.
+ *   - `run` is the SERVER-SIDE run row the engine was handed (its `trigger` decides cap spending, its
+ *     `recipeRev` is the revision the gate judges when it names one, and its `requestedBy` and the
+ *     revision rows decide whether a block is gated). No recipe field can supply or override it.
  *   - `fetch` IS the guarded request (`guardedRequest` in `servers/shared/fetch-page.js`), bound here
  *     and not a caller's seam: every URL a source reads goes through the scheme, address, redirect and
  *     byte checks, whatever a caller passed in `deps`. A test may inject a fake as `deps.testFetch`,
@@ -104,10 +104,17 @@
  * source error: it still renders, but a block that names a role writes the templated fallback instead of
  * calling that role's model.
  *
- * ONE READ OF THE REVISIONS PER RUN: the owner-history half of the gate is one map built from a single
- * read of the report's revisions (`ownerChainAnswers`), asked for lazily on the first gated block and
- * reused for every gated block after it. A recipe with ten bot-introduced sources costs one pass over
- * the revisions, not ten.
+ * ONE PASS OVER THE REVISIONS PER RUN: the owner-history half of the gate is one map built by
+ * `ownerChainAnswers` (one keyset-paged pass over the report's revisions), asked for lazily on the first
+ * gated block and reused for every gated block after it. A recipe with ten bot-introduced sources costs
+ * one pass over the revisions, not ten.
+ *
+ * THE GATE JUDGES THE REVISION THIS RUN EXECUTES: a preview pins its own revision on the run row
+ * (`run.recipeRev`, written when the run was created), and `run.js` executes exactly that revision. If
+ * the owner or a bot saves again after the preview was requested, the report's head moves but this run
+ * still runs the pinned one, so the gate must judge it too: `gateFor` uses `run.recipeRev` when it is a
+ * revision number, and the report's `recipe_rev` only when the run names none (a scheduled or manual run
+ * passes no pinned revision here, and is not gated at all).
  *
  * THE EXTRA STEP CAP: the day's ONE `extra_step_runs` belongs to the RUN, and it is taken by the block
  * that really spends it, in the one place that knows it will: a custom block's step claims it inside
@@ -388,14 +395,20 @@ export async function runRecipe(db, deps, { report, recipe, run, live = null, st
   let email = null;
   const blocks = Array.isArray(recipe?.blocks) ? recipe.blocks : [];
 
-  // The owner-history answers of this run's gate: ONE read of the report's revisions, asked for on the
+  // The owner-history answers of this run's gate: ONE pass over the report's revisions, asked for on the
   // first gated block and reused by every gated block after it.
   const gateSeam = gateDeps(seam);
   let gate = null;
   const gateFor = async () => {
     if (gate === null) {
       const reportId = report && typeof report.id === "string" ? report.id : "";
-      const headRev = Number(report?.recipe_rev);
+      // The revision this run EXECUTES: a preview pinned one at run creation, and a save after that moved
+      // the report's head without moving what this run reads. A run that pinned none (only a gated
+      // preview reaches here) falls back to the report's head.
+      const pinnedRev = Number(run?.recipeRev);
+      const headRev = Number.isInteger(pinnedRev) && pinnedRev >= 1
+        ? pinnedRev
+        : Number(report?.recipe_rev);
       gate = { headRev, ownerChain: await ownerChainAnswers(db, reportId, headRev, gateSeam) };
     }
     return gate;

@@ -10,18 +10,19 @@
  * The order, and why:
  *   a. `runnableStep`: the NEWEST revision of that step key must be approved, sealed, and its assets
  *      the ones on disk. Anything else is `step_waiting` with the one sentence an owner reads.
- *   b. the cap: a run that is not the schedule counts ONE `extra_step_runs` for the report's day, taken
- *      with one conditional increment (`claimExtraStepRun`), and a claim that finds the cap used up is
- *      `cap_reached`. A manual run and a bot-requested preview both count; the scheduled run does not.
- *      The claim is taken HERE, after (a), because a step that is still waiting never runs and so spends
- *      nothing. A run executor (`blocks/run-recipe.js`) hands its own claim for the whole run as
- *      `claimExtraStep` together with its `CLAIMED_BY_EXECUTOR` token (claim-token.js) as `claimToken`:
- *      the pair means this run already has a claim to spend (it also goes to a credentialed `http_json`
- *      block), so it is used instead of a second one. Either half alone is not that pair, `true`
- *      included, and a caller that hands neither takes its own claim.
- *   c. the files and the hosts the approval covers are re-checked NOW: an asset swapped under it is
+ *   b. the files and the hosts the approval covers are re-checked NOW: an asset swapped under it is
  *      `asset_changed`, a host whose seal no longer verifies is `host_unverified`. A step never runs
  *      with an asset or a host the owner did not approve.
+ *   c. the cap: a run that is not the schedule counts ONE `extra_step_runs` for the report's day, taken
+ *      with one conditional increment (`claimExtraStepRun`), and a claim that finds the cap used up is
+ *      `cap_reached`. A manual run and a bot-requested preview both count; the scheduled run does not.
+ *      The claim is taken HERE, after (a) and (b), because a step that is still waiting, or whose asset
+ *      or host no longer verifies, never runs and so spends nothing. A run executor
+ *      (`blocks/run-recipe.js`) hands its own claim for the whole run as `claimExtraStep` together with
+ *      its `CLAIMED_BY_EXECUTOR` token (claim-token.js) as `claimToken`: the pair means this run already
+ *      has a claim to spend (it also goes to a credentialed `http_json` block), so it is used instead of
+ *      a second one. Either half alone is not that pair, `true` included, and a caller that hands neither
+ *      takes its own claim.
  *   d. the bundle dir is written FRESH from the approved `files_json`, every path validated again here,
  *      into a 0700 tmp dir that is removed whatever happens.
  *   e. `ensureEnv`: the per-report, per-language env, built walled if it is not there yet.
@@ -225,28 +226,7 @@ export async function runCustomStepForReport(db, deps = {}, {
     }
     const step = runnable.step;
 
-    // (b) One extra step run for anything that is not the schedule, taken HERE so a step that is still
-    // waiting spends nothing. A run executor's own claim is used when it handed the token and the claim
-    // together; anything else takes its own.
-    const day = dayOf(seam, now);
-    if (trigger !== "schedule") {
-      const executorClaim = executorClaimOf(claimToken, claimExtraStep);
-      if (executorClaim) {
-        // The run's one claim: false when this run already spent it, and `cap_reached` when it is
-        // refused, which the block reports as the run's cap error.
-        await executorClaim();
-      } else {
-        const caps = await getCaps(db);
-        const claimed = await claimExtraStepRun(db, {
-          reportId,
-          day,
-          max: caps.maxExtraStepRunsPerReportDay,
-        });
-        if (!claimed) return { ok: false, code: "cap_reached", error: "cap_reached" };
-      }
-    }
-
-    // (c) The assets and the hosts the approval covers, checked again now.
+    // (b) The assets and the hosts the approval covers, checked again now.
     const assetsDir = join(home, "reports", reportId, "assets");
     for (const asset of Array.isArray(step.assets) ? step.assets : []) {
       const verified = await verifyAssetOnDisk(stepDeps, {
@@ -267,6 +247,28 @@ export async function runCustomStepForReport(db, deps = {}, {
       egressAllow.push(String(row.host));
     }
     const injectRules = await injectRulesFor(db, stepDeps, { reportId });
+
+    // (c) One extra step run for anything that is not the schedule, taken HERE — after (a) and (b) — so a
+    // step that is still waiting, or whose asset or host no longer verifies, spends nothing. A run
+    // executor's own claim is used when it handed the token and the claim together; anything else takes
+    // its own.
+    const day = dayOf(seam, now);
+    if (trigger !== "schedule") {
+      const executorClaim = executorClaimOf(claimToken, claimExtraStep);
+      if (executorClaim) {
+        // The run's one claim: false when this run already spent it, and `cap_reached` when it is
+        // refused, which the block reports as the run's cap error.
+        await executorClaim();
+      } else {
+        const caps = await getCaps(db);
+        const claimed = await claimExtraStepRun(db, {
+          reportId,
+          day,
+          max: caps.maxExtraStepRunsPerReportDay,
+        });
+        if (!claimed) return { ok: false, code: "cap_reached", error: "cap_reached" };
+      }
+    }
 
     // (d) The bundle dir, written fresh, removed whatever happens.
     bundleDir = mkdtempSync(join(osTmpdir(), "crow-report-step-bundle-" + process.pid + "-"));

@@ -51,7 +51,10 @@
  * under a decision.
  */
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync, closeSync, constants, fstatSync, mkdirSync, openSync, readSync, renameSync, rmSync,
+  writeFileSync,
+} from "node:fs";
 import { isIP } from "node:net";
 import { join } from "node:path";
 import { approvalSeal, newApprovalNonce, verifyApprovalSeal } from "./seal.js";
@@ -818,8 +821,67 @@ export async function removeAsset(db, deps, { reportId, name } = {}) {
 }
 
 /**
+ * The bytes of one asset file, or null. Opened read-only with O_NOFOLLOW and O_NONBLOCK, then fstat'd
+ * BEFORE a byte is read: only a regular file of at most `ASSET_MAX_BYTES` is read at all, so a symlink
+ * (`ELOOP`), a FIFO, a device or a directory answers null instead of being followed, blocked on or
+ * read. The fstat is the check, on the opened handle — never an lstat ahead of a plain read, which
+ * leaves a window for the path to be swapped between the two.
+ *
+ * @param {object} d resolved deps
+ * @param {string} reportId
+ * @param {string} sha256
+ * @returns {Buffer|null}
+ */
+function readAssetBytes(d, reportId, sha256) {
+  let fd;
+  try {
+    fd = openSync(
+      assetPath(d, reportId, sha256),
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+    );
+  } catch {
+    return null;
+  }
+  try {
+    let opened;
+    try {
+      opened = fstatSync(fd);
+    } catch {
+      return null;
+    }
+    if (!opened.isFile()) return null;
+    const size = Number(opened.size);
+    if (!Number.isFinite(size) || size < 0 || size > ASSET_MAX_BYTES) return null;
+    // One byte past the size the fstat named, so a file that grew after it does not hash equal.
+    const bytes = Buffer.allocUnsafe(size + 1);
+    let total = 0;
+    while (total < bytes.length) {
+      let read;
+      try {
+        read = readSync(fd, bytes, total, bytes.length - total, null);
+      } catch {
+        return null;
+      }
+      if (read <= 0) break;
+      total += read;
+    }
+    if (total > ASSET_MAX_BYTES) return null;
+    return Buffer.from(bytes.subarray(0, total));
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      // The read is over either way; a handle that will not close is not this function's answer.
+    }
+  }
+}
+
+/**
  * Does the file behind this asset row still hash to the row's sha256? A swapped file, a deleted one, a
- * row that names a path this module would not write, or an unreadable directory is `false`.
+ * row that names a path this module would not write, or an unreadable directory is `false`. A symlink
+ * or any other non-regular file at the asset path (a FIFO, a device, a directory) also reads as
+ * changed: the file is opened O_NOFOLLOW and fstat'd before it is read, so nothing is followed and
+ * nothing that is not a regular file is read at all.
  *
  * @param {object} [deps]
  * @param {object} row a `report_assets` row
@@ -832,7 +894,8 @@ export async function verifyAssetOnDisk(deps, row) {
     const reportId = pathIdOf(text(row.report_id !== undefined ? row.report_id : row.reportId));
     const sha256 = text(row.sha256);
     if (!SHA256_RE.test(sha256)) return false;
-    const bytes = readFileSync(assetPath(d, reportId, sha256));
+    const bytes = readAssetBytes(d, reportId, sha256);
+    if (bytes === null) return false;
     return sha256Hex(bytes) === sha256;
   } catch {
     return false;
