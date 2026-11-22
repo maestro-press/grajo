@@ -8,7 +8,7 @@ set -euo pipefail
 umask 077
 BUNDLE_DIR="${CROW_BUNDLE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 SCRATCH="${WORKSPACE_SCRATCH_DIR:-$HOME/.crow-workspace-restore}"
-IMAGE="nextcloud:34.0.6-apache"
+IMAGE="nextcloud:35.0.3-apache"
 PROJECT="crow-ws-restore"
 WAIT_S=300
 log() { printf '[restore-scratch] %s\n' "$*"; }

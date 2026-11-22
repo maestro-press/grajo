@@ -30,7 +30,7 @@ x-nextcloud-volumes: &nextcloud-volumes
 
 services:
   nextcloud:
-    image: nextcloud:34.0.6-apache
+    image: nextcloud:35.0.3-apache
     restart: unless-stopped
     mem_limit: 2g
     ports:
@@ -47,7 +47,7 @@ services:
         condition: service_healthy
 
   nextcloud-cron:
-    image: nextcloud:34.0.6-apache
+    image: nextcloud:35.0.3-apache
     restart: unless-stopped
     mem_limit: 512m
     entrypoint: /cron.sh
