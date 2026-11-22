@@ -59,11 +59,16 @@ test("no entry points with the flag off", async () => {
   assert.equal(a, b);
   assert.ok(a.includes("saveIntegration("), "the save button is there");
   assert.ok(!a.includes("data-int-moved") && !a.includes("data-int-advanced") && !a.includes("/services"));
-  // Project home: no Services link; the markup equals the flag-on markup minus the link.
+  // Project home: no Services link; the markup equals the flag-on markup minus that one link.
   const off = projectHomeHtml(HOME_DATA, PROJECT, "en", { servicesUi: false });
   const on = projectHomeHtml(HOME_DATA, PROJECT, "en", { servicesUi: true });
   assert.ok(!off.includes("/services") && !off.includes("ph-services"));
-  assert.equal(on.replace(/\n    <nav class="ph-head">.*?<\/nav>/s, ""), off);
+  assert.match(on, /<a class="ph-link ph-services"[^>]*>.*?<\/a>/);
+  assert.equal(on.replace(/<a class="ph-link ph-services" [^>]*>[^<]*<\/a>/, ""), off);
+  // The Reports link is always in the head nav, flag or no flag.
+  for (const html of [off, on]) {
+    assert.ok(html.includes("ph-reports") && html.includes("/dashboard/project/spring/reports"), "the Reports link is there");
+  }
   // Default arg reads the flag.
   assert.equal(projectHomeHtml(HOME_DATA, PROJECT, "en"), off);
   // Onboarding still deep-links the Settings section.

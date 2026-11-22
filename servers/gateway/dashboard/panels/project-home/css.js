@@ -15,6 +15,9 @@ import { lifecycleRules } from "../../shared/project-lifecycle-ui.js";
 export function projectHomeCss() {
   return `<style>
   body.shell .ph { min-width: 0; max-width: 44rem; display: flex; flex-direction: column; gap: 24px; }
+  /* The head nav: the project's own pages (Reports, and Services while that page is on). */
+  body.shell .ph-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; min-width: 0; }
+  body.shell .ph-head .ph-link { min-height: 44px; }
 ${sessionUiCss("body.shell")}
 ${lifecycleRules()}
   body.shell .ph-missing { align-items: flex-start; gap: 12px; }

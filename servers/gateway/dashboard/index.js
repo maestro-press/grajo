@@ -105,6 +105,7 @@ import makePanel, { openMakeItem } from "./panels/make.js";
 import projectHomePanel from "./panels/project-home.js";
 import reportRunPanel from "./panels/report-run.js";
 import projectServicesPanel from "./panels/project-services.js";
+import projectReportsPanel from "./panels/project-reports.js";
 import forYouPanel from "./panels/for-you.js";
 import mailPanel from "./panels/mail.js";
 import widgetsPanel from "./panels/widgets.js";
@@ -191,6 +192,7 @@ export default function dashboardRouter(mcpAuthMiddleware, { renderLayout: rende
   registerPanel(projectHomePanel);
   registerPanel(reportRunPanel);
   registerPanel(projectServicesPanel);
+  registerPanel(projectReportsPanel);
   registerPanel(forYouPanel); // 404s unless CROW_FOR_YOU=1 (the panel checks per request)
   registerPanel(mailPanel); // 404s unless CROW_MAIL=1 (the panel checks per request)
   // The generic widget page (widgets phase 2, Task 3): the same gate and flag as For You, one swipe in.
@@ -1295,6 +1297,10 @@ export default function dashboardRouter(mcpAuthMiddleware, { renderLayout: rende
   // A project's Services page (project services): hidden, and a 404 like any unknown path, while
   // CROW_SERVICES_UI is off.
   router.all("/dashboard/project/:slug/services", (req, res, next) => (servicesUiEnabled() ? dispatchPanel(req, res, next, "project-services") : next()));
+  // A project's Reports list and one report's page (Crow Recurring Reports, task 9b). Hidden, and the
+  // panel answers the project's missing page for a slug or a report id this instance does not have.
+  router.all("/dashboard/project/:slug/reports", (req, res, next) => dispatchPanel(req, res, next, "project-reports"));
+  router.all("/dashboard/project/:slug/reports/:id", (req, res, next) => dispatchPanel(req, res, next, "project-reports"));
   // One report run's page (R2-1): the run view a `dashboard` link in a report email opens. Hidden, and
   // the panel answers 404 for a slug, report or run this instance does not have.
   router.all("/dashboard/project/:slug/reports/:id/runs/:runId", (req, res, next) => dispatchPanel(req, res, next, "report-run"));

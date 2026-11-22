@@ -162,11 +162,11 @@ function sessionsSection(data, project, lang, now) {
 
 /** The home page body. */
 export function projectHomeHtml(data, project, lang, { now = new Date(), servicesUi = servicesUiEnabled(), req = null } = {}) {
-  // The Services link exists only while CROW_SERVICES_UI is on; off, the markup is exactly as before.
-  const services = servicesUi
-    ? `\n    <nav class="ph-head"><a class="ph-link ph-services" href="/dashboard/project/${encodeURIComponent(project.slug)}/services">${escapeHtml(t("projectHome.services", lang))}</a></nav>`
-    : "";
-  return `<div class="ph" data-ph data-project-id="${Number(project.id)}" data-project-slug="${escapeHtml(project.slug)}">${services}
+  // The head nav: Reports is always there (a project's reports are the project's own pages). The
+  // Services link exists only while CROW_SERVICES_UI is on.
+  const home = `/dashboard/project/${encodeURIComponent(project.slug)}`;
+  const nav = `\n    <nav class="ph-head"><a class="ph-link ph-reports" href="${home}/reports">${escapeHtml(t("projectHome.reports", lang))}</a>${servicesUi ? `<a class="ph-link ph-services" href="${home}/services">${escapeHtml(t("projectHome.services", lang))}</a>` : ""}</nav>`;
+  return `<div class="ph" data-ph data-project-id="${Number(project.id)}" data-project-slug="${escapeHtml(project.slug)}">${nav}
     ${noticeHtml(data, lang)}
     ${startControlHtml(data, lang, { projectId: Number(project.id), projectSlug: project.slug })}
     ${botsSection(data, project, lang, req)}

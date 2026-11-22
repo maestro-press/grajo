@@ -34,10 +34,11 @@ export const TAB_OF = Object.freeze({
   artifacts: "make",
   "project-home": "chat",
   "project-services": "chat",
+  "project-reports": "chat",
 });
 
 /** Panels whose scope is the project their path names (resolveShellPage). */
-export const SLUG_SCOPED_PANELS = new Set(["project-home", "project-services"]);
+export const SLUG_SCOPED_PANELS = new Set(["project-home", "project-services", "project-reports"]);
 
 const SCOPE_MAX_AGE = 34560000; // 400 days, seconds
 const DEFAULT_RETURN = "/dashboard/perch";
