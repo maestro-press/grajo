@@ -61,6 +61,8 @@ function shellOpts(over = {}) {
     headerIcons: BIRD,
     lang: "en",
     variant: "shell",
+    navGroups: [{ id: "workspace", name: "Workspace", collapsed: false,
+      panels: [...ALL_PANELS].map((id) => ({ id, name: id, route: `/dashboard/${id}` })) }],
     shell: {
       scope: { all: true },
       projects: PROJECTS,

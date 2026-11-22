@@ -432,6 +432,15 @@ export function shellCss() {
     overflow-wrap: anywhere;
   }
   body.shell .shell-more-item:hover { border-color: var(--crow-accent); color: var(--crow-accent); }
+  /* A nav group's name, above its panels and across the whole grid row. */
+  body.shell .shell-more-heading {
+    grid-column: 1 / -1;
+    margin: 6px 0 0;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: var(--crow-text-muted);
+  }
 
   /* ─── The drawer's Apps launcher (R1.2 PR 5), also the grid in a session's apps sheet ─── */
   body.shell .shell-apps { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 8px; }

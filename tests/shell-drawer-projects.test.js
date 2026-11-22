@@ -7,9 +7,15 @@ const projects = [
   { id: 2, slug: "beta", name: "Beta" },
   { id: 3, slug: "gamma", name: "Gamma" },
 ];
-const fakePanels = new Set(["messages", "bot-builder", "schedule", "memory", "media", "board"]);
+const fakePanels = new Set(["messages", "bot-builder", "schedule", "memory", "media", "board", "contacts", "blog"]);
 const getPanel = (id) => (fakePanels.has(id) ? { name: id } : null);
-const base = { scope: { all: true }, projects, lang: "en", getPanel };
+const navGroups = [{ id: "workspace", name: "Workspace", collapsed: false, panels: [
+  { id: "messages", name: "Messages", route: "/dashboard/messages", navOrder: 1 },
+  { id: "memory", name: "Memory", route: "/dashboard/memory", navOrder: 2 },
+  { id: "contacts", name: "Contacts", route: "/dashboard/contacts", navOrder: 3 },
+  { id: "blog", name: "Blog", route: "/dashboard/blog", navOrder: 4 },
+]}];
+const base = { scope: { all: true }, projects, lang: "en", getPanel, navGroups };
 
 test("projects render as links to their home with a dot", () => {
   const html = shellDrawer({ ...base, homeSlug: "beta" });

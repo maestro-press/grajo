@@ -273,7 +273,7 @@ export function renderLayout({ title, content, activePanel, panels, scripts, aft
 
   if (isShell) {
     return renderShellDocument({
-      docHead, title, content, scripts, afterContent, headerIcons, lang, bodyClass, instanceTabsStrip, shell,
+      docHead, title, content, scripts, afterContent, headerIcons, lang, bodyClass, instanceTabsStrip, navGroups, csrf, shell,
     });
   }
 
@@ -357,9 +357,12 @@ ${layoutTailJs()}
  * scripts; the voice, CSRF, auth-boundary, service-worker and toast code is
  * the classic layout's own.
  */
-function renderShellDocument({ docHead, title, content, scripts, afterContent, headerIcons, lang, bodyClass, instanceTabsStrip, shell }) {
+function renderShellDocument({ docHead, title, content, scripts, afterContent, headerIcons, lang, bodyClass, instanceTabsStrip, navGroups, csrf, shell }) {
   const sh = shell || {};
-  const ctx = { scope: sh.scope || { all: true }, projects: Array.isArray(sh.projects) ? sh.projects : [], lang, counts: sh.counts, homeSlug: sh.homeSlug ?? null };
+  const ctx = { scope: sh.scope || { all: true }, projects: Array.isArray(sh.projects) ? sh.projects : [], lang, counts: sh.counts, homeSlug: sh.homeSlug ?? null, csrf: csrfTokenString(csrf) };
+  // The owner's own nav groups drive "More of Crow", and the CSRF token makes
+  // the avatar sheet's Log out a POST; both reach the chrome through `ctx`.
+  if (Array.isArray(navGroups)) ctx.navGroups = navGroups;
   if (typeof sh.getPanel === "function") ctx.getPanel = sh.getPanel;
   if (sh.apps && typeof sh.apps === "object") ctx.apps = sh.apps;
   const tab = sh.tab === "chat" || sh.tab === "board" || sh.tab === "make" ? sh.tab : null;

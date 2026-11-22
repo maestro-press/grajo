@@ -16,7 +16,7 @@
 import { escapeHtml } from "../shared/components.js";
 import { t } from "../shared/i18n.js";
 import { crowMarkSvg } from "../shared/crow-mark.js";
-import { getPanel as registryGetPanel } from "../panel-registry.js";
+import { getPanel as registryGetPanel, getVisiblePanels } from "../panel-registry.js";
 import { needsYouLabel } from "../panels/board/needs-you-label.js";
 import { forYouEnabled } from "../../for-you/flag.js";
 import { mailEnabled } from "../../mail/flag.js";
@@ -57,38 +57,41 @@ const CLOSE_ICON = `<svg ${ICON_ATTRS}><path d="M18 6L6 18M6 6l12 12"/></svg>`;
 const CHEVRON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" focusable="false"><polyline points="6 9 12 15 18 9"/></svg>';
 
 /**
- * The "More of Crow" grid. An entry renders only when its panel is
- * registered on this gateway (and its `when`, if any, holds), so the drawer
- * never links to a 404.
+ * "More of Crow" follows the owner's navigation settings: the same groups the
+ * classic sidebar shows, in the same order and with the same members (see
+ * resolveNavGroups). A group left with nothing to show emits no heading. An
+ * entry renders only when its panel is registered on this gateway (and its
+ * `when`, if any, holds), so the drawer never links to a 404.
+ *
+ * These two lead the grid, ahead of the nav groups and without a heading of
+ * their own: the shell's owner-only pages.
  */
-const MORE_ENTRIES = [
+const SHELL_ONLY = [
   // For You v1: only while CROW_FOR_YOU=1 AND this is the owner's own local password session
   // (the page 404s for every other session). `when` gets this render's { forYouOwner }.
   { id: "for-you", fallback: "For You", when: (opts = {}) => forYouEnabled() && ownerFor(opts.forYouOwner) },
   // Crow Mail's reader: the same two gates (CROW_MAIL=1 and the owner's own local password
   // session), because /dashboard/mail 404s for every other session.
   { id: "mail", key: "nav.mail", fallback: "Mail", when: (opts = {}) => mailEnabled() && ownerFor(opts.forYouOwner) },
-  { id: "messages", fallback: "Messages" },
-  { id: "bot-builder", fallback: "Bots" },
-  { id: "schedule", fallback: "Schedules" },
-  { id: "memory", fallback: "Memory" },
-  { id: "media", fallback: "Media" },
-  { id: "ramble", fallback: "Ramble" },
-  { id: "extensions", fallback: "Extensions" },
-  { id: "model-catalog", fallback: "Models" },
-  { id: "contacts", fallback: "Contacts" },
-  { id: "files", fallback: "Files" },
-  { id: "blog", fallback: "Blog" },
-  { id: "skills", fallback: "Skills" },
-  { id: "metering", key: "nav.metering", fallback: "Usage" },
+].map((e) => ({ route: `/dashboard/${e.id}`, key: `nav.${e.id}`, ...e }));
+
+/**
+ * Panels the new shell already reaches another way, so More leaves them out:
+ * settings (the avatar sheet), projects (the drawer's project list), bot-board
+ * (the Board tab) and perch (the Chat tab).
+ */
+const MOVED_ON_PURPOSE = new Set(["settings", "projects", "bot-board", "perch"]);
+
+/** Per-panel exceptions in More: its own way in, or when it shows at all. */
+const MORE_RULES = {
+  // The classic home. A bare /dashboard/nest sends a new-mode device to Chat,
+  // so this way in asks for the nest explicitly (?open=1).
+  nest: { route: "/dashboard/nest?open=1" },
   // Fediverse Admin has no nav.* translation: the label falls through to the
   // registered panel's own manifest name ("Fediverse Admin"). It is listed only
   // while a federated bundle is installed (the panel hides itself the same way).
-  { id: "fediverse", fallback: "Fediverse", when: () => hasFederatedBundleInstalled() },
-  // The classic home. A bare /dashboard/nest sends a new-mode device to Chat,
-  // so this way in asks for the nest explicitly (?open=1).
-  { id: "nest", fallback: "Crow's Nest", route: "/dashboard/nest?open=1" },
-].map((e) => ({ route: `/dashboard/${e.id}`, key: `nav.${e.id}`, ...e }));
+  fediverse: { when: () => hasFederatedBundleInstalled() },
+};
 
 /** The sheet's own close button (Escape and a backdrop tap also close it). */
 function closeButton(lang) {
@@ -206,16 +209,66 @@ function projectForm({ scope, projects, lang, counts, homeSlug, extraClass = "" 
   return `<form class="shell-projects${extraClass}" method="post" action="/dashboard/scope"><input type="hidden" name="return" value=""><input type="hidden" name="_csrf" value="">${rows}</form>`;
 }
 
+/**
+ * One More entry: where it links, and the label the classic sidebar would use
+ * (the nav.<id> translation, else the panel's own manifest name).
+ */
+function moreItem(id, panel, lang, route) {
+  const rule = MORE_RULES[id];
+  return {
+    id,
+    href: (rule && rule.route) || route || panel.route || `/dashboard/${id}`,
+    text: label(`nav.${id}`, panel.name || id, lang),
+  };
+}
+
+/** Whether a panel's More rule lets it in at all (no rule: always in). */
+function moreShows(id) {
+  const rule = MORE_RULES[id];
+  return !rule || !rule.when || rule.when();
+}
+
+/** A group's heading: the nav.group.<id> translation, else the stored name. */
+function moreHeading(group, lang) {
+  const key = `nav.group.${group.id}`;
+  const translated = t(key, lang);
+  return `<h4 class="shell-more-heading">${escapeHtml(translated === key ? group.name : translated)}</h4>`;
+}
+
 /** The "More of Crow" row: a details whose summary names the first four entries. */
-function moreDetails({ lang, getPanel, forYouOwner }) {
+function moreDetails({ lang, getPanel, forYouOwner, navGroups }) {
   const owner = ownerFor(forYouOwner);
-  // Labels follow the classic sidebar's rule: the nav.<id> translation, else
-  // the panel's own manifest name, else a plain fallback.
-  const entries = MORE_ENTRIES.map((e) => ({ e, panel: getPanel(e.id) })).filter((x) => x.panel && (!x.e.when || x.e.when({ forYouOwner: owner })))
-    .map(({ e, panel }) => ({ e, text: label(e.key, panel.name || e.fallback, lang) }));
+  const link = (x) => `<a href="${x.href}" class="shell-more-item"${x.id === "for-you" ? " data-for-you-entry" : ""}>${escapeHtml(x.text)}</a>`;
+  // The shell's own pages first, heading-less; a panel they already took is
+  // never repeated under its nav group.
+  const lead = SHELL_ONLY.filter((e) => getPanel(e.id) && (!e.when || e.when({ forYouOwner: owner })))
+    .map((e) => moreItem(e.id, getPanel(e.id), lang, e.route));
+  const taken = new Set(lead.map((x) => x.id));
+  const wanted = (p) => !MOVED_ON_PURPOSE.has(p.id) && !taken.has(p.id) && getPanel(p.id) && moreShows(p.id);
+
+  const blocks = [];
+  if (Array.isArray(navGroups) && navGroups.length) {
+    for (const group of navGroups) {
+      const items = (Array.isArray(group.panels) ? group.panels : []).filter(wanted)
+        .map((p) => moreItem(p.id, getPanel(p.id) || p, lang));
+      // A collapsed group still lists its panels: collapsing is a side-menu
+      // affordance (the classic sidebar's group header), not a statement about
+      // what this drawer offers. A group left with nothing to show (every
+      // panel moved elsewhere on purpose) emits no heading at all.
+      if (items.length) blocks.push({ heading: moreHeading(group, lang), items });
+    }
+  } else {
+    // Nav resolution failed, or produced no groups at all (the classic sidebar
+    // fell back to one flat list): More falls back to the registry itself, so
+    // it is never emptier than that.
+    const items = getVisiblePanels().filter(wanted).map((p) => moreItem(p.id, p, lang));
+    if (items.length) blocks.push({ heading: "", items });
+  }
+
+  const entries = [...lead, ...blocks.flatMap((b) => b.items)];
   if (!entries.length) return "";
   const sub = entries.slice(0, 4).map((x) => x.text).join(", ") + "…";
-  const grid = entries.map(({ e, text }) => `<a href="${e.route}" class="shell-more-item"${e.id === "for-you" ? " data-for-you-entry" : ""}>${escapeHtml(text)}</a>`).join("");
+  const grid = lead.map(link).join("") + blocks.map((b) => b.heading + b.items.map(link).join("")).join("");
   return `<details class="shell-more-row"><summary class="shell-project"><span class="shell-project-text"><span class="shell-project-name">${escapeHtml(t("shell.more", lang))}</span><span class="shell-project-sub">${escapeHtml(sub)}</span></span></summary><div class="shell-more">${grid}</div></details>`;
 }
 
@@ -225,7 +278,7 @@ function archivedLink(lang) {
 }
 
 /** The Chat / Board / Make nav, rendered right after </main>. */
-export function shellTabsNav({ tab, scope, projects, lang, counts, homeSlug, forYouOwner, getPanel = registryGetPanel }) {
+export function shellTabsNav({ tab, scope, projects, lang, counts, homeSlug, forYouOwner, navGroups, getPanel = registryGetPanel }) {
   const sp = scopedProject(scope, projects);
   // "Board · N" counts the scoped project's cards needing you, so it matches
   // the Board; "Chat · N" its chats waiting on you (the counts Map's `.parts`).
@@ -246,7 +299,7 @@ export function shellTabsNav({ tab, scope, projects, lang, counts, homeSlug, for
       <div class="shell-rail-projects">
         <h3 class="shell-heading">${escapeHtml(t("shell.projects", lang))}</h3>
         ${projectForm({ scope, projects, lang, counts, homeSlug, extraClass: " shell-projects--rail" })}
-        ${moreDetails({ lang, getPanel, forYouOwner })}
+        ${moreDetails({ lang, getPanel, forYouOwner, navGroups })}
         ${archivedLink(lang)}
       </div>
     </nav>`;
@@ -306,31 +359,40 @@ function appsSection({ apps, lang }) {
 }
 
 /** The drawer: projects, the Apps launcher (new mode), then the "More of Crow" grid. */
-export function shellDrawer({ scope, projects, lang, counts, homeSlug, apps, forYouOwner, getPanel = registryGetPanel }) {
+export function shellDrawer({ scope, projects, lang, counts, homeSlug, apps, forYouOwner, navGroups, getPanel = registryGetPanel }) {
   return `<dialog id="shell-drawer" class="shell-sheet shell-drawer" aria-labelledby="shell-drawer-title">
     <div class="shell-sheet-inner">
       ${closeButton(lang)}
       <h3 class="shell-heading" id="shell-drawer-title">${escapeHtml(t("shell.projects", lang))}</h3>
       ${projectForm({ scope, projects, lang, counts, homeSlug })}
       ${appsSection({ apps, lang })}
-      ${moreDetails({ lang, getPanel, forYouOwner })}
+      ${moreDetails({ lang, getPanel, forYouOwner, navGroups })}
       ${archivedLink(lang)}
     </div>
   </dialog>`;
 }
 
 /**
- * The account sheet: Settings, Models, What Crow can reach, and the classic
- * switch (and For You first, while CROW_FOR_YOU=1 and the request is the owner's own local
+ * The account sheet: Settings, Models, What Crow can reach, the classic switch
+ * and Log out (and For You first, while CROW_FOR_YOU=1 and the request is the owner's own local
  * password session). With `tray` (the header bird's or bell's notifications tray,
  * notifications.js, trusted server markup) it is the ONE "Notifications and
  * settings" sheet the mascot opens (phone review 2026-10-29): the tray first,
  * then the settings links, and no separate avatar button exists.
+ *
+ * Logging out is the sheet's last row. With the viewer's `csrf` token in hand
+ * it is a POST; without one it is the plain link to the GET confirm page, which
+ * changes nothing on its own (a GET logout would be a same-origin image
+ * target).
  */
-export function shellAvatarSheet({ lang, tray, forYouOwner, getPanel = registryGetPanel }) {
+export function shellAvatarSheet({ lang, tray, forYouOwner, getPanel = registryGetPanel, csrf = "" }) {
   const settings = label("nav.settings", "Settings", lang);
   const merged = typeof tray === "string" && tray !== "";
   const name = escapeHtml(t(merged ? "shell.notifSettings" : "shell.account", lang));
+  const token = typeof csrf === "string" ? csrf : "";
+  const logout = token
+    ? `<form method="post" action="/dashboard/logout" data-turbo="false" class="shell-mode-form"><input type="hidden" name="_csrf" value="${escapeHtml(token)}"><button type="submit" class="shell-sheet-link shell-mode-btn">${escapeHtml(t("nav.logout", lang))}</button></form>`
+    : `<a href="/dashboard/logout" class="shell-sheet-link" data-turbo="false">${escapeHtml(t("nav.logout", lang))}</a>`;
   return `<dialog id="shell-avatar" class="shell-sheet shell-avatar-sheet${merged ? " shell-crow-sheet" : ""}" aria-label="${name}">
     <div class="shell-sheet-inner">
       ${closeButton(lang)}${merged ? `
@@ -343,6 +405,7 @@ export function shellAvatarSheet({ lang, tray, forYouOwner, getPanel = registryG
       <a href="/dashboard/settings?section=models" class="shell-sheet-link">${escapeHtml(t("settings.section.models", lang))}</a>
       <a href="/dashboard/settings?section=integrations" class="shell-sheet-link">${escapeHtml(t("shell.reach", lang))}</a>
       <form method="post" action="/dashboard/mode" class="shell-mode-form"><input type="hidden" name="_csrf" value=""><input type="hidden" name="mode" value="classic"><button type="submit" class="shell-sheet-link shell-mode-btn">${escapeHtml(t("shell.useClassic", lang))}</button></form>
+      ${logout}
     </div>
   </dialog>`;
 }
