@@ -328,9 +328,11 @@ describe("an owner-edited compose", () => {
 
     const card = store.upserts.find((c) => c.source === COMPOSE_EDITED_SOURCE);
     assert.ok(card, "the compose-edited card is raised");
-    assert.equal(card.title, "Web's compose file has local changes");
+    // Approved English fix (BUG 3, 2026-11-22): "settings file" everywhere, and
+    // the body now names the file it is about.
+    assert.equal(card.title, "Web's settings file has local changes");
     assert.match(card.why, /Crow did not update it/);
-    assert.match(card.why, /Move your changes into docker-compose\.override\.yml and restore the compose file/);
+    assert.match(card.why, /Move your changes into docker-compose\.override\.yml and restore the settings file/);
     assert.match(card.why, /docker-compose\.yml\.bak when Crow restores it/);
     // The restore action is owner-gated inside the remedy, never by the card.
     assert.deepEqual(card.remedies, [
@@ -526,7 +528,7 @@ describe("the repo compose is tighter than an unrefreshable installed one", () =
     assert.ok(card, "the repo-drift card is raised");
     assert.equal(card.dedupKey, `bundle:${id}:repo`);
     assert.equal(card.why, "Web is published to other devices; Crow now ships it on this computer only. "
-      + "Restart won't change that while its compose file has local changes — see the other card.");
+      + "Restart won't change that while its settings file has local changes — see the other card.");
   });
 
   test("the unknown verdict gets the same card, worded for what Crow knows", async () => {
@@ -546,7 +548,7 @@ describe("the repo compose is tighter than an unrefreshable installed one", () =
 
     const card = store.upserts.find((c) => c.source === REPO_DRIFT_SOURCE);
     assert.ok(card);
-    assert.match(card.why, /Crow cannot tell whether the installed compose file has local changes/);
+    assert.match(card.why, /Crow cannot tell whether the installed settings file has local changes/);
   });
 
   test("a port the owner declared in an override file is skipped (widened on purpose)", async () => {

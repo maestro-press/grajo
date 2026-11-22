@@ -1,0 +1,669 @@
+{
+  "addon-keys": {
+    "details": [],
+    "remedies": [],
+    "title": "Saved add-on keys cannot be read",
+    "why": "Crow's keychain key is missing, so it did not save this key. Restore the keychain key or import a keychain export first."
+  },
+  "addon-wall/denied-hidden-target": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser tried to reach an address, which it is not set up for. It stays off until you choose."
+  },
+  "addon-wall/denied-plain-target": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser tried to reach 192.0.2.9:80, which it is not set up for. It stays off until you choose."
+  },
+  "addon-wall/exit-code": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser stopped with exit code 7. It stays off until you choose."
+  },
+  "addon-wall/installed-changed": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser its installed files changed; reinstall it to wall it. It stays off until you choose."
+  },
+  "addon-wall/no-reason-default": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser could not run inside its wall. It stays off until you choose."
+  },
+  "addon-wall/not-ready": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser stopped before it was ready. It stays off until you choose."
+  },
+  "addon-wall/open-hidden-in-folder": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser could not open a file in its folder. It stays off until you choose."
+  },
+  "addon-wall/open-outside": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser could not open a file outside its folder. It stays off until you choose."
+  },
+  "addon-wall/open-rel": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser could not open data/secret.txt. It stays off until you choose."
+  },
+  "addon-wall/refused": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser its wall could not be set up on this computer. It stays off until you choose."
+  },
+  "addon-wall/warmup-alone": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser could not get its packages ready inside its wall. It stays off until you choose."
+  },
+  "addon-wall/warmup-denied": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser could not get its packages ready inside its wall: tried to reach 192.0.2.9:80, which it is not set up for. It stays off until you choose."
+  },
+  "addon-wall/warmup-exit-code": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser could not get its packages ready inside its wall: stopped with exit code 7. It stays off until you choose."
+  },
+  "addon-wall/warmup-not-ready": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser could not get its packages ready inside its wall. It stays off until you choose."
+  },
+  "addon-wall/warmup-open-hidden-in-folder": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser could not get its packages ready inside its wall: could not open a file in its folder. It stays off until you choose."
+  },
+  "addon-wall/warmup-open-outside": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser could not get its packages ready inside its wall: could not open a file outside its folder. It stays off until you choose."
+  },
+  "addon-wall/warmup-open-rel": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "addon-unwall",
+        "kind": "form",
+        "label": "Run browser without the wall"
+      },
+      {
+        "actionId": "addon-keep-off",
+        "kind": "form",
+        "label": "Keep it off"
+      }
+    ],
+    "title": "An add-on could not run inside its wall",
+    "why": "browser could not get its packages ready inside its wall: could not open data/secret.txt. It stays off until you choose."
+  },
+  "boot-guard/launcher": {
+    "details": [],
+    "remedies": [],
+    "title": "The boot guard did not run",
+    "why": "This service is configured to roll back a Crow update that keeps crashing on startup (CROW_BOOT_GUARD=1), but the part that runs before every start did not run. Nothing else is affected — but a bad update cannot be rolled back automatically, so it would keep restarting. Re-run the boot-guard install step for this service (scripts/ops/install-boot-guard.sh), then restart it."
+  },
+  "boot-guard/other": {
+    "details": [],
+    "remedies": [],
+    "title": "The boot guard did not run",
+    "why": "This service is configured to roll back a Crow update that keeps crashing on startup (CROW_BOOT_GUARD=1), but its record could not be read. Nothing else is affected — but a bad update cannot be rolled back automatically, so it would keep restarting. Re-run the boot-guard install step for this service (scripts/ops/install-boot-guard.sh), then restart it."
+  },
+  "boot-guard/recorder": {
+    "details": [],
+    "remedies": [],
+    "title": "The boot guard did not run",
+    "why": "This service is configured to roll back a Crow update that keeps crashing on startup (CROW_BOOT_GUARD=1), but the part that records how a start ended did not run. Nothing else is affected — but a bad update cannot be rolled back automatically, so it would keep restarting. Re-run the boot-guard install step for this service (scripts/ops/install-boot-guard.sh), then restart it."
+  },
+  "browser-image-stale/no-version": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "restart-browser-addon",
+        "kind": "form",
+        "label": "Restart the browser add-on"
+      },
+      {
+        "href": "/dashboard/extensions",
+        "kind": "link",
+        "label": "Open Extensions"
+      }
+    ],
+    "title": "The browser add-on is still running the old version",
+    "why": "Crow updated the browser add-on, but the copy that is running is still the old one. Restart it to load the update. A restart cannot be undone, and the pages that are open in the browser now will close. Saved logins and cookies are kept."
+  },
+  "browser-image-stale/version-known": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "restart-browser-addon",
+        "kind": "form",
+        "label": "Restart the browser add-on"
+      },
+      {
+        "href": "/dashboard/extensions",
+        "kind": "link",
+        "label": "Open Extensions"
+      }
+    ],
+    "title": "The browser add-on is still running the old version",
+    "why": "Crow updated the browser add-on, but the copy that is running is still the old one. Restart it to load the update. A restart cannot be undone, and the pages that are open in the browser now will close. Saved logins and cookies are kept. Running now: version 1.9.2. The update would install version 1.9.4."
+  },
+  "browser-image-stale/version-unknown": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "restart-browser-addon",
+        "kind": "form",
+        "label": "Restart the browser add-on"
+      },
+      {
+        "href": "/dashboard/extensions",
+        "kind": "link",
+        "label": "Open Extensions"
+      }
+    ],
+    "title": "The browser add-on is still running the old version",
+    "why": "Crow updated the browser add-on, but the copy that is running is still the old one. Restart it to load the update. A restart cannot be undone, and the pages that are open in the browser now will close. Saved logins and cookies are kept. Running now: an earlier version that does not report its number. The update would install version 1.9.4."
+  },
+  "bundle-bind-drift/bind-extra": {
+    "details": [],
+    "remedies": [
+      {
+        "href": "/dashboard/extensions",
+        "kind": "link",
+        "label": "Open Extensions"
+      }
+    ],
+    "title": "Restart Audiobookshelf to apply its updated network settings",
+    "why": "Audiobookshelf is still reachable on 0.0.0.0:9000 from other devices, but its settings no longer publish that port. Restart it on the Extensions page to apply them."
+  },
+  "bundle-bind-drift/bind-wider": {
+    "details": [],
+    "remedies": [
+      {
+        "href": "/dashboard/extensions",
+        "kind": "link",
+        "label": "Open Extensions"
+      }
+    ],
+    "title": "Restart Audiobookshelf to apply its updated network settings",
+    "why": "Audiobookshelf is still reachable on 0.0.0.0:13378 from other devices, but its settings now keep it on this computer only. Restart it on the Extensions page to apply them."
+  },
+  "bundle-compose-edited": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "restore-bundle-compose",
+        "kind": "form",
+        "label": "Restore Crow's compose"
+      },
+      {
+        "href": "/dashboard/extensions",
+        "kind": "link",
+        "label": "Open Extensions"
+      }
+    ],
+    "title": "Changedetection.io's compose file has local changes",
+    "why": "Changedetection.io's compose file has local changes, so Crow did not update it. Move your changes into docker-compose.override.yml and restore the compose file (a copy of the current one is kept as docker-compose.yml.bak when Crow restores it)."
+  },
+  "bundle-compose-image-change/added": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "apply-bundle-compose-update",
+        "kind": "form",
+        "label": "Apply the update"
+      },
+      {
+        "href": "/dashboard/extensions",
+        "kind": "link",
+        "label": "Open Extensions"
+      }
+    ],
+    "title": "Vikunja's settings file has an update Crow did not apply",
+    "why": "Crow keeps Vikunja on its current settings because the update would also add a helper step \"vikunja-volume-owner\" that uses the image \"busybox:1.38.0@sha256:a46257e0\". Back up its data, then press 'Apply the update' to switch, or keep it as it is."
+  },
+  "bundle-compose-image-change/removed": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "apply-bundle-compose-update",
+        "kind": "form",
+        "label": "Apply the update"
+      },
+      {
+        "href": "/dashboard/extensions",
+        "kind": "link",
+        "label": "Open Extensions"
+      }
+    ],
+    "title": "Vikunja's settings file has an update Crow did not apply",
+    "why": "Crow keeps Vikunja on its current settings because the update would also remove the step \"web-legacy-helper\". Back up its data, then press 'Apply the update' to switch, or keep it as it is."
+  },
+  "bundle-compose-image-change/swapped": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "apply-bundle-compose-update",
+        "kind": "form",
+        "label": "Apply the update"
+      },
+      {
+        "href": "/dashboard/extensions",
+        "kind": "link",
+        "label": "Open Extensions"
+      }
+    ],
+    "title": "Vikunja's settings file has an update Crow did not apply",
+    "why": "Crow keeps Vikunja on its current settings because the update would also change its image (vikunja/vikunja:0.24.6 → vikunja/vikunja:0.25.1; it may be older than what is running). The update also tightens how Vikunja is published. Back up its data, then press 'Apply the update' to switch, or keep it as it is."
+  },
+  "bundle-compose-image-change/swapped-none": {
+    "details": [],
+    "remedies": [
+      {
+        "actionId": "apply-bundle-compose-update",
+        "kind": "form",
+        "label": "Apply the update"
+      },
+      {
+        "href": "/dashboard/extensions",
+        "kind": "link",
+        "label": "Open Extensions"
+      }
+    ],
+    "title": "Vikunja's settings file has an update Crow did not apply",
+    "why": "Crow keeps Vikunja on its current settings because the update would also change its image (none → none; it may be older than what is running). The update also tightens how Vikunja is published. Back up its data, then press 'Apply the update' to switch, or keep it as it is."
+  },
+  "bundle-compose-needs-config": {
+    "details": [],
+    "remedies": [
+      {
+        "href": "/dashboard/extensions",
+        "kind": "link",
+        "label": "Open Extensions"
+      }
+    ],
+    "title": "Vikunja's settings file was not updated",
+    "why": "Crow could not update Vikunja's settings file: it needs VIKUNJA_DB_PASSWORD set first (Configure on its Extensions card)."
+  },
+  "bundle-repo-bind-drift/edited": {
+    "details": [],
+    "remedies": [
+      {
+        "href": "/dashboard/extensions",
+        "kind": "link",
+        "label": "Open Extensions"
+      }
+    ],
+    "title": "Audiobookshelf is still published to other devices",
+    "why": "Audiobookshelf is published to other devices; Crow now ships it on this computer only. Restart won't change that while its compose file has local changes — see the other card."
+  },
+  "bundle-repo-bind-drift/unknown": {
+    "details": [],
+    "remedies": [
+      {
+        "href": "/dashboard/extensions",
+        "kind": "link",
+        "label": "Open Extensions"
+      }
+    ],
+    "title": "Audiobookshelf is still published to other devices",
+    "why": "Audiobookshelf is published to other devices; Crow now ships it on this computer only. Restart won't change that while Crow cannot tell whether the installed compose file has local changes."
+  },
+  "caddy-admin-socket": {
+    "details": [
+      {
+        "code": "/etc/caddy/Caddyfile",
+        "label": "Caddyfile:"
+      }
+    ],
+    "remedies": [],
+    "title": "This machine's Caddy admin API is open to any program on it",
+    "why": "Caddy's admin API is on its default local address with no authentication, so any program or bot on this machine can rewrite the Caddy that fronts Crow. One command moves it onto a unix socket only Caddy's own service user can open. Crow does not run as root, so run this once on the server: sudo bash <checkout>/scripts/fix-caddy-admin-socket.sh"
+  },
+  "caddy-proxy-socket": {
+    "details": [
+      {
+        "code": "/etc/caddy/Caddyfile",
+        "label": "Caddyfile:"
+      }
+    ],
+    "remedies": [],
+    "title": "Visitors coming in through this machine's Caddy are being turned away",
+    "why": "Caddy still hands them to the gateway over a loopback connection with its own forwarding header, which Crow cannot tell apart from any other program on this machine — so Crow's Nest refuses them. Pointing Caddy at the gateway's own proxy socket fixes it. Crow does not run as root, so run this once on the server: sudo bash <checkout>/scripts/fix-caddy-proxy-socket.sh"
+  },
+  "data-backend-reapproval": {
+    "details": [],
+    "remedies": [
+      {
+        "href": "/dashboard/projects",
+        "kind": "link",
+        "label": "Open the Projects page"
+      }
+    ],
+    "title": "Data backends need approving again",
+    "why": "3 data backend(s) were approved before Crow protected approvals with a key kept outside its database. They stay stopped until you approve them again on the Projects page."
+  },
+  "remote-exposure/crow-sharing": {
+    "details": [
+      {
+        "code": "crow-sharing",
+        "label": "Capability:"
+      },
+      {
+        "code": "peer-phone",
+        "label": "Requesting instance:"
+      }
+    ],
+    "remedies": [
+      {
+        "actionId": "expose-capability-30d",
+        "kind": "form",
+        "label": "Allow for 30 days"
+      },
+      {
+        "actionId": "expose-capability-7d",
+        "kind": "form",
+        "label": "Allow for 7 days"
+      },
+      {
+        "actionId": "expose-capability-forever",
+        "kind": "form",
+        "label": "Allow until I remove it"
+      }
+    ],
+    "title": "Your Phone tried to use Sharing & Messages, but it isn't shared with this device yet",
+    "why": "Allow it for Phone only — your other Crows stay unchanged, and the allowance can expire or be removed in Settings."
+  },
+  "remote-exposure/named-peer": {
+    "details": [
+      {
+        "code": "funkwhale",
+        "label": "Capability:"
+      },
+      {
+        "code": "peer-glasses",
+        "label": "Requesting instance:"
+      }
+    ],
+    "remedies": [
+      {
+        "actionId": "expose-capability-30d",
+        "kind": "form",
+        "label": "Allow for 30 days"
+      },
+      {
+        "actionId": "expose-capability-7d",
+        "kind": "form",
+        "label": "Allow for 7 days"
+      },
+      {
+        "actionId": "expose-capability-forever",
+        "kind": "form",
+        "label": "Allow until I remove it"
+      }
+    ],
+    "title": "Your Glasses tried to use Music, but it isn't shared with this device yet",
+    "why": "Allow it for Glasses only — your other Crows stay unchanged, and the allowance can expire or be removed in Settings."
+  },
+  "remote-exposure/no-name": {
+    "details": [
+      {
+        "code": "crow-memory",
+        "label": "Capability:"
+      },
+      {
+        "code": "peer-nameless",
+        "label": "Requesting instance:"
+      }
+    ],
+    "remedies": [
+      {
+        "actionId": "expose-capability-30d",
+        "kind": "form",
+        "label": "Allow for 30 days"
+      },
+      {
+        "actionId": "expose-capability-7d",
+        "kind": "form",
+        "label": "Allow for 7 days"
+      },
+      {
+        "actionId": "expose-capability-forever",
+        "kind": "form",
+        "label": "Allow until I remove it"
+      }
+    ],
+    "title": "Your another device tried to use Memory, but it isn't shared with this device yet",
+    "why": "Allow it for another device only — your other Crows stay unchanged, and the allowance can expire or be removed in Settings."
+  },
+  "remote-exposure/unknown-addon": {
+    "details": [
+      {
+        "code": "weather-station",
+        "label": "Capability:"
+      },
+      {
+        "code": "peer-tablet",
+        "label": "Requesting instance:"
+      }
+    ],
+    "remedies": [
+      {
+        "actionId": "expose-capability-30d",
+        "kind": "form",
+        "label": "Allow for 30 days"
+      },
+      {
+        "actionId": "expose-capability-7d",
+        "kind": "form",
+        "label": "Allow for 7 days"
+      },
+      {
+        "actionId": "expose-capability-forever",
+        "kind": "form",
+        "label": "Allow until I remove it"
+      }
+    ],
+    "title": "Your Tablet tried to use weather-station, but it isn't shared with this device yet",
+    "why": "Allow it for Tablet only — your other Crows stay unchanged, and the allowance can expire or be removed in Settings."
+  }
+}

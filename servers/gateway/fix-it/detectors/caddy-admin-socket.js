@@ -25,8 +25,9 @@
  */
 
 import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+import { cardContext, cardText } from "../card-copy.js";
+import { appRoot } from "../app-root.js";
 
 export const CADDYFILE = "/etc/caddy/Caddyfile";
 export const DEDUP_KEY = "caddy:admin-open";
@@ -49,9 +50,7 @@ const LOOPBACK_PROXY_LINE = /^[ \t]*reverse_proxy[ \t]+(?:localhost|127\.0\.0\.1
 const ADMIN_OPTION_LINE = /^[ \t]*admin(?:[ \t]|$)/m;
 
 /** The app checkout this gateway runs from (the fix script lives in it). */
-export function appRoot() {
-  return resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
-}
+export { appRoot };
 
 /**
  * → the card's text when a readable Crow Caddyfile has no `admin` option (so
@@ -70,12 +69,14 @@ export function caddyAdminProblem({ caddyfile = CADDYFILE, app = appRoot(), read
   if (ADMIN_OPTION_LINE.test(text)) return null;
 
   const fixCommand = `sudo bash ${resolve(app, "scripts", "fix-caddy-admin-socket.sh")}`;
+  // ONE copy table (fix-it/card-copy.js): English here, the dashboard's language
+  // at view time, with the command COMPUTED there — never read from crow.db.
+  const copy = cardText("caddy-admin-socket", {}, "en");
   return {
-    title: "This machine's Caddy admin API is open to any program on it",
-    why: "Caddy's admin API is on its default local address with no authentication, so any program or bot on this machine can rewrite the Caddy that fronts Crow. "
-      + "One command moves it onto a unix socket only Caddy's own service user can open. Crow does not run as root, so run this once on the server: " + fixCommand,
+    title: copy.title,
+    why: copy.why,
     fixCommand,
-    context: { caddyfile, fixCommand },
+    context: cardContext("caddy-admin-socket", {}, { caddyfile, fixCommand }),
   };
 }
 

@@ -31,6 +31,7 @@ import {
   ADDON_KEYCHAIN_FIELD, AddonKeysUnavailableError, addonSecretsSealingOn, keychainEnvNames,
   readAddonSecretsSync, sealableEnv,
 } from "../shared/addon-secrets.js";
+import { cardContext, cardText } from "./fix-it/card-copy.js";
 import { gatewayKeychainPaths } from "./addon-keys-paths.js";
 import { keychainKeyState, loadKeychainKey } from "./keychain/key.js";
 import { countEntries, ensureWriteKey, rowSecretEquals, saveExtensionSecret } from "./keychain/store.js";
@@ -61,7 +62,9 @@ export class AddonKeysSaveRefusedError extends Error {
  */
 export const ADDON_KEY_CARD_SOURCE = "addon-keys";
 export const ADDON_KEY_CARD_KEY = "addon-keys-unreadable";
-export const ADDON_KEY_CARD_TITLE = "Saved add-on keys cannot be read";
+/** The card's code in the copy table (fix-it/card-copy.js), rendered per language. */
+const ADDON_KEY_CARD_CODE = "addon-keys-unreadable";
+export const ADDON_KEY_CARD_TITLE = cardText(ADDON_KEY_CARD_CODE, {}, "en").title;
 
 /**
  * Raise (or bump) the one add-on-keys card. Best-effort by design: a card that cannot be
@@ -69,14 +72,20 @@ export const ADDON_KEY_CARD_TITLE = "Saved add-on keys cannot be read";
  * add-on id and env NAMES only — never a value.
  */
 export async function raiseAddonKeysUnreadableCard(db, { bundleId = null, names = [] } = {}) {
+  // The stored English equals KEY_SAVE_REFUSED (the error message this refusal
+  // also throws); the card renders the approved Spanish from the same key.
+  const text = cardText(ADDON_KEY_CARD_CODE, {}, "en");
   return upsertFixItItem(db, {
     source: ADDON_KEY_CARD_SOURCE,
     dedupKey: ADDON_KEY_CARD_KEY,
-    title: ADDON_KEY_CARD_TITLE,
-    why: KEY_SAVE_REFUSED,
+    title: text.title,
+    why: text.why,
     severity: "warn",
     remedies: [],
-    context: { bundle_id: bundleId, names: (Array.isArray(names) ? names : []).filter((n) => typeof n === "string") },
+    context: cardContext(ADDON_KEY_CARD_CODE, {}, {
+      bundle_id: bundleId,
+      names: (Array.isArray(names) ? names : []).filter((n) => typeof n === "string"),
+    }),
   });
 }
 

@@ -37,10 +37,10 @@
  * this detector resolves it before deciding again (a new card must never dedupe
  * onto a card that can never be allowed).
  *
- * DB-free: it composes strings from the (already name-enriched) payload and the
- * pure friendly-name map, then calls the db-bound store it's handed.
+ * DB-free: it hands the (already name-enriched) payload to the code-held card
+ * copy (fix-it/card-copy.js) and then calls the db-bound store it's handed.
  */
-import { resolveFriendlyName } from "../friendly-names.js";
+import { cardContext, cardText } from "../card-copy.js";
 import { normalizePeerId, normalizePairingTag } from "../../../shared/peer-id.js";
 import { UNKNOWN_CAPABILITY_BUCKET } from "../peer-card-counters.js";
 import { withPeerLock } from "../peer-card-lock.js";
@@ -96,19 +96,27 @@ async function decideAndStore({ capability, peerId, peerName, toolName, tag, sto
     return; // no card, no NEW card
   }
 
-  const friendly = resolveFriendlyName(capability);
   // `requestingInstanceName` is the peer's label as THIS instance stored it
   // (fix-it/index.js resolves it from the instance registry by the verified
-  // id) — display text only; identity stays `peerId`.
-  const peer = peerName || "another device";
+  // id) — display text only; identity stays `peerId`. The label is stored as a
+  // VALUE (never baked into a sentence), so the card renders it in the viewer's
+  // language; an empty label is the no-name variant ("Another device …").
+  const peer = typeof peerName === "string" ? peerName : "";
+  const values = { peer, capability, requestingInstance: peerId };
+  const text = cardText("remote-exposure", values, "en");
   await store.upsertItem({
     source: SOURCE,
     dedupKey: dedupKeyFor(peerId, capability, tag),
-    title: `Your ${peer} tried to use ${friendly}, but it isn't shared with this device yet`,
-    why: `Allow it for ${peer} only — your other Crows stay unchanged, and the allowance can expire or be removed in Settings.`,
+    title: text.title,
+    why: text.why,
     severity: "warn",
     remedies: cardRemedies(capability, peerId),
-    context: { capability, requestingInstance: peerId, toolName: toolName || null, pairingTag: normalizePairingTag(tag) },
+    context: cardContext("remote-exposure", values, {
+      capability,
+      requestingInstance: peerId,
+      toolName: toolName || null,
+      pairingTag: normalizePairingTag(tag),
+    }),
   });
 }
 

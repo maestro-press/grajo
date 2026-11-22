@@ -141,7 +141,7 @@
       
     </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
       <div style="font-weight:600;margin-bottom:0.2rem">Audiobookshelf is still published to other devices </div>
-      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">Audiobookshelf is published to other devices; Crow now ships it on this computer only. Restart won't change that while its compose file has local changes — see the other card.</div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">Audiobookshelf is published to other devices; Crow now ships it on this computer only. Restart won't change that while its settings file has local changes — see the other card.</div>
       <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
         <a class="btn btn-secondary" href="/dashboard/extensions" data-fixit-link>Open Extensions</a>
         <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
@@ -185,8 +185,8 @@
       </div>
       
     </div><div class="nest-fixit-card" style="border:1px solid var(--crow-border,#2222);border-left:3px solid var(--crow-warning,#e0a000);border-radius:8px;padding:0.8rem 1rem;margin-bottom:0.6rem;background:var(--crow-surface,rgba(255,255,255,0.02))">
-      <div style="font-weight:600;margin-bottom:0.2rem">Changedetection.io's compose file has local changes </div>
-      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">Changedetection.io's compose file has local changes, so Crow did not update it. Move your changes into docker-compose.override.yml and restore the compose file (a copy of the current one is kept as docker-compose.yml.bak when Crow restores it).</div>
+      <div style="font-weight:600;margin-bottom:0.2rem">Changedetection.io's settings file has local changes </div>
+      <div style="color:var(--crow-text-secondary);font-size:0.9rem;margin-bottom:0.6rem">Changedetection.io's settings file (docker-compose.yml) has local changes, so Crow did not update it. Move your changes into docker-compose.override.yml and restore the settings file (a copy of the current one is kept as docker-compose.yml.bak when Crow restores it).</div>
       <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
         <form method="POST" action="/dashboard/fix-it/action" style="display:inline">
     <input type="hidden" name="_csrf" value="tok">

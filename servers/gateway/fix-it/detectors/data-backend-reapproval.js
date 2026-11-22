@@ -13,6 +13,7 @@
  * runBootChecks() calls `check()` once per gateway start, and the card resolves
  * itself once nothing is left to re-approve.
  */
+import { cardContext, cardRemedyLabel, cardText } from "../card-copy.js";
 import { isLegacyApproval } from "../../../shared/data-backend-approval.js";
 
 export const SOURCE = "data-backend-reapproval";
@@ -20,13 +21,15 @@ export const DEDUP_KEY = "data-backend:legacy-approval";
 /** The link remedy whose target lives in code (fix-it/index.js LINK_REMEDIES). */
 export const REMEDY_ACTION_ID = "open-projects-page";
 
-export const TITLE = "Data backends need approving again";
+const CARD_CODE = "data-backend-reapproval";
+
+/** The card's title, from the ONE copy table (fix-it/card-copy.js). */
+export const TITLE = cardText(CARD_CODE, { n: 0 }, "en").title;
 
 /** The card's body, with the number of backends waiting. */
 export function bodyText(count) {
   const n = Number(count) || 0;
-  return `${n} data backend(s) were approved before Crow protected approvals with a key kept outside its database. `
-    + "They stay stopped until you approve them again on the Projects page.";
+  return cardText(CARD_CODE, { n }, "en").why;
 }
 
 /** How many mcp_server rows carry the old bare-hash approval. */
@@ -54,19 +57,26 @@ export default {
       try { await store.resolveByKey(SOURCE, DEDUP_KEY); } catch { /* no row yet, or no store */ }
       return null;
     }
+    // The stored English is built from the same keys the renderer uses, and the
+    // count travels as a VALUE, so a Spanish dashboard renders it too.
+    const text = cardText(CARD_CODE, { n: count }, "en");
     await store.upsertItem({
       source: SOURCE,
       dedupKey: DEDUP_KEY,
-      title: TITLE,
-      why: bodyText(count),
+      title: text.title,
+      why: text.why,
       severity: "warn",
       // A link, not a POST: the owner approves on the Projects page, where the
       // command is shown in full. The destination is held in code (LINK_REMEDIES,
       // fix-it/index.js) — only the actionId is stored, so a crow.db writer
       // cannot point this card at another host. handleFixItAction refuses a
       // non-instant entry, so this actionId can never be executed as one.
-      remedies: [{ actionId: REMEDY_ACTION_ID, kind: "link", label: "Open the Projects page" }],
-      context: { legacyApprovals: count },
+      remedies: [{
+        actionId: REMEDY_ACTION_ID,
+        kind: "link",
+        label: cardRemedyLabel(CARD_CODE, REMEDY_ACTION_ID, "en"),
+      }],
+      context: cardContext(CARD_CODE, { n: count }, { legacyApprovals: count }),
     });
     return { count };
   },

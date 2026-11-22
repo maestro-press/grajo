@@ -119,7 +119,8 @@ test("an installed manifest whose sandbox block differs refuses the wall as inst
   assert.equal(rec.calls.length, 0, "the changed copy never reaches the spawn wrapper");
 
   assert.equal(failures.wallFailureReason({ refused: "installed-changed" }), failures.INSTALLED_CHANGED_REASON);
-  assert.equal(failures.INSTALLED_CHANGED_REASON, "its installed files changed; reinstall it to wall it");
+  // Approved English fix (BUG 2, 2026-11-22): no doubled subject after the id.
+  assert.equal(failures.INSTALLED_CHANGED_REASON, "has installed files that changed; reinstall it to wall it");
 });
 
 // ---- media's local TTS ports --------------------------------------------

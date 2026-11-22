@@ -35,7 +35,7 @@ import { gatewayListenPort } from "./listen-port.js";
 import { getOrCreateLocalInstanceId, LOCAL_INSTANCE_ID_RE } from "./instance-registry.js";
 import { addonWallMode } from "../../scripts/addon-sandbox/spawn.mjs";
 import { AddonStdioTransport, createStderrPrefixer } from "../../scripts/addon-sandbox/transport.mjs";
-import { clearWallFailures, recordWallFailure, wallFailureByRef, wallFailureReason, WARMUP_REASON } from "../../scripts/addon-sandbox/failures.mjs";
+import { clearWallFailures, recordWallFailure, wallFailureByRef, wallFailureReason, wallFailureReasonCode, WARMUP_REASON } from "../../scripts/addon-sandbox/failures.mjs";
 import { createWallContext } from "../../scripts/addon-sandbox/gateway-wall.mjs";
 import { warmAddon } from "../../scripts/addon-sandbox/warmup.mjs";
 import { isApproved, approvalNotFromThisMachine, approvalForAnotherBackend, hasApproval, isLegacyApproval, LEGACY_APPROVAL_MESSAGE, MACHINE_APPROVAL_MESSAGE, NOT_FOR_THIS_BACKEND_MESSAGE, verifyBackendLaunch, backendEnv, parseStoredSpec, prepareSpawn, PENDING_STATUS } from "../shared/data-backend-approval.js";
@@ -280,15 +280,19 @@ export function reportWallFailure(id, { refused = false, wall = null, transport 
     const exitCode = warmup
       ? (Number.isInteger(warmup.exitCode) ? warmup.exitCode : null)
       : (Number.isInteger(transport?.exitCode) ? transport.exitCode : null);
-    const reason = wallFailureReason({
+    const details = {
       denials,
       stderrLines,
       exitCode,
       installDir: wallInstallRoot(id, cwd),
       dataDir: join(resolveDataDir(), id),
       refused,
-    });
-    const ref = recordWallFailure(id, reason);
+    };
+    const reason = wallFailureReason(details);
+    // The card renders this code in the viewer's language; `reason` stays the
+    // English sentence (console lines, and an older card's stored body).
+    const reasonCode = wallFailureReasonCode(details);
+    const ref = recordWallFailure(id, reason, reasonCode);
     if (!ref) return;
 
     let db = null;
@@ -298,7 +302,7 @@ export function reportWallFailure(id, { refused = false, wall = null, transport 
         // A newer failure for the same add-on drops this record: an older,
         // out-of-order emit must never overwrite the card with a dead ref.
         if (wallFailureByRef(ref) === null) return null;
-        return dep("emitFixIt", realEmitWallFailure)(db, "addon-wall-failed", { id, reason, ref });
+        return dep("emitFixIt", realEmitWallFailure)(db, "addon-wall-failed", { id, reason, reasonCode, ref });
       })
       .catch((err) => console.warn(`  [proxy] addon ${id}: the Fix-it card could not be raised — ${err?.message || err}`))
       .finally(() => { try { db.close(); } catch { /* already closed */ } });

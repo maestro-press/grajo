@@ -12,6 +12,7 @@
  * No event fires for this: `runBootChecks()` calls `check()` once per start.
  */
 import { bootGuardProblem } from "../../boot-guard-state.js";
+import { bootGuardCardCode, cardContext, cardText } from "../card-copy.js";
 
 export const DEDUP_KEY = "boot-guard:did-not-run";
 export const SOURCE = "boot-guard";
@@ -36,22 +37,16 @@ export default {
       try { await store.resolveByKey(SOURCE, DEDUP_KEY); } catch { /* no row yet, or no store */ }
       return null;
     }
-    const which = problem.reason === "recorder"
-      ? "the part that records how a start ended did not run"
-      : problem.reason === "launcher"
-        ? "the part that runs before every start did not run"
-        : "its record could not be read";
+    const code = bootGuardCardCode(problem.reason);
+    const text = cardText(code, {}, "en");
     await store.upsertItem({
       source: SOURCE,
       dedupKey: DEDUP_KEY,
-      title: "The boot guard did not run",
-      why: `This service is configured to roll back a Crow update that keeps crashing on startup `
-        + `(CROW_BOOT_GUARD=1), but ${which}. Nothing else is affected — but a bad update cannot be `
-        + `rolled back automatically, so it would keep restarting. Re-run the boot-guard install step `
-        + `for this service (scripts/ops/install-boot-guard.sh), then restart it.`,
+      title: text.title,
+      why: text.why,
       severity: "warn",
       remedies: [], // needs the unit directory: the gateway cannot write /etc as root
-      context: { reason: problem.reason, detail: String(problem.detail ?? "") },
+      context: cardContext(code, {}, { reason: problem.reason, detail: String(problem.detail ?? "") }),
     });
     return problem;
   },

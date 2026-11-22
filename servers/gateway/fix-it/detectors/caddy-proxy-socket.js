@@ -20,8 +20,9 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+import { cardContext, cardText } from "../card-copy.js";
+import { appRoot } from "../app-root.js";
 
 export const CADDYFILE = "/etc/caddy/Caddyfile";
 /** The systemd socket unit that owns the socket (root:caddy 0660). */
@@ -41,9 +42,7 @@ export const DEDUP_KEY = "caddy:loopback-reverse-proxy";
 const LOOPBACK_PROXY_LINE = /^[ \t]*reverse_proxy[ \t]+(?:localhost|127\.0\.0\.1):3001(?:[^A-Za-z0-9.:]|$)/m;
 
 /** The app checkout this gateway runs from (the fix script lives in it). */
-export function appRoot() {
-  return resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
-}
+export { appRoot };
 
 /**
  * → the card's text when a readable Caddyfile still dials the gateway over
@@ -67,12 +66,16 @@ export function caddyProxySocketProblem({
   void socketUnit; void exists;
 
   const fixCommand = `sudo bash ${resolve(app, "scripts", "fix-caddy-proxy-socket.sh")}`;
+  // The title and the body come from the ONE copy table (fix-it/card-copy.js)
+  // in English here, in the dashboard's language at view time. The command in
+  // the body is the one this detector built, and so is the one a stored card
+  // renders — never a value read from crow.db.
+  const copy = cardText("caddy-proxy-socket", {}, "en");
   return {
-    title: "Visitors coming in through this machine's Caddy are being turned away",
-    why: "Caddy still hands them to the gateway over a loopback connection with its own forwarding header, which Crow cannot tell apart from any other program on this machine — so Crow's Nest refuses them. "
-      + "Pointing Caddy at the gateway's own proxy socket fixes it. Crow does not run as root, so run this once on the server: " + fixCommand,
+    title: copy.title,
+    why: copy.why,
     fixCommand,
-    context: { caddyfile, fixCommand },
+    context: cardContext("caddy-proxy-socket", {}, { caddyfile, fixCommand }),
   };
 }
 

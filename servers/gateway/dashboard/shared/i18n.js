@@ -44,6 +44,81 @@ const FIXIT_CARD_COPY_EN = {
   "fixit.addonWall.stale": "This failure is from before Crow last restarted; start the add-on again to see whether it still fails",
   "fixit.addonWall.keepOff": "Keep it off",
   "fixit.addonWall.unwall": "Run {id} without the wall",
+
+  // ── Cards whose text is held here and rendered at VIEW time ───────────────
+  // fix-it/card-copy.js owns the code → key mapping: the detectors write their
+  // stored English from these keys, and both renderers read them in the
+  // dashboard's language. Every value below is approved copy (round 2, 2026-11-22,
+  // with the English bug fixes of the same date applied to R1b, F4, F5, F7, F8,
+  // W1 and W2). Remedy messages (M1-M13) are NOT here: they are never shown.
+  // Remote exposure: one title/why pair for a named peer, one for a peer with no
+  // name (the stored `peer` value is empty — the old code spliced in "another
+  // device", giving "Your another device").
+  "fixit.card.remoteExposure.namedTitle": "Your {peer} tried to use {friendly}, but it isn't shared with this device yet",
+  "fixit.card.remoteExposure.namelessTitle": "Another device tried to use {friendly}, but it isn't shared with this device yet",
+  "fixit.card.remoteExposure.namedWhy": "Allow it for {peer} only — your other Crows stay unchanged, and the allowance can expire or be removed in Settings.",
+  "fixit.card.remoteExposure.namelessWhy": "Allow it for another device only — your other Crows stay unchanged, and the allowance can expire or be removed in Settings.",
+  // The three Allow durations (peer-card-policy.js keeps the English constants;
+  // the view-time label comes from these keys by actionId).
+  "fixit.card.remedy.allow30d": "Allow for 30 days",
+  "fixit.card.remedy.allow7d": "Allow for 7 days",
+  "fixit.card.remedy.allowForever": "Allow until I remove it",
+  // Boot guard: one title and three WHOLE sentences (no spliced fragment).
+  "fixit.card.bootGuard.title": "The boot guard did not run",
+  "fixit.card.bootGuard.recorderWhy": "This service is configured to roll back a Crow update that keeps crashing on startup (CROW_BOOT_GUARD=1), but the part that records how a start ended did not run. Nothing else is affected — but a bad update cannot be rolled back automatically, so it would keep restarting. Re-run the boot-guard install step for this service (scripts/ops/install-boot-guard.sh), then restart it.",
+  "fixit.card.bootGuard.launcherWhy": "This service is configured to roll back a Crow update that keeps crashing on startup (CROW_BOOT_GUARD=1), but the part that runs before every start did not run. Nothing else is affected — but a bad update cannot be rolled back automatically, so it would keep restarting. Re-run the boot-guard install step for this service (scripts/ops/install-boot-guard.sh), then restart it.",
+  "fixit.card.bootGuard.otherWhy": "This service is configured to roll back a Crow update that keeps crashing on startup (CROW_BOOT_GUARD=1), but its record could not be read. Nothing else is affected — but a bad update cannot be rolled back automatically, so it would keep restarting. Re-run the boot-guard install step for this service (scripts/ops/install-boot-guard.sh), then restart it.",
+  // The two Caddy cards: {fixCommand} is always recomputed from code.
+  "fixit.card.caddyProxy.title": "Visitors coming in through this machine's Caddy are being turned away",
+  "fixit.card.caddyProxy.why": "Caddy still hands them to the gateway over a loopback connection with its own forwarding header, which Crow cannot tell apart from any other program on this machine — so Crow's Nest refuses them. Pointing Caddy at the gateway's own proxy socket fixes it. Crow does not run as root, so run this once on the server: {fixCommand}",
+  "fixit.card.caddyAdmin.title": "This machine's Caddy admin API is open to any program on it",
+  "fixit.card.caddyAdmin.why": "Caddy's admin API is on its default local address with no authentication, so any program or bot on this machine can rewrite the Caddy that fronts Crow. One command moves it onto a unix socket only Caddy's own service user can open. Crow does not run as root, so run this once on the server: {fixCommand}",
+  // Data backends waiting to be approved again ({n} is the count).
+  "fixit.card.dataBackend.title": "Data backends need approving again",
+  "fixit.card.dataBackend.why": "{n} data backend(s) were approved before Crow protected approvals with a key kept outside its database. They stay stopped until you approve them again on the Projects page.",
+  // bundle-bind-drift's family: the restart-to-apply pair, the edited/repo/file
+  // trio, the needs-config card and the three image-change sentences (the tail
+  // quotes the Apply button's own label, so the two must stay identical).
+  "fixit.card.bundleDrift.title": "Restart {name} to apply its updated network settings",
+  "fixit.card.bundleDrift.widerWhy": "{name} is still reachable on {hostIp}:{hostPort} from other devices, but its settings now keep it on this computer only. Restart it on the Extensions page to apply them.",
+  "fixit.card.bundleDrift.extraWhy": "{name} is still reachable on {hostIp}:{hostPort} from other devices, but its settings no longer publish that port. Restart it on the Extensions page to apply them.",
+  "fixit.card.bundleComposeEdited.title": "{name}'s settings file has local changes",
+  "fixit.card.bundleComposeEdited.why": "{name}'s settings file ({composeRel}) has local changes, so Crow did not update it. Move your changes into docker-compose.override.yml and restore the settings file (a copy of the current one is kept as {composeRel}.bak when Crow restores it).",
+  "fixit.card.bundleRepoDrift.title": "{name} is still published to other devices",
+  "fixit.card.bundleRepoDrift.editedWhy": "{name} is published to other devices; Crow now ships it on this computer only. Restart won't change that while its settings file has local changes — see the other card.",
+  "fixit.card.bundleRepoDrift.unknownWhy": "{name} is published to other devices; Crow now ships it on this computer only. Restart won't change that while Crow cannot tell whether the installed settings file has local changes.",
+  "fixit.card.bundleNeedsConfig.title": "{name}'s settings file was not updated",
+  "fixit.card.bundleNeedsConfig.why": "Crow could not update {name}'s settings file: it needs {key} set first (Configure on its Extensions card).",
+  "fixit.card.bundleImageChange.title": "{name}'s settings file has an update Crow did not apply",
+  "fixit.card.bundleImageChange.addedWhy": "Crow keeps {name} on its current settings because the update would also add a helper step \"{service}\" that uses the image \"{to}\". {tail}",
+  "fixit.card.bundleImageChange.removedWhy": "Crow keeps {name} on its current settings because the update would also remove the step \"{service}\". {tail}",
+  "fixit.card.bundleImageChange.swappedWhy": "Crow keeps {name} on its current settings because the update would also change its image ({from} → {to}; it may be older than what is running). The update also tightens how {name} is published. {tail}",
+  "fixit.card.bundleImageChange.tail": "Back up its data, then press 'Apply the update' to switch, or keep it as it is.",
+  "fixit.card.bundleImageChange.serviceFallback": "a helper step",
+  "fixit.card.bundleImageChange.none": "none",
+  // The add-on-keys card (servers/gateway/addon-secrets-seal.js).
+  "fixit.card.addonKeys.title": "Saved add-on keys cannot be read",
+  "fixit.card.addonKeys.why": "Crow's keychain key is missing, so it did not save this key. Restore the keychain key or import a keychain export first.",
+  // The buttons those cards offer, keyed by the remedy's actionId.
+  "fixit.card.remedy.openProjectsPage": "Open the Projects page",
+  "fixit.card.remedy.openExtensions": "Open Extensions",
+  "fixit.card.remedy.restoreCompose": "Restore Crow's compose",
+  "fixit.card.remedy.applyUpdate": "Apply the update",
+  // ── Why an add-on could not run inside its wall (W1-W11) ──────────────────
+  // The reason is a code + values kept on the in-memory record
+  // (scripts/addon-sandbox/failures.mjs), rendered here at view time and spliced
+  // into fixit.addonWall.why as {reason}.
+  "fixit.wall.reason.refused": "could not be set up inside its wall on this computer",
+  "fixit.wall.reason.installedChanged": "has installed files that changed; reinstall it to wall it",
+  "fixit.wall.reason.warmup": "could not get its packages ready inside its wall",
+  "fixit.wall.reason.notReady": "stopped before it was ready",
+  "fixit.wall.reason.denied": "tried to reach {target}, which it is not set up for",
+  "fixit.wall.reason.hiddenTarget": "an address",
+  "fixit.wall.reason.openRel": "could not open {rel}",
+  "fixit.wall.reason.openFolder": "could not open a file in its folder",
+  "fixit.wall.reason.openOutside": "could not open a file outside its folder",
+  "fixit.wall.reason.exitCode": "stopped with exit code {exitCode}",
+  "fixit.wall.reason.default": "could not run inside its wall",
 };
 
 /**
@@ -77,6 +152,62 @@ const FIXIT_CARD_COPY_ES_APPROVED = Object.freeze({
   "fixit.addonWall.stale": "Este fallo es de antes del último reinicio de Crow; vuelve a iniciar el complemento para ver si sigue fallando",
   "fixit.addonWall.keepOff": "Mantenerlo apagado",
   "fixit.addonWall.unwall": "Ejecutar {id} sin aislamiento",
+
+  // ── Las tarjetas que se redactan aquí y se dibujan al VERLAS ───────────────
+  // Copia aprobada por el operador 2026-11-22 (ronda 2), con las correcciones
+  // inglesas de la misma fecha aplicadas a R1b, F4, F5, F7, F8, W1 y W2. Los
+  // mensajes de remedio (M1-M13) no están aquí: nunca se muestran.
+  "fixit.card.remoteExposure.namedTitle": "{peer} intentó usar {friendly}, pero todavía no se comparte con este dispositivo",
+  "fixit.card.remoteExposure.namelessTitle": "Otro dispositivo intentó usar {friendly}, pero todavía no se comparte con este dispositivo",
+  "fixit.card.remoteExposure.namedWhy": "Permítelo solo para {peer}: tus otros Crows no cambian, y el permiso puede caducar o quitarse en Ajustes.",
+  "fixit.card.remoteExposure.namelessWhy": "Permítelo solo para ese dispositivo: tus otros Crows no cambian, y el permiso puede caducar o quitarse en Ajustes.",
+  "fixit.card.remedy.allow30d": "Permitir durante 30 días",
+  "fixit.card.remedy.allow7d": "Permitir durante 7 días",
+  "fixit.card.remedy.allowForever": "Permitir hasta que yo lo quite",
+  "fixit.card.bootGuard.title": "La protección de arranque no se ejecutó",
+  "fixit.card.bootGuard.recorderWhy": "Este servicio está configurado para revertir una actualización de Crow que falla una y otra vez al arrancar (CROW_BOOT_GUARD=1), pero la parte que registra cómo terminó un arranque no se ejecutó. Nada más se ve afectado, pero una actualización defectuosa no se podría revertir automáticamente y seguiría reiniciándose. Vuelve a ejecutar el paso de instalación de la protección de arranque para este servicio (scripts/ops/install-boot-guard.sh) y luego reinícialo.",
+  "fixit.card.bootGuard.launcherWhy": "Este servicio está configurado para revertir una actualización de Crow que falla una y otra vez al arrancar (CROW_BOOT_GUARD=1), pero la parte que se ejecuta antes de cada arranque no se ejecutó. Nada más se ve afectado, pero una actualización defectuosa no se podría revertir automáticamente y seguiría reiniciándose. Vuelve a ejecutar el paso de instalación de la protección de arranque para este servicio (scripts/ops/install-boot-guard.sh) y luego reinícialo.",
+  "fixit.card.bootGuard.otherWhy": "Este servicio está configurado para revertir una actualización de Crow que falla una y otra vez al arrancar (CROW_BOOT_GUARD=1), pero no se pudo leer su registro. Nada más se ve afectado, pero una actualización defectuosa no se podría revertir automáticamente y seguiría reiniciándose. Vuelve a ejecutar el paso de instalación de la protección de arranque para este servicio (scripts/ops/install-boot-guard.sh) y luego reinícialo.",
+  "fixit.card.caddyProxy.title": "Los visitantes que entran por el Caddy de este equipo están siendo rechazados",
+  "fixit.card.caddyProxy.why": "Caddy sigue pasándolos a la puerta de enlace por una conexión loopback (bucle local) con su propio encabezado de reenvío, y Crow no puede distinguirla de cualquier otro programa de este equipo, así que Crow's Nest los rechaza. Se arregla apuntando Caddy al socket proxy propio de la puerta de enlace. Crow no se ejecuta como root, así que ejecuta esto una vez en el servidor: {fixCommand}",
+  "fixit.card.caddyAdmin.title": "La API de administración de Caddy de este equipo está abierta a cualquier programa que se ejecute en él",
+  "fixit.card.caddyAdmin.why": "La API de administración de Caddy está en su dirección local predeterminada y sin autenticación, así que cualquier programa o bot de este equipo puede reescribir el Caddy que da acceso a Crow. Un solo comando la pasa a un socket unix que solo puede abrir el usuario de servicio del propio Caddy. Crow no se ejecuta como root, así que ejecuta esto una vez en el servidor: {fixCommand}",
+  "fixit.card.dataBackend.title": "Hay orígenes de datos que hay que aprobar de nuevo",
+  "fixit.card.dataBackend.why": "{n} origen(es) de datos se aprobaron antes de que Crow protegiera las aprobaciones con una clave guardada fuera de su base de datos. Siguen detenidos hasta que los apruebes de nuevo en la página de Proyectos.",
+  "fixit.card.bundleDrift.title": "Reinicia {name} para aplicar sus ajustes de red actualizados",
+  "fixit.card.bundleDrift.widerWhy": "{name} sigue siendo accesible en {hostIp}:{hostPort} desde otros dispositivos, pero sus ajustes ahora lo limitan a este equipo. Reinícialo en la página de Extensiones para aplicarlos.",
+  "fixit.card.bundleDrift.extraWhy": "{name} sigue siendo accesible en {hostIp}:{hostPort} desde otros dispositivos, pero sus ajustes ya no publican ese puerto. Reinícialo en la página de Extensiones para aplicarlos.",
+  "fixit.card.bundleComposeEdited.title": "El archivo de ajustes de {name} tiene cambios locales",
+  "fixit.card.bundleComposeEdited.why": "El archivo de ajustes de {name} ({composeRel}) tiene cambios locales, así que Crow no lo actualizó. Pasa tus cambios a docker-compose.override.yml y restaura el archivo de ajustes (cuando Crow lo restaura, guarda una copia del actual como {composeRel}.bak).",
+  "fixit.card.bundleRepoDrift.title": "{name} sigue publicado en otros dispositivos",
+  "fixit.card.bundleRepoDrift.editedWhy": "{name} está publicado en otros dispositivos; Crow ahora lo entrega solo en este equipo. Reiniciarlo no cambiará eso mientras su archivo de ajustes tenga cambios locales: mira la otra tarjeta.",
+  "fixit.card.bundleRepoDrift.unknownWhy": "{name} está publicado en otros dispositivos; Crow ahora lo entrega solo en este equipo. Reiniciarlo no cambiará eso mientras Crow no pueda saber si el archivo de ajustes instalado tiene cambios locales.",
+  "fixit.card.bundleNeedsConfig.title": "No se actualizó el archivo de ajustes de {name}",
+  "fixit.card.bundleNeedsConfig.why": "Crow no pudo actualizar el archivo de ajustes de {name}: primero hay que configurar {key} (Configurar, en su tarjeta de Extensiones).",
+  "fixit.card.bundleImageChange.title": "El archivo de ajustes de {name} tiene una actualización que Crow no aplicó",
+  "fixit.card.bundleImageChange.addedWhy": "Crow mantiene {name} con sus ajustes actuales porque la actualización también añadiría un paso auxiliar \"{service}\" que usa la imagen \"{to}\". {tail}",
+  "fixit.card.bundleImageChange.removedWhy": "Crow mantiene {name} con sus ajustes actuales porque la actualización también quitaría el paso \"{service}\". {tail}",
+  "fixit.card.bundleImageChange.swappedWhy": "Crow mantiene {name} con sus ajustes actuales porque la actualización también cambiaría su imagen ({from} → {to}; puede ser más antigua que la que se está ejecutando). La actualización también restringe cómo se publica {name}. {tail}",
+  "fixit.card.bundleImageChange.tail": "Haz una copia de seguridad de sus datos y luego pulsa «Aplicar la actualización» para cambiar, o déjalo como está.",
+  "fixit.card.bundleImageChange.serviceFallback": "un paso auxiliar",
+  "fixit.card.bundleImageChange.none": "ninguna",
+  "fixit.card.addonKeys.title": "No se pueden leer las claves guardadas de los complementos",
+  "fixit.card.addonKeys.why": "Falta la clave del llavero de Crow, así que no se guardó esta clave. Primero restaura la clave del llavero o importa una exportación del llavero.",
+  "fixit.card.remedy.openProjectsPage": "Abrir la página de Proyectos",
+  "fixit.card.remedy.openExtensions": "Abrir Extensiones",
+  "fixit.card.remedy.restoreCompose": "Restaurar el compose de Crow",
+  "fixit.card.remedy.applyUpdate": "Aplicar la actualización",
+  "fixit.wall.reason.refused": "no pudo configurar su aislamiento en este equipo",
+  "fixit.wall.reason.installedChanged": "tiene archivos instalados que cambiaron; reinstálalo para aislarlo",
+  "fixit.wall.reason.warmup": "no pudo preparar sus paquetes dentro de su aislamiento",
+  "fixit.wall.reason.notReady": "se detuvo antes de estar listo",
+  "fixit.wall.reason.denied": "intentó conectarse a {target}, para lo que no está configurado",
+  "fixit.wall.reason.hiddenTarget": "una dirección",
+  "fixit.wall.reason.openRel": "no pudo abrir {rel}",
+  "fixit.wall.reason.openFolder": "no pudo abrir un archivo de su carpeta",
+  "fixit.wall.reason.openOutside": "no pudo abrir un archivo fuera de su carpeta",
+  "fixit.wall.reason.exitCode": "se detuvo con el código de salida {exitCode}",
+  "fixit.wall.reason.default": "no pudo ejecutarse dentro de su aislamiento",
 });
 
 const FIXIT_CARD_COPY = Object.fromEntries(Object.entries(FIXIT_CARD_COPY_EN).map(([key, en]) => {

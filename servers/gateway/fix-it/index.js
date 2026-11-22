@@ -26,8 +26,9 @@ import sharingBotAclDetector, {
 } from "./detectors/sharing-bot-acl.js";
 import addonWallDetector, {
   SOURCE as ADDON_WALL_SOURCE,
-  whyText as addonWallWhyText,
+  whyTextForRecord as addonWallWhyTextForRecord,
 } from "./detectors/addon-wall.js";
+import { renderStoredCard } from "./card-copy.js";
 import exposeCapabilityRemedy from "./remedies/expose-capability.js";
 import restoreBundleCompose, {
   ACTION_ID as RESTORE_COMPOSE_ACTION,
@@ -171,7 +172,7 @@ export async function resolveAddonWallCard(db, id) {
   try {
     await store.resolveByKey(db, ADDON_WALL_SOURCE, CARD_DEDUP_PREFIX + id);
     const live = liveWallFailureFor(id);
-    if (live) await emitFixIt(db, "addon-wall-failed", { id, reason: live.reason, ref: live.ref });
+    if (live) await emitFixIt(db, "addon-wall-failed", { id, reason: live.reason, reasonCode: live.reasonCode, ref: live.ref });
   } catch (err) {
     console.warn(`[fix-it] add-on wall card could not be resolved: ${err?.message || err}`);
   }
@@ -338,20 +339,28 @@ function nestRemedyButton(itemId, r, req, lang) {
 /** `lang` as the copy table knows it. */
 const LANG = (lang) => (lang === "es" ? "es" : "en");
 
-/** The stored-row remedy, as a model entry (null when it can never render). */
-function storedRemedyModel(r, lang) {
+/**
+ * The stored-row remedy, as a model entry (null when it can never render).
+ *
+ * `ownLabel(r)` is the code-held label for this card KIND, in the dashboard's
+ * language (fix-it/card-copy.js `renderStoredCard`): it wins over the stored
+ * label, so a button whose words the card owns agrees with the body around it.
+ * It answers null for an actionId the kind does not own.
+ */
+function storedRemedyModel(r, lang, ownLabel = null) {
   if (!r || typeof r !== "object") return null;
+  const owned = typeof ownLabel === "function" ? ownLabel(r) : null;
   if (r.kind === "link") {
     // A link whose actionId this file does not hold has no destination and is
     // not rendered at all — a stored href is never read.
     const href = linkRemedyTarget(r);
     if (!href) return null;
-    const label = typeof r.label === "string" && r.label ? r.label : t("fixit.open", lang);
+    const label = owned || (typeof r.label === "string" && r.label ? r.label : t("fixit.open", lang));
     return { kind: "link", label, href };
   }
   if (typeof r.actionId !== "string" || !r.actionId) return null;
   const gated = r.kind === "confirm" || r.kind === "guided";
-  const label = typeof r.label === "string" && r.label ? r.label : t("fixit.fix", lang);
+  const label = owned || (typeof r.label === "string" && r.label ? r.label : t("fixit.fix", lang));
   return gated
     ? { kind: "gated", label, actionId: r.actionId, gatedKind: r.kind }
     : { kind: "form", label, actionId: r.actionId };
@@ -412,7 +421,9 @@ function cardModel(item, lang) {
     return {
       ...base,
       title: t("fixit.addonWall.title", lang),
-      why: addonWallWhyText(record.id, record.reason, lang),
+      // The reason is rendered from the record's CODE in the dashboard's language
+      // (the stored English sentence is the fallback for an older record).
+      why: addonWallWhyTextForRecord(record, lang),
       remedies: [
         { kind: "form", label: unwallLabel(record.id, lang), actionId: UNWALL_ACTION },
         keepOff,
@@ -445,8 +456,19 @@ function cardModel(item, lang) {
     };
   }
 
-  const remedies = (item.remedies || []).map((r) => storedRemedyModel(r, lang)).filter(Boolean);
-  return { ...base, title: item.title, why: item.why || "", remedies, details: storedDetails(item, lang) };
+  // A card the copy table knows renders its title/body/button labels from code in
+  // the dashboard's language; the stored text is what a Spanish dashboard used to
+  // show, and it stays the answer for every row written before `context.card`
+  // existed (and for one whose code or values are not usable).
+  const copy = renderStoredCard(item, lang);
+  const remedies = (item.remedies || []).map((r) => storedRemedyModel(r, lang, copy?.remedyLabel)).filter(Boolean);
+  return {
+    ...base,
+    title: copy ? copy.title : item.title,
+    why: copy ? copy.why : (item.why || ""),
+    remedies,
+    details: storedDetails(item, lang),
+  };
 }
 
 /**

@@ -53,7 +53,8 @@ import { composeProjectName } from "../../bundle-lifecycle.js";
 import { dockerRunner, readInstalled } from "../../bundle-core.js";
 import { readComposeEdited, readComposeImageChange, readComposeNeedsConfig, readComposeState, sha256 } from "../../bundle-compose-state.js";
 import { isSatelliteEntry, BUNDLE_ID_RE } from "../../satellites/installs.js";
-import { ACTION_ID as RESTORE_COMPOSE_ACTION_ID, APPLY_UPDATE_ACTION_ID, LABEL as RESTORE_COMPOSE_LABEL } from "../remedies/restore-bundle-compose.js";
+import { ACTION_ID as RESTORE_COMPOSE_ACTION_ID, APPLY_UPDATE_ACTION_ID } from "../remedies/restore-bundle-compose.js";
+import { cardContext, cardRemedyLabel, cardText, imageChangeCardCode } from "../card-copy.js";
 import { SOURCE as BROWSER_IMAGE_STALE_SOURCE } from "./browser-image-stale.js";
 
 export const SOURCE = "bundle-bind-drift";
@@ -176,66 +177,69 @@ async function sweepUninstalledCards(store, { installedPath, log }) {
   return resolveFamilyCards(store, (id) => !installedIds.has(id));
 }
 
+/*
+ * The card copy is held in ONE place, fix-it/card-copy.js, keyed by a card code:
+ * these helpers build the STORED English from those same keys (so an English
+ * card reads exactly as it always did) and the renderer builds the dashboard's
+ * language from them at view time. The values a code takes are the only ones
+ * stored on the row (`context.card.values`).
+ */
+
 /** The card's title, for the bundle's display name. */
 export function driftTitle(name) {
-  return `Restart ${name} to apply its updated network settings`;
+  return cardText("bind-wider", { name }, "en").title;
 }
 
 /** The card's body for a running bind that is wider than the compose file's. */
 export function widerBindBody(name, hostIp, hostPort) {
-  return `${name} is still reachable on ${hostIp}:${hostPort} from other devices, but its settings now keep it on this computer only. `
-    + "Restart it on the Extensions page to apply them.";
+  return cardText("bind-wider", { name, hostIp, hostPort }, "en").why;
 }
 
 /** The card's body for a published port the compose file no longer has. */
 export function extraPortBody(name, hostIp, hostPort) {
-  return `${name} is still reachable on ${hostIp}:${hostPort} from other devices, but its settings no longer publish that port. `
-    + "Restart it on the Extensions page to apply them.";
+  return cardText("bind-extra", { name, hostIp, hostPort }, "en").why;
 }
 
 export function composeEditedTitle(name) {
-  return `${name}'s compose file has local changes`;
+  return cardText("compose-edited", { name }, "en").title;
 }
 
 /**
  * What the owner can actually do: the changes belong in the override file, and the
- * compose file is restored from Crow's copy — with the current one kept beside it as
+ * settings file is restored from Crow's copy — with the current one kept beside it as
  * `<compose>.bak` when the card's restore action runs.
  */
 export function composeEditedBody(name, composeRel = "docker-compose.yml") {
-  return `${name}'s compose file has local changes, so Crow did not update it. `
-    + `Move your changes into docker-compose.override.yml and restore the compose file (a copy of the current one is kept as ${composeRel}.bak when Crow restores it).`;
+  return cardText("compose-edited", { name, composeRel }, "en").why;
 }
 
 export function repoDriftTitle(name) {
-  return `${name} is still published to other devices`;
+  return cardText("repo-drift-edited", { name }, "en").title;
 }
 
 /**
  * The card for the case a restart cannot fix: the port is wide because the OWNER's
- * compose file says so, and the repo's copy already binds it to this computer only.
+ * settings file says so, and the repo's copy already binds it to this computer only.
  */
 export function repoDriftBody(name) {
-  return `${name} is published to other devices; Crow now ships it on this computer only. `
-    + "Restart won't change that while its compose file has local changes — see the other card.";
+  return cardText("repo-drift-edited", { name }, "en").why;
 }
 
 /** The same case when Crow could not tell whether the file was edited (no git history). */
 export function repoDriftUnknownBody(name) {
-  return `${name} is published to other devices; Crow now ships it on this computer only. `
-    + "Restart won't change that while Crow cannot tell whether the installed compose file has local changes.";
+  return cardText("repo-drift-unknown", { name }, "en").why;
 }
 
 export function composeNeedsConfigTitle(name) {
-  return `${name}'s settings file was not updated`;
+  return cardText("needs-config", { name }, "en").title;
 }
 
 export function composeNeedsConfigBody(name, key) {
-  return `Crow could not update ${name}'s settings file: it needs ${key} set first (Configure on its Extensions card).`;
+  return cardText("needs-config", { name, key }, "en").why;
 }
 
 export function composeImageChangeTitle(name) {
-  return `${name}'s settings file has an update Crow did not apply`;
+  return cardText("image-swapped", { name }, "en").title;
 }
 
 /**
@@ -250,21 +254,12 @@ export function composeImageChangeTitle(name) {
  * as an addition, one it REMOVES (`to` is null) as a removal. The port sentence belongs
  * to the image swap this card was built for (the tightened bind that comes with it); an
  * added or removed step does not publish the app differently, so it is left out there.
+ * An empty step name and an empty image name are resolved at render time ("a helper
+ * step" / "none", "un paso auxiliar" / "ninguna").
  */
 export function composeImageChangeBody(name, change) {
-  const from = change?.from || null;
-  const to = change?.to || null;
-  const service = change?.service || "a helper step";
-  const tail = "Back up its data, then press 'Apply the update' to switch, or keep it as it is.";
-  if (!from && to) {
-    return `Crow keeps ${name} on its current settings because the update would also add a helper step "${service}" that uses the image "${to}". ${tail}`;
-  }
-  if (from && !to) {
-    return `Crow keeps ${name} on its current settings because the update would also remove the step "${service}". ${tail}`;
-  }
-  return `Crow keeps ${name} on its current settings because the update would also change its image (${from || "none"} → ${to || "none"}; it may be older than what is running). `
-    + `The update also tightens how ${name} is published. `
-    + tail;
+  const values = { name, service: change?.service || "", from: change?.from || "", to: change?.to || "" };
+  return cardText(imageChangeCardCode(values), values, "en").why;
 }
 
 function readJson(path) {
@@ -404,7 +399,7 @@ export default {
     const only = opts.only ? new Set(Array.isArray(opts.only) ? opts.only : [opts.only]) : null;
     const installedPath = opts.installedPath || join(crowHome, "installed.json");
     const installed = readInstalled(installedPath);
-    const linkRemedy = { actionId: REMEDY_ACTION_ID, kind: "link", label: "Open Extensions" };
+    const linkRemedy = { actionId: REMEDY_ACTION_ID, kind: "link", label: cardRemedyLabel("bind-wider", REMEDY_ACTION_ID, "en") };
 
     // ── the bundles that are GONE: see the doc comment above. A pass for one bundle
     //    never sweeps, and the sweep is isolated like every other boot-time decision.
@@ -440,10 +435,15 @@ export default {
           why: composeEditedBody(name, compose.composeRel),
           severity: "warn",
           remedies: [
-            { actionId: RESTORE_COMPOSE_ACTION_ID, kind: "instant", label: RESTORE_COMPOSE_LABEL, args: { bundle: id } },
+            {
+              actionId: RESTORE_COMPOSE_ACTION_ID,
+              kind: "instant",
+              label: cardRemedyLabel("compose-edited", RESTORE_COMPOSE_ACTION_ID, "en"),
+              args: { bundle: id },
+            },
             linkRemedy,
           ],
-          context: { bundle: id, compose: compose.composeRel },
+          context: cardContext("compose-edited", { name, composeRel: compose.composeRel }, { bundle: id, compose: compose.composeRel }),
         });
         cards.push(`${id}: compose-edited`);
       } else {
@@ -460,7 +460,11 @@ export default {
           why: composeNeedsConfigBody(name, needsConfig.missing[0]),
           severity: "warn",
           remedies: [linkRemedy],
-          context: { bundle: id, compose: needsConfig.compose || compose.composeRel, key: needsConfig.missing[0] },
+          context: cardContext("needs-config", { name, key: needsConfig.missing[0] }, {
+            bundle: id,
+            compose: needsConfig.compose || compose.composeRel,
+            key: needsConfig.missing[0],
+          }),
         });
         cards.push(`${id}: compose-needs-config`);
       } else {
@@ -473,6 +477,11 @@ export default {
       const imageChange = readComposeImageChange(dir);
       if (imageChange) {
         const first = imageChange[0];
+        const code = imageChangeCardCode({
+          service: first.service || "",
+          from: first.from || "",
+          to: first.to || "",
+        });
         await store.upsertItem({
           source: COMPOSE_IMAGE_CHANGE_SOURCE,
           dedupKey: dedupKeyFor(id),
@@ -480,10 +489,21 @@ export default {
           why: composeImageChangeBody(name, first),
           severity: "warn",
           remedies: [
-            { actionId: APPLY_UPDATE_ACTION_ID, kind: "instant", label: "Apply the update", args: { bundle: id } },
+            {
+              actionId: APPLY_UPDATE_ACTION_ID,
+              kind: "instant",
+              label: cardRemedyLabel(code, APPLY_UPDATE_ACTION_ID, "en"),
+              args: { bundle: id },
+            },
             linkRemedy,
           ],
-          context: { bundle: id, compose: compose.composeRel, service: first.service, from: first.from, to: first.to },
+          context: cardContext(code, { name, service: first.service, from: first.from, to: first.to }, {
+            bundle: id,
+            compose: compose.composeRel,
+            service: first.service,
+            from: first.from,
+            to: first.to,
+          }),
         });
         cards.push(`${id}: compose-image-change`);
       } else {
@@ -507,6 +527,7 @@ export default {
       } else {
         const first = drifted[0];
         const hostIp = first.hostIp || "0.0.0.0";
+        const code = first.kind === "extra" ? "bind-extra" : "bind-wider";
         await store.upsertItem({
           source: SOURCE,
           dedupKey: dedupKeyFor(id),
@@ -514,7 +535,11 @@ export default {
           why: first.kind === "extra" ? extraPortBody(name, hostIp, first.hostPort) : widerBindBody(name, hostIp, first.hostPort),
           severity: "warn",
           remedies: [linkRemedy],
-          context: { bundle: id, bind: `${hostIp}:${first.hostPort}`, containerPort: `${first.containerPort}/${first.protocol}` },
+          context: cardContext(code, { name, hostIp, hostPort: first.hostPort }, {
+            bundle: id,
+            bind: `${hostIp}:${first.hostPort}`,
+            containerPort: `${first.containerPort}/${first.protocol}`,
+          }),
         });
         cards.push(`${id}: ${drifted.length} bind(s)`);
       }
@@ -554,6 +579,7 @@ export default {
         continue;
       }
       const firstRepo = repoDrift[0];
+      const repoCode = verdict === "edited" ? "repo-drift-edited" : "repo-drift-unknown";
       await store.upsertItem({
         source: REPO_DRIFT_SOURCE,
         dedupKey: repoDriftKey,
@@ -561,7 +587,11 @@ export default {
         why: verdict === "edited" ? repoDriftBody(name) : repoDriftUnknownBody(name),
         severity: "warn",
         remedies: [linkRemedy],
-        context: { bundle: id, bind: `${firstRepo.hostIp || "0.0.0.0"}:${firstRepo.hostPort}`, containerPort: `${firstRepo.containerPort}/${firstRepo.protocol}` },
+        context: cardContext(repoCode, { name }, {
+          bundle: id,
+          bind: `${firstRepo.hostIp || "0.0.0.0"}:${firstRepo.hostPort}`,
+          containerPort: `${firstRepo.containerPort}/${firstRepo.protocol}`,
+        }),
       });
       cards.push(`${id}: ${repoDrift.length} bind(s) the repo already closes`);
     }

@@ -105,10 +105,12 @@ test("detector ignores a null-capability denial", async () => {
   assert.equal(s.created.length, 0);
 });
 
-test("detector falls back to 'another device' when peer name absent", async () => {
+test("detector falls back to 'Another device' when peer name absent", async () => {
   const s = fakeStore();
   await detector.onEvent("peer-exposure:denied", { capability: "funkwhale", requestingInstance: "peer-1" }, s);
-  assert.match(s.created[0].title, /another device/);
+  // Approved English fix (BUG 1, 2026-11-22): the no-name title is no longer
+  // "Your another device ...".
+  assert.match(s.created[0].title, /^Another device tried to use Music, but it isn't shared with this device yet$/);
 });
 
 test("detector refuses a card for an identity that is not a verified peer id", async () => {
