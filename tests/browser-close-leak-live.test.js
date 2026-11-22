@@ -111,6 +111,7 @@ import {
 } from "../bundles/browser/server/private-address.js";
 import { createPageOwnership } from "../bundles/browser/server/page-ownership.js";
 import { findChrome } from "./fixtures/headless-chrome.mjs";
+import { pickFreeDisplay, stopXvfb } from "./helpers/xvfb-display.mjs";
 
 const REQUIRE_CHROME = process.env.CROW_REQUIRE_TEST_CHROME === "1";
 
@@ -901,12 +902,28 @@ test("live: blankPageSafely leaks nothing and leaves the page usable for a later
 // case 3: headful, the last page — closing it exits the browser, blanking it does not
 // ---------------------------------------------------------------------------
 
-/** A private Xvfb on a display number nothing else uses, killed by its own pid. */
+/**
+ * A private Xvfb on a display number nothing else uses, stopped — and its
+ * `/tmp` lock and socket removed — by its own pid.
+ *
+ * The number comes from the shared helper, which judges a display by whether it
+ * is really IN USE, not by whether a lock file exists: an Xvfb that dies on
+ * SIGKILL cannot unlink its own `/tmp/.X<n>-lock` and `/tmp/.X11-unix/X<n>`, so
+ * the old `existsSync` picker counted the litter of every earlier run as a live
+ * display and after enough runs there was "no free X display number" at all.
+ *
+ * A candidate whose Xvfb exits during startup (something else got there first)
+ * is passed over, and the next pick starts at the number after it — so the scan
+ * still covers :90..:139 exactly once and cannot spin on one bad display.
+ */
 async function startXvfb(t) {
   const bin = which("Xvfb");
   if (!bin) return { error: "Xvfb is not installed (no X display for a headful Chromium)" };
-  for (let n = 90; n < 140; n++) {
-    if (existsSync(`/tmp/.X11-unix/X${n}`) || existsSync(`/tmp/.X${n}-lock`)) continue;
+  const unusable = [];
+  for (let from = 90; from < 140; ) {
+    const n = await pickFreeDisplay({ from, to: 140 });
+    if (n === null) break;
+    from = n + 1; // everything below n is taken: pickFreeDisplay already said so
     const child = spawn(bin, [`:${n}`, "-screen", "0", "800x600x24"], {
       stdio: ["ignore", "ignore", "pipe"],
       detached: true,
@@ -915,18 +932,20 @@ async function startXvfb(t) {
     child.stderr.on("data", (d) => { if (log.length < 4000) log += d.toString(); });
     let exited = false;
     child.on("exit", () => { exited = true; });
-    const stop = async () => {
-      try { process.kill(-child.pid, "SIGKILL"); } catch { /* already gone */ }
-      await Promise.race([new Promise((r) => child.once("exit", r)), sleep(2000)]);
-    };
     const up = await waitUntil(() => exited || existsSync(`/tmp/.X11-unix/X${n}`), 10000);
     if (up && !exited) {
+      // Memoized so the success path's explicit stop and the t.after net below
+      // are the SAME stop: it has to be idempotent.
+      let stopping = null;
+      const stop = () => (stopping ??= stopXvfb(child, n));
       t.after(stop);
       return { display: `:${n}`, stop };
     }
-    await stop();
+    unusable.push(`:${n}`);
     if (exited && log.trim()) t.diagnostic(`Xvfb :${n} exited: ${log.trim().slice(0, 300)}`);
+    await stopXvfb(child, n); // ends it if it is somehow alive, then clears its litter
   }
+  if (unusable.length) t.diagnostic(`Xvfb could not start on ${unusable.join(", ")}`);
   return { error: "no free X display number between :90 and :139" };
 }
 
@@ -955,69 +974,86 @@ test("live headful: closing the last page exits Chromium; a fresh survivor keeps
     return;
   }
 
-  // The control: close every page naively. Headful Chromium has no tabs left, so
-  // it exits — and anything the pages were doing goes with it.
-  const control = await launchBrowser({ chromium: pw.chromium, headful: true, display: xvfb.display });
-  if (control.error) {
-    skipOrFail(t, control.error);
-    return;
-  }
+  // Everything below owns this display: stop it on every exit path (the finally),
+  // and prove in the SUCCESS path that stopping it left no lock/socket litter.
+  const displayNumber = Number(xvfb.display.slice(1));
   try {
-    const browser = control.browser;
-    const context = browser.contexts()[0];
-    assert.ok(context, "the headful browser has a default context");
-    if (context.pages().length === 0) await context.newPage();
-    assert.ok(context.pages().length >= 1, "the headful browser has a page");
-    for (const page of [...context.pages()]) {
-      await withTimeout(page.close(), 5000); // the browser may exit mid-loop
+    // The control: close every page naively. Headful Chromium has no tabs left, so
+    // it exits — and anything the pages were doing goes with it.
+    const control = await launchBrowser({ chromium: pw.chromium, headful: true, display: xvfb.display });
+    if (control.error) {
+      skipOrFail(t, control.error);
+      return;
     }
-    const gone = await waitUntil(async () => browser.isConnected() === false || !(await devtoolsAnswers(control.port)), 8000);
-    assert.ok(gone, "headful Chromium stayed alive after its last page was closed, so the last-page rule is untestable here");
+    try {
+      const browser = control.browser;
+      const context = browser.contexts()[0];
+      assert.ok(context, "the headful browser has a default context");
+      if (context.pages().length === 0) await context.newPage();
+      assert.ok(context.pages().length >= 1, "the headful browser has a page");
+      for (const page of [...context.pages()]) {
+        await withTimeout(page.close(), 5000); // the browser may exit mid-loop
+      }
+      const gone = await waitUntil(async () => browser.isConnected() === false || !(await devtoolsAnswers(control.port)), 8000);
+      assert.ok(gone, "headful Chromium stayed alive after its last page was closed, so the last-page rule is untestable here");
+    } finally {
+      await control.close();
+    }
+
+    // The fix path: two pages, then the cleanup. Every OLD page is blanked and
+    // closed — in headful Chromium that would close the last tab and exit the
+    // browser, so a FRESH survivor has to exist first.
+    const fixed = await launchBrowser({ chromium: pw.chromium, headful: true, display: xvfb.display });
+    if (fixed.error) {
+      skipOrFail(t, fixed.error);
+      return;
+    }
+    try {
+      const browser = fixed.browser;
+      const context = browser.contexts()[0];
+      assert.ok(context, "the headful browser has a default context");
+      if (context.pages().length === 0) await context.newPage();
+      await context.newPage();
+      assert.equal(context.pages().length, 2, "two pages before the cleanup");
+      const originals = [...context.pages()];
+
+      const proc = fakeProc();
+      const run = blankPagesOnExit(() => context, { proc });
+      proc.stdin.emit("close");
+      await run();
+      await sleep(1000);
+
+      assert.equal(
+        browser.isConnected(),
+        true,
+        "the browser survived: the cleanup closed every old page, and the fresh survivor is what kept it alive",
+      );
+      const settled = await waitUntil(async () => context.pages().length === 1, 5000);
+      assert.ok(settled, `one about:blank page remains (got ${context.pages().length})`);
+      const survivor = context.pages()[0];
+      assert.ok(
+        !originals.includes(survivor),
+        "the page left behind is a FRESH survivor, not one of the two old pages (closing both old ones is what would exit the browser)",
+      );
+      assert.equal(survivor.url(), "about:blank", "and the survivor is the blank page the cleanup made first");
+      const extra = await withTimeout(context.newPage(), 10000);
+      assert.ok(extra && !extra.error && !extra.timedOut, "a new page can still be opened: the browser is alive and usable");
+      assert.equal(context.pages().length, 2, "the new page joined the context");
+    } finally {
+      await fixed.close();
+    }
+
+    // SUCCESS: stop the display explicitly, then assert it left no litter. A
+    // SIGKILLed Xvfb strands /tmp/.X<n>-lock and /tmp/.X11-unix/X<n>, and the
+    // picker treats any lock as taken — after ~50 runs, "no free X display".
+    await xvfb.stop();
+    assert.equal(existsSync(`/tmp/.X${displayNumber}-lock`), false, "stopping Xvfb removed its display lock");
+    assert.equal(existsSync(`/tmp/.X11-unix/X${displayNumber}`), false, "stopping Xvfb removed its socket");
   } finally {
-    await control.close();
-  }
-
-  // The fix path: two pages, then the cleanup. Every OLD page is blanked and
-  // closed — in headful Chromium that would close the last tab and exit the
-  // browser, so a FRESH survivor has to exist first.
-  const fixed = await launchBrowser({ chromium: pw.chromium, headful: true, display: xvfb.display });
-  if (fixed.error) {
-    skipOrFail(t, fixed.error);
-    return;
-  }
-  try {
-    const browser = fixed.browser;
-    const context = browser.contexts()[0];
-    assert.ok(context, "the headful browser has a default context");
-    if (context.pages().length === 0) await context.newPage();
-    await context.newPage();
-    assert.equal(context.pages().length, 2, "two pages before the cleanup");
-    const originals = [...context.pages()];
-
-    const proc = fakeProc();
-    const run = blankPagesOnExit(() => context, { proc });
-    proc.stdin.emit("close");
-    await run();
-    await sleep(1000);
-
-    assert.equal(
-      browser.isConnected(),
-      true,
-      "the browser survived: the cleanup closed every old page, and the fresh survivor is what kept it alive",
-    );
-    const settled = await waitUntil(async () => context.pages().length === 1, 5000);
-    assert.ok(settled, `one about:blank page remains (got ${context.pages().length})`);
-    const survivor = context.pages()[0];
-    assert.ok(
-      !originals.includes(survivor),
-      "the page left behind is a FRESH survivor, not one of the two old pages (closing both old ones is what would exit the browser)",
-    );
-    assert.equal(survivor.url(), "about:blank", "and the survivor is the blank page the cleanup made first");
-    const extra = await withTimeout(context.newPage(), 10000);
-    assert.ok(extra && !extra.error && !extra.timedOut, "a new page can still be opened: the browser is alive and usable");
-    assert.equal(context.pages().length, 2, "the new page joined the context");
-  } finally {
-    await fixed.close();
+    // Runs on the success path, on an assertion failure and on every skip/early
+    // return above; t.after(stop) in startXvfb stays registered as a second net.
+    // stop() must be idempotent.
+    await xvfb.stop();
   }
 });
 
