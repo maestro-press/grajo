@@ -1,11 +1,13 @@
 /**
  * The browser block's operator-approved copy (approved 2026-11-19; the install consent
- * message and the guide copy were re-approved 2026-11-20 for item 67) is byte-exact
- * wherever it lands: the Fix-it card's COPY object (EN + ES), the install consent message
- * in the bundle manifest (its final passage — the relay-gate copy approved for item 67),
- * the turn-end paragraph of the guide (EN + ES), and the guide's limits list. The strings
- * below are the approved text; the files must equal them character for character — no
- * smart quotes, no re-wrapped words, no paraphrase.
+ * message and the guide copy were re-approved 2026-11-20 for item 67; the card's version
+ * sentence was approved 2026-11-21) is byte-exact wherever it lands: the Fix-it card's
+ * COPY object (EN + ES), the install consent message in the bundle manifest (its final
+ * passage — the relay-gate copy approved for item 67), the turn-end paragraph of the guide
+ * (EN + ES), and the guide's limits list. The strings below are the approved text; the
+ * files must equal them character for character — no smart quotes, no re-wrapped words, no
+ * paraphrase. `{running}` and `{new}` are the card's placeholders: the detector fills them
+ * with the real versions and the stored card never carries a brace.
  *
  * Nothing here touches ~/.crow: the detector module is imported read-only, and the
  * manifest and guides are read from this checkout.
@@ -34,6 +36,16 @@ const APPROVED = {
   openExtensions: {
     en: "Open Extensions",
     es: "Abrir Extensiones",
+  },
+  // approved 2026-11-21: ONE sentence, naming the version that is running and the one an
+  // update would install. The placeholders are substituted before the card is stored.
+  versionKnown: {
+    en: "Running now: version {running}. The update would install version {new}.",
+    es: "En marcha ahora: versión {running}. La actualización instalaría la versión {new}.",
+  },
+  versionUnknown: {
+    en: "Running now: an earlier version that does not report its number. The update would install version {new}.",
+    es: "En marcha ahora: una versión anterior que no indica su número. La actualización instalaría la versión {new}.",
   },
 };
 

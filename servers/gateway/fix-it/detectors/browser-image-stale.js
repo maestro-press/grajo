@@ -26,6 +26,17 @@ export const COPY = Object.freeze({
     en: "Open Extensions",
     es: "Abrir Extensiones",
   },
+  // Approved 2026-11-21: ONE extra sentence naming the version that is RUNNING and the
+  // one the update would install. `{running}` and `{new}` are replaced with the real
+  // strings before the card is stored — a placeholder is never shown.
+  versionKnown: {
+    en: "Running now: version {running}. The update would install version {new}.",
+    es: "En marcha ahora: versión {running}. La actualización instalaría la versión {new}.",
+  },
+  versionUnknown: {
+    en: "Running now: an earlier version that does not report its number. The update would install version {new}.",
+    es: "En marcha ahora: una versión anterior que no indica su número. La actualización instalaría la versión {new}.",
+  },
 });
 
 /**
@@ -80,6 +91,26 @@ export const COPY = Object.freeze({
  * only exist on images built after this change — useless for the installs that need
  * the card).
  *
+ * What replaced the label: the image carries the bundle's OWN manifest.json
+ * (`COPY manifest.json ./`, so /app/manifest.json holds the version the image was built
+ * from). It is a version MARKER, not a compared file. The detector READS it
+ * (`docker exec <id> cat /app/manifest.json` → `.version`) to name the running version on
+ * the card, and deliberately EXCLUDES it from the content comparison: a manifest version
+ * bump on its own restarts and rebuilds nothing, so comparing it would raise a card whose
+ * only evidence is a number nothing runs — and the card's own remedy (a rebuild) would
+ * leave that number identical in the image and in the bundle only by coincidence, so it
+ * could come straight back. Only the files that RUN decide "stale".
+ *
+ * The version SENTENCE fails soft, in the same spirit. Reading the running version is a
+ * docker exec, so it can fail for the very installs the card exists for (an image built
+ * before the marker has no /app/manifest.json at all): any failure is UNKNOWN, which has
+ * its own approved sentence, and never a throw and never a reason to hide the card. And
+ * if the INSTALLED manifest's version cannot be read, no sentence is added at all rather
+ * than one with a placeholder in it. Both versions are also UNTRUSTED text being written
+ * into approved copy, so a value that is not a short version-shaped string
+ * (`VERSION_PATTERN`: 1-32 characters of letters, digits, `.`, `+`, `-`) is UNKNOWN too —
+ * it can never smuggle a newline, a brace or the other placeholder into the card.
+ *
  * Known limits, honestly:
  *
  *   Dockerfile only   the Dockerfile is not in the image, so a change to the Dockerfile
@@ -89,7 +120,8 @@ export const COPY = Object.freeze({
  *   directories       a `COPY <dir>/ …` line names a directory, which is not walked:
  *                     only regular files named directly are hashed, so an edit INSIDE
  *                     a copied directory is not seen. The browser image copies single
- *                     files (cdp-relay.mjs, entrypoint.sh, package.json).
+ *                     files (cdp-relay.mjs, entrypoint.sh, package.json,
+ *                     package-lock.json, and the manifest.json version marker above).
  *   stopped           only RUNNING containers are checked. A stopped add-on gets no
  *                     card — Start runs `up -d --build`, which rebuilds it anyway.
  *
@@ -149,8 +181,27 @@ export const DOCKER_EXEC_TIMEOUT_MS = 20_000;
 export const FALLBACK_INPUTS = Object.freeze(["entrypoint.sh", "cdp-relay.mjs"]);
 /** The browser image's WORKDIR, for the fallback above (the Dockerfile is unreadable). */
 export const FALLBACK_WORKDIR = "/app";
+/**
+ * The version MARKER the image carries: the bundle's own manifest.json, copied in. It is
+ * read to name the running version and excluded from the content comparison (see above).
+ */
+export const MANIFEST_BASENAME = "manifest.json";
 /** A COPY source or destination that is a glob, a URL or a variable is not a path we can use. */
 const LITERAL_SOURCE = /^[^$*?[\]{}]+$/;
+/**
+ * The ONLY shape of a version string that may reach the card: 1-32 characters of
+ * letters, digits, dot, plus and hyphen. Both versions come from files a container or an
+ * installed bundle controls, and both are filled into the approved sentence, so a value
+ * with whitespace, a newline, a brace or any other character — or one long enough to be
+ * nonsense — is UNKNOWN, exactly like a failed read. No trimming: `1.9.2\n` is not a
+ * version, it is a value that failed the pattern.
+ */
+const VERSION_PATTERN = /^[0-9A-Za-z.+-]{1,32}$/;
+
+/** A version string we are willing to name, or null (UNKNOWN) for anything else. */
+function approvedVersion(value) {
+  return typeof value === "string" && VERSION_PATTERN.test(value) ? value : null;
+}
 
 function readJson(path) {
   try { return JSON.parse(readFileSync(path, "utf8")); } catch { return null; }
@@ -324,6 +375,47 @@ async function containerHashes({ id, dests, runner }) {
   return { hashes, missing };
 }
 
+/**
+ * The `version` the running container's own manifest.json reports, or null when it cannot
+ * be known. `docker exec <id> cat <dest>`, bounded like every other docker call, then
+ * JSON.parse and `.version` if it passes VERSION_PATTERN. EVERY failure is UNKNOWN: a
+ * non-zero exit (an image built before the marker has no /app/manifest.json), a timeout,
+ * a manifest that will not parse, a JSON document without a version, a version string
+ * that is too long or carries whitespace, braces or any other character (this is a
+ * container's stdout: untrusted text that would otherwise be written into the card).
+ * Never a throw, and never a reason to hide a card whose content evidence stands on its
+ * own.
+ */
+async function containerManifestVersion({ id, dest, runner }) {
+  try {
+    const out = await runner("docker", ["exec", id, "cat", dest], { timeout: DOCKER_EXEC_TIMEOUT_MS });
+    const parsed = JSON.parse(String(out?.stdout ?? ""));
+    return approvedVersion(parsed?.version);
+  } catch { return null; }
+}
+
+/**
+ * The approved version sentence, placeholders filled — or null when it cannot be said
+ * without leaving one. Nothing is said when the INSTALLED version is unreadable or is not
+ * version-shaped: both approved forms name it, so neither reads correctly without it, and
+ * a card with a placeholder in it is worse than a card with one sentence fewer. A running
+ * version that fails the same pattern is UNKNOWN — its own approved sentence, which names
+ * only the installed version.
+ *
+ * Both values are checked here as well as where they are read (a caller can pass
+ * anything), and they are filled in ONE pass over the template: `String.replace` scans
+ * the ORIGINAL text, so a value carrying `{new}` or `{running}` can no longer be
+ * substituted into by a later step and dress itself up as a version.
+ */
+export function versionSentence({ runningVersion, newVersion }) {
+  const installed = approvedVersion(newVersion);
+  if (!installed) return null;
+  const running = approvedVersion(runningVersion);
+  const template = running ? COPY.versionKnown.en : COPY.versionUnknown.en;
+  const values = { running: running ?? "", new: installed };
+  return template.replace(/\{(running|new)\}/g, (placeholder, name) => (name in values ? values[name] : placeholder));
+}
+
 export default {
   source: SOURCE,
   // A container's content emits no event: runBootChecks() calls check() at gateway start.
@@ -371,7 +463,15 @@ export default {
     if (!composeText) { await resolveCard(); return { cards: [] }; }
 
     // What the image is built from, and the hash each of those files has on disk now.
-    const planned = imageCopies({ composeText, composeRel, dir })
+    const copies = imageCopies({ composeText, composeRel, dir });
+    // The image also carries the bundle's manifest.json: a version MARKER, deliberately
+    // never compared (see the header). Only its destination is kept — where step (b)
+    // reads the running version from. /app/manifest.json is where the browser image puts
+    // it when the Dockerfile cannot be read to say.
+    const manifestDest = copies.find((c) => basename(c.source) === MANIFEST_BASENAME)?.dest
+      || imagePath(FALLBACK_WORKDIR, MANIFEST_BASENAME);
+    const planned = copies
+      .filter(({ source }) => basename(source) !== MANIFEST_BASENAME)
       .map(({ dest, source }) => ({ dest, source, sha256: fileSha256(source) }))
       .filter((p) => p.sha256 !== null);
     // Nothing comparable: no build context, an unreadable input, nothing to say.
@@ -399,6 +499,8 @@ export default {
     if (ids.length === 0) { await resolveCard(); return { cards: [] }; }
 
     const differences = [];
+    /** The FIRST running container that differs — where the running version is read from. */
+    let firstStaleId = null;
     for (const id of ids) {
       const answer = await containerHashes({ id, dests, runner });
       if (!answer) {
@@ -407,10 +509,12 @@ export default {
         log.warn(`[fix-it] browser image check skipped: could not read the files in container ${id} (the browser card was left as it is)`);
         return { cards: [] };
       }
+      let differs = false;
       for (const p of planned) {
-        if (answer.missing.has(p.dest)) { differences.push(p.dest); continue; }
-        if (answer.hashes.get(p.dest) !== p.sha256) differences.push(p.dest);
+        if (answer.missing.has(p.dest)) { differences.push(p.dest); differs = true; continue; }
+        if (answer.hashes.get(p.dest) !== p.sha256) { differences.push(p.dest); differs = true; }
       }
+      if (differs && firstStaleId === null) firstStaleId = id;
     }
 
     // The running containers already hold exactly the installed bytes.
@@ -427,11 +531,23 @@ export default {
       return { cards: [] };
     }
 
+    // The card is going up with nothing left in its way: name the version the container
+    // is RUNNING, read out of that container (the first one that differs). A failed read
+    // is UNKNOWN — never a throw, never a reason to hide the card.
+    const runningVersion = firstStaleId
+      ? await containerManifestVersion({ id: firstStaleId, dest: manifestDest, runner })
+      : null;
+    // Read from the installed bundle's manifest, so validated like the running one: it is
+    // filled into the same sentence, and a value that fails the pattern means no sentence.
+    const installedVersion = approvedVersion(manifest?.version);
+    const sentence = versionSentence({ runningVersion, newVersion: installedVersion });
+
     await store.upsertItem({
       source: SOURCE,
       dedupKey: DEDUP_KEY,
       title: COPY.title.en,
-      why: COPY.body.en,
+      // The approved body, then the approved version sentence with the real strings in it.
+      why: sentence ? `${COPY.body.en} ${sentence}` : COPY.body.en,
       severity: "warn",
       remedies: [
         { actionId: RESTART_ACTION_ID, kind: "instant", label: COPY.restartAction.en, args: { bundle: BUNDLE_ID } },
@@ -442,6 +558,10 @@ export default {
         // Where inside the image the bytes differ from the files Crow installed.
         files: [...new Set(differences)].slice(0, 8),
         installed: [...new Set(planned.map((p) => relative(dir, p.source)))].slice(0, 8),
+        // What the running container reports (null when it cannot say) and what the update
+        // would install (null when the installed manifest is unreadable).
+        runningVersion: runningVersion ?? null,
+        newVersion: installedVersion ?? null,
       },
     });
     return { cards: [`${BUNDLE_ID}: the running container holds files that differ from the installed ones`] };

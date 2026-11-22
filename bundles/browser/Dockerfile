@@ -42,6 +42,7 @@ RUN node -e 'const browsers = require("./node_modules/playwright-core/browsers.j
 
 COPY entrypoint.sh ./
 COPY cdp-relay.mjs ./
+COPY manifest.json ./
 RUN chmod +x entrypoint.sh
 
 # 6080 is noVNC; 9222 is the CDP relay (Chromium itself listens on no port — it

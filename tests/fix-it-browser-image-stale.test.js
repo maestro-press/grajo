@@ -31,6 +31,15 @@
  * no running container hides the card too (tests/fix-it-browser-chromium-guard.test.js
  * pins the guard itself). The docker stub answers that read from `profileVersion`.
  *
+ * And the card names the VERSIONS. The image also carries the bundle's own manifest.json
+ * (`COPY manifest.json ./`): a version MARKER, not a compared file. It is read out of the
+ * running container (`docker exec <id> cat /app/manifest.json` → `.version`) to say what
+ * is running beside what an update would install, and it is EXCLUDED from the sha256
+ * comparison — a manifest version bump on its own restarts and rebuilds nothing, so it
+ * must never be able to raise the card. A read that fails (an image built before the
+ * marker has no such file, garbage JSON, no version string) is the approved UNKNOWN
+ * sentence, never a throw and never a hidden card.
+ *
  * Docker is never real here (every call goes through the injected runner), the
  * restart is injected, and CROW_HOME is a scratch dir set BEFORE the dynamic imports,
  * so nothing reads the real ~/.crow or touches a container.
@@ -148,6 +157,13 @@ const PROFILE_145 = "145.0.7632.6";
 const PROFILE_159 = "159.0.8154.6";
 /** `profileVersion` for a container whose profile cannot be read at all (the exec fails). */
 const PROFILE_UNREADABLE = Symbol("profile-unreadable");
+/**
+ * The running container has no /app/manifest.json at all — every image built before the
+ * version marker existed, which is exactly the install this card is for.
+ */
+const RUNNING_MANIFEST_MISSING = Symbol("running-manifest-missing");
+/** The version read does not answer at all (a cold exec that runs into its bound). */
+const RUNNING_MANIFEST_TIMEOUT = Symbol("running-manifest-timeout");
 
 /** What the installed bundle holds on disk. */
 const INSTALLED_FILES = {
@@ -204,12 +220,29 @@ function put(relPath, content) {
 }
 
 /**
- * The installed browser bundle; `files` overrides the content of a build input, and
- * `lock` the lockfile (`null` omits it — an install whose lock cannot be read).
+ * The version sentences, approved 2026-11-21 (with the placeholders the detector fills).
+ * The card shows the EN known/unknown form; the ES twins are pinned here too.
  */
-function installBrowser({ whenIso = FILES_OLD, files = {}, lock = LOCKFILE, installed = [{ id: "browser", version: "1.8.0" }] } = {}) {
+const APPROVED_VERSION_KNOWN = {
+  en: "Running now: version {running}. The update would install version {new}.",
+  es: "En marcha ahora: versión {running}. La actualización instalaría la versión {new}.",
+};
+const APPROVED_VERSION_UNKNOWN = {
+  en: "Running now: an earlier version that does not report its number. The update would install version {new}.",
+  es: "En marcha ahora: una versión anterior que no indica su número. La actualización instalaría la versión {new}.",
+};
+
+/** An approved sentence with its placeholders filled, as the card renders it. */
+const fill = (text, values) => Object.entries(values).reduce((out, [key, value]) => out.split(`{${key}}`).join(value), text);
+
+/**
+ * The installed browser bundle; `files` overrides the content of a build input, `lock`
+ * the lockfile (`null` omits it — an install whose lock cannot be read), and `version`
+ * the version its manifest.json declares.
+ */
+function installBrowser({ whenIso = FILES_OLD, files = {}, lock = LOCKFILE, version = "1.9.4", installed = [{ id: "browser", version }] } = {}) {
   put("bundles/browser/manifest.json", JSON.stringify({
-    id: "browser", name: "Browser Automation", version: "1.8.0", type: "bundle",
+    id: "browser", name: "Browser Automation", version, type: "bundle",
     docker: { composefile: "docker-compose.yml" },
   }));
   put("bundles/browser/docker-compose.yml", COMPOSE);
@@ -275,8 +308,10 @@ function execDestPaths(args) {
 
 /** The content-check exec calls (`sha256sum <dests…>`); the guard's profile reads are apart. */
 const execCalls = (runner) => runner.calls.filter((c) => c.args[0] === "exec" && c.args[2] === "sha256sum");
+/** The version read's `cat <…/manifest.json>` exec calls (the card's version marker). */
+const manifestCalls = (runner) => runner.calls.filter((c) => c.args[0] === "exec" && c.args[2] === "cat" && basename(String(c.args[3] ?? "")) === "manifest.json");
 /** The Chromium-downgrade guard's `cat …/Last Version` exec calls. */
-const profileCalls = (runner) => runner.calls.filter((c) => c.args[0] === "exec" && c.args[2] === "cat");
+const profileCalls = (runner) => runner.calls.filter((c) => c.args[0] === "exec" && c.args[2] === "cat" && basename(String(c.args[3] ?? "")) === "Last Version");
 const execDests = (runner) => new Set(execCalls(runner).flatMap((c) => execDestPaths(c.args)));
 /** The container an exec call names (the first argument that is one of the running ids). */
 const execContainer = (args, ids) => args.slice(1).find((a) => ids.includes(a)) || args[1];
@@ -291,9 +326,11 @@ const execContainer = (args, ids) => args.slice(1).find((a) => ids.includes(a)) 
  * detector must pick the destination itself (the unreadable-Dockerfile fallback).
  * `execAnswer` forces one answer for every exec call (a throw, garbage, …).
  * `profileVersion` is what `Last Version` holds; PROFILE_UNREADABLE makes that read
- * fail (a container whose profile cannot be read).
+ * fail (a container whose profile cannot be read). `runningManifest` is what the
+ * container's own `/app/manifest.json` answers to `cat` — the version marker the card
+ * names; RUNNING_MANIFEST_MISSING (the default) is an image built before it existed.
  */
-function dockerStub({ ids = ["container1"], imageIds = ["sha256:cafe"], created = IMAGE_OLD, containerFiles = {}, basenameFiles = null, execAnswer = null, profileVersion = PROFILE_145 } = {}) {
+function dockerStub({ ids = ["container1"], imageIds = ["sha256:cafe"], created = IMAGE_OLD, containerFiles = {}, basenameFiles = null, execAnswer = null, profileVersion = PROFILE_145, runningManifest = RUNNING_MANIFEST_MISSING } = {}) {
   const lookup = (files, dest) => {
     if (dest in files) return files[dest];
     if (basenameFiles && basename(dest) in basenameFiles) return basenameFiles[basename(dest)];
@@ -307,6 +344,17 @@ function dockerStub({ ids = ["container1"], imageIds = ["sha256:cafe"], created 
     if (args[0] === "exec") {
       if (execAnswer) return execAnswer({ args: [...args], opts });
       if (args[2] === "cat") {
+        // The version marker: the card's `cat <…/manifest.json>`, answered from a knob.
+        const target = String(args[3] ?? "");
+        if (basename(target) === "manifest.json") {
+          if (runningManifest === RUNNING_MANIFEST_TIMEOUT) {
+            throw Object.assign(new Error("docker exec timed out after 20000ms"), { killed: true, signal: "SIGTERM" });
+          }
+          if (runningManifest === RUNNING_MANIFEST_MISSING) {
+            throw Object.assign(new Error("docker exec exited 1"), { code: 1, stdout: "", stderr: `cat: ${target}: No such file or directory` });
+          }
+          return { stdout: runningManifest, stderr: "" };
+        }
         if (profileVersion === PROFILE_UNREADABLE) {
           throw Object.assign(new Error("docker exec exited 1"), { code: 1, stdout: "", stderr: "cat: /root/.config/chromium-crow/Last Version: No such file or directory" });
         }
@@ -362,7 +410,9 @@ describe("the signal: the CONTENT inside the running container differs from the 
     assert.equal(card.source, "browser-image-stale");
     assert.equal(card.dedupKey, DEDUP_KEY);
     assert.equal(card.title, COPY.title.en);
-    assert.equal(card.why, COPY.body.en);
+    // The approved body, then the approved version sentence. This fixture's container is
+    // from before the version marker, so it cannot report its number.
+    assert.equal(card.why, `${COPY.body.en} ${fill(APPROVED_VERSION_UNKNOWN.en, { new: "1.9.4" })}`);
     assert.equal(card.severity, "warn");
     // The restart is owner-gated inside the remedy, never by the stored card.
     assert.deepEqual(card.remedies, [
@@ -451,6 +501,9 @@ describe("the signal: the CONTENT inside the running container differs from the 
     assert.deepEqual([...execDests(runner)].sort(), ["/app/cdp-relay.mjs", "/app/entrypoint.sh", "/app/package-lock.json", "/app/package.json"]);
     // The Dockerfile itself is not in the image and is not hashed.
     assert.ok(!execDests(runner).has("/app/Dockerfile"));
+    // …and neither is the manifest.json version MARKER the image does carry: it is read,
+    // never compared (see the version-sentence tests below).
+    assert.ok(!execDests(runner).has("/app/manifest.json"), "the version marker is never hashed");
   });
 
   test("(c) CONTROL: the lockfile inside the container differs from the installed one → card", async () => {
@@ -621,6 +674,246 @@ describe("a COPY whose source the installed bundle does not have", () => {
 
     assert.equal(s.upserts.length, 1, "a source that IS installed and differs inside the container is stale");
     assert.ok(execDests(runner).has("/app/extra.mjs"));
+  });
+});
+
+describe("the version sentence: what is running, and what the update would install", () => {
+  test("the two sentences are the approved text, EN and ES, with their placeholders", () => {
+    assert.deepEqual(COPY.versionKnown, APPROVED_VERSION_KNOWN);
+    assert.deepEqual(COPY.versionUnknown, APPROVED_VERSION_UNKNOWN);
+    assert.equal(COPY.versionKnown.es, "En marcha ahora: versión {running}. La actualización instalaría la versión {new}.");
+    assert.equal(COPY.versionUnknown.es, "En marcha ahora: una versión anterior que no indica su número. La actualización instalaría la versión {new}.");
+  });
+
+  test("known: the container reports 1.9.2 and the installed bundle is 1.9.4 → the approved EN sentence, filled in", async () => {
+    installBrowser({ version: "1.9.4" });
+    const s = fakeStore();
+    const runner = dockerStub({
+      containerFiles: { container1: inContainer({ relay: RELAY_OLD }) },
+      runningManifest: '{"id":"browser","name":"Browser Automation","version":"1.9.2"}\n',
+    });
+
+    await runCheck(s, { runner });
+
+    assert.equal(s.upserts.length, 1);
+    const card = s.upserts[0];
+    assert.equal(
+      card.why,
+      `${COPY.body.en} ${fill(APPROVED_VERSION_KNOWN.en, { running: "1.9.2", new: "1.9.4" })}`,
+      "the body, then ONE approved sentence with the real versions in it",
+    );
+    assert.ok(!card.why.includes("{"), "no placeholder is ever shown");
+    assert.equal(card.context?.runningVersion, "1.9.2");
+    assert.equal(card.context?.newVersion, "1.9.4");
+    // The version really was read out of the running container, bounded like every exec.
+    assert.equal(manifestCalls(runner).length, 1, "one version read, from the first differing container");
+    assert.equal(typeof manifestCalls(runner)[0].opts?.timeout, "number", "the version read is time-bounded");
+    assert.match(String(manifestCalls(runner)[0].args[3]), /^\/app\/manifest\.json$/, "from the image's own marker path");
+  });
+
+  for (const [what, runningManifest] of [
+    ["the file is missing (an image built before the marker)", RUNNING_MANIFEST_MISSING],
+    ["the answer is garbage", "{ not json at all\n"],
+    ["the manifest has no version", '{"id":"browser","name":"Browser Automation"}\n'],
+    ["the version is not a string", '{"id":"browser","version":19}\n'],
+    ["the version is empty", '{"id":"browser","version":""}\n'],
+  ]) {
+    test(`unknown: ${what} → the approved unknown sentence, and the card is still raised`, async () => {
+      installBrowser({ version: "1.9.4" });
+      const s = fakeStore();
+      const runner = dockerStub({ containerFiles: { container1: inContainer({ relay: RELAY_OLD }) }, runningManifest });
+
+      await runCheck(s, { runner });
+
+      assert.equal(s.upserts.length, 1, "the content evidence stands on its own: the card is not hidden");
+      const card = s.upserts[0];
+      assert.equal(card.why, `${COPY.body.en} ${fill(APPROVED_VERSION_UNKNOWN.en, { new: "1.9.4" })}`);
+      assert.ok(!card.why.includes("{"), "no placeholder is ever shown");
+      assert.equal(card.context?.runningVersion, null);
+      assert.equal(card.context?.newVersion, "1.9.4");
+    });
+  }
+
+  test("unknown: the version read TIMES OUT → no throw, the unknown sentence", async () => {
+    installBrowser({ version: "1.9.4" });
+    const s = fakeStore();
+    const runner = dockerStub({
+      containerFiles: { container1: inContainer({ relay: RELAY_OLD }) },
+      runningManifest: RUNNING_MANIFEST_TIMEOUT,
+    });
+
+    await assert.doesNotReject(runCheck(s, { runner }));
+
+    assert.equal(s.upserts.length, 1);
+    assert.equal(s.upserts[0].why, `${COPY.body.en} ${fill(APPROVED_VERSION_UNKNOWN.en, { new: "1.9.4" })}`);
+    assert.equal(s.upserts[0].context?.runningVersion, null);
+  });
+
+  // The running version is a `docker exec`'s stdout, so it is UNTRUSTED text that ends
+  // up inside the approved sentence. Only a short, version-shaped string may be named;
+  // anything else — a value that would inject the other placeholder, a newline, a
+  // space, an over-long string, other characters — is UNKNOWN, exactly like a failed
+  // read. Otherwise a container could write the card's copy.
+  for (const [what, raw] of [
+    ["the very placeholder {new}", "{new}"],
+    ["a newline in the middle", "1.9.2\nThe update would install version 9.9.9."],
+    ["40 characters", `1.9.2${"0".repeat(35)}`],
+    ["33 characters", `1.9.2${"0".repeat(28)}`],
+    ["a space", "1.9.2 beta"],
+    ["the other placeholder {running}", "{running}"],
+    ["a brace and a space", "{ new }"],
+  ]) {
+    test(`sanitised: ${what} is never named — it is UNKNOWN, like a failed read`, async () => {
+      installBrowser({ version: "1.9.4" });
+      const s = fakeStore();
+      const runner = dockerStub({
+        containerFiles: { container1: inContainer({ relay: RELAY_OLD }) },
+        runningManifest: JSON.stringify({ id: "browser", name: "Browser Automation", version: raw }),
+      });
+
+      await runCheck(s, { runner });
+
+      assert.equal(s.upserts.length, 1, "the content evidence stands on its own: the card is still raised");
+      const card = s.upserts[0];
+      assert.equal(
+        card.why,
+        `${COPY.body.en} ${fill(APPROVED_VERSION_UNKNOWN.en, { new: "1.9.4" })}`,
+        "the approved UNKNOWN sentence, byte for byte",
+      );
+      assert.equal(card.context?.runningVersion, null, "the untrusted value is not even stored");
+      assert.equal(card.context?.newVersion, "1.9.4");
+      // The container's text reached neither the sentence nor the context: in particular
+      // `{new}` could not fill itself in and pretend a version was known.
+      assert.ok(!card.why.includes("9.9.9"), "nothing the container wrote lands in the card text");
+      assert.ok(!card.why.includes("{running}"));
+      assert.ok(!card.why.includes("beta"));
+      // The version WAS read, so this is the sanitiser's doing and not a skipped read.
+      assert.equal(manifestCalls(runner).length, 1);
+    });
+  }
+
+  // CONTROL: a real version string with the pattern's own characters is still named.
+  test("CONTROL: a normal 1.9.2, and a 32-character build string, are still named", async () => {
+    for (const version of ["1.9.2", `1.9.2${"0".repeat(27)}`, "1.9.2-rc.1+build.5"]) {
+      installBrowser({ version: "1.9.4" });
+      const s = fakeStore();
+      const runner = dockerStub({
+        containerFiles: { container1: inContainer({ relay: RELAY_OLD }) },
+        runningManifest: JSON.stringify({ id: "browser", version }),
+      });
+
+      await runCheck(s, { runner });
+
+      assert.equal(s.upserts.length, 1);
+      const card = s.upserts[0];
+      assert.equal(card.context?.runningVersion, version, `${version} is version-shaped, so it is shown`);
+      assert.equal(card.why, `${COPY.body.en} ${fill(APPROVED_VERSION_KNOWN.en, { running: version, new: "1.9.4" })}`);
+    }
+  });
+
+  test("the installed version is not version-shaped either → the sentence is LEFT OUT, never substituted", async () => {
+    // The INSTALLED version is read from the bundle's manifest, and it is filled into the
+    // same sentence: a value holding `{running}` would inject the other placeholder.
+    installBrowser({ version: "1.9.4 {running}" });
+    const s = fakeStore();
+    const runner = dockerStub({
+      containerFiles: { container1: inContainer({ relay: RELAY_OLD }) },
+      runningManifest: '{"id":"browser","version":"1.9.2"}\n',
+    });
+
+    await runCheck(s, { runner });
+
+    assert.equal(s.upserts.length, 1, "the card is still offered: the files differ");
+    assert.equal(s.upserts[0].why, COPY.body.en, "the approved body only — never a sentence with a placeholder in it");
+    assert.equal(s.upserts[0].context?.newVersion, null);
+  });
+
+  test("VERSION ONLY: the running marker says 1.9.3, the installed bundle 1.9.4, every compared file identical → NO card, and a pending one resolves", async () => {
+    // The real Dockerfile copies manifest.json in, so the image really does carry it.
+    installBrowser({ version: "1.9.4", files: { Dockerfile: REAL_DOCKERFILE } });
+    const s = fakeStore();
+    const runner = dockerStub({
+      containerFiles: { container1: { ...inContainer(), "/app/manifest.json": '{"id":"browser","version":"1.9.3"}\n' } },
+      runningManifest: '{"id":"browser","version":"1.9.3"}\n',
+    });
+
+    await runCheck(s, { runner });
+
+    assert.deepEqual(s.upserts, [], "a manifest version difference on its own is not a stale image: nothing restarts for it");
+    assert.ok(s.resolved.includes(resolvedKey()), "and a pending card resolves");
+    assert.equal(execDests(runner).has("/app/manifest.json"), false, "manifest.json is never hashed: it is a marker, not a compared file");
+    assert.deepEqual(manifestCalls(runner), [], "no card is going up, so nothing is read to name it");
+    assert.ok(execDests(runner).has("/app/cdp-relay.mjs"), "the files that DO run were still compared");
+  });
+
+  test("two running containers: the version is read from the FIRST one that differs", async () => {
+    installBrowser({ version: "1.9.4" });
+    const s = fakeStore();
+    const runner = dockerStub({
+      ids: ["container1", "container2"],
+      containerFiles: { container1: inContainer(), container2: inContainer({ relay: RELAY_OLD }) },
+      runningManifest: '{"id":"browser","version":"1.9.0"}\n',
+    });
+
+    await runCheck(s, { runner });
+
+    assert.equal(s.upserts.length, 1);
+    assert.deepEqual(
+      manifestCalls(runner).map((c) => execContainer(c.args, ["container1", "container2"])),
+      ["container2"],
+      "container1 matches, so the version comes from the one that differs",
+    );
+    assert.equal(s.upserts[0].context?.runningVersion, "1.9.0");
+  });
+
+  test("two running containers, BOTH differing: the version still comes from the first", async () => {
+    installBrowser({ version: "1.9.4" });
+    const s = fakeStore();
+    const runner = dockerStub({
+      ids: ["container1", "container2"],
+      containerFiles: {
+        container1: inContainer({ relay: RELAY_OLD }),
+        container2: inContainer({ entrypoint: "#!/bin/sh\n" }),
+      },
+      runningManifest: '{"id":"browser","version":"1.9.0"}\n',
+    });
+
+    await runCheck(s, { runner });
+
+    assert.equal(s.upserts.length, 1);
+    assert.equal(s.upserts[0].context?.runningVersion, "1.9.0", "the FIRST differing container is the one asked");
+  });
+
+  test("CONTROL: the same manifest difference WITH a stale relay → card (the marker is added, not compared instead)", async () => {
+    installBrowser({ version: "1.9.4", files: { Dockerfile: REAL_DOCKERFILE } });
+    const s = fakeStore();
+    const runner = dockerStub({
+      containerFiles: { container1: { ...inContainer({ relay: RELAY_OLD }), "/app/manifest.json": '{"id":"browser","version":"1.9.3"}\n' } },
+      runningManifest: '{"id":"browser","version":"1.9.3"}\n',
+    });
+
+    await runCheck(s, { runner });
+
+    assert.equal(s.upserts.length, 1);
+    assert.equal(s.upserts[0].context?.runningVersion, "1.9.3");
+    assert.equal(s.upserts[0].context?.newVersion, "1.9.4");
+    assert.equal(s.upserts[0].why, `${COPY.body.en} ${fill(APPROVED_VERSION_KNOWN.en, { running: "1.9.3", new: "1.9.4" })}`);
+  });
+
+  test("the installed manifest's version is unreadable → the version sentence is LEFT OUT (never a placeholder)", async () => {
+    installBrowser({ version: "1.9.4" });
+    put("bundles/browser/manifest.json", "{ not a manifest at all\n");
+    const s = fakeStore();
+    const runner = dockerStub({
+      containerFiles: { container1: inContainer({ relay: RELAY_OLD }) },
+      runningManifest: '{"id":"browser","version":"1.9.2"}\n',
+    });
+
+    await runCheck(s, { runner });
+
+    assert.equal(s.upserts.length, 1, "the card is still offered: the files differ");
+    assert.equal(s.upserts[0].why, COPY.body.en, "the approved body only — no sentence that would need a placeholder");
+    assert.equal(s.upserts[0].context?.newVersion, null);
   });
 });
 
