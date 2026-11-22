@@ -28,6 +28,10 @@
  * approvals module's `isLive`, so a report a direct UPDATE or a repointed provider stopped reads
  * `live: false` here.
  *
+ * A report's schedule is the owner's too: `PUT /:id/schedule` writes the cron and the zone of its own
+ * `schedules` row, and both are part of the live seal, so a change to either on a live report pauses it
+ * with the same fixed sentence a live-set settings change leaves.
+ *
  * NOTHING ON THIS ROUTER SENDS MAIL, and it never imports the send door or a delivery module. An owner
  * add of a recipient is a propose plus an approve in one tap; "Send to the rest" only writes `pending`
  * `report_sends` rows for a run (reports/send-log.js); the delivery seam is somebody else's, and it
@@ -44,6 +48,7 @@ import {
 } from "../reports/approvals.js";
 import { buildApprovalsDeps } from "../reports/approvals-deps.js";
 import { deleteReport } from "../reports/delete.js";
+import { setReportSchedule } from "../reports/schedule-set.js";
 import { listRuns } from "../reports/run.js";
 import { approveSource, listDraftSources, revokeSource } from "../reports/source-approvals.js";
 import { requestRun } from "../reports/run-requests.js";
@@ -437,6 +442,23 @@ export function reportsApiRouter(dashboardAuth, deps = {}) {
     const row = await updateSettings(db, approvalsDeps, {
       reportId: id,
       settings: body.settings,
+      actor: { kind: "owner" },
+    });
+    res.json({ report: await reportView(db, approvalsDeps, row) });
+  }));
+
+  // PUT /:id/schedule — when the report runs: the cron expression and the zone it is read in. Both are
+  // inside the live seal, so a change to either on a live report pauses it, exactly as the live-set
+  // settings do, and only a fresh preview and go-live take it back to live.
+  router.put(`${REPORTS_API_PREFIX}/:id/schedule`, route("PUT /:id/schedule", async (db, req, res) => {
+    const id = idOf(req, res);
+    if (!id) return;
+    const body = req.body == null ? {} : req.body;
+    if (typeof body !== "object" || Array.isArray(body)) return sendError(res, 400, "bad_input");
+    const row = await setReportSchedule(db, approvalsDeps, {
+      reportId: id,
+      cron: body.cron,
+      tz: body.tz,
       actor: { kind: "owner" },
     });
     res.json({ report: await reportView(db, approvalsDeps, row) });
