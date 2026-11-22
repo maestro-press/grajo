@@ -191,13 +191,96 @@ async function session(width = 1900, height = 900) {
   const ws = new WebSocket(tab.webSocketDebuggerUrl);
   await new Promise((r, j) => { ws.once("open", r); ws.once("error", j); });
   let id = 0;
-  const send = (method, params = {}) => new Promise((resolve, reject) => {
+  // ---- diagnostics -------------------------------------------------------
+  // A CDP -32000 "Inspected target navigated or closed" was seen exactly once,
+  // in CI, in the dictation test, and nobody could name the trigger from the
+  // error alone. Every line below is inert until a command fails: a passing
+  // run prints nothing (a test run that chats on stdout is its own bug).
+  const startedAt = Date.now();
+  /** The prefix the injected page script logs with; the console relay keeps
+   *  only entries carrying it, so Turbo's and the shell's own logging stays out. */
+  const TRAIL_PREFIX = "[crow-trail] ";
+  /** Short, stamped facts about the session's document/navigation life. */
+  const trail = [];
+  const stamp = (text) => (Date.now() - startedAt) + "ms " + text;
+  /** The command in flight — named in the printed block, because "which
+   *  command" is the half of the answer the CDP error never carries. */
+  let lastStep = "(no command yet)";
+  let trailPrinted = false;
+  const printTrail = (step) => {
+    console.error("[perch-leak trail] failing step: " + step);
+    if (!trail.length) console.error("(no navigation/reload/pagehide/fetch-failure events recorded)");
+    for (const line of trail) console.error(line);
+  };
+  /** Auto print, once per session: the first failure is the interesting one,
+   *  and every later command in the same test would only repeat it. */
+  const failTrail = () => {
+    if (trailPrinted) return;
+    trailPrinted = true;
+    printTrail(lastStep);
+  };
+  // Page-side events come back as console calls (the page cannot talk to this
+  // side any other way), so Runtime.enable must precede the navigation these
+  // listeners are installed for. Two of the four are Turbo's own: a visit that
+  // is really a full reload, or a refetch that failed, is what a "target
+  // navigated" error tends to mean.
+  // NB: page script — plain string concatenation inside, no backticks.
+  const TRAIL_SCRIPT = `(function(){
+    function log(t){ try { console.debug('[crow-trail] ' + t); } catch (e) {} }
+    document.addEventListener('turbo:reload', function(e){
+      var d = ''; try { d = JSON.stringify(e.detail); } catch (err) { d = String(e.detail); }
+      log('turbo:reload ' + d);
+    });
+    window.addEventListener('pagehide', function(){ log('pagehide ' + location.href); });
+    document.addEventListener('turbo:before-fetch-response', function(e){
+      var d = e.detail || {}, r = d.fetchResponse, ok = false, status = 0;
+      try { ok = !!(r && r.succeeded); status = (r && r.statusCode) || 0; } catch (err) {}
+      /* Turbo 8's events carry no detail.url: the request lives on the
+         fetchResponse (location.href, or response.url for a response object). */
+      var u = (r && r.location && r.location.href) || (r && r.response && r.response.url) || '';
+      if (!ok || status >= 400) log('turbo:before-fetch-response status=' + status + ' url=' + u + ' succeeded=' + ok);
+    });
+    document.addEventListener('turbo:fetch-request-error', function(e){
+      var d = e.detail || {};
+      /* Likewise: the failed request is detail.request, not detail.url. */
+      log('turbo:fetch-request-error ' + ((d.request && d.request.url) || '') + ' ' + (d.error ? String(d.error) : ''));
+    });
+  })();`;
+  // One persistent listener for events; the per-command listeners below stay
+  // as they were and ignore anything without their own id.
+  let loadFired = null;
+  ws.on("message", (raw) => {
+    let m; try { m = JSON.parse(raw); } catch { return; }
+    if (!m.method) return;
+    const p = m.params || {};
+    if (m.method === "Page.frameNavigated" && p.frame && !p.frame.parentId) {
+      // Main frame only: a cross-document load (a Turbo visit is NOT one —
+      // that is the distinction this whole file exists to pin).
+      trail.push(stamp("frameNavigated " + (p.frame.url || "(no url)")));
+      return;
+    }
+    if (m.method === "Page.loadEventFired") { if (loadFired) loadFired(); return; }
+    if (m.method === "Runtime.consoleAPICalled") {
+      const first = (p.args || [])[0];
+      const v = first && first.value;
+      if (typeof v === "string" && v.startsWith(TRAIL_PREFIX)) trail.push(stamp(v.slice(TRAIL_PREFIX.length)));
+    }
+  });
+  // `quiet` exists for the ready-wait below: Runtime.evaluate during a document
+  // swap is EXPECTED to fail, and must not trip the once-per-session print on a
+  // run that goes on to pass.
+  const send = (method, params = {}, { quiet = false } = {}) => new Promise((resolve, reject) => {
+    lastStep = method + (typeof params.expression === "string" ? " " + params.expression.slice(0, 80) : "");
     const mine = ++id;
     const onMsg = (raw) => {
       const m = JSON.parse(raw);
       if (m.id !== mine) return;
       ws.off("message", onMsg);
-      m.error ? reject(new Error(JSON.stringify(m.error))) : resolve(m.result || {});
+      if (m.error) {
+        if (!quiet) failTrail();
+        return reject(new Error(JSON.stringify(m.error)));
+      }
+      resolve(m.result || {});
     };
     ws.on("message", onMsg);
     ws.send(JSON.stringify({ id: mine, method, params }));
@@ -205,15 +288,85 @@ async function session(width = 1900, height = 900) {
   await send("Emulation.setDeviceMetricsOverride",
     { width, height, deviceScaleFactor: 1, mobile: width < 900 });
   await send("Page.enable");
-  await send("Page.navigate", { url: `http://${HOST_FROM_CONTAINER}:${port}/dashboard/perch` });
-  await sleep(1800);
+  await send("Runtime.enable");
+  await send("Page.addScriptToEvaluateOnNewDocument", { source: TRAIL_SCRIPT });
+  // ---- ready-wait -------------------------------------------------------
+  // This used to be `await sleep(1800)`. Under the full suite several Chrome
+  // sessions share the box, and a fixed sleep can expire BEFORE the document
+  // is done — the first command then races the navigation, which is a
+  // plausible source of the -32000 that only ever appeared in CI. Wait for the
+  // load event, then for the actual Turbo/document state, against ONE deadline
+  // so the two waits cannot add up to 30 s.
+  const READY_DEADLINE_MS = 15000;
+  const deadline = Date.now() + READY_DEADLINE_MS;
+  let loadSeen = false;
+  const loadWait = new Promise((r) => { loadFired = r; }).then(() => { loadSeen = true; });
+  // Why: callers call session() outside try/finally (the tab is closed from a
+  // test's own finally, which never runs if session() itself throws), so a
+  // failure here — a CDP error, or the deadline throw below — would leak this
+  // websocket and its Chrome tab for the rest of the run. Close both on the
+  // way out, then rethrow the original error unchanged.
+  try {
+    await send("Page.navigate", { url: `http://${HOST_FROM_CONTAINER}:${port}/dashboard/perch` });
+    // A bare sleep() as the race's losing side would keep its timer pending
+    // after the load event wins, holding the event loop open past the wait.
+    let loadTimer = null;
+    const loadExpired = new Promise((r) => { loadTimer = setTimeout(r, Math.max(0, deadline - Date.now())); });
+    try {
+      await Promise.race([loadWait, loadExpired]);
+    } finally {
+      clearTimeout(loadTimer);
+    }
+    /** A quiet command bounded by `ms` (at least 1, so it always arms a real
+     *  timer): a document swap that never answers must not hang the ready-wait
+     *  past its own deadline. The rejection is the poll's "not ready yet". */
+    const sendBounded = (method, params, ms) => new Promise((resolve, reject) => {
+      const budget = Math.max(1, ms);
+      const timer = setTimeout(() => reject(new Error("no answer within " + budget + " ms")), budget);
+      send(method, params, { quiet: true }).then(
+        (out) => { clearTimeout(timer); resolve(out); },
+        (err) => { clearTimeout(timer); reject(err); },
+      );
+    });
+    const TURBO_READY = "typeof window.Turbo === 'object' && document.readyState === 'complete'";
+    for (;;) {
+      let ready = false;
+      try {
+        const out = await sendBounded("Runtime.evaluate", { expression: TURBO_READY, returnByValue: true }, deadline - Date.now());
+        ready = !!(out.result && out.result.value === true);
+      } catch { /* a document swap is exactly what the poll is waiting out */ }
+      if (ready) break;
+      if (Date.now() >= deadline) {
+        // Say what is actually missing — "not ready" alone sends the next person
+        // reading this to the same dead end the -32000 did.
+        const missing = [];
+        if (!loadSeen) missing.push("Page.loadEventFired never arrived");
+        try {
+          const out = await sendBounded("Runtime.evaluate", {
+            expression: "JSON.stringify({turbo:typeof window.Turbo,ready:document.readyState})",
+            returnByValue: true,
+          }, 1000);
+          missing.push(out.result && typeof out.result.value === "string" ? out.result.value : "page state unreadable");
+        } catch { missing.push("page state unreadable (Runtime.evaluate failed)"); }
+        throw new Error("session(): page did not finish loading with Turbo ready within " +
+          READY_DEADLINE_MS + " ms (" + missing.join("; ") + ")");
+      }
+      await sleep(50);
+    }
+  } catch (err) {
+    ws.close();
+    await fetch(CDP + "/json/close/" + tab.id).catch(() => {});
+    throw err;
+  }
   const evalIn = async (expression) => {
     const out = await send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
-    if (out.exceptionDetails) throw new Error("page threw: " + JSON.stringify(out.exceptionDetails));
+    if (out.exceptionDetails) {
+      failTrail();
+      throw new Error("page threw: " + JSON.stringify(out.exceptionDetails));
+    }
     return out.result.value;
   };
   await send("DOM.enable");
-  await send("Runtime.enable");
   /** Real registered listeners on window/document, counted by type. Not a
    *  page-side proxy: DOMDebugger reads the browser's own listener table, so a
    *  handler that is inert but still ATTACHED is still counted. */
@@ -241,6 +394,15 @@ async function session(width = 1900, height = 900) {
     json: async (expr) => JSON.parse(await evalIn(expr)),
     turboLoaded: async () => (await evalIn(`typeof window.Turbo`)) === "object",
     listenerCounts,
+    /** Explicit trail print, for a test that wants the context of its OWN
+     *  assertion failure — print unless already printed: a CDP error inside
+     *  the same session has auto-printed it already, and a second identical
+     *  block only pushes the error the reader wants further up. */
+    dumpTrail: (reason) => {
+      if (trailPrinted) return;
+      trailPrinted = true;
+      printTrail(reason || lastStep);
+    },
     visit: async (url) => { await evalIn(`Turbo.visit(${JSON.stringify(url)},{action:'replace'}); 'go'`); await sleep(1200); },
     open: async () => { await evalIn(`location.hash='${SID}'; 'go'`); await sleep(2200); },
     close: async () => { ws.close(); await fetch(CDP + "/json/close/" + tab.id).catch(() => {}); },
@@ -684,6 +846,12 @@ test("dictation: five Turbo visits after a recording leave no listener, track or
     assert.equal(media.streams, 2, "two recordings were made");
     assert.equal(media.live, 0, "no live MediaStreamTrack");
     assert.equal(media.open, 0, "no unclosed AudioContext (of " + media.ctxs + ")");
+  } catch (err) {
+    // This is the test that flaked in CI with a CDP -32000. If it ever fails
+    // again, the block above names the command in flight and what the document
+    // did around it — none of which the CDP error itself carries.
+    s.dumpTrail(String(err && err.message));
+    throw err;
   } finally { await s.close(); }
 });
 

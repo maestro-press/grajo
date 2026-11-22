@@ -245,8 +245,20 @@ test("every column's frame is the context frame of its first sample", async () =
       previousFrame = frame;
     }
   }
-  assert.equal(levels[0].frame, 0, "the first window opens on the input's first frame");
-  assert.equal(levels[0].cols[0], 0, "and its first column starts there too");
+  // The "on" message is delivered to the worklet thread asynchronously, so the
+  // render thread can render block 0 before it arrives and the meter can miss
+  // the first block(s) under load. The true invariant is that the first window
+  // opens on a render-block boundary at or after the input's first frame, and
+  // that its first column starts exactly there. The deterministic check of the
+  // late-start case is driven block by block in
+  // tests/studio-record-worklets.test.js. The bound below is the other half of
+  // that invariant: generous enough for a busy box (about 130 ms of blocks),
+  // but a meter that never starts or starts seconds late still fails.
+  assert.ok(
+    levels[0].frame <= 50 * 128,
+    `the meter started within about 130 ms of the render, got ${levels[0].frame}`,
+  );
+  assert.equal(levels[0].cols[0], levels[0].frame, "and its first column starts there too");
 });
 
 test("dispose takes the meter out of the graph and no post arrives after it", async () => {

@@ -213,6 +213,8 @@ test("install-set: sequential, continue-on-error, exactly one deferred restart, 
   app.use(express.json());
   app.use(bundlesRouter());
   const server = app.listen(0);
+  // A CI stall past the 5 s default keep-alive timeout lets undici reuse a socket the server is closing (ECONNRESET).
+  server.keepAliveTimeout = 60_000;
   await new Promise((r) => server.once("listening", r));
   const base = `http://127.0.0.1:${server.address().port}`;
 

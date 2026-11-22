@@ -1006,6 +1006,74 @@ test("showing a lane again starts from an empty ring, so no stale column is post
   }
 });
 
+/**
+ * A meter's window opens on the first block it measured, not on the block the
+ * lane was asked to show.
+ *
+ * The "on" message crosses to the worklet thread asynchronously, so in a real
+ * render the first block(s) can go by before the processor sees it (which is why
+ * `studio-record-meter.test.js` allows a late first window). Here the late start
+ * is exact: one block is rendered while the lane is hidden, and "on" arrives
+ * after it.
+ */
+test("a meter turned on one block late opens its first window on that block, and its columns are stamped from there", () => {
+  const meter = bareMeter(1);
+  // A rising ramp: a column's minimum IS its first sample, so reading the value
+  // back names the frame that sample was rendered at.
+  const ramp = (frame) => (frame + 1) / 100000;
+
+  // Block 0 is rendered while the lane is hidden: nothing is measured or posted.
+  meter.run(0, 128, ramp);
+  assert.deepEqual(meter.scope.posts, [], "a hidden lane measures nothing");
+
+  // Shown after block 0 went by, so the meter's first block is the one at frame
+  // 128 — and that is where its first window opens.
+  meter.send({ type: "on" });
+  meter.run(128, 2 * SAMPLE_RATE - 128, ramp);
+
+  const levels = meter.levels();
+  assert.ok(levels.length > 0, "the meter posted");
+  const first = levels[0];
+  assert.equal(first.frame, 128, "the first window opens on the first block the meter was active for");
+  assert.equal(first.cols[0], 128, "and its first column starts there too");
+
+  let previousFrame = null;
+  for (let at = 0; at + 2 < first.cols.length; at += 3) {
+    const frame = first.cols[at];
+    const min = first.cols[at + 1];
+    assert.equal(Math.round(min * 100000) - 1, frame, `column ${at / 3} of the first post names frame ${frame}`);
+    if (previousFrame !== null) assert.equal(frame, previousFrame + 480, "columns follow each other");
+    previousFrame = frame;
+  }
+});
+
+/**
+ * The other side of the same boundary: a message that arrives before any block
+ * makes the input's first frame the window's first frame.
+ */
+test("a meter turned on before the first block opens its first window on frame 0", () => {
+  const meter = bareMeter(1);
+  const ramp = (frame) => (frame + 1) / 100000;
+
+  meter.send({ type: "on" });
+  meter.run(0, 2 * SAMPLE_RATE, ramp);
+
+  const levels = meter.levels();
+  assert.ok(levels.length > 0, "the meter posted");
+  const first = levels[0];
+  assert.equal(first.frame, 0, "the first window opens on the input's first frame");
+  assert.equal(first.cols[0], 0, "and its first column starts there too");
+
+  let previousFrame = null;
+  for (let at = 0; at + 2 < first.cols.length; at += 3) {
+    const frame = first.cols[at];
+    const min = first.cols[at + 1];
+    assert.equal(Math.round(min * 100000) - 1, frame, `column ${at / 3} of the first post names frame ${frame}`);
+    if (previousFrame !== null) assert.equal(frame, previousFrame + 480, "columns follow each other");
+    previousFrame = frame;
+  }
+});
+
 // ---- the punch gate (a take that keeps the input only inside a range) ------
 
 /** A real range, in frames into the pass, over an eight-beat (two-bar) clip. */
