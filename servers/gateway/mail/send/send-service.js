@@ -16,7 +16,9 @@
  * again; a failure whose outcome is unknowable (`NETWORK`, `TIMEOUT`, `PROTOCOL`) settles `unknown`,
  * which is never retried automatically and is reconciled against the Sent folder with a bounded
  * backoff. The one case that is not retried at all is `unknown` without an explicit confirm after at
- * least one Sent-folder check.
+ * least one Sent-folder check. One failure is settled by its DETAIL rather than its code: a token
+ * refresh that failed (`detail: "token"`, from `authFor`) happened before any connection existed, so
+ * nothing was transmitted — `failed`, sendable again, even though the code may be NETWORK or PROTOCOL.
  *
  * Every time is epoch ms from an injectable clock, every id and timer is injectable, and `deps` is the
  * whole seam: a test drives this module with a fake adapter and a fake clock, and Task 6's sweep and
@@ -91,6 +93,7 @@ export const SEND_FAIL_REASONS = Object.freeze({
   all_rejected: "The mail server refused every recipient, so nothing was sent.",
   changed: "The mailbox changed on the server before the message went out, so nothing was sent.",
   missed: "The send time passed while this Crow was not running, so nothing was sent.",
+  token: "Crow could not get a new sign-in token from the mail provider, so nothing was sent.",
   network: "Crow lost the connection before the outcome was known.",
   timeout: "The mail server did not answer before the deadline, so the outcome is unknown.",
   protocol: "The mail server answered with something Crow could not use, so the outcome is unknown.",
@@ -232,6 +235,20 @@ function codeOf(err) {
     return toMailError(err).code;
   } catch {
     return "unknown";
+  }
+}
+
+/**
+ * The failure's allow-listed detail token, or null. Never the error's text: `authFor` tags a token
+ * refresh that failed before any connection was opened with `token`, which is what tells this module
+ * nothing was transmitted even when the code (NETWORK/PROTOCOL/TIMEOUT) would otherwise read as an
+ * unknown outcome.
+ */
+function detailOf(err) {
+  try {
+    return toMailError(err).detail ?? null;
+  } catch {
+    return null;
   }
 }
 
@@ -699,8 +716,13 @@ export async function deliver(db, deps, draftId, options = {}) {
   } catch (err) {
     // Only the code: an adapter's message can quote a server reply, a username or an address.
     const code = codeOf(err);
+    const detail = detailOf(err);
     logCode("send_failed", code);
-    const unknownReason = UNKNOWN_OUTCOMES[code];
+    // A token refresh that failed (the provider's own NETWORK/PROTOCOL/TIMEOUT, tagged `token` by
+    // authFor) happened before any connection was opened: nothing was transmitted, so the row is
+    // retryable instead of "we could not confirm this went out".
+    const tokenFailure = detail === "token";
+    const unknownReason = tokenFailure ? null : UNKNOWN_OUTCOMES[code];
     if (unknownReason) {
       const changed = await markUnknown(db, draftId, claimToken, now, unknownReason);
       return { outcome: "unknown", reason: unknownReason, changed };
@@ -708,9 +730,11 @@ export async function deliver(db, deps, draftId, options = {}) {
     // The adapter reports nodemailer's envelope refusal (every recipient, or the MAIL FROM, refused
     // before any byte was transmitted) as BAD_INPUT with this token: the same fixed sentence as a send
     // whose every recipient came back rejected.
-    const reason = code === "BAD_INPUT" && err?.detail === "EENVELOPE"
-      ? "all_rejected"
-      : (FAILED_OUTCOMES[code] ?? "send_failed");
+    const reason = tokenFailure
+      ? "token"
+      : code === "BAD_INPUT" && detail === "EENVELOPE"
+        ? "all_rejected"
+        : (FAILED_OUTCOMES[code] ?? "send_failed");
     await settle(db, draftId, claimToken, "failed", { now, failReason: phraseFor(reason) });
     return { outcome: "failed", reason };
   } finally {

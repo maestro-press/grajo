@@ -11,7 +11,7 @@ import { MAIL_DDL, MAIL_ACCOUNT_SEND_COLUMNS } from "../servers/shared/mail-sche
 import { MAIL_ERROR_TEXT, MailError } from "../servers/gateway/mail/errors.js";
 import { createAccount } from "../servers/gateway/mail/store/accounts.js";
 import {
-  ensureKeychainTable, ensureWriteKey, listEntries, saveServiceSecret, serviceSecretsFor,
+  ensureKeychainTable, ensureWriteKey, listEntries, saveServiceSecret, serviceSecretsFor, deleteEntry,
   KeychainKeyMissingError,
 } from "../servers/gateway/keychain/store.js";
 import { loadKeychainKey } from "../servers/gateway/keychain/key.js";
@@ -24,6 +24,9 @@ const SAM = "sam@example.com";
 const PASSWORD = "app-pass-9f2c";
 const OTHER_PASSWORD = "app-pass-5b71";
 const HUNTER = "hunter2";
+const CLIENT_ID = "client-id-4f1a2b7d";
+const CLIENT_SECRET = "client-secret-9d3c51aa";
+const SAM_CLIENT_SECRET = "client-secret-1b7e0f42";
 
 const dirs = [];
 after(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true }); });
@@ -141,9 +144,117 @@ test("only the mail env keys are accepted, and only with a non-empty secret", as
   await ensureKeychainTable(db);
   assert.equal((await keychainRows(db)).length, 0, "a refused save writes no row");
 
-  assert.deepEqual(MAIL_SECRET_KEYS, ["MAIL_PASSWORD", "MAIL_REFRESH_TOKEN"]);
+  assert.deepEqual(MAIL_SECRET_KEYS, [
+    "MAIL_PASSWORD", "MAIL_REFRESH_TOKEN", "MAIL_OAUTH_CLIENT_ID", "MAIL_OAUTH_CLIENT_SECRET",
+  ]);
   await credentials.saveSecret(account.id, "MAIL_REFRESH_TOKEN", "refresh-token-1");
   assert.deepEqual(await credentials.getSecrets(account.id), { MAIL_REFRESH_TOKEN: "refresh-token-1" });
+
+  // A near miss of a real key is still refused: the list is exact, never a prefix or a pattern.
+  for (const key of ["MAIL_OAUTH_CLIENT", "MAIL_OAUTH", "OAUTH_CLIENT_SECRET", "MAIL_CLIENT_SECRET",
+    "mail_oauth_client_id", "MAIL_OAUTH_CLIENT_ID ", " MAIL_PASSWORD"]) {
+    await assert.rejects(credentials.saveSecret(account.id, key, PASSWORD), mailCode("BAD_INPUT"), JSON.stringify(key));
+  }
+});
+
+/* ------------------------------------------- OAuth client keys (plan 5, Task 2) */
+
+// An OAuth sign-in needs the app registration's own pair (client id and client secret) beside the
+// refresh token, so both are keychain keys of the account like the other two. They are still sealed:
+// the client secret is a secret, and the pair is useless without the token it refreshes.
+const OAUTH_KEYS = Object.freeze(["MAIL_OAUTH_CLIENT_ID", "MAIL_OAUTH_CLIENT_SECRET"]);
+
+test("the OAuth client id and secret save, read back, and stay out of every plaintext column", async () => {
+  const db = await freshDb();
+  const credentials = createMailCredentials({ db, crowHome: freshHome() });
+  const account = await createAccount(db, accountInput(ALEX));
+
+  const savedId = await credentials.saveSecret(account.id, "MAIL_OAUTH_CLIENT_ID", CLIENT_ID);
+  const savedSecret = await credentials.saveSecret(account.id, "MAIL_OAUTH_CLIENT_SECRET", CLIENT_SECRET);
+  assert.equal(savedId.created, true);
+  assert.equal(savedSecret.created, true);
+
+  assert.deepEqual(await credentials.getSecrets(account.id), {
+    MAIL_OAUTH_CLIENT_ID: CLIENT_ID,
+    MAIL_OAUTH_CLIENT_SECRET: CLIENT_SECRET,
+  });
+
+  const rows = await keychainRows(db);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map((r) => r.env_key).sort(), [...OAUTH_KEYS].sort());
+  for (const row of rows) {
+    // env_key holds the KEY NAME, which is metadata; the value is nowhere in plaintext.
+    assert.equal(row.kind, "service");
+    assert.equal(row.bundle_id, MAIL_BUNDLE_ID);
+    assert.equal(row.connection_uuid, account.id);
+    assert.equal(row.status, "active");
+    assert.equal(row.label, `Mail: ${ALEX}`, "the label names the account, never a credential");
+    for (const column of ["label", "username", "url", "env_key"]) {
+      const text = row[column] == null ? "" : String(row[column]);
+      assert.ok(!text.includes(CLIENT_ID), `crow_keychain.${column} carries the client id`);
+      assert.ok(!text.includes(CLIENT_SECRET), `crow_keychain.${column} carries the client secret`);
+    }
+    assert.equal(row.username ?? null, null);
+    assert.equal(row.url ?? null, null);
+  }
+  assertNoPlaintext(rows, CLIENT_ID, CLIENT_SECRET);
+});
+
+test("all four keys of one account go together, and another account's rows are untouched", async () => {
+  const db = await freshDb();
+  const credentials = createMailCredentials({ db, crowHome: freshHome() });
+  const alex = await createAccount(db, accountInput(ALEX));
+  const sam = await createAccount(db, accountInput(SAM));
+
+  await credentials.saveSecret(alex.id, "MAIL_PASSWORD", PASSWORD);
+  await credentials.saveSecret(alex.id, "MAIL_REFRESH_TOKEN", "refresh-alex");
+  await credentials.saveSecret(alex.id, "MAIL_OAUTH_CLIENT_ID", CLIENT_ID);
+  await credentials.saveSecret(alex.id, "MAIL_OAUTH_CLIENT_SECRET", CLIENT_SECRET);
+  await credentials.saveSecret(sam.id, "MAIL_OAUTH_CLIENT_ID", CLIENT_ID);
+  await credentials.saveSecret(sam.id, "MAIL_OAUTH_CLIENT_SECRET", SAM_CLIENT_SECRET);
+
+  const out = await credentials.deleteSecrets(alex.id);
+  assert.equal(out.deleted, 4, "every one of the four keys went with the account");
+  assert.deepEqual(await credentials.getSecrets(alex.id), {});
+  assert.equal((await db.execute({
+    sql: "SELECT COUNT(*) AS n FROM crow_keychain WHERE connection_uuid = ?", args: [alex.id],
+  })).rows[0].n, 0);
+
+  assert.deepEqual(await credentials.getSecrets(sam.id), {
+    MAIL_OAUTH_CLIENT_ID: CLIENT_ID,
+    MAIL_OAUTH_CLIENT_SECRET: SAM_CLIENT_SECRET,
+  }, "the other account keeps its own pair");
+  assertNoPlaintext(await keychainRows(db), CLIENT_SECRET, SAM_CLIENT_SECRET);
+});
+
+test("a mail row for an OAuth key still lists in the keychain panel and is not the panel's to delete", async () => {
+  const db = await freshDb();
+  const home = freshHome();
+  const credentials = createMailCredentials({ db, crowHome: home });
+  const account = await createAccount(db, accountInput(ALEX));
+  await credentials.saveSecret(account.id, "MAIL_OAUTH_CLIENT_ID", CLIENT_ID);
+  await credentials.saveSecret(account.id, "MAIL_OAUTH_CLIENT_SECRET", CLIENT_SECRET);
+  const key = await ensureWriteKey(db, { crowHome: home });
+
+  const entries = await listEntries(db, { keyId: key.id });
+  const mine = entries.filter((entry) => entry.connection_uuid === account.id);
+  assert.equal(mine.length, 2, "the panel's reader sees both OAuth rows");
+  assert.deepEqual(mine.map((e) => e.env_key).sort(), [...OAUTH_KEYS].sort());
+  for (const entry of mine) {
+    assert.equal(entry.kind, "service");
+    assert.equal(entry.bundle_id, MAIL_BUNDLE_ID);
+    assert.equal(entry.label, `Mail: ${ALEX}`);
+    assert.equal(entry.readable, true);
+  }
+  const listed = JSON.stringify(entries);
+  assert.ok(!listed.includes(CLIENT_ID), "no listed field carries the client id");
+  assert.ok(!listed.includes(CLIENT_SECRET), "no listed field carries the client secret");
+
+  // Its lifetime is the account's: the keychain page may not purge a mail row, the account delete is.
+  for (const entry of mine) {
+    await assert.rejects(deleteEntry(db, entry.id), (err) => err.code === "KEYCHAIN_MAIL_ROW");
+  }
+  assert.equal((await listEntries(db, { keyId: key.id })).length, 2, "both rows are still there");
 });
 
 test("the row falls back to the account id when the mail_accounts row is gone", async () => {
@@ -298,9 +409,64 @@ test("REVIEW FOCUS 2 — a provider error carrying a secret surfaces as AUTH_FAI
   assert.ok(!surface.includes(HUNTER), "no error field quotes the provider's text");
 });
 
-test("a provider that throws a MailError keeps only its allow-listed detail", async () => {
+test("H1: a provider's own MailError keeps its code, so a NETWORK blip is not read as a dead credential", async () => {
+  for (const thrown of [
+    new MailError("NETWORK", "ECONNRESET"),
+    new MailError("NETWORK"),
+    new MailError("PROTOCOL", "no_access_token"),
+    new MailError("TIMEOUT", "ETIMEDOUT"),
+    new MailError("AUTH_FAILED", "invalid_grant"),
+  ]) {
+    const tokenProvider = async () => { throw thrown; };
+    let caught = null;
+    try {
+      await authFor(XOAUTH2_ACCOUNT, { credentials: {}, tokenProvider });
+    } catch (err) {
+      caught = err;
+    }
+    assert.equal(caught.code, thrown.code, "its code is what the supervisor decides on");
+    // REVIEW FIX R3: a code whose send-side meaning would be "the outcome is unknown" is tagged
+    // `token` here — the refresh failed before any connection existed, so nothing was sent. The code
+    // itself is unchanged, so the supervisor's back-off is not affected.
+    if (thrown.code === "AUTH_FAILED") {
+      assert.equal(caught, thrown, "a dead grant travels as the very error the provider threw");
+      assert.equal(caught.detail, thrown.detail);
+    } else {
+      assert.equal(caught.detail, "token", `${thrown.code} arrives tagged as a token failure`);
+    }
+  }
+});
+
+test("R3: a provider's NETWORK/PROTOCOL/TIMEOUT failure arrives as `token`: nothing was sent", async () => {
+  for (const code of ["NETWORK", "PROTOCOL", "TIMEOUT"]) {
+    const tokenProvider = async () => { throw new MailError(code, "ECONNRESET"); };
+    const err = await authFor(XOAUTH2_ACCOUNT, { credentials: {}, tokenProvider }).catch((error) => error);
+    assert.ok(err instanceof MailError, `${code}: a MailError`);
+    assert.equal(err.code, code, `${code}: the code the supervisor backs off on is unchanged`);
+    assert.equal(err.detail, "token", `${code}: tagged as a token failure`);
+    assert.equal(err.message, MAIL_ERROR_TEXT[code], "the fixed sentence is the code's own");
+  }
+
+  // A dead grant is a credential answer, not a network fault: its own detail survives the trip.
+  for (const detail of ["invalid_grant", "retired"]) {
+    const thrown = new MailError("AUTH_FAILED", detail);
+    const tokenProvider = async () => { throw thrown; };
+    const err = await authFor(XOAUTH2_ACCOUNT, { credentials: {}, tokenProvider }).catch((error) => error);
+    assert.equal(err, thrown, `${detail}: travels as it was thrown`);
+    assert.equal(err.detail, detail);
+  }
+
+  // Keychain faults are not token failures either.
+  const missing = new KeychainKeyMissingError();
+  const tokenProvider = async () => { throw missing; };
+  const err = await authFor(XOAUTH2_ACCOUNT, { credentials: {}, tokenProvider }).catch((error) => error);
+  assert.equal(err, missing);
+});
+
+test("H1: only a failure that is NOT a MailError is flattened to AUTH_FAILED, without its text or its code", async () => {
   const tokenProvider = async () => {
-    throw Object.assign(new MailError("TIMEOUT", "ETIMEDOUT"), { message: `token ${HUNTER}` });
+    // A library error that classifies as a network fault AND quotes the token: neither may survive.
+    throw Object.assign(new Error(`refresh refused for ${HUNTER}`), { code: "ECONNRESET" });
   };
   let thrown = null;
   try {
@@ -309,8 +475,8 @@ test("a provider that throws a MailError keeps only its allow-listed detail", as
     thrown = err;
   }
   assert.ok(thrown instanceof MailError);
-  assert.equal(thrown.code, "AUTH_FAILED");
-  assert.equal(thrown.detail, "ETIMEDOUT");
+  assert.equal(thrown.code, "AUTH_FAILED", "an unclassified library error is still a refused sign-in");
+  assert.equal(thrown.detail, null, "and the library's own code is never the detail");
   assert.ok(!String(thrown.message).includes(HUNTER));
 });
 

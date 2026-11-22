@@ -30,6 +30,7 @@ import {
 } from "../servers/gateway/mail/store/messages.js";
 import { fetchOlder, searchRemote } from "../servers/gateway/mail/sync/engine.js";
 import { MailError } from "../servers/gateway/mail/errors.js";
+import { createImapSmtpAdapter } from "../servers/gateway/mail/adapter/imap-smtp.js";
 import { createFakeMailAdapter } from "./fixtures/fake-mail-adapter.mjs";
 import { makeRaw } from "./fixtures/fake-mail-server.mjs";
 import {
@@ -251,6 +252,8 @@ async function setup(options = {}) {
   const account = await createAccount(db, {
     address: options.address ?? "alex@example.com",
     label: options.label ?? "Alex",
+    // An OAuth account for the tests that need the real adapter's sign-in path.
+    ...(options.authKind == null ? {} : { authKind: options.authKind, provider: options.provider ?? "google" }),
     imap: { host: "mail.example.test", port: 993, security: "ssl" },
     smtp: { host: "mail.example.test", port: 587, security: "starttls" },
   });
@@ -536,6 +539,38 @@ test("AUTH_FAILED marks the account, notices once, stops retrying, and syncNow r
   assert.equal((await getSyncState(h.db, h.accountId)).state, "idle");
   assert.equal(h.notices.length, 1);
   assert.equal((await h.supervisor.status(h.accountId)).watching, true);
+});
+
+test("H1: a token provider that fails with NETWORK leaves the account active, backs off and rings nothing", async () => {
+  const h = await setup({
+    start: false,
+    authKind: "xoauth2",
+    adapterFactory: ({ account }) => createImapSmtpAdapter({
+      account,
+      credentials: { getSecrets: async () => ({ MAIL_OAUTH_CLIENT_ID: "client-id-test" }) },
+      // What the token provider does on a network blip. The registry's provider classifies it as
+      // NETWORK, and the adapter hands the sign-in failure to the supervisor exactly as it came.
+      tokenProvider: async () => { throw new MailError("NETWORK", "ECONNRESET"); },
+      // A sign-in that failed must not leave a socket behind: this throws if one is ever opened.
+      clientFactory: () => { throw new Error("no connection may be opened for a failed token"); },
+    }),
+  });
+  await h.supervisor.start();
+
+  const account = await getAccount(h.db, h.accountId);
+  assert.equal(account.status, "active", "a refresh that could not reach the provider is not a dead credential");
+  assert.equal(account.statusDetail, null);
+  const state = await getSyncState(h.db, h.accountId);
+  assert.equal(state.state, "backoff", "NETWORK stays on the transient ladder");
+  assert.equal(state.errorCode, "NETWORK", "with its own code, never AUTH_FAILED");
+  assert.equal(state.failures, 1);
+  assert.deepEqual(h.notices, [], "and the bell does not ring");
+
+  // The transient path keeps retrying: the next attempt is made on the back-off ladder.
+  await h.clock.advance(BACKOFF_BASE_MS);
+  assert.equal((await getSyncState(h.db, h.accountId)).failures, 2);
+  assert.equal((await getAccount(h.db, h.accountId)).status, "active");
+  assert.deepEqual(h.notices, []);
 });
 
 /* -------------------------------------------------------------------- notices */

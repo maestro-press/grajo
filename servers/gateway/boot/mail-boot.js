@@ -15,7 +15,9 @@
  *   1. reads the keychain (`createMailCredentials({db})`), which is the only plaintext path and is
  *      handed to the supervisor, which in turn hands it to the adapter factory;
  *   2. builds `adapterFactory({account, credentials})` — the pinned supervisor signature — as the real
- *      IMAP/SMTP adapter, with the rotation writer for an OAuth refresh token plan 5 will supply;
+ *      IMAP/SMTP adapter, with a per-account OAuth token provider from this module's provider registry
+ *      (mail/oauth/registry.js) for an account that signs in with XOAUTH2, and the rotation writer for
+ *      the injected single-provider test seam (plan 5);
  *   3. wraps the claims module for the supervisor's two hooks. `makeIsClaimedElsewhere` answers
  *      `{claimed, instanceName}` while the supervisor tests `=== true`, so a loser is `true` from this
  *      side; `refreshClaim(db, address, …)` takes an address while the supervisor passes a whole
@@ -60,6 +62,7 @@ import { getInstance, getOrCreateLocalInstanceId } from "../instance-registry.js
 import { createImapSmtpAdapter } from "../mail/adapter/imap-smtp.js";
 import { makeIsClaimedElsewhere, refreshClaim as refreshOwnClaimInDb } from "../mail/claims.js";
 import { createMailCredentials, createRotationWriter } from "../mail/credentials.js";
+import { createTokenProviderRegistry } from "../mail/oauth/registry.js";
 import { ACCOUNT_REMOVED_REASON, transition } from "../mail/drafts/store.js";
 import { mailEnabled } from "../mail/flag.js";
 import { MailError, toMailError } from "../mail/errors.js";
@@ -150,17 +153,43 @@ async function resolveLocalInstance(db, given) {
 /**
  * The production adapter factory, in the pinned supervisor shape: `({account, credentials})` in, an
  * adapter out. The credentials reader comes from the supervisor (it passes the reader it was built
- * with); the rotation writer stores a refresh token a provider rotates, and is inert on the password
- * path.
+ * with).
+ *
+ * An OAuth account gets a THIN provider that asks the registry for its account's provider on every call,
+ * never the provider object itself: a `forget()` (an account removal, or a fresh grant) retires the
+ * provider, and an adapter built before it would otherwise drag the retired object around for its whole
+ * life and answer AUTH_FAILED/`retired` to a sign-in that should have succeeded. The registry still
+ * answers the SAME object for the same account (one cache, one refresh in flight, one rotation writer);
+ * the adapter just never holds on to it. That registry provider is also the single writer of a rotated
+ * refresh token (mail/oauth/token-provider.js), so an adapter built on it is handed NO rotation writer
+ * (a second writer would store the same rotation twice). An injected single `tokenProvider` (the test
+ * seam) is the other way round: it does not write anything itself, so the adapter keeps its rotation
+ * writer. The adapter's `onTokenRotated` takes the token alone (its own contract); the writer is
+ * `createRotationWriter`'s `(accountId, {refreshToken})`, so the factory binds the account id here — the
+ * one place that knows which account the adapter is for. Password accounts are untouched by both —
+ * `authFor` never asks a provider for one.
  */
-function defaultAdapterFactory(credentials, tokenProvider) {
-  const onTokenRotated = createRotationWriter(credentials);
+function defaultAdapterFactory(credentials, { tokenProvider = null, tokenProviderFor = null } = {}) {
+  const writeRotation = createRotationWriter(credentials);
   return function adapterFactory({ account, credentials: reader } = {}) {
+    const usesRegistry = account != null && account.authKind === "xoauth2" && typeof tokenProviderFor === "function";
+    const perAccount = usesRegistry
+      ? (request) => {
+        // The CURRENT provider, every call: `forget()` is what ends the old one, and a reconnect is a
+        // new provider this adapter never had to be rebuilt to see.
+        const current = tokenProviderFor(account.id);
+        if (typeof current !== "function") throw new MailError("AUTH_FAILED");
+        return current(request);
+      }
+      : null;
     return createImapSmtpAdapter({
       account,
       credentials: reader ?? credentials,
-      tokenProvider: typeof tokenProvider === "function" ? tokenProvider : null,
-      onTokenRotated,
+      tokenProvider: perAccount ?? (typeof tokenProvider === "function" ? tokenProvider : null),
+      // The registry's provider writes its own rotations; the injected single provider does not.
+      onTokenRotated: usesRegistry
+        ? null
+        : (refreshToken) => writeRotation(account.id, { refreshToken }),
     });
   };
 }
@@ -331,6 +360,7 @@ function stoppedHandle(reason) {
     started: false,
     reason,
     supervisor: undefined,
+    tokenProviders: null,
     async stop() {
       stopAccountRemovalHook();
     },
@@ -349,7 +379,15 @@ function stoppedHandle(reason) {
  * @param {Function} [options.adapterFactory] `({account, credentials}) => adapter`
  * @param {object} [options.credentials] the keychain reader; `createMailCredentials({db})` by default
  * @param {string} [options.crowHome] passed to the keychain when this module builds the reader
- * @param {Function|null} [options.tokenProvider] OAuth provider (plan 5)
+ * @param {Function|null} [options.tokenProvider] OAuth provider (plan 5): one provider for every
+ *   xoauth2 account. The test seam; production takes the registry below instead
+ * @param {object|null} [options.tokenProviders] an already-built token provider registry
+ *   (`{tokenProviderFor, forget}`), used as it is
+ * @param {{tokenUrl?: string}} [options.oauthEndpoints] TEST ONLY: point the registry's token POST at a
+ *   local fake provider
+ * @param {Function} [options.markAuthFailed] the caller's own hook for a dead grant
+ *   (`(accountId) => …`); NONE by default — the provider latches the dead grant in memory and the sync
+ *   supervisor writes the account's `auth_failed` status and rings its one notice
  * @param {object|Function} [options.localInstance] `{instanceId, instanceName}` or `(db) => …`
  * @param {Function} [options.now]
  * @param {Function} [options.setTimer]
@@ -443,9 +481,29 @@ async function beginStart(options) {
     }
     const credentials = options.credentials
       ?? createMailCredentials({ db, crowHome: options.crowHome });
+
+    // The per-account token providers are built here unless a test injected the whole factory (or its
+    // own single provider): the registry is what the routes and the send paths reach for, so it must
+    // exist wherever the real adapter factory does. Building it reads nothing — a provider opens the
+    // keychain and the network only when a token is actually asked for.
+    let tokenProviders = options.tokenProviders ?? null;
+    if (tokenProviders == null && typeof options.adapterFactory !== "function" && typeof options.tokenProvider !== "function") {
+      tokenProviders = createTokenProviderRegistry({
+        db,
+        credentials,
+        // TEST ONLY: points the token POST at a local fake provider; production passes nothing.
+        ...(options.oauthEndpoints !== undefined ? { endpoints: options.oauthEndpoints } : {}),
+        ...(options.now !== undefined ? { now: options.now } : {}),
+        ...(typeof options.markAuthFailed === "function" ? { markAuthFailed: options.markAuthFailed } : {}),
+      });
+    }
+
     const adapterFactory = typeof options.adapterFactory === "function"
       ? options.adapterFactory
-      : defaultAdapterFactory(credentials, options.tokenProvider);
+      : defaultAdapterFactory(credentials, {
+        tokenProvider: options.tokenProvider,
+        tokenProviderFor: tokenProviders == null ? null : (accountId) => tokenProviders.tokenProviderFor(accountId),
+      });
     const local = await resolveLocalInstance(db, options.localInstance);
     // Shutdown may have started while this awaited: nothing is built for a process that is going down.
     if (shuttingDown) {
@@ -495,6 +553,10 @@ async function beginStart(options) {
     const handle = {
       started: true,
       supervisor,
+      // The one registry of per-account OAuth providers (`tokenProviderFor`), or null when a test
+      // injected its own factory and there is nothing to keep. The routes reach it through
+      // `tokenProviderForAccount()` below.
+      tokenProviders,
       reason: undefined,
       stopped: false,
       stop,
@@ -625,4 +687,46 @@ export function reportsAdapterFor(account, fn) {
     return Promise.reject(new MailError("NETWORK", "stopped"));
   }
   return supervisor.withAdapter(account?.id, fn);
+}
+
+/**
+ * The OAuth token provider this running supervisor keeps for one account, or null when no registry is
+ * running (a closed gate, a start that injected its own factory, or a stopped service).
+ *
+ * This is the seam the dashboard uses: `servers/gateway/dashboard/index.js` mounts Crow Mail's API with
+ * `tokenProviderFor` bound to this function, so a request that builds an adapter of its own (the API's
+ * fallback factory) signs in with the same provider object the sync worker and every action adapter
+ * use — one cache, one refresh in flight, one rotation writer.
+ *
+ * @param {string} accountId
+ * @returns {Function|null}
+ */
+export function tokenProviderForAccount(accountId) {
+  const handle = currentHandle;
+  const registry = handle != null && handle.started === true ? handle.tokenProviders : null;
+  if (registry == null || typeof registry.tokenProviderFor !== "function") return null;
+  return registry.tokenProviderFor(accountId);
+}
+
+/**
+ * Forget one account's provider — its removal, or a fresh grant that must not inherit the old cache or
+ * the old dead-grant flag. Never a reason to fail a removal: a service that is not running has nothing
+ * to forget, and the promise never rejects.
+ *
+ * It settles after a rotation write that was already in the air (the provider hands its in-flight
+ * write to `retire()`), so the account's DELETE can await it and only then delete the sealed secrets:
+ * the other order leaves a freshly written refresh token behind for the account it just removed.
+ *
+ * @param {string} accountId
+ * @returns {Promise<void>}
+ */
+export async function forgetTokenProviderForAccount(accountId) {
+  const handle = currentHandle;
+  const registry = handle != null && handle.started === true ? handle.tokenProviders : null;
+  if (registry == null || typeof registry.forget !== "function") return;
+  try {
+    await registry.forget(accountId);
+  } catch {
+    // Forgetting a cache entry is bookkeeping; the removal the caller asked for goes ahead.
+  }
 }

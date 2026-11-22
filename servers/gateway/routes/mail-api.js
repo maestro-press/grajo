@@ -44,7 +44,7 @@ import { getInstance, getOrCreateLocalInstanceId } from "../instance-registry.js
 import { createImapSmtpAdapter } from "../mail/adapter/imap-smtp.js";
 import { accountsOverview } from "../mail/accounts-overview.js";
 import { checkClaim, claimedElsewhereSentence, releaseClaim, writeClaim } from "../mail/claims.js";
-import { createMailCredentials } from "../mail/credentials.js";
+import { createMailCredentials, createRotationWriter } from "../mail/credentials.js";
 import { MailError, MAIL_ERROR_TEXT, toMailError } from "../mail/errors.js";
 import { mailEnabled } from "../mail/flag.js";
 import { probeAccount } from "../mail/probe.js";
@@ -381,11 +381,82 @@ function claimsFor(deps) {
   };
 }
 
-function adapterFactoryFor(deps) {
+/**
+ * The adapter factory the routes use when boot provided none.
+ *
+ * `deps.tokenProviderFor(accountId)` is the per-account seam (the boot registry's own
+ * `tokenProviderFor`): one provider object per account, shared with the sync worker and every action
+ * adapter, so a request here never builds a second cache or a second rotation writer. The adapter is
+ * handed a THIN function that asks the seam on every call, never the provider object itself: a
+ * `forget()` (an account removal, or a fresh grant) retires that object, and an adapter that held it
+ * would answer AUTH_FAILED/`retired` to a sign-in that should have used the new provider.
+ * `deps.tokenProvider` (one provider for every account) is kept for callers from before the registry
+ * and for tests; the per-account function wins when both are given. A password account is handed no
+ * provider at all.
+ *
+ * A rotated refresh token has exactly one writer. The registry's provider writes its own rotations, so
+ * an adapter built on it is handed NO writer (a second one would store the same rotation twice). A
+ * single injected `tokenProvider` writes nothing itself, so the adapter keeps its own writer, bound to
+ * this account id here — the one place that knows which account the adapter is for — exactly as
+ * boot/mail-boot.js's default factory binds it. Without it a rotation through this seam would be
+ * dropped on the floor and the next refresh would spend a token the provider had already replaced.
+ *
+ * Exported because it is the seam those two rules are pinned by (tests/mail-oauth-token-provider.test.js).
+ *
+ * @param {{adapterFactory?: Function, tokenProvider?: Function, tokenProviderFor?: Function}} deps
+ * @returns {(args: {account: object, credentials: object}) => object}
+ */
+export function fallbackAdapterFactory(deps = {}) {
   if (typeof deps.adapterFactory === "function") return deps.adapterFactory;
   if (typeof runtime.adapterFactory === "function") return runtime.adapterFactory;
-  const tokenProvider = typeof deps.tokenProvider === "function" ? deps.tokenProvider : null;
-  return ({ account, credentials }) => createImapSmtpAdapter({ account, credentials, tokenProvider });
+  const single = typeof deps.tokenProvider === "function" ? deps.tokenProvider : null;
+  const perAccount = typeof deps.tokenProviderFor === "function" ? deps.tokenProviderFor : null;
+  return ({ account, credentials }) => {
+    const usesRegistry = perAccount != null && account != null && account.authKind === "xoauth2";
+    // The CURRENT provider on every call, never the object: `forget()` retires the one this adapter was
+    // built beside, and a reconnect's new provider must be reachable through the same adapter.
+    const registryProvider = usesRegistry
+      ? (request) => {
+        const current = perAccount(account.id);
+        if (typeof current !== "function") throw new MailError("AUTH_FAILED");
+        return current(request);
+      }
+      : null;
+    const tokenProvider = registryProvider ?? single;
+    // The registry's provider is the writer; a single injected provider is not, so this factory binds
+    // `createRotationWriter`'s `(accountId, {refreshToken})` to the account the adapter is for.
+    let onTokenRotated = null;
+    if (!usesRegistry && single != null && account != null
+      && credentials != null && typeof credentials.saveSecret === "function") {
+      const writeRotation = createRotationWriter(credentials);
+      onTokenRotated = (refreshToken) => writeRotation(account.id, { refreshToken });
+    }
+    return createImapSmtpAdapter({ account, credentials, tokenProvider, onTokenRotated });
+  };
+}
+
+/** The factory `ctx.adapterFactory` hands the mounted routes. */
+function adapterFactoryFor(deps) {
+  return fallbackAdapterFactory(deps);
+}
+
+/**
+ * The forget hook boot supplied, or null: an account's removal drops its cached provider. Awaited,
+ * because it settles after a rotation write that was already in the air — the sealed secrets must be
+ * deleted after that row landed, or the deleted account is left holding a live refresh token.
+ *
+ * @param {object} deps
+ * @param {string} accountId
+ * @returns {Promise<void>} never rejects
+ */
+function forgetTokenProviderFor(deps, accountId) {
+  if (typeof deps.forgetTokenProvider !== "function") return Promise.resolve();
+  try {
+    return Promise.resolve(deps.forgetTokenProvider(accountId)).then(() => undefined, () => undefined);
+  } catch (err) {
+    logCode("delete_token_provider", err);
+    return Promise.resolve();
+  }
 }
 
 /** The supervisor, or null: a build without sync running still serves reads and still connects. */
@@ -490,9 +561,12 @@ function endRemovalFor(deps, accountId, started) {
  * @param {{openDb?: Function, adapterFactory?: Function, supervisor?: object|null,
  *   credentials?: object, claims?: {checkClaim?: Function, writeClaim?: Function, releaseClaim?: Function},
  *   localInstance?: object|Function, tokenProvider?: Function,
+ *   tokenProviderFor?: (accountId: string) => Function|null, forgetTokenProvider?: Function,
  *   recordSecrets?: Function, ownerCheck?: Function}} [deps]
  *   `openDb` mints the request's crow.db client; `recordSecrets(values)` records masked values and
  *   defaults to `recordServiceSecretValues`; `ownerCheck` defaults to `isLocalPasswordSessionOn`;
+ *   `tokenProviderFor` is the boot registry's per-account provider (a single `tokenProvider` is the
+ *   older, one-for-every-account seam) and `forgetTokenProvider(accountId)` drops one on removal;
  *   `claims` replaces the claim code (any function it leaves out stays the real one).
  * @returns {import("express").Router}
  */
@@ -704,10 +778,12 @@ export function mailApiRouter(dashboardAuth, deps = {}) {
   }));
 
   // DELETE /accounts/:id — the id is marked as being removed, then the worker (awaited: its run,
-  // timers, watcher and both of its connections are gone before the rows are touched), then the rows,
-  // the secret and the claim; the mark goes in a `finally`, so a delete that fails still frees the id. A
-  // keychain or claim failure after the row is gone is logged by code: the secret of a deleted account
-  // is never served again, and a claim row that cannot be tombstoned still expires with this
+  // timers, watcher and both of its connections are gone before the rows are touched), then the cached
+  // OAuth provider is retired and AWAITED (before the rows and the sealed secrets, so a refresh in
+  // flight starts no new write and one already on its way has landed before the secrets go), then the
+  // rows, the secret and the claim; the mark goes in a `finally`, so a delete that fails still frees the
+  // id. A keychain or claim failure after the row is gone is logged by code: the secret of a deleted
+  // account is never served again, and a claim row that cannot be tombstoned still expires with this
   // instance's liveness.
   router.delete(`${MAIL_API_PREFIX}/accounts/:id`, route("DELETE /accounts/:id", async (db, req, res) => {
     const id = String(req.params.id);
@@ -720,6 +796,11 @@ export function mailApiRouter(dashboardAuth, deps = {}) {
     const removalBegan = beginRemovalFor(deps, id);
     try {
       await stopWorkerForDelete(deps, id);
+      // The cached provider is RETIRED here and AWAITED, before its rows go and before the sealed
+      // secrets are removed: a refresh still in flight starts no new rotation write, and a write that
+      // was already in the air has landed by the time this resolves — so `deleteSecrets` below removes
+      // the row it created rather than racing it.
+      await forgetTokenProviderFor(deps, id);
       const removed = await deleteAccount(db, id);
       try {
         await credentials.deleteSecrets(id);

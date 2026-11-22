@@ -4,8 +4,9 @@
  * nodemailer quote the server, the command and the username in `response`, `responseText`, `command`
  * and `message`, so `toMailError` reads only the fields the ruling allows (classification booleans,
  * `code`, `responseStatus`, `name`) and copies none of the free text. `detail` is kept only when it is
- * an allow-listed token (`ECONNRESET`, `NO`, `sync_deadline`), so a server string can never reach a
- * log, `mail_sync_state.error_code` or `mail_accounts.status_detail`.
+ * an allow-listed token (`ECONNRESET`, `NO`, `sync_deadline`, `EENVELOPE`, `token` for a failure that
+ * happened before any connection was opened), so a server string can never reach a log,
+ * `mail_sync_state.error_code` or `mail_accounts.status_detail`.
  */
 const DETAIL_RE = /^[A-Za-z0-9_]{1,40}$/;
 
@@ -44,7 +45,9 @@ function safeDetail(value) {
 export class MailError extends Error {
   /**
    * @param {string} code one of MAIL_ERROR_CODES
-   * @param {string|null} [detail] an allow-listed token (a socket code, an IMAP status, `sync_deadline`)
+   * @param {string|null} [detail] an allow-listed token (a socket code, an IMAP status, `sync_deadline`,
+   *   `EENVELOPE`, `token` for a failure before any connection was opened, an OAuth
+   *   `invalid_grant`/`invalid_client`) — the same short-token rule admits them all
    */
   constructor(code, detail = null) {
     if (typeof code !== "string" || !Object.hasOwn(MAIL_ERROR_TEXT, code)) {

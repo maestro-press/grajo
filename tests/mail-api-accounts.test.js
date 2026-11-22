@@ -173,6 +173,7 @@ async function setup({
   wrapDb = null,
   writeContext = false,
   ownerCheck = undefined,
+  forgetTokenProvider = null,
 } = {}) {
   const dir = join(root, "t" + (++n));
   mkdirSync(dir);
@@ -250,6 +251,7 @@ async function setup({
     recordSecrets: record,
     ...(claimsOverride === null ? {} : { claims: claimsOverride }),
     ...(ownerCheck === undefined ? {} : { ownerCheck }),
+    ...(forgetTokenProvider === null ? {} : { forgetTokenProvider }),
   }));
   app.use(dash);
 
@@ -719,6 +721,32 @@ test("RF5/M4/B1: DELETE stops the account's real worker first, then removes the 
   assert.equal((await del(`${accountsPath}/ma-0123456789abcdef`)).status, 404);
   assert.equal((await del(`${accountsPath}/not-an-account`)).status, 404);
   await s.supervisor.stop();
+});
+
+test("M1: DELETE retires the cached token provider BEFORE the sealed secrets are removed", async () => {
+  const order = [];
+  let id = null;
+  const s = await setup({
+    forgetTokenProvider: (accountId) => order.push("forget:" + accountId),
+    credentials: {
+      getSecrets: async () => ({}),
+      saveSecret: async () => ({ id: 1, created: true }),
+      deleteSecrets: async (accountId) => { order.push("deleteSecrets:" + accountId); return { deleted: 0 }; },
+    },
+    adapterFactory: () => createFakeMailAdapter(),
+  });
+
+  const created = await post(accountsPath, BODY);
+  assert.equal(created.status, 201, created.text);
+  id = created.json.account.id;
+  order.length = 0;
+
+  const r = await del(accountPath(id));
+  assert.equal(r.status, 200, r.text);
+  // A refresh still in flight in the account's provider must be retired before its secrets are deleted,
+  // or the rotated refresh token it is about to write lands after the delete as a live credential.
+  assert.deepEqual(order, ["forget:" + id, "deleteSecrets:" + id]);
+  assert.equal(await s.count("mail_accounts"), 0);
 });
 
 test("DELETE brackets the removal: beginRemoval before stopAccount, endRemoval after the rows", async () => {

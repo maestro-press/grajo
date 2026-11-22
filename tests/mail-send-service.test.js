@@ -763,6 +763,51 @@ test("AUTH_FAILED leaves state failed and Send is allowed again", async () => {
   assert.equal((await getDraft(db, draft.id)).state, "holding");
 });
 
+test("R3: a token refresh that failed with NETWORK settles failed (nothing was sent), not unknown", async () => {
+  const db = await freshDb();
+  const account = await makeAccount(db);
+  const fake = makeFake();
+  const { deps } = makeDeps(fake);
+  const draft = await makeDraft(db, account);
+  await tap(db, deps, draft);
+  // What authFor throws when the token endpoint could not be reached: the code is still NETWORK, and
+  // the detail says the failure happened before any connection, so the row is retryable.
+  fake.handle(() => { throw new MailError("NETWORK", "token"); });
+
+  const out = await deliver(db, deps, draft.id, { now: DUE });
+  assert.equal(out.outcome, "failed");
+  assert.equal(out.reason, "token");
+  const row = await getDraft(db, draft.id);
+  assert.equal(row.state, "failed");
+  assert.equal(row.failReason, SEND_FAIL_REASONS.token);
+  assert.equal(row.nextReconcileAt, null, "no Sent-folder check is due: nothing left Crow");
+
+  // Sendable again: nothing was transmitted, so the person may tap it a second time.
+  const again = await requestSend(db, deps, { draftId: draft.id, hash: row.headHash, now: DUE + 1000 });
+  assert.equal(again.ok, true);
+  assert.equal((await getDraft(db, draft.id)).state, "holding");
+});
+
+test("R3: an SMTP connect refusal keeps its own meaning — a plain NETWORK is still unknown", async () => {
+  const db = await freshDb();
+  const account = await makeAccount(db);
+  const fake = makeFake();
+  const { deps } = makeDeps(fake);
+  const draft = await makeDraft(db, account);
+  await tap(db, deps, draft);
+  // A refused SMTP connection: the socket never opened, but the send had already begun, so the outcome
+  // is exactly what it was before this change — unknown, never a silent resend.
+  fake.handle(() => { throw new MailError("NETWORK", "ECONNREFUSED"); });
+
+  const out = await deliver(db, deps, draft.id, { now: DUE });
+  assert.equal(out.outcome, "unknown");
+  assert.equal(out.reason, "network");
+  const row = await getDraft(db, draft.id);
+  assert.equal(row.state, "unknown");
+  assert.equal(row.failReason, SEND_FAIL_REASONS.network);
+  assert.equal(row.nextReconcileAt, row.attemptAt + 60_000, "the Sent folder is checked as before");
+});
+
 test("a slow send that outlives STALE_SENDING_MS in this process is never marked unknown by the sweep", async () => {
   const db = await freshDb();
   const account = await makeAccount(db);

@@ -1,9 +1,16 @@
 /**
- * Crow Mail's credentials: an account's password or OAuth refresh token lives in the sealed keychain of
- * the gateway (`kind 'service'`, `connection_uuid` = the mail account id, bundle `crow-mail`), never in
- * `mail_accounts`, a page, a log or an error. Three functions reach the keychain — saveSecret,
- * getSecrets and deleteSecrets — and getSecrets is the only plaintext path: the adapter factory calls
- * it to build a login, and nothing else does.
+ * Crow Mail's credentials: an account's password, OAuth refresh token and OAuth client pair live in
+ * the sealed keychain of the gateway (`kind 'service'`, `connection_uuid` = the mail account id, bundle
+ * `crow-mail`), never in `mail_accounts`, a page, a log or an error. Three functions reach the keychain —
+ * saveSecret, getSecrets and deleteSecrets — and getSecrets is the only plaintext path: the adapter
+ * factory calls it to build a login, and the OAuth token provider calls it for the client pair and the
+ * token it refreshes. Nothing else reads it.
+ *
+ * Four keys, and each is one row of the account: MAIL_PASSWORD for a password account; for an OAuth
+ * account, MAIL_REFRESH_TOKEN plus the app registration it refreshes with (MAIL_OAUTH_CLIENT_ID and
+ * MAIL_OAUTH_CLIENT_SECRET). The client pair is a credential like the token — the secret is useless
+ * without it and it is useless without the secret — so it is sealed here rather than stored in the
+ * account row, and a restored crow.db without its key file cannot refresh silently.
  *
  * Every entry point is scoped to mail. The account id must be the store's `ma-<16 hex>` form, and a
  * keychain row under that connection uuid that belongs to another bundle (or to none) makes all three
@@ -45,7 +52,12 @@ import { loadKeychainKey } from "../keychain/key.js";
 export const MAIL_BUNDLE_ID = MAIL_BUNDLE;
 
 /** The only env keys a mail account row may hold. Nothing else is ever written or served. */
-export const MAIL_SECRET_KEYS = Object.freeze(["MAIL_PASSWORD", "MAIL_REFRESH_TOKEN"]);
+export const MAIL_SECRET_KEYS = Object.freeze([
+  "MAIL_PASSWORD",
+  "MAIL_REFRESH_TOKEN",
+  "MAIL_OAUTH_CLIENT_ID",
+  "MAIL_OAUTH_CLIENT_SECRET",
+]);
 
 const SECRET_KEYS = new Set(MAIL_SECRET_KEYS);
 // Exactly what the account store creates (`"ma-" + randomBytes(8).toString("hex")`). Anything else is
@@ -71,6 +83,24 @@ function requireSecret(value) {
 function asMailError(err) {
   if (err instanceof MailError || err instanceof KeychainKeyMissingError) return err;
   return toMailError(err);
+}
+
+/**
+ * The provider codes whose send-side meaning would otherwise be "the outcome is unknown". A token
+ * refresh happens BEFORE any connection is opened, so a failure with one of these codes provably sent
+ * nothing and is tagged `token` (see `asTokenFailure`).
+ */
+const PRE_CONNECT_TOKEN_CODES = new Set(["NETWORK", "PROTOCOL", "TIMEOUT"]);
+
+/**
+ * A provider's MailError as the caller should see it: the same code (the supervisor's back-off and the
+ * account's status read nothing else), with the `token` detail when the failure provably happened before
+ * any connection — so the send service knows nothing was transmitted. Any other code keeps its own
+ * detail: `invalid_grant` names a dead grant, and the key-missing fault is not a MailError at all.
+ */
+function asTokenFailure(err) {
+  if (!PRE_CONNECT_TOKEN_CODES.has(err.code)) return err;
+  return new MailError(err.code, "token");
 }
 
 /**
@@ -122,7 +152,7 @@ export function createMailCredentials({ db, crowHome } = {}) {
      * on every save, so a key created after the gateway booted is picked up.
      *
      * @param {string} accountId the mail account id (the keychain's connection uuid)
-     * @param {"MAIL_PASSWORD"|"MAIL_REFRESH_TOKEN"} envKey
+     * @param {"MAIL_PASSWORD"|"MAIL_REFRESH_TOKEN"|"MAIL_OAUTH_CLIENT_ID"|"MAIL_OAUTH_CLIENT_SECRET"} envKey
      * @param {string} secret non-empty plaintext
      * @returns {Promise<{id: number, created: boolean}>}
      */
@@ -147,8 +177,8 @@ export function createMailCredentials({ db, crowHome } = {}) {
     },
 
     /**
-     * One account's secrets as `{envKey: plaintext}`, or `{}` when nothing is saved. Only the two mail
-     * env keys can come back. A row sealed under a key that is not on this machine raises
+     * One account's secrets as `{envKey: plaintext}`, or `{}` when nothing is saved. Only MAIL_SECRET_KEYS
+     * can come back. A row sealed under a key that is not on this machine raises
      * KeychainKeyMissingError unchanged.
      *
      * @param {string} accountId
@@ -227,12 +257,22 @@ export function createRotationWriter(credentials) {
  *   result then carries `rotationFailed: true`, a fixed boolean with no error text, so the caller can
  *   say so without ever seeing what the writer said.
  *
- * A provider error is a library error and may quote the token it was given, so only a MailError's own
- * allow-listed `detail` survives; the code is always AUTH_FAILED. Two faults are not the provider's
- * and travel unchanged instead: KeychainKeyMissingError (the key file is not on this machine — the
- * key's fault, not a bad password, so it must not be reported as AUTH_FAILED) and, on the password
- * path, any MailError. Any other failure on the password path is classified, so a keychain or driver
- * message never leaves as the error's text.
+ * A provider's own MailError keeps its code and travels on: the provider (mail/oauth/token-provider.js)
+ * already classifies its failures, and flattening them here would turn a NETWORK blip during a refresh
+ * into a dead credential — the supervisor marks an account `auth_failed`, rings the bell and stops
+ * syncing on AUTH_FAILED, and a server that was briefly unreachable is not that. Only a failure that is
+ * NOT a MailError is flattened to AUTH_FAILED, because a library error can quote the refresh token or
+ * the server's reply and none of its text may travel. Two faults are never a MailError and always pass
+ * through as they are: KeychainKeyMissingError (the key file is not on this machine — the key's fault,
+ * not a bad password) on both paths, and on the password path any MailError. On the password path every
+ * remaining failure is classified, so a keychain or driver message never leaves as the error's text.
+ *
+ * One thing is added to a provider's failure, never taken away: a code whose meaning on the send path
+ * would be "the outcome is unknown" (NETWORK, PROTOCOL, TIMEOUT) is re-thrown as the SAME code with the
+ * `token` detail. A token refresh happens before any connection is opened, so such a failure provably
+ * sent nothing — the send service settles the row `failed` (sendable again) instead of `unknown`, while
+ * the code the sync supervisor backs off on is unchanged. A dead grant keeps its own detail
+ * (`invalid_grant`/`retired`): it is a credential answer rather than a network fault.
  *
  * @param {object} account a mail_accounts row as the account store returns it
  * @param {{credentials?: object, tokenProvider?: Function, forceRefresh?: boolean,
@@ -270,8 +310,14 @@ export async function authFor(account, { credentials, tokenProvider, forceRefres
       // A provider that reads its own client secret from the keychain can fail on the key rather than
       // the token; that fault is the caller's to report and travels unchanged.
       if (err instanceof KeychainKeyMissingError) throw err;
+      // The provider already classified this one — NETWORK for an unreachable token endpoint, PROTOCOL
+      // for an answer Crow could not use, AUTH_FAILED for a dead grant — and its detail is already an
+      // allow-listed token. It travels on with its code: a network blip must not read as a dead
+      // credential. A code that would read as an unknown outcome on the send path is tagged `token`,
+      // because no connection was opened yet, so nothing was sent.
+      if (err instanceof MailError) throw asTokenFailure(err);
       // Never the library's text: it can quote the refresh token or the server's reply.
-      throw new MailError("AUTH_FAILED", err instanceof MailError ? err.detail : null);
+      throw new MailError("AUTH_FAILED");
     }
     const accessToken = result && typeof result.accessToken === "string" ? result.accessToken : "";
     if (!accessToken) throw new MailError("AUTH_FAILED");
