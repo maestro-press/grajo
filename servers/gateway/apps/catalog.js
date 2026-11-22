@@ -98,7 +98,10 @@ function build(crowHome) {
         });
       }
     } else {
-      apps.push({ ...base, kind: "page", href: panel.route || `/dashboard/${panel.id}`, desktopPath: null, leaseDeclared: false });
+      // A bundle's registered panel: the app IS the panel's page. `panelOnly` is
+      // this module's own mark (never sent to a client): with no mcpServers there
+      // is no server grant to narrow it by, so every scope lists it (appsForBots).
+      apps.push({ ...base, kind: "page", href: panel.route || `/dashboard/${panel.id}`, desktopPath: null, leaseDeclared: false, panelOnly: mcpServers.length === 0 });
     }
   }
   return Object.freeze(apps.map((a) => Object.freeze(a)));
@@ -117,6 +120,11 @@ export function listApps({ crowHome }) {
  * Apps any of the given bots can use: an app counts when one of its mcpServers is
  * in some bot's granted-server set.
  *
+ * A panel-only app (a bundle's registered panel, `panelOnly`) is the exception: its
+ * bundle declares no mcpServers, so there is nothing a bot could be granted and no
+ * grant to narrow it by — it shows in every scope. The rule below is for apps that
+ * stand for a bot's TOOLS (a server, a web UI it fronts): those keep the narrowing.
+ *
  * Decision on `crow-core` (the combined router entry, servers/core): it covers the
  * built-in memory/projects/sharing/blog/tasks servers, none of which is a UI
  * bundle, so granting crow-core grants NO bundle apps. A bundle must name its own
@@ -125,7 +133,7 @@ export function listApps({ crowHome }) {
 export function appsForBots(apps, grantedServerSets) {
   const granted = new Set();
   for (const set of grantedServerSets) for (const s of set) granted.add(s);
-  return apps.filter((a) => a.mcpServers.some((s) => granted.has(s)));
+  return apps.filter((a) => a.panelOnly || a.mcpServers.some((s) => granted.has(s)));
 }
 
 /** Lazy: the bridge and the Bot Builder queries are heavy and not needed to list apps. */
@@ -167,8 +175,10 @@ export async function grantedServers(db, def, { remoteEnabled, crowHome, repoSki
 }
 
 /**
- * Union of apps over the project's enabled bots. Cached per project (and db)
- * for 30 s; a bot-def save or an install clears it.
+ * Union of apps over the project's enabled bots. Panel-only apps are in every
+ * project's list whatever its bots are granted (appsForBots), so a project with
+ * no bots at all still lists them. Cached per project (and db) for 30 s; a
+ * bot-def save or an install clears it.
  */
 export async function appsForProject(db, projectId, { crowHome }) {
   const key = String(crowHome) + "\0" + String(projectId);

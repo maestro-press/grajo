@@ -6,7 +6,7 @@
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -134,6 +134,27 @@ test("All apps is the full catalog", async () => {
     assert.ok(!raw.includes(`"${k}"`), `no ${k} key in the response`);
   }
   assert.ok(!raw.includes("b1"), "no bot id in the response");
+});
+
+test("a panel-only bundle shows under This project; an ungranted mcpServers bundle stays hidden", async () => {
+  const { registerPanel } = await import("../servers/gateway/dashboard/panel-registry.js");
+  bundle("wsp", { panel: "panels/wsp.js" }); // a panel, no mcpServers
+  bundle("wsp-mcp", { panel: "panels/wsp-mcp.js", mcpServers: ["wsp-mcp"] }); // a panel AND a server: grant-gated
+  registerPanel({ id: "wsp", name: "wsp", route: "/dashboard/wsp", bundleId: "wsp", handler() {} });
+  registerPanel({ id: "wsp-mcp", name: "wsp-mcp", route: "/dashboard/wsp-mcp", bundleId: "wsp-mcp", handler() {} });
+  const installed = join(HOME, "installed.json");
+  const before = JSON.parse(readFileSync(installed, "utf8"));
+  writeFileSync(installed, JSON.stringify([...before, { id: "wsp" }, { id: "wsp-mcp" }]));
+  _resetCatalogCache();
+  try {
+    const ids = async (scope) => (await launcherFor(db, scope)).apps.map((a) => a.id).sort();
+    assert.deepEqual(await ids(scopeOf(P_EMPTY, "empty")), ["wsp"], "no grants: only the panel-only bundle");
+    assert.deepEqual(await ids(scopeOf(P_OWNED, "owned")), ["browser", "wsp"], "the grant still narrows mcpServers bundles");
+    assert.ok((await ids({ all: true })).includes("wsp-mcp"), "everything lists it");
+  } finally {
+    writeFileSync(installed, JSON.stringify(before));
+    _resetCatalogCache();
+  }
 });
 
 test("an unknown or archived slug is an empty project, not an error", async () => {

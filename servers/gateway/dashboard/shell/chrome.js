@@ -20,6 +20,7 @@ import { getPanel as registryGetPanel } from "../panel-registry.js";
 import { needsYouLabel } from "../panels/board/needs-you-label.js";
 import { forYouEnabled } from "../../for-you/flag.js";
 import { mailEnabled } from "../../mail/flag.js";
+import { hasFederatedBundleInstalled } from "../panels/fediverse.js";
 
 /**
  * For You's entry points are the OWNER's alone: the page 404s for every other session (an SSO
@@ -75,6 +76,15 @@ const MORE_ENTRIES = [
   { id: "ramble", fallback: "Ramble" },
   { id: "extensions", fallback: "Extensions" },
   { id: "model-catalog", fallback: "Models" },
+  { id: "contacts", fallback: "Contacts" },
+  { id: "files", fallback: "Files" },
+  { id: "blog", fallback: "Blog" },
+  { id: "skills", fallback: "Skills" },
+  { id: "metering", key: "nav.metering", fallback: "Usage" },
+  // Fediverse Admin has no nav.* translation: the label falls through to the
+  // registered panel's own manifest name ("Fediverse Admin"). It is listed only
+  // while a federated bundle is installed (the panel hides itself the same way).
+  { id: "fediverse", fallback: "Fediverse", when: () => hasFederatedBundleInstalled() },
   // The classic home. A bare /dashboard/nest sends a new-mode device to Chat,
   // so this way in asks for the nest explicitly (?open=1).
   { id: "nest", fallback: "Crow's Nest", route: "/dashboard/nest?open=1" },
