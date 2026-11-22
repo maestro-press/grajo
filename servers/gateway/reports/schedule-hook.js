@@ -117,6 +117,7 @@ import { registerSchedulerHook, unregisterSchedulerHook } from "../scheduler-hoo
 import { gatewayRunId } from "../run-id.js";
 import { modelRoleOfRecipe, verifyLive, REPORT_LIVE } from "./approvals.js";
 import { releaseLease, takeLease } from "./lease.js";
+import { repairDanglingSchedulePointers } from "./schedule-clear.js";
 import { executeRun, getRun, getScheduledRun, NOT_LIVE_TEXT, RESTARTED_TEXT, startRun, statusAuditOk } from "./run.js";
 import { claimRunRequests, pruneRunRequests } from "./run-requests.js";
 // The run statuses a send may start from. `send-log.js` owns the list and imports no mail module, so the
@@ -1092,6 +1093,10 @@ export function _setReportsHookForTest(hook) {
  * it never sweeps and never takes the lease. Nothing here looks at instance sync: `CROW_DISABLE_INSTANCE_SYNC=1`
  * is a sync setting, not a reports one.
  *
+ * Before the hook is registered, every report pointer that names no `schedules` row is nulled
+ * (`repairDanglingSchedulePointers` in schedule-clear.js): a repaired box says "no schedule" instead of
+ * naming a row nobody can reach, and the repair can never keep the hook from starting.
+ *
  * @param {{noAuth?: boolean, db?: object, deps?: object, dbFactory?: Function}} [opts]
  * @returns {Promise<{started: boolean, reason?: string, hook?: object, swept?: object}>}
  */
@@ -1106,6 +1111,15 @@ export async function startReportsAtBoot({ noAuth = false, db = null, deps = {},
       console.warn(`[reports] scheduler hook not started: ${err?.message || err}`);
       return { started: false, reason: "no-database" };
     }
+  }
+  // A report whose pointer names no schedule row has no schedule to run: the pointer is nulled here,
+  // before the hook starts, so the page says "no schedule" instead of naming a row nobody can reach.
+  // This repair never throws and answers 0 on a failure, so it can never keep the hook from starting.
+  try {
+    const repaired = await repairDanglingSchedulePointers(client);
+    if (repaired > 0) console.log(`[reports] cleared ${repaired} dangling schedule pointer(s)`);
+  } catch (err) {
+    console.warn(`[reports] the dangling schedule pointers were not repaired: ${err?.message || err}`);
   }
   try {
     const hook = registerReportsHook(client, deps);

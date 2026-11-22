@@ -30,7 +30,8 @@
  *
  * A report's schedule is the owner's too: `PUT /:id/schedule` writes the cron and the zone of its own
  * `schedules` row, and both are part of the live seal, so a change to either on a live report pauses it
- * with the same fixed sentence a live-set settings change leaves.
+ * with the same fixed sentence a live-set settings change leaves. `DELETE /:id/schedule` takes that row
+ * and the pointer to it away, and pauses a live report with the same sentence.
  *
  * THE CARD: `GET /:id/card` is the one read a report's card in a Perch chat is drawn from
  * (reports/card-view.js). It carries the full settings of everything the card offers to act on: a
@@ -61,6 +62,7 @@ import {
 import { buildApprovalsDeps } from "../reports/approvals-deps.js";
 import { buildReportCardView, computeReportChanges } from "../reports/card-view.js";
 import { deleteReport } from "../reports/delete.js";
+import { clearReportSchedule } from "../reports/schedule-clear.js";
 import { setReportSchedule } from "../reports/schedule-set.js";
 import { listRuns } from "../reports/run.js";
 import { approveSource, listDraftSources, revokeSource } from "../reports/source-approvals.js";
@@ -518,6 +520,19 @@ export function reportsApiRouter(dashboardAuth, deps = {}) {
       reportId: id,
       cron: body.cron,
       tz: body.tz,
+      actor: { kind: "owner" },
+    });
+    res.json({ report: await reportView(db, approvalsDeps, row) });
+  }));
+
+  // DELETE /:id/schedule — when the report runs: the owner takes its own `schedules` rows and the
+  // pointer to them away. The row id is inside the live seal, so a live report is paused here exactly
+  // as a schedule change pauses it, and only a fresh preview and go-live take it back to live.
+  router.delete(`${REPORTS_API_PREFIX}/:id/schedule`, route("DELETE /:id/schedule", async (db, req, res) => {
+    const id = idOf(req, res);
+    if (!id) return;
+    const row = await clearReportSchedule(db, approvalsDeps, {
+      reportId: id,
       actor: { kind: "owner" },
     });
     res.json({ report: await reportView(db, approvalsDeps, row) });
