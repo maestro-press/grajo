@@ -12,7 +12,7 @@ import { MAIL_ERROR_TEXT, MailError } from "../servers/gateway/mail/errors.js";
 import { createAccount } from "../servers/gateway/mail/store/accounts.js";
 import {
   ensureKeychainTable, ensureWriteKey, listEntries, saveServiceSecret, serviceSecretsFor, deleteEntry,
-  KeychainKeyMissingError,
+  deleteServiceSecret, REPORTS_BUNDLE, KeychainKeyMissingError,
 } from "../servers/gateway/keychain/store.js";
 import { loadKeychainKey } from "../servers/gateway/keychain/key.js";
 import {
@@ -328,6 +328,98 @@ test("deleteSecrets removes one account's rows and leaves another account's alon
   assert.equal(Number(left.rows[0].n), 0);
   assert.equal((await keychainRows(db)).length, 1);
   assertNoPlaintext(await keychainRows(db), PASSWORD, "refresh-alex");
+});
+
+/* --------------------------------------------- one key, and the guards around it */
+
+// Plan 5's review round: `deleteSecret` is a write like any other, so its three guards are pinned
+// directly — a shape it does not accept, a key that is not one of the four, and a connection uuid a
+// row of ANOTHER bundle also sits under. Nothing is deleted by any of them.
+test("deleteSecret refuses a bad account id and an unknown key, and deletes nothing", async () => {
+  const db = await freshDb();
+  const credentials = createMailCredentials({ db, crowHome: freshHome() });
+  const account = await createAccount(db, accountInput(ALEX));
+  await credentials.saveSecret(account.id, "MAIL_PASSWORD", PASSWORD);
+  const before = await keychainRows(db);
+
+  for (const id of ["", "not-an-id", "ma-XYZ", account.id + " ", null, 42]) {
+    await assert.rejects(credentials.deleteSecret(id, "MAIL_PASSWORD"), mailCode("BAD_INPUT"), JSON.stringify(id));
+  }
+  for (const key of ["IMAP_PASSWORD", "MAIL_OAUTH_CLIENT", "mail_password", " MAIL_PASSWORD", null, 7]) {
+    await assert.rejects(credentials.deleteSecret(account.id, key), mailCode("BAD_INPUT"), JSON.stringify(key));
+  }
+  await assert.rejects(credentials.deleteSecret(account.id), mailCode("BAD_INPUT"), "a missing key is BAD_INPUT");
+  assert.deepEqual(await keychainRows(db), before, "every guard refused before anything was deleted");
+  assert.deepEqual(await credentials.getSecrets(account.id), { MAIL_PASSWORD: PASSWORD });
+});
+
+test("deleteSecret refuses an id whose keychain row belongs to another bundle, and deletes nothing", async () => {
+  const db = await freshDb();
+  const home = freshHome();
+  const credentials = createMailCredentials({ db, crowHome: home });
+  const account = await createAccount(db, accountInput(ALEX));
+  // A row of another bundle that happens to sit on the same connection uuid: mail does not own it.
+  const key = await ensureWriteKey(db, { crowHome: home });
+  await saveServiceSecret(db, key, {
+    connectionUuid: account.id,
+    bundleId: REPORTS_BUNDLE,
+    envKey: "MAIL_PASSWORD",
+    label: "Reports: weekly",
+    secret: "another-bundle-secret",
+  });
+  const before = await keychainRows(db);
+  assert.equal(before.length, 1, "the foreign row is there");
+
+  await assert.rejects(credentials.deleteSecret(account.id, "MAIL_PASSWORD"), mailCode("BAD_INPUT"));
+  await assert.rejects(credentials.deleteSecrets(account.id), mailCode("BAD_INPUT"));
+  await assert.rejects(credentials.getSecrets(account.id), mailCode("BAD_INPUT"));
+  await assert.rejects(credentials.saveSecret(account.id, "MAIL_PASSWORD", PASSWORD), mailCode("BAD_INPUT"));
+
+  assert.deepEqual(await keychainRows(db), before, "the other bundle's row was never read, replaced or removed");
+  assertNoPlaintext(await keychainRows(db), "another-bundle-secret");
+});
+
+test("deleteSecret removes one key of one account, is idempotent, and leaves every other row alone", async () => {
+  const db = await freshDb();
+  const credentials = createMailCredentials({ db, crowHome: freshHome() });
+  const alex = await createAccount(db, accountInput(ALEX));
+  const sam = await createAccount(db, accountInput(SAM));
+  await credentials.saveSecret(alex.id, "MAIL_REFRESH_TOKEN", "refresh-alex");
+  await credentials.saveSecret(alex.id, "MAIL_OAUTH_CLIENT_ID", CLIENT_ID);
+  await credentials.saveSecret(alex.id, "MAIL_OAUTH_CLIENT_SECRET", CLIENT_SECRET);
+  await credentials.saveSecret(sam.id, "MAIL_OAUTH_CLIENT_SECRET", SAM_CLIENT_SECRET);
+
+  // The one a re-keyed grant drops: the old registration's client secret.
+  assert.deepEqual(await credentials.deleteSecret(alex.id, "MAIL_OAUTH_CLIENT_SECRET"), { deleted: 1 });
+  assert.deepEqual(await credentials.getSecrets(alex.id), {
+    MAIL_REFRESH_TOKEN: "refresh-alex",
+    MAIL_OAUTH_CLIENT_ID: CLIENT_ID,
+  }, "only the key named went");
+  assert.deepEqual(await credentials.getSecrets(sam.id), {
+    MAIL_OAUTH_CLIENT_SECRET: SAM_CLIENT_SECRET,
+  }, "another account's row of the same key is untouched");
+  assert.deepEqual(await credentials.deleteSecret(alex.id, "MAIL_OAUTH_CLIENT_SECRET"), { deleted: 0 }, "idempotent");
+  assert.deepEqual(await credentials.deleteSecret(alex.id, "MAIL_PASSWORD"), { deleted: 0 }, "a key it never had");
+  assertNoPlaintext(await keychainRows(db), CLIENT_SECRET, SAM_CLIENT_SECRET);
+});
+
+test("the store's one-key delete is scoped to the bundle, so a row another bundle owns is never removed", async () => {
+  const db = await freshDb();
+  const home = freshHome();
+  const key = await ensureWriteKey(db, { crowHome: home });
+  const uuid = "ma-0123456789abcdef";
+  await saveServiceSecret(db, key, { connectionUuid: uuid, bundleId: MAIL_BUNDLE_ID, envKey: "MAIL_PASSWORD", label: "Mail", secret: PASSWORD });
+  await saveServiceSecret(db, key, { connectionUuid: "svc-0123456789abcdef", bundleId: REPORTS_BUNDLE, envKey: "MAIL_PASSWORD", label: "Reports", secret: "report-secret" });
+
+  // The bundle is part of the WHERE: named as another bundle's, this delete finds nothing at all.
+  assert.deepEqual(await deleteServiceSecret(db, uuid, "MAIL_PASSWORD", { bundleId: REPORTS_BUNDLE }), { deleted: 0 });
+  assert.equal((await keychainRows(db)).length, 2, "nothing was removed by a delete for another bundle");
+  // The mail row itself is removed once, and the other bundle's own row stays.
+  assert.deepEqual(await deleteServiceSecret(db, uuid, "MAIL_PASSWORD"), { deleted: 1 });
+  assert.deepEqual(await deleteServiceSecret(db, uuid, "MAIL_PASSWORD"), { deleted: 0 }, "idempotent");
+  const left = (await keychainRows(db)).map((row) => [row.bundle_id, row.connection_uuid]);
+  assert.deepEqual(left, [[REPORTS_BUNDLE, "svc-0123456789abcdef"]], "the other bundle's row is still there");
+  assertNoPlaintext(await keychainRows(db), PASSWORD, "report-secret");
 });
 
 /* ------------------------------------------------------------------- authFor */

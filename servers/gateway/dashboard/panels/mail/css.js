@@ -164,7 +164,45 @@ const SETTINGS_RULES = `
   .ml-danger {
     display: flex; flex-direction: column; align-items: flex-start; gap: 8px; min-width: 0;
     padding-top: 8px; border-top: 1px solid var(--crow-border);
-  }`;
+  }
+  /* The Gmail and Microsoft setup cards (plan 5, Task 5): one card per provider, each path inside it,
+     the numbered steps, the redirect address with its Copy control, the tick a passed check shows and
+     the line a refusal is written into. Every control is a 44 px target and nothing sets a fixed
+     width, so the cards never make the page scroll sideways on a phone. */
+  .ml-wizard { gap: 12px; }
+  .ml-card-subtitle { margin: 0; min-width: 0; font-size: 0.95rem; font-weight: 700; line-height: 1.3; overflow-wrap: anywhere; }
+  .ml-wizard-path { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .ml-wizard-path[hidden] { display: none; }
+  .ml-wizard-steps { margin: 0; padding-inline-start: 1.25rem; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .ml-wizard-step { min-width: 0; font-size: 0.9rem; line-height: 1.45; overflow-wrap: anywhere; }
+  .ml-wizard-step-text { min-width: 0; overflow-wrap: anywhere; }
+  .ml-wizard-uri {
+    display: inline-block; min-width: 0; max-width: 100%; padding: 2px 6px; box-sizing: border-box;
+    border-radius: 6px; background: var(--crow-bg-elevated); color: var(--crow-text-primary);
+    font-family: inherit; font-size: 0.85rem; overflow-wrap: anywhere;
+  }
+  .ml-wizard-copy { min-height: 44px; padding: 0 12px; font-size: 0.85rem; }
+  .ml-wizard-link { color: var(--crow-accent); font-size: 0.9rem; overflow-wrap: anywhere; }
+  .ml-wizard-form { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .ml-wizard-tick { font-size: 1rem; font-weight: 700; color: var(--crow-accent); }
+  .ml-wizard-tick[hidden] { display: none; }
+  /* The passed check's own word (N1), beside the tick's glyph: the glyph is the mark, the sentence is
+     what a screen reader (and anyone reading the line) is told. */
+  .ml-tick-glyph { margin-inline-end: 6px; }
+  .ml-tick-said { font-size: 0.9rem; font-weight: 600; color: var(--crow-text-primary); }
+  /* The Copy control's answer (N2), right after the control, hidden until a copy really happened. */
+  .ml-copy-said { display: inline-block; margin-inline-start: 6px; font-size: 0.85rem; color: var(--crow-text-secondary); }
+  .ml-copy-said[hidden] { display: none; }
+  .ml-wizard-check { color: var(--crow-text-primary); }
+  .ml-wizard-check[hidden] { display: none; }
+  .ml-wizard-status { font-weight: 600; }
+  /* The reconnect block (plan 5, Task 6): the banner a due grant carries, its button and the line a
+     refused sign-in is written into. The Copy control's own tick sits beside it, never on the card. */
+  .ml-reconnect { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; min-width: 0; }
+  .ml-copy-tick { margin-inline-start: 6px; }
+  /* The Copy control's tick paints its own glyph, so the step's text stays the approved sentence. */
+  .ml-copy-tick::before { content: "\\2713"; }
+  .ml [data-ml-no-address] { gap: 8px; }"`;
 
 /**
  * @param {{inbox?: boolean, message?: boolean, settings?: boolean}} options `inbox` adds the list

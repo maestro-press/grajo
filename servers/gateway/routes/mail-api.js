@@ -36,25 +36,35 @@
  */
 import { Router, json as jsonParserOf } from "express";
 import { createDbClient } from "../../db.js";
-import { cleanPeerName } from "../../shared/peer-label.js";
 import { recordServiceSecretValues } from "../../shared/secret-values.js";
 import { withoutWriteContext } from "../../shared/history/write-context.js";
 import { isLocalPasswordSessionOn } from "../dashboard/local-session.js";
-import { getInstance, getOrCreateLocalInstanceId } from "../instance-registry.js";
 import { createImapSmtpAdapter } from "../mail/adapter/imap-smtp.js";
 import { accountsOverview } from "../mail/accounts-overview.js";
-import { checkClaim, claimedElsewhereSentence, releaseClaim, writeClaim } from "../mail/claims.js";
-import { createMailCredentials, createRotationWriter } from "../mail/credentials.js";
-import { MailError, MAIL_ERROR_TEXT, toMailError } from "../mail/errors.js";
+import {
+  claimsFor,
+  connectAccount,
+  credentialsFor,
+  isDuplicateAddress,
+  localInstanceFor,
+  logCode,
+  startBackgroundSync,
+} from "../mail/accounts/connect.js";
+import { claimedElsewhereSentence } from "../mail/claims.js";
+import { createRotationWriter } from "../mail/credentials.js";
+import { MailError, MAIL_ERROR_TEXT } from "../mail/errors.js";
 import { mailEnabled } from "../mail/flag.js";
-import { probeAccount } from "../mail/probe.js";
-import { createAccount, deleteAccount, getAccount, listAccounts, updateAccount, MAIL_SENT_COPY_VALUES } from "../mail/store/accounts.js";
+import { presetFor } from "../mail/providers/presets.js";
+import { deleteOauthMeta } from "../mail/oauth/meta.js";
+import { createFlowStore } from "../mail/oauth/state.js";
+import { deleteAccount, getAccount, listAccounts, updateAccount, MAIL_SENT_COPY_VALUES } from "../mail/store/accounts.js";
 import { listFolders } from "../mail/store/messages.js";
 import { readSetting, writeSetting } from "../dashboard/settings/registry.js";
 import { SKIP_SPECIAL_USE } from "../mail/sync/engine.js";
 import { registerActionRoutes } from "./mail-api-actions.js";
 import { registerDraftRoutes } from "./mail-drafts-api.js";
 import { registerMessageRoutes } from "./mail-api-messages.js";
+import { registerOauthRoutes } from "./mail-api-oauth.js";
 import { registerReaderRoutes } from "./mail-api-reader.js";
 
 /** The mount point. The gateway's global JSON parser skips this prefix (see index.js `_hasOwnParser`). */
@@ -85,6 +95,8 @@ const FIXED_TEXT = Object.freeze({
   bad_input: "That request is not valid.",
   duplicate_address: "That address is already connected on this Crow.",
   keychain_key_missing: "The keychain key for this password is not on this machine.",
+  // Plan 5: an OAuth account is made by the sign-in wizard's callback, never by the connect route.
+  oauth_via_wizard: "OAuth accounts are connected through Crow's sign-in wizard.",
   internal: "Something went wrong.",
 });
 
@@ -154,18 +166,11 @@ function sendMailError(res, err) {
   sendError(res, STATUS_BY_CODE[err.code] ?? 500, err.code);
 }
 
-/** A route's failure in the log: the code only, so no value can travel with it. */
-function logCode(route, err) {
-  try {
-    console.warn(`[mail-api] ${route}: ${toMailError(err).code}`);
-  } catch {
-    // A log line is never worth failing a request over.
-  }
-}
-
 /* ------------------------------------------------------------- validation */
 
-function cleanText(value, max) {
+/** A trimmed, bounded, control-character-free string, or null. Exported so the OAuth wizard's own
+ *  field checks agree with this router's on what "clean" means. */
+export function cleanText(value, max) {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   if (!trimmed || trimmed.length > max || CONTROL_CHARS_RE.test(trimmed)) return null;
@@ -173,7 +178,7 @@ function cleanText(value, max) {
 }
 
 /** One plain mailbox address: one `@`, no whitespace, no control characters, no angle brackets. */
-function readPlainAddress(value) {
+export function readPlainAddress(value) {
   if (typeof value !== "string") return null;
   const address = value.trim().toLowerCase();
   if (!address || address.length > ADDRESS_MAX) return null;
@@ -192,6 +197,43 @@ function readEndpoint(value) {
   return { host, port: value.port, security: value.security };
 }
 
+/**
+ * The body's `authKind`, or null when it names one this Crow does not know. Absent (or empty) is
+ * `password`, the only kind this route can make: an OAuth account arrives through the wizard's own
+ * callback (plan 5), so `xoauth2` here is answered `oauth_via_wizard` rather than half-connected.
+ */
+function readConnectAuthKind(body) {
+  if (body == null || typeof body !== "object" || Array.isArray(body)) return null;
+  const raw = body.authKind;
+  if (raw === undefined || raw === null || raw === "") return "password";
+  if (raw === "password" || raw === "xoauth2") return raw;
+  return null;
+}
+
+/**
+ * The provider preset a password connect names, or null when it names none.
+ *
+ * Plan 5's Gmail card sends the address, the app password and the preset's id and nothing else: a
+ * preset's endpoints and its Sent-copy rule are the preset's own, so neither the page nor its client
+ * script carries a host or a port, and the wizard cannot disagree with `presets.js`. A named preset
+ * must be the one the ADDRESS belongs to (Gmail named for a Microsoft address is `bad_input`), must
+ * itself take a password, and must offer both endpoints — `generic` offers none, so it is never
+ * named this way.
+ *
+ * @param {object} body the request's body
+ * @param {string} address the already-normalised mailbox address
+ * @returns {object|null} one of PRESETS, or null
+ */
+function readConnectPreset(body, address) {
+  const named = typeof body?.provider === "string" ? body.provider.trim() : "";
+  if (named === "") return null;
+  const own = presetFor(address);
+  if (!own || own.id !== named) return null;
+  if (!own.authKinds.includes("password")) return null;
+  if (!own.imap || !own.smtp) return null;
+  return own;
+}
+
 /** The connect body, or null. The account store validates it again; this is what keeps a probe from
  *  being opened for a shape the store would refuse. */
 function readAccountInput(body) {
@@ -200,6 +242,10 @@ function readAccountInput(body) {
   if (!label) return null;
   const address = readPlainAddress(body.address);
   if (!address) return null;
+  // A named preset is optional: without one, both endpoints must be in the body, exactly as before.
+  const namesPreset = typeof body.provider === "string" && body.provider.trim() !== "";
+  const preset = namesPreset ? readConnectPreset(body, address) : null;
+  if (namesPreset && !preset) return null;
   let username = null;
   if (body.username !== undefined && body.username !== null && body.username !== "") {
     if (typeof body.username !== "string") return null;
@@ -209,10 +255,17 @@ function readAccountInput(body) {
   }
   const password = body.password;
   if (typeof password !== "string" || password === "" || password.length > PASSWORD_MAX) return null;
-  const imap = readEndpoint(body.imap);
-  const smtp = readEndpoint(body.smtp);
+  const imap = readEndpoint(body.imap) ?? (preset ? { ...preset.imap } : null);
+  const smtp = readEndpoint(body.smtp) ?? (preset ? { ...preset.smtp } : null);
   if (!imap || !smtp) return null;
-  return { label, address, username, password, imap, smtp };
+  const input = { label, address, username, password, imap, smtp };
+  // A preset a caller named is stored on the account with its own Sent-copy rule: the wizard path's
+  // "app password first" must end in an account that files its Sent copy the provider's way.
+  if (preset) {
+    input.provider = preset.id;
+    input.sentCopy = preset.sentCopy;
+  }
+  return input;
 }
 
 /** The settings body, or null on an unknown key or a value of the wrong type. */
@@ -324,63 +377,6 @@ async function mailSettingsView(db) {
   };
 }
 
-function isDuplicateAddress(err) {
-  return err instanceof MailError && err.code === "BAD_INPUT" && err.detail === "address";
-}
-
-/**
- * Is this address already connected here? The same identity the store's UNIQUE COLLATE NOCASE column
- * enforces, checked before anything is dialled: a second account for one mailbox is the owner's input,
- * not a server's verdict, so the probe at the far end of the world need not be asked at all.
- */
-async function addressTaken(db, address) {
-  const wanted = String(address).trim().toLowerCase();
-  for (const account of await listAccounts(db)) {
-    if (String(account.address).trim().toLowerCase() === wanted) return true;
-  }
-  return false;
-}
-
-/** This instance's id and the name its own registry row carries (never an address or a mailbox host). */
-async function defaultLocalInstance(db) {
-  const instanceId = getOrCreateLocalInstanceId();
-  let instanceName = "";
-  try {
-    const row = await getInstance(db, instanceId);
-    instanceName = cleanPeerName(row?.name);
-  } catch {
-    instanceName = "";
-  }
-  return { instanceId, instanceName };
-}
-
-function localInstanceFor(db, deps) {
-  if (typeof deps.localInstance === "function") return deps.localInstance(db);
-  if (deps.localInstance != null) return Promise.resolve(deps.localInstance);
-  return defaultLocalInstance(db);
-}
-
-function credentialsFor(db, deps) {
-  if (deps.credentials != null) return deps.credentials;
-  return createMailCredentials({ db });
-}
-
-/**
- * The claim code this router calls, or a test's own stand-in: the same seam `credentials` and
- * `adapterFactory` use. A partial stand-in falls back to the real function it does not replace.
- */
-const REAL_CLAIMS = Object.freeze({ checkClaim, writeClaim, releaseClaim });
-
-function claimsFor(deps) {
-  const claims = deps.claims;
-  if (claims == null) return REAL_CLAIMS;
-  return {
-    checkClaim: typeof claims.checkClaim === "function" ? claims.checkClaim : checkClaim,
-    writeClaim: typeof claims.writeClaim === "function" ? claims.writeClaim : writeClaim,
-    releaseClaim: typeof claims.releaseClaim === "function" ? claims.releaseClaim : releaseClaim,
-  };
-}
-
 /**
  * The adapter factory the routes use when boot provided none.
  *
@@ -466,44 +462,6 @@ function supervisorFor(deps) {
 }
 
 /**
- * A sync outlives the request that asked for it, so it is opened with no write context: otherwise
- * every row it wrote later would be attributed to the sign-in that happened to click Connect (see the
- * `withoutWriteContext` note in servers/gateway/dashboard/auth.js). Its failure is the supervisor's to
- * report, not this route's.
- */
-function startBackgroundSync(deps, accountId) {
-  const supervisor = supervisorFor(deps);
-  if (!supervisor || typeof supervisor.syncNow !== "function") return;
-  withoutWriteContext(() => {
-    Promise.resolve()
-      .then(() => supervisor.syncNow(accountId))
-      .catch((err) => logCode("background_sync", err));
-  });
-}
-
-/** Undo a connect that could not be finished: the secret, then the account. Best effort, code-logged. */
-async function undoConnect(db, credentials, accountId) {
-  try {
-    await credentials.deleteSecrets(accountId);
-  } catch (err) {
-    logCode("undo_secret", err);
-  }
-  try {
-    await deleteAccount(db, accountId);
-  } catch (err) {
-    logCode("undo_account", err);
-  }
-}
-
-async function releaseClaimQuietly(claims, db, address, localInstanceId) {
-  try {
-    await claims.releaseClaim(db, address, { localInstanceId });
-  } catch (err) {
-    logCode("undo_claim", err);
-  }
-}
-
-/**
  * Retire the account's sync worker BEFORE its rows go, and wait for it: the worker's run, timers,
  * watcher and both of its connections are gone by the time this resolves, so nothing of the deleted
  * account can write an orphan folder, message or sync state afterwards, or send a notice about it.
@@ -562,12 +520,18 @@ function endRemovalFor(deps, accountId, started) {
  *   credentials?: object, claims?: {checkClaim?: Function, writeClaim?: Function, releaseClaim?: Function},
  *   localInstance?: object|Function, tokenProvider?: Function,
  *   tokenProviderFor?: (accountId: string) => Function|null, forgetTokenProvider?: Function,
- *   recordSecrets?: Function, ownerCheck?: Function}} [deps]
+ *   recordSecrets?: Function, ownerCheck?: Function, flowStore?: object,
+ *   oauthAdapterFactory?: Function, fetchImpl?: Function, endpoints?: {tokenUrl?: string},
+ *   now?: () => number}} [deps]
  *   `openDb` mints the request's crow.db client; `recordSecrets(values)` records masked values and
  *   defaults to `recordServiceSecretValues`; `ownerCheck` defaults to `isLocalPasswordSessionOn`;
  *   `tokenProviderFor` is the boot registry's per-account provider (a single `tokenProvider` is the
  *   older, one-for-every-account seam) and `forgetTokenProvider(accountId)` drops one on removal;
- *   `claims` replaces the claim code (any function it leaves out stays the real one).
+ *   `claims` replaces the claim code (any function it leaves out stays the real one). Plan 5's OAuth
+ *   wizard adds its own seams: `flowStore` (this router instance's in-memory state store — a test may
+ *   inject one, and its clock), `oauthAdapterFactory` (the OAuth probe's adapter, a TEST seam),
+ *   `fetchImpl` (the OAuth transport, `globalThis.fetch` by default) and `endpoints` (TEST ONLY: the
+ *   loopback token URL `mail/oauth/flow.js` accepts).
  * @returns {import("express").Router}
  */
 export function mailApiRouter(dashboardAuth, deps = {}) {
@@ -578,6 +542,10 @@ export function mailApiRouter(dashboardAuth, deps = {}) {
   // 64KB is generous for a connect (an address, two endpoints, a password) and small enough that a
   // mailbox body never travels through this route. The 413 and the 400 are this router's own.
   const jsonParser = jsonParserOf({ limit: "64kb" });
+  // Plan 5's OAuth flow store: one per router instance, in memory only (D1 — a restart during sign-in
+  // just means starting again). Every state token, PKCE verifier and pending client secret lives here
+  // and nowhere else until the callback has spent it.
+  const flowStore = deps.flowStore ?? createFlowStore();
 
   /** One client per request, closed in `finally`; a handler that throws answers its MailError code. */
   const route = (label, handler) => async (req, res) => {
@@ -694,75 +662,43 @@ export function mailApiRouter(dashboardAuth, deps = {}) {
     res.json(await mailSettingsView(db));
   }));
 
-  // POST /accounts — a duplicate is refused before anything dials, the probe comes before anything is
-  // stored, then one claim; a claim that is lost afterwards is undone whole, so an address is never
-  // half-connected.
+  // POST /accounts — one password account. The sequence itself is `connectAccount`
+  // (mail/accounts/connect.js), so plan 5's OAuth callback runs the same one: a duplicate is refused
+  // before anything dials, the probe comes before anything is stored, then one claim; a claim that is
+  // lost afterwards is undone whole, so an address is never half-connected. An address another
+  // instance holds — or a claim lost to one — answers 409 naming it; a duplicate answers
+  // `duplicate_address`.
   router.post(`${MAIL_API_PREFIX}/accounts`, route("POST /accounts", async (db, req, res) => {
+    const authKind = readConnectAuthKind(req.body);
+    if (authKind === null) return sendError(res, 400, "bad_input");
+    // OAuth arrives through the wizard's own callback (plan 5), never as a password-shaped body here.
+    if (authKind === "xoauth2") return sendError(res, 400, "oauth_via_wizard");
     const input = readAccountInput(req.body);
     if (!input) return sendError(res, 400, "bad_input");
-    // Before the probe and before the secret is even masked: one mailbox is one account here, and the
-    // store's own identity rule (lower-cased) is this rule.
-    if (await addressTaken(db, input.address)) return sendError(res, 409, "duplicate_address");
-    const local = await localInstanceFor(db, deps);
-
-    // The new password joins the masking set before any path can write it to a log. A recorder that
-    // cannot write its file is logged by code and must not fail the connect or echo the value.
-    try {
-      await recordSecrets([input.password]);
-    } catch (err) {
-      logCode("record_secret", err);
-    }
-
-    const claims = claimsFor(deps);
-    const claim = await claims.checkClaim(db, input.address, { localInstanceId: local.instanceId });
-    if (!claim.ok) return sendError(res, 409, "CLAIMED_ELSEWHERE", claimedElsewhereSentence(claim.instanceName));
-
-    // Before anything is stored: a refused sign-in leaves no account, no secret and no claim behind.
-    await probeAccount({
-      adapterFactory: adapterFactoryFor(deps),
-      account: probeRow(input),
-      credentials: probeCredentials(input.password),
-    });
 
     let account;
     try {
-      account = await createAccount(db, {
-        label: input.label,
-        address: input.address,
-        username: input.username,
-        authKind: "password",
-        imap: input.imap,
-        smtp: input.smtp,
+      account = await connectAccount(db, {
+        ...deps,
+        // The factory this request's probe would use: the caller's, else the runtime boot published,
+        // else the real adapter — the same precedence every other mail route reads.
+        adapterFactory: adapterFactoryFor(deps),
+        // A value, not a lookup: a connect with no supervisor running still connects, and just starts
+        // no background sync.
+        supervisor: supervisorFor(deps),
+      }, {
+        draft: input,
+        authKind,
+        secrets: { MAIL_PASSWORD: input.password },
       });
     } catch (err) {
       if (isDuplicateAddress(err)) return sendError(res, 409, "duplicate_address");
+      if (err instanceof MailError && err.code === "CLAIMED_ELSEWHERE") {
+        return sendError(res, 409, "CLAIMED_ELSEWHERE", claimedElsewhereSentence(err.instanceName));
+      }
       throw err;
     }
 
-    const credentials = credentialsFor(db, deps);
-    // The re-check belongs to this same failure handling: a claim written a moment ago can still lose
-    // to one another instance wrote concurrently (the winner is computed from the whole set), and the
-    // re-check itself can fail — a DB fault there must undo the connect too, never leave the account,
-    // its secret and the claim behind as a half-connected address peers see as held here.
-    let after;
-    try {
-      await credentials.saveSecret(account.id, "MAIL_PASSWORD", input.password);
-      await claims.writeClaim(db, input.address, { localInstanceId: local.instanceId, instanceName: local.instanceName });
-      after = await claims.checkClaim(db, input.address, { localInstanceId: local.instanceId });
-    } catch (err) {
-      await undoConnect(db, credentials, account.id);
-      await releaseClaimQuietly(claims, db, input.address, local.instanceId);
-      throw err;
-    }
-
-    // A lost claim: nothing of this connect may remain.
-    if (!after.ok) {
-      await undoConnect(db, credentials, account.id);
-      await releaseClaimQuietly(claims, db, input.address, local.instanceId);
-      return sendError(res, 409, "CLAIMED_ELSEWHERE", claimedElsewhereSentence(after.instanceName));
-    }
-
-    startBackgroundSync(deps, account.id);
     res.status(201).json({ account: accountSummary(account) });
   }));
 
@@ -781,10 +717,11 @@ export function mailApiRouter(dashboardAuth, deps = {}) {
   // timers, watcher and both of its connections are gone before the rows are touched), then the cached
   // OAuth provider is retired and AWAITED (before the rows and the sealed secrets, so a refresh in
   // flight starts no new write and one already on its way has landed before the secrets go), then the
-  // rows, the secret and the claim; the mark goes in a `finally`, so a delete that fails still frees the
-  // id. A keychain or claim failure after the row is gone is logged by code: the secret of a deleted
-  // account is never served again, and a claim row that cannot be tombstoned still expires with this
-  // instance's liveness.
+  // rows, the secret, the OAuth meta and the claim; the mark goes in a `finally`, so a delete that
+  // fails still frees the id. A keychain, meta or claim failure after the row is gone is logged by
+  // code: the secret of a deleted account is never served again, a label left behind names an id
+  // nothing owns, and a claim row that cannot be tombstoned still expires with this instance's
+  // liveness.
   router.delete(`${MAIL_API_PREFIX}/accounts/:id`, route("DELETE /accounts/:id", async (db, req, res) => {
     const id = String(req.params.id);
     if (!MAIL_ACCOUNT_ID_RE.test(id)) return sendError(res, 404, "not_found");
@@ -807,7 +744,18 @@ export function mailApiRouter(dashboardAuth, deps = {}) {
       } catch (err) {
         logCode("delete_secret", err);
       }
-      await releaseClaimQuietly(claimsFor(deps), db, account.address, local.instanceId);
+      // Plan 5's grant label goes with the account it describes. It is not a secret and nothing reads
+      // one for a removed account, so a failure here is logged by code and never fails the delete.
+      try {
+        await deleteOauthMeta(db, id);
+      } catch (err) {
+        logCode("delete_oauth_meta", err);
+      }
+      try {
+        await claimsFor(deps).releaseClaim(db, account.address, { localInstanceId: local.instanceId });
+      } catch (err) {
+        logCode("undo_claim", err);
+      }
       res.json({ ok: true, messages: removed.messages });
     } finally {
       endRemovalFor(deps, id, removalBegan);
@@ -823,12 +771,12 @@ export function mailApiRouter(dashboardAuth, deps = {}) {
     if (!account) return sendError(res, 404, "not_found");
     const supervisor = supervisorFor(deps);
     const started = Boolean(supervisor && typeof supervisor.syncNow === "function");
-    if (started) startBackgroundSync(deps, id);
+    if (started) startBackgroundSync(supervisor, id);
     res.status(started ? 202 : 200).json({ ok: true, started });
   }));
 
   const ctx = {
-    guards: { flag: flagGuard, owner: ownerGuard },
+    guards: { headers: guardHeaders, flag: flagGuard, owner: ownerGuard },
     openDb,
     credentials: (db) => credentialsFor(db, deps),
     supervisor: () => supervisorFor(deps),
@@ -841,6 +789,17 @@ export function mailApiRouter(dashboardAuth, deps = {}) {
     sendMailError,
     logCode,
     route,
+    // Plan 5's wizard: the store a `start` mints into and a `take` spends from, and the seams the two
+    // provider calls need. `endpoints` is the loopback-only TEST override; production never passes it.
+    flowStore,
+    oauth: {
+      fetchImpl: typeof deps.fetchImpl === "function" ? deps.fetchImpl : globalThis.fetch,
+      endpoints: deps.endpoints ?? null,
+      now: typeof deps.now === "function" ? deps.now : Date.now,
+      adapterFactory: typeof deps.oauthAdapterFactory === "function" ? deps.oauthAdapterFactory : null,
+      claims: deps.claims ?? null,
+      forgetTokenProvider: typeof deps.forgetTokenProvider === "function" ? deps.forgetTokenProvider : null,
+    },
   };
 
   // Task 20 fills the mailbox routes on this same router, with these same guards and helpers.
@@ -853,6 +812,9 @@ export function mailApiRouter(dashboardAuth, deps = {}) {
   // the same flag/owner/no-store/CSRF/64 KB chain (servers/gateway/index.js's `_hasOwnParser` already
   // hands every `/dashboard/mail/api/` path to this router's own parser).
   registerDraftRoutes(router, ctx);
+  // Plan 5's OAuth wizard routes and the callback (`/dashboard/mail/oauth/callback`, outside the API
+  // prefix and carrying the same guards itself), behind this same router's flag/owner/no-store chain.
+  registerOauthRoutes(router, ctx);
 
   return router;
 }
@@ -862,24 +824,6 @@ function isSkippedFolder(folder) {
   const specialUse = typeof folder.specialUse === "string" ? folder.specialUse : "";
   if (!specialUse) return false;
   return specialUse.split(/\s+/).some((token) => SKIPPED_SPECIAL_USE.has(token.trim().toLowerCase()));
-}
-
-/** The account row a probe connects: the values just typed, with no stored id behind them. */
-function probeRow(input) {
-  return {
-    id: "probe",
-    label: input.label,
-    address: input.address,
-    username: input.username,
-    authKind: "password",
-    imap: input.imap,
-    smtp: input.smtp,
-  };
-}
-
-/** The credentials reader a probe is handed: the password just typed, for that one connect. */
-function probeCredentials(password) {
-  return { getSecrets: async () => ({ MAIL_PASSWORD: password }) };
 }
 
 /** A body above 64KB is `too_large`; anything else the parser refuses is `bad_input`. Neither answer

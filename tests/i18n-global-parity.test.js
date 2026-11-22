@@ -150,6 +150,7 @@ const IDENTICAL_OK = new Set([
   "mail.scheduleTimeLabel", // operator copy not yet supplied
   "mail.draftSuggestReason", // a single placeholder: no words to translate
   "mail.draftAsk", // operator copy not yet supplied (the instruction a chosen bot is handed)
+  "mail.wizard.gmailTitle", // plan 5's C1: the provider's own name, the same word in both languages
 ]);
 
 const keys = Object.keys(translations);

@@ -6015,6 +6015,76 @@ export const translations = {
   "mail.draftSuggestReason": { en: "{project}", es: "{project}" },
   // The instruction a chosen bot's first turn is asked for (the turn route refuses an empty one).
   "mail.draftAsk": { en: "Draft a reply to this thread.", es: "Draft a reply to this thread." }, // operator copy not yet supplied
+  // Crow Mail's Gmail and Microsoft setup wizards (plan 5, Task 5), in the OPERATOR-APPROVED copy
+  // (C1-C26 and K3/K4, approved 2026-11-21). Every sentence here is that file's text verbatim, with
+  // the address a step names carried as {address}; nothing in this block is written or reworded here.
+  // The two cards' titles are the providers' own names (C1, C14), so C1 is identical in both
+  // languages and is one of the reviewed exceptions in tests/i18n-global-parity.test.js.
+  "mail.wizard.gmailTitle": { en: "Gmail", es: "Gmail" }, // a product name
+  "mail.wizard.gmailIntro": { en: "Two ways to connect Gmail. An app password is quicker. Signing in with Google takes longer to set up.", es: "Hay dos formas de conectar Gmail. Una contraseña de aplicación es más rápida. Iniciar sesión con Google lleva más tiempo de configurar." },
+  "mail.wizard.appPasswordTitle": { en: "Use an app password", es: "Usar una contraseña de aplicación" },
+  "mail.wizard.appPasswordStep1": { en: "Turn on 2-Step Verification for your Google account.", es: "Activa la verificación en dos pasos en tu cuenta de Google." },
+  "mail.wizard.appPasswordStep2": { en: "Open Google's app passwords page, create one, and name it Crow.", es: "Abre la página de contraseñas de aplicación de Google, crea una y llámala Crow." },
+  "mail.wizard.appPasswordLink": { en: "Open the app passwords page", es: "Abrir la página de contraseñas de aplicación" },
+  "mail.wizard.appPasswordStep3": { en: "Paste the 16-digit password here. Spaces don't matter.", es: "Pega aquí la contraseña de 16 dígitos. Los espacios no importan." },
+  "mail.wizard.fieldGmailAddress": { en: "Gmail address", es: "Dirección de Gmail" },
+  "mail.wizard.fieldAppPassword": { en: "App password", es: "Contraseña de aplicación" },
+  "mail.wizard.connect": { en: "Connect", es: "Conectar" },
+  "mail.wizard.appPasswordFailed": { en: "Google may not offer app passwords for this account. They need 2-Step Verification turned on, and they aren't available on work or school accounts, with security-key-only sign-in, or with Advanced Protection. Try signing in with Google below.", es: "Puede que Google no ofrezca contraseñas de aplicación para esta cuenta. Necesitan la verificación en dos pasos activada y no están disponibles en cuentas de trabajo o escuela, con inicio de sesión solo con llaves de seguridad ni con la Protección Avanzada. Prueba a iniciar sesión con Google más abajo." },
+  "mail.wizard.googleTitle": { en: "Sign in with Google", es: "Iniciar sesión con Google" },
+  "mail.wizard.googleIntro": { en: "You set this up once in your own Google Cloud project. Crow shows a check after each step.", es: "Esto se configura una vez en tu propio proyecto de Google Cloud. Crow muestra una comprobación después de cada paso." },
+  "mail.wizard.googleStep1": { en: "Create a project in the Google Cloud console.", es: "Crea un proyecto en la consola de Google Cloud." },
+  "mail.wizard.googleStep2": { en: "Set up the OAuth consent screen with the user type External.", es: "Configura la pantalla de consentimiento de OAuth con el tipo de usuario Externo." },
+  "mail.wizard.googleStep3": { en: "Add your own Google account as a test user.", es: "Añade tu propia cuenta de Google como usuario de prueba." },
+  "mail.wizard.googleStep4": { en: "Create an OAuth client of type Web application.", es: "Crea un cliente de OAuth del tipo Aplicación web." },
+  "mail.wizard.googleStep5": { en: "Add this redirect address to the client: {address} (Copy)", es: "Añade esta dirección de redirección al cliente: {address} (Copiar)" },
+  "mail.wizard.googleStep6": { en: "Paste the client ID and client secret here, then press Connect.", es: "Pega aquí el ID de cliente y el secreto de cliente y pulsa Conectar." },
+  "mail.wizard.copy": { en: "Copy", es: "Copiar" },
+  "mail.wizard.googleTestingNote": { en: "While your Google project is in Testing, Google ends the sign-in every 7 days. Crow reminds you to reconnect before that happens.", es: "Mientras tu proyecto de Google esté en modo de prueba, Google cierra la sesión cada 7 días. Crow te avisa para que vuelvas a conectar antes de que pase." },
+  "mail.wizard.fieldClientId": { en: "Client ID", es: "ID de cliente" },
+  "mail.wizard.fieldClientSecret": { en: "Client secret", es: "Secreto de cliente" },
+  "mail.wizard.microsoftTitle": { en: "Outlook.com or Microsoft 365", es: "Outlook.com o Microsoft 365" },
+  "mail.wizard.microsoftIntro": { en: "Microsoft accounts connect by signing in with Microsoft. You set this up once as an app registration in Microsoft Entra.", es: "Las cuentas de Microsoft se conectan iniciando sesión con Microsoft. Esto se configura una vez como un registro de aplicación en Microsoft Entra." },
+  "mail.wizard.microsoftStep1": { en: "Create an app registration in the Microsoft Entra admin center, for personal and work or school accounts.", es: "Crea un registro de aplicación en el centro de administración de Microsoft Entra, para cuentas personales y de trabajo o escuela." },
+  "mail.wizard.microsoftStep2": { en: "Add this redirect address to it: {address} (Copy)", es: "Añádele esta dirección de redirección: {address} (Copiar)" },
+  "mail.wizard.microsoftStep3": { en: "Add the permissions IMAP.AccessAsUser.All, SMTP.Send and offline_access.", es: "Añade los permisos IMAP.AccessAsUser.All, SMTP.Send y offline_access." },
+  "mail.wizard.microsoftStep4": { en: "Paste the application (client) ID here, then press Connect.", es: "Pega aquí el ID de aplicación (cliente) y pulsa Conectar." },
+  "mail.wizard.microsoftAdminNote": { en: "Many work and school organisations need an administrator to approve the app. If you see 'Need admin approval', ask your administrator.", es: "Muchas organizaciones de trabajo o escuela necesitan que un administrador apruebe la aplicación. Si ves 'Se necesita la aprobación del administrador', pregunta a tu administrador." },
+  "mail.wizard.microsoftSendingNote": { en: "Some organisations turn off sending from email apps, so sending may fail even when reading works.", es: "Algunas organizaciones desactivan el envío desde aplicaciones de correo, así que el envío puede fallar aunque la lectura funcione." },
+  "mail.wizard.noDashboardAddress": { en: "Set this machine's dashboard address first. Signing in with Google or Microsoft needs it. App passwords work without it.", es: "Primero configura la dirección del panel de este equipo. Iniciar sesión con Google o Microsoft la necesita. Las contraseñas de aplicación funcionan sin ella." },
+  "mail.wizard.openSetting": { en: "Open the setting", es: "Abrir el ajuste" },
+  "mail.wizard.connected": { en: "Connected. Crow is fetching your mail.", es: "Conectado. Crow está descargando tu correo." },
+  "mail.wizard.selftest": { en: "Send a test message", es: "Enviar un mensaje de prueba" },
+  "mail.wizard.selftestSent": { en: "Test message sent to yourself.", es: "Mensaje de prueba enviado a ti mismo." },
+  "mail.wizard.selftestFailed": { en: "The test message could not be sent.", es: "No se pudo enviar el mensaje de prueba." },
+  "mail.wizard.redirectMismatch": { en: "The redirect address does not match. Copy it again from this page into your app's settings.", es: "La dirección de redirección no coincide. Cópiala de nuevo desde esta página en los ajustes de tu aplicación." },
+  "mail.wizard.denied": { en: "You did not allow access.", es: "No permitiste el acceso." },
+  "mail.wizard.expired": { en: "This sign-in expired or was already used. Start again.", es: "Este inicio de sesión caducó o ya se usó. Empieza de nuevo." },
+  "mail.wizard.probeFailed": { en: "You signed in, but Crow could not open your mailbox. Nothing was saved.", es: "Iniciaste sesión, pero Crow no pudo abrir tu buzón. No se guardó nada." },
+  "mail.wizard.clientIdShape": { en: "That doesn't look like a Google client ID. It ends in .apps.googleusercontent.com.", es: "Eso no parece un ID de cliente de Google. Termina en .apps.googleusercontent.com." },
+  "mail.wizard.oauthFailed": { en: "Crow could not finish connecting this account. Nothing was saved.", es: "Crow no pudo terminar de conectar esta cuenta. No se guardó nada." },
+  "mail.wizard.oauthViaWizard": { en: "OAuth accounts are connected through Crow's sign-in wizard.", es: "Las cuentas OAuth se conectan con el asistente de inicio de sesión de Crow." },
+  // Plan 5's third and fourth approved cards (N1-N6, approved 2026-11-21), verbatim: the word a
+  // step's check says once it passed (drawn beside the tick, so a screen reader hears it), the word
+  // the Copy control says once it has copied, the callback status `oauth_no_refresh`, the Microsoft
+  // tenant field's label and hint, and the sentence that field shows when the value typed into it is
+  // not a directory (tenant) GUID or a domain name. N5 reuses rows that already ship: the mailbox
+  // field is `mail.fieldAddress` ("Address") and the client-id field is
+  // `mail.wizard.fieldClientId` (C13's "Client ID").
+  "mail.wizard.checkPassed": { en: "Looks right.", es: "Parece correcto." },
+  "mail.wizard.copied": { en: "Copied.", es: "Copiado." },
+  "mail.wizard.noRefresh": { en: "Google or Microsoft did not allow Crow to stay signed in. Nothing was saved. Start again.", es: "Google o Microsoft no permitieron que Crow siguiera con la sesión iniciada. No se guardó nada. Empieza de nuevo." },
+  "mail.wizard.tenantLabel": { en: "Directory (tenant) ID (optional)", es: "ID de directorio (inquilino) (opcional)" },
+  "mail.wizard.tenantHint": { en: "Leave empty unless your organisation's administrator gave you one.", es: "Déjalo vacío salvo que el administrador de tu organización te haya dado uno." },
+  // N6, the fourth card's one row: the tenant field's own refusal, in the field's line.
+  "mail.wizard.tenantInvalid": { en: "That doesn't look like a directory (tenant) ID. Leave it empty or paste the one your administrator gave you.", es: "Eso no parece un ID de directorio (inquilino). Déjalo vacío o pega el que te dio tu administrador." },
+  // Plan 5, Task 6's reconnect prompt, in the same operator-approved copy: C28's sentence and its
+  // button (the settings card of a grant Google will end), and C29, the sentence an OAuth account's
+  // card shows instead of the app-password one (its bell is the same sentence, in English, and lives
+  // in `mail/oauth/watch.js`).
+  "mail.wizard.reconnectSoon": { en: "Google will end this sign-in soon.", es: "Google cerrará pronto este inicio de sesión." },
+  "mail.wizard.reconnect": { en: "Reconnect", es: "Volver a conectar" },
+  "mail.statusAuthFailedOauth": { en: "The sign-in for this account stopped working. Reconnect to keep mail syncing.", es: "El inicio de sesión de esta cuenta dejó de funcionar. Vuelve a conectar para seguir sincronizando el correo." },
   // Bots can't read Crow's identity file (item-70 channel 3): the boot check's
   // bell. The body is a frame — the check appends its own findings (paths and
   // reasons only, never content) and the restart sentence.

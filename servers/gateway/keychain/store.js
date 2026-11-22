@@ -450,6 +450,29 @@ export async function deleteServiceSecrets(db, connectionUuid) {
   return { deleted: r.rowsAffected };
 }
 
+/**
+ * Removes ONE secret of one connection: the key a re-keyed grant no longer has (a fresh OAuth grant
+ * that names no client secret must not keep the old registration's). Idempotent; no key is needed,
+ * because nothing is unsealed.
+ *
+ * The delete is scoped to the BUNDLE as well as the connection uuid and the env key (Crow Mail's rows
+ * are `crow-mail`), so a row another bundle wrote under the same uuid is never removed by a mail
+ * re-key: the read and the upsert are by (kind, uuid, env key), so without this one a project
+ * connection whose uuid happened to equal an account id could lose its own secret here.
+ * `bundleId` is the caller's own id, defaulting to Crow Mail's, the only bundle this function serves.
+ */
+export async function deleteServiceSecret(db, connectionUuid, envKey, { bundleId = MAIL_BUNDLE } = {}) {
+  await ensureKeychainTable(db);
+  if (typeof connectionUuid !== "string" || connectionUuid === "") return { deleted: 0 };
+  if (typeof envKey !== "string" || envKey === "") return { deleted: 0 };
+  const bundle = typeof bundleId === "string" && bundleId !== "" ? bundleId : MAIL_BUNDLE;
+  const r = await db.execute({
+    sql: "DELETE FROM crow_keychain WHERE kind = 'service' AND connection_uuid = ? AND env_key = ? AND bundle_id = ?",
+    args: [connectionUuid, envKey, bundle],
+  });
+  return { deleted: r.rowsAffected };
+}
+
 export async function addManualSecret(db, key, { label, username = null, url = null, secret }) {
   await ensureKeychainTable(db);
   requireKey(key);

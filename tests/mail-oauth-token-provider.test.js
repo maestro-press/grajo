@@ -547,7 +547,10 @@ test("H2: a grant that dies OUTSIDE the supervisor is announced exactly once by 
     assert.equal(bells.length, 1, "exactly one bell");
     assert.equal(bells[0].source, "mail");
     assert.equal(bells[0].title, "Crow Mail cannot sign in");
-    assert.equal(bells[0].body, `Crow could not sign in to "Alex". Check the app password.`);
+    // Plan 5, Task 6: this account signs in with XOAUTH2, so its bell is C29 — never the sentence that
+    // sends the owner looking for an app password it does not have — and it names no address.
+    assert.equal(bells[0].body, "The sign-in for this account stopped working. Reconnect to keep mail syncing.");
+    assert.equal(bells[0].body.includes(ADDRESS), false, "the bell carries no address");
 
     // The following ticks ring nothing more: the account is already auth_failed.
     await clock.advance(POLL_MS * 3);

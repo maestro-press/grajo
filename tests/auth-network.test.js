@@ -1333,3 +1333,113 @@ test("auth-network: the Services Private switch refuses SSO, onhost and this-mac
     server.close();
   }
 });
+
+// Crow Mail (plan 5, Task 4b): the OAuth wizard's routes and the callback. The callback is the one
+// path a provider sends a browser to, so it is the one a Funnel-marked request could reach with a
+// session cookie attached: it is never a public path, the middleware refuses it, and the route refuses
+// it itself (even when CROW_DASHBOARD_PUBLIC has opened the gateway-wide middleware).
+test("rejectFunneled middleware: the OAuth wizard routes and the callback are never funnel-exposed", async () => {
+  const paths = [
+    "/dashboard/mail/oauth/callback?code=c&state=s",
+    "/dashboard/mail/api/oauth/redirect-uri",
+    "/dashboard/mail/api/oauth/check",
+    "/dashboard/mail/api/oauth/start",
+    "/dashboard/mail/api/accounts/ma-0123456789abcdef/selftest",
+  ];
+  const server = await startTestApp();
+  try {
+    const port = server.address().port;
+    for (const path of paths) {
+      const r = await request(port, path, { "tailscale-funnel-request": "?1" });
+      assert.equal(r.status, 403, `expected 403 on ${path}, got ${r.status}`);
+    }
+  } finally {
+    server.close();
+  }
+  const { isFunnelPublicPath, PUBLIC_FUNNEL_PREFIXES } = await import("../servers/gateway/funnel.js");
+  for (const path of paths) {
+    const bare = path.split("?")[0];
+    assert.equal(isFunnelPublicPath(bare), false, bare);
+    assert.ok(!PUBLIC_FUNNEL_PREFIXES.some((p) => bare.startsWith(p)), bare);
+  }
+  assert.ok(!PUBLIC_FUNNEL_PREFIXES.some((p) => "/dashboard/mail/oauth/callback".startsWith(p)),
+    "the callback is not public");
+  assert.equal(isFunnelPublicPath("/dashboard/mail/oauth/callback"), false);
+});
+
+// The callback's own guards, through the REAL owner rule: a Funnel-marked request and a peer's SSO
+// session (a dashboard session by the dashboard's own rule, and never the owner's) are refused BEFORE
+// `take()` — so no state token can be spent by a request that is not the owner's own browser.
+test("Crow Mail's OAuth callback refuses Funnel and a peer-SSO session before take() runs", async () => {
+  const { mailApiRouter } = await import("../servers/gateway/routes/mail-api.js");
+  const { markFromLaptop } = await import("./helpers/off-box.js");
+  const { createHash } = await import("node:crypto");
+  const hash = (t) => createHash("sha256").update(t).digest("hex");
+
+  const prev = { mail: process.env.CROW_MAIL, public: process.env.CROW_DASHBOARD_PUBLIC };
+  process.env.CROW_MAIL = "1";
+  delete process.env.CROW_DASHBOARD_PUBLIC;
+
+  const spent = { begin: 0, take: 0 };
+  const flowStore = {
+    begin() { spent.begin += 1; return "state"; },
+    take() { spent.take += 1; return null; },
+    size() { return 0; },
+  };
+  const SCOPES = new Map([
+    [hash("owner-session"), "dashboard"],
+    [hash("peer-sso-session"), "dashboard sso src:peer-1"],
+  ]);
+  const fakeDb = {
+    async execute(query) {
+      const args = query && typeof query === "object" ? (query.args ?? []) : [];
+      const scopes = SCOPES.get(args[0]);
+      return { rows: scopes ? [{ scopes }] : [] };
+    },
+    close() {},
+  };
+  const gate = (req, res, next) => {
+    const m = /(?:^|;\s*)crow_session=([^;]+)/.exec(req.headers.cookie || "");
+    if (!m) return res.status(401).json({ error: "unauthorized" });
+    req.dashboardSession = decodeURIComponent(m[1]);
+    markFromLaptop(req);
+    next();
+  };
+  const app = express();
+  // Every request is classified as coming from the owner's laptop: the callback is not under the API
+  // prefix, so the session stub above never sees it, and a loopback test socket would otherwise be
+  // "this machine" — which the owner rule refuses for a different reason.
+  app.use((req, _res, next) => { markFromLaptop(req); next(); });
+  app.use(mailApiRouter(gate, { openDb: () => fakeDb, flowStore }));
+  const server = await new Promise((resolve) => { const s = app.listen(0, "127.0.0.1", () => resolve(s)); });
+  const path = "/dashboard/mail/oauth/callback?code=c&state=s";
+  const cookie = (token) => ({ cookie: `crow_session=${token}` });
+  try {
+    const port = server.address().port;
+    // CROW_DASHBOARD_PUBLIC opens the gateway-wide Funnel middleware; the route still refuses.
+    process.env.CROW_DASHBOARD_PUBLIC = "true";
+    const funneled = await request(port, path, { "tailscale-funnel-request": "?1", ...cookie("owner-session") });
+    assert.equal(funneled.status, 403, "the callback refuses Funnel itself");
+    assert.equal(spent.take, 0, "and spends no state token");
+    delete process.env.CROW_DASHBOARD_PUBLIC;
+
+    const sso = await request(port, path, cookie("peer-sso-session"));
+    assert.equal(sso.status, 403, `a peer-SSO session is refused, got ${sso.status}`);
+    assert.equal(spent.take, 0, "take() was never called for a peer's session");
+
+    const anonymous = await request(port, path);
+    assert.equal(anonymous.status, 401, "no session at all is refused");
+    assert.equal(spent.take, 0, "and still spends nothing");
+
+    // The owner's own session reaches the flow store — the guards were the only refusal above.
+    const owner = await request(port, path, cookie("owner-session"));
+    assert.equal(owner.status, 302);
+    assert.equal(owner.location, "/dashboard/mail?view=settings&mailStatus=oauth_expired");
+    assert.equal(spent.take, 1, "take() runs only after the guards");
+    assert.equal(spent.begin, 0, "this test never started a flow");
+  } finally {
+    server.close();
+    if (prev.mail === undefined) delete process.env.CROW_MAIL; else process.env.CROW_MAIL = prev.mail;
+    if (prev.public === undefined) delete process.env.CROW_DASHBOARD_PUBLIC; else process.env.CROW_DASHBOARD_PUBLIC = prev.public;
+  }
+});

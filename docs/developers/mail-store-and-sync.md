@@ -26,6 +26,7 @@ hidden owner-only panel (see "The reader" below).
 | `servers/gateway/mail/thread-key.js` | thread assignment and merge rules |
 | `servers/gateway/mail/sanitize.js` | HTML sanitiser and the remote-image policy |
 | `servers/gateway/mail/store/{accounts,messages}.js` | the stores (libsql-style `db.execute({sql,args})`) |
+| `servers/gateway/mail/accounts/connect.js` | `connectAccount` / `reconnectAccount`: one account's row, sealed secrets and claim, or nothing |
 | `servers/gateway/mail/adapter/{interface,imap-smtp}.js` | the adapter contract and the imapflow/nodemailer implementation |
 | `servers/gateway/mail/sync/{engine,supervisor}.js` | one pass over a mailbox, and the per-account loops |
 | `servers/gateway/boot/mail-boot.js` | `startMailSync` / `stopMailSync` — the boot wiring |
@@ -34,6 +35,16 @@ hidden owner-only panel (see "The reader" below).
 Data flows one way: the **supervisor** decides when an account syncs; the **engine** lists folders,
 fetches UIDs and writes rows; the **store** owns every SQL statement; the **routes** read the store and
 never talk to a server except through the supervisor's short-lived adapter (`withAdapter`).
+
+An account is made in one place: `connectAccount(db, deps, {draft, secrets, authKind, tokenProvider})`
+in `mail/accounts/connect.js`. It refuses a duplicate address and an address another live instance
+holds, proves the sign-in with `probeAccount` before anything is stored, creates the row, seals every
+secret it was handed, writes the claim and re-checks it inside the same failure handling — a connect
+that loses that re-check, or fails anywhere after the row exists, removes the row AND every sealed
+secret and tombstones the claim. `reconnectAccount` is its sibling for an existing account: the same
+claim check and probe, then only the secrets are swapped, the row goes `active` and the worker is
+restarted. `POST /accounts` and (plan 5) the OAuth wizard's callback both call it, so neither can drift
+from the other.
 
 ## The flag
 
@@ -192,7 +203,8 @@ Consequences worth knowing:
   start and once a day — that refresh is how a peer paired *after* the claim was made ever receives it.
   A loser stops its watcher and timers, closes its connection and marks the account
   `claimed_elsewhere`; it is re-evaluated on each tick and restarts once the claim clears.
-- Claims are written when an account is connected (the `POST /accounts` route), not at boot.
+- Claims are written when an account is connected (`connectAccount` in `mail/accounts/connect.js`, which
+  the `POST /accounts` route and plan 5's OAuth callback both call), not at boot.
 - **Partial-mesh limit.** Convergence assumes every instance sees the same set of claims. There is no
   relay: with A–B and B–C paired but not A–C, A and C never see each other's claim rows and can both
   connect the same address. Clock skew is accepted too: an earlier `claimedAt` wins by design.

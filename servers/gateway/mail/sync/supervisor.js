@@ -118,6 +118,7 @@
  */
 import { MailError, toMailError } from "../errors.js";
 import { mailEnabled } from "../flag.js";
+import { OAUTH_SIGN_IN_STOPPED_TEXT } from "../oauth/watch.js";
 import {
   getAccount,
   getSyncState,
@@ -1040,11 +1041,16 @@ export function createMailSupervisor(options = {}) {
   }
 
   /**
-   * One fixed sentence per kind. There are two kinds and one persisted stamp: `mail_sync_state` has
-   * no per-kind column and the schema does not change, so the failing-sync notice is gated by
-   * `last_notice_at` (plus its own in-memory stamp) while the AUTH_FAILED notice is sent on the
-   * transition into `auth_failed` only and never consults the gap. Both kinds write that one shared
-   * `last_notice_at` column.
+   * One fixed sentence per kind, and — for a refused sign-in — one per KIND OF ACCOUNT. There are two
+   * failure kinds and one persisted stamp: `mail_sync_state` has no per-kind column and the schema
+   * does not change, so the failing-sync notice is gated by `last_notice_at` (plus its own in-memory
+   * stamp) while the AUTH_FAILED notice is sent on the transition into `auth_failed` only and never
+   * consults the gap. Both kinds write that one shared `last_notice_at` column.
+   *
+   * An XOAUTH2 account's notice is the approved C29 sentence (`OAUTH_SIGN_IN_STOPPED_TEXT`, from
+   * `oauth/watch.js`) and names no address and no password: its sign-in is fixed by signing in again,
+   * and "Check the app password" would send the owner looking for a password that account does not
+   * have. A password account keeps its own sentence, label included.
    */
   async function sendNotice(worker, kind, epoch = worker.epoch) {
     if (!current(worker, epoch)) return;
@@ -1058,8 +1064,9 @@ export function createMailSupervisor(options = {}) {
     const account = await accountOrNull(worker.accountId);
     const label = typeof account?.label === "string" && account.label !== "" ? account.label : "this account";
     const title = kind === "auth" ? "Crow Mail cannot sign in" : "Mail sync is failing";
+    const oauthAccount = account?.authKind === "xoauth2";
     const body = kind === "auth"
-      ? `Crow could not sign in to "${label}". Check the app password.`
+      ? (oauthAccount ? OAUTH_SIGN_IN_STOPPED_TEXT : `Crow could not sign in to "${label}". Check the app password.`)
       : `Crow cannot sync "${label}" right now. It will keep trying.`;
 
     // The stamp is written before the notice: a notice that cannot be delivered must not be repeated

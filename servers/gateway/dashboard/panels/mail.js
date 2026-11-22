@@ -62,6 +62,7 @@ import { renderMailPage, mailErrorStrings } from "./mail/html.js";
 import { settingsHtml } from "./mail/settings-html.js";
 import { mailCss } from "./mail/css.js";
 import { mailClientJs } from "./mail/client.js";
+import { dashboardRedirectUri } from "../../routes/mail-api-oauth.js";
 
 /** Rows per page. The cursor is the only way to the next one. */
 const INBOX_PAGE_SIZE = 30;
@@ -231,10 +232,18 @@ export default {
       for (const entry of accounts) {
         allow[entry.id] = await listImageAllow(db, entry.id);
       }
+      // Plan 5's wizard cards show this instance's own callback address — the very value
+      // `GET /dashboard/mail/api/oauth/redirect-uri` answers with, computed by the same function and
+      // with the same Funnel rule (a funneled request has no usable redirect origin) — and the fixed
+      // status key the callback left in the URL. Nothing else from the query is read.
+      const { redirectUri } = dashboardRedirectUri(process.env, {
+        funneled: Boolean(req.headers["tailscale-funnel-request"]),
+      });
+      const mailStatus = typeof query.mailStatus === "string" ? query.mailStatus : "";
       return layout({
         title: t("mail.title", lang),
         content: mailCss({ settings: true }) + mailErrorStrings(lang)
-          + settingsHtml({ accounts, elsewhere, allow, lang, tz }) + mailClientJs(lang),
+          + settingsHtml({ accounts, elsewhere, allow, lang, tz, redirectUri, mailStatus }) + mailClientJs(lang),
       });
     }
 

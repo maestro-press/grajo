@@ -1,10 +1,10 @@
 /**
- * Crow Mail's credentials: an account's password, OAuth refresh token and OAuth client pair live in
- * the sealed keychain of the gateway (`kind 'service'`, `connection_uuid` = the mail account id, bundle
- * `crow-mail`), never in `mail_accounts`, a page, a log or an error. Three functions reach the keychain —
- * saveSecret, getSecrets and deleteSecrets — and getSecrets is the only plaintext path: the adapter
- * factory calls it to build a login, and the OAuth token provider calls it for the client pair and the
- * token it refreshes. Nothing else reads it.
+ * Mail's credentials: an account's password, OAuth refresh token and OAuth client pair live in the
+ * sealed keychain of the gateway (`kind 'service'`, `connection_uuid` = the mail account id, bundle
+ * `crow-mail`), never in `mail_accounts`, a page, a log or an error. Four functions reach the keychain —
+ * saveSecret, getSecrets, deleteSecrets and deleteSecret (one key) — and getSecrets is the only
+ * plaintext path: the adapter factory calls it to build a login, and the OAuth token provider calls it
+ * for the client pair and the token it refreshes. Nothing else reads it.
  *
  * Four keys, and each is one row of the account: MAIL_PASSWORD for a password account; for an OAuth
  * account, MAIL_REFRESH_TOKEN plus the app registration it refreshes with (MAIL_OAUTH_CLIENT_ID and
@@ -41,6 +41,7 @@ import {
   ensureWriteKey,
   saveServiceSecret,
   serviceSecretsFor,
+  deleteServiceSecret,
   deleteServiceSecrets,
   KeychainKeyMissingError,
   MAIL_BUNDLE,
@@ -202,6 +203,26 @@ export function createMailCredentials({ db, crowHome } = {}) {
           if (rows.length === 0) return {};
         }
         return await serviceSecretsFor(db, key, id, { allowedKeys: MAIL_SECRET_KEYS });
+      } catch (err) {
+        throw asMailError(err);
+      }
+    },
+
+    /**
+     * Remove ONE secret of one account: the key a fresh grant no longer has (a reconnect whose grant
+     * names no client secret must not keep the old registration's). No key is needed — nothing is
+     * unsealed — so an account can still lose a stale key on a machine whose key file is gone.
+     *
+     * @param {string} accountId the mail account id (the keychain's connection uuid)
+     * @param {"MAIL_PASSWORD"|"MAIL_REFRESH_TOKEN"|"MAIL_OAUTH_CLIENT_ID"|"MAIL_OAUTH_CLIENT_SECRET"} envKey
+     * @returns {Promise<{deleted: number}>}
+     */
+    async deleteSecret(accountId, envKey) {
+      const id = requireAccountId(accountId);
+      const key = requireSecretKey(envKey);
+      try {
+        await assertMailOwned(db, id);
+        return await deleteServiceSecret(db, id, key);
       } catch (err) {
         throw asMailError(err);
       }

@@ -99,7 +99,7 @@ const message = (db, { accountId, folderId, uid, messageId, isRead = false, from
     flags: isRead ? ["\\Seen"] : [],
   });
 
-test("the shape is exactly the plan's: no host, port, username, secret, claim key or hash", async () => {
+test("the shape is exactly the plan's: no host, port, username, secret, client id, claim key or hash", async () => {
   const db = await freshDb();
   const row = await account(db);
   await updateAccount(db, row.id, { localModelsOnly: true, digestOptIn: true, lastSyncAt: NOW });
@@ -108,9 +108,13 @@ test("the shape is exactly the plan's: no host, port, username, secret, claim ke
 
   const overview = await accountsOverview(db, { localInstanceId: LOCAL });
   assert.deepEqual(Object.keys(overview).sort(), ["accounts", "elsewhere"]);
+  // Plan 5, Task 6 added the three facts the settings card draws its reconnect control from: the kind
+  // of sign-in, the OAuth provider's own name and the reconnect watch's predicate. None is a credential
+  // — the client id and the secret stay in the sealed keychain — and a password account answers null /
+  // false for the two OAuth ones.
   assert.deepEqual(Object.keys(overview.accounts[0]).sort(), [
-    "address", "digestOptIn", "heldBy", "id", "label", "lastSyncAt", "localModelsOnly", "status",
-    "statusDetail", "unreadCount",
+    "address", "authKind", "digestOptIn", "heldBy", "id", "label", "lastSyncAt", "localModelsOnly",
+    "oauthProvider", "reconnectDue", "status", "statusDetail", "unreadCount",
   ]);
   const view = overview.accounts[0];
   assert.equal(view.id, row.id);
@@ -123,13 +127,29 @@ test("the shape is exactly the plan's: no host, port, username, secret, claim ke
   assert.equal(view.digestOptIn, true);
   assert.equal(view.lastSyncAt, NOW);
   assert.equal(view.unreadCount, 1);
+  assert.equal(view.authKind, "password", "a password account's own kind");
+  assert.equal(view.oauthProvider, null, "no OAuth provider on a password account");
+  assert.equal(view.reconnectDue, false, "and nothing to reconnect");
+
+  // An OAuth account: the provider's name, and the watch's predicate over its grant's label.
+  const oauthRow = await createAccount(db, {
+    label: "Work", address: "jo@example.test", username: "jo@example.test", authKind: "xoauth2",
+    provider: "gmail", imap: { host: "mail.example.test", port: 993, security: "ssl" },
+    smtp: { host: "mail.example.test", port: 465, security: "ssl" },
+  });
+  const oauthView = (await accountsOverview(db, { localInstanceId: LOCAL })).accounts
+    .find((entry) => entry.id === oauthRow.id);
+  assert.equal(oauthView.authKind, "xoauth2");
+  assert.equal(oauthView.oauthProvider, "google", "the preset id is mapped to the provider flow.js names");
+  assert.equal(oauthView.reconnectDue, false, "a grant with no label recorded is not due");
 
   // The account id is random hex: it can hold a port-looking digit run, so scan a copy
   // with every id replaced by a fixed non-digit string.
   assert.match(view.id, /^ma-[0-9a-f]{16}$/);
   const scanned = JSON.stringify(overview, (k, v) => (k === "id" ? "ID" : v));
   for (const needle of ["mail.example.test", "993", "465", "alexuser", "imap", "smtp", "MAIL_PASSWORD",
-    addressHash("alex@example.com"), "mail_claim"]) {
+    addressHash("alex@example.com"), "mail_claim", "MAIL_OAUTH_CLIENT_ID", "client_secret",
+    "apps.googleusercontent.com"]) {
     assert.equal(scanned.includes(needle), false, `the overview holds ${needle}`);
   }
 });

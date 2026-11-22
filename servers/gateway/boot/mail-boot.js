@@ -29,12 +29,14 @@
  *   5. calls `setMailApiRuntime({supervisor, adapterFactory})` so every later request shares this
  *      running supervisor instead of building its own;
  *   6. publishes the same supervisor to the send service (`setMailSendSupervisor`) and, only when
- *      `mailEnabled()`, registers the `mail-send` scheduler hook that delivers held and scheduled
- *      sends. The account-removal guard (`onAccountDeleting`, which cancels an account's unsent mail
+ *      `mailEnabled()`, registers the two scheduler hooks this module owns: `mail-send` (which delivers
+ *      held and scheduled sends) and `mail-oauth-watch` (plan 5, Task 6 — the one bell, once per
+ *      Testing-mode Google grant, five days before Google ends the sign-in). The account-removal guard
+ *      (`onAccountDeleting`, which cancels an account's unsent mail
  *      before its rows go) follows the flag alone and is registered ahead of the sync gate, so a box
  *      that runs no supervisor still cancels a removed account's unsent mail. `stop()` unregisters
- *      both, clears the supervisor and then closes what it opened, so no tick outlives the connection
- *      it would borrow and no removal runs against a stopped mail service.
+ *      all three, clears the supervisor and then closes what it opened, so no tick outlives the
+ *      connection it would borrow and no removal runs against a stopped mail service.
  *
  * `startMailSync` never throws: every failure is caught and reported through the log sink as an event
  * name and a MailError code, never as an error's text (a library's message can quote a server reply or
@@ -63,6 +65,7 @@ import { createImapSmtpAdapter } from "../mail/adapter/imap-smtp.js";
 import { makeIsClaimedElsewhere, refreshClaim as refreshOwnClaimInDb } from "../mail/claims.js";
 import { createMailCredentials, createRotationWriter } from "../mail/credentials.js";
 import { createTokenProviderRegistry } from "../mail/oauth/registry.js";
+import { registerOauthWatchHook } from "../mail/oauth/watch.js";
 import { ACCOUNT_REMOVED_REASON, transition } from "../mail/drafts/store.js";
 import { mailEnabled } from "../mail/flag.js";
 import { MailError, toMailError } from "../mail/errors.js";
@@ -97,6 +100,12 @@ let shuttingDown = false;
  */
 let currentMailSendHook = null;
 
+/**
+ * The reconnect-watch scheduler hook this boot registered, or null. Same lifetime as the send hook
+ * (plan 5, Task 6): one per process, registered only when mail is on, taken back on the way down.
+ */
+let currentOauthWatchHook = null;
+
 /** Take back the scheduler hook this module registered, if any. Idempotent, and never a reason to fail. */
 function stopMailSendHook() {
   const hook = currentMailSendHook;
@@ -106,6 +115,18 @@ function stopMailSendHook() {
     hook.unregister();
   } catch {
     // Unregistering is bookkeeping at shutdown; the process is going down either way.
+  }
+}
+
+/** Take back the reconnect watch's hook, if any. Idempotent, like the send hook's own stop. */
+function stopOauthWatchHook() {
+  const hook = currentOauthWatchHook;
+  currentOauthWatchHook = null;
+  if (hook == null) return;
+  try {
+    hook.unregister();
+  } catch {
+    // As above.
   }
 }
 
@@ -593,6 +614,16 @@ async function beginStart(options) {
           say({ event: "hook_failed", code: toMailError(err).code });
         }
       }
+      // The reconnect watch (plan 5, Task 6): one bell, once per Testing-mode Google grant, five days
+      // in — before Google ends the sign-in. Same scheduler, same lifetime, same rule that a hook that
+      // cannot register costs a reminder and never a boot.
+      if (currentOauthWatchHook == null) {
+        try {
+          currentOauthWatchHook = registerOauthWatchHook(db, options.now === undefined ? {} : { now: options.now });
+        } catch (err) {
+          say({ event: "hook_failed", code: toMailError(err).code });
+        }
+      }
     }
 
     say({ event: "started" });
@@ -605,6 +636,7 @@ async function beginStart(options) {
       if (currentHandle === handle) currentHandle = null;
       // The hook first: no tick may reach a supervisor this stop is taking away, or a db it closes.
       stopMailSendHook();
+      stopOauthWatchHook();
       stopAccountRemovalHook();
       try {
         if (typeof supervisor.stop === "function") await supervisor.stop();
@@ -651,6 +683,7 @@ export async function stopMailSync() {
   if (handle == null) {
     // Nothing was started, so nothing may still point at a supervisor or a hook.
     stopMailSendHook();
+    stopOauthWatchHook();
     stopAccountRemovalHook();
     setMailSendSupervisor(null);
     return false;

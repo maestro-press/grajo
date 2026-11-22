@@ -25,15 +25,24 @@
  * markup or an event handler. The page makes no request of its own and holds no script; its header row
  * carries the same settings gear every other view has.
  *
- * The add-account form's body is its own exported function so plan 5 replaces it whole (provider
- * presets, Gmail's app-password steps, the OAuth wizards) without touching the cards. Its fields are
- * the minimal set a password account needs; its security lists offer `ssl` and `starttls` only —
- * there is no plaintext option in the UI. The client turns the field names below into the connect
- * body (`imap: {host, port, security}` and the same for `smtp`).
+ * The add-account area (plan 5, Task 5) is the Gmail card, the Microsoft card and — for every other
+ * provider — the generic form below them, whose field names plan 2 fixed. The two cards' sentences
+ * are the operator-approved copy and live in `wizard-html.js`; they carry no host, port or credential,
+ * because a password connection is made against the provider preset the server applies. The area is
+ * drawn with this instance's own redirect address (the one `GET /dashboard/mail/api/oauth/redirect-uri`
+ * answers with), or with none at all when the machine has no dashboard address: then each card shows
+ * C19 and keeps its app-password path usable. The client script (`wizard-client.js`) is emitted with
+ * the page; it owns every action, and every sentence it can show rides the markup as a data attribute.
+ *
+ * The page also shows the callback's fixed status key (`?mailStatus=oauth_connected` and the rest) as
+ * its approved sentence above the cards, and nothing at all for a key it has no sentence for.
  */
 import { escapeHtml } from "../../shared/components.js";
 import { t, fill } from "../../shared/i18n.js";
 import { anotherCrow, mailGearLink } from "./html.js";
+import { mailStatusHtml, wizardsHtml } from "./wizard-html.js";
+import { mailWizardClientJs } from "./wizard-client.js";
+import { dashboardRedirectUri } from "../../../routes/mail-api-oauth.js";
 
 const e = escapeHtml;
 
@@ -60,10 +69,14 @@ function heldNameOf(account, lang) {
   return name || anotherCrow(lang);
 }
 
-/** The status in words: working, a sign-in that needs the password, or held by another instance. */
+/** The status in words: working, a sign-in that needs the owner, or held by another instance. */
 function statusWord(account, lang) {
   const status = typeof account?.status === "string" ? account.status : "active";
-  if (status === "auth_failed") return t("mail.statusAuthFailed", lang);
+  if (status === "auth_failed") {
+    // An OAuth account's sign-in is fixed by signing in again, never by typing a password: it shows
+    // the approved C29 sentence instead (plan 5, Task 6), and the card carries the Reconnect control.
+    return account?.authKind === "xoauth2" ? t("mail.statusAuthFailedOauth", lang) : t("mail.statusAuthFailed", lang);
+  }
   if (status === "claimed_elsewhere") {
     return fill(t("mail.statusHeld", lang), { instance: heldNameOf(account, lang) });
   }
@@ -118,8 +131,33 @@ function allowListHtml(accountId, senders, lang) {
 }
 
 /**
+ * The reconnect block (plan 5, Task 6): one button that starts the same sign-in the wizard does, for an
+ * account that already exists. It is drawn for a grant Google is about to end (C28's sentence above
+ * it) and for an OAuth account whose sign-in already stopped (C29 is the card's status line).
+ *
+ * The card names the account, its provider and the address it already has, and nothing else: the
+ * client id and the client secret are read server-side from the sealed keychain when the start route
+ * runs, so no registration and no secret is ever drawn onto this page. The refusal line is the
+ * approved K3 sentence (`data-ml-hint-flow_failed`), carried here so the client script needs no text
+ * of its own.
+ */
+function reconnectHtml(account, lang) {
+  const id = String(account?.id ?? "");
+  const provider = typeof account?.oauthProvider === "string" ? account.oauthProvider : "";
+  const address = typeof account?.address === "string" ? account.address : "";
+  const soon = account?.reconnectDue === true ? `<p class="ml-note">${e(t("mail.wizard.reconnectSoon", lang))}</p>` : "";
+  return `<div class="ml-reconnect" data-ml-reconnect-banner data-ml-hint-flow_failed="${e(t("mail.wizard.oauthFailed", lang))}">`
+    + soon
+    + `<button class="ml-btn ml-btn--primary" type="button" data-ml-reconnect data-account="${e(id)}"`
+    + ` data-ml-reconnect-provider="${e(provider)}" data-ml-reconnect-address="${e(address)}">${e(t("mail.wizard.reconnect", lang))}</button>`
+    + `<p class="ml-note ml-wizard-check" data-ml-reconnect-result role="status" hidden></p>`
+    + "</div>";
+}
+
+/**
  * The password control, drawn only for an account the server refused: the field the new password is
- * typed into, and the button the client sends it with. An account that signs in has nothing here.
+ * typed into, and the button the client sends it with. An account that signs in has nothing here, and
+ * neither has an OAuth account (its control is the reconnect block above).
  */
 function updatePasswordHtml(accountId, lang) {
   return `<details class="ml-update-password" data-ml-update-password data-account="${e(accountId)}">`
@@ -184,6 +222,19 @@ function mailSettingsHtml(lang) {
     + "</section>";
 }
 
+/**
+ * The test-message control (plan 5's C21), which is optional and runs only at a person's tap: it is a
+ * button and a hidden line, never a request from this page, and its two result sentences travel as
+ * data attributes so the client script has no text of its own.
+ */
+function selftestHtml(accountId, lang) {
+  return `<div class="ml-actions">`
+    + `<button class="ml-btn" type="button" data-ml-selftest data-account="${e(accountId)}"`
+    + ` data-ml-selftest-sent="${e(t("mail.wizard.selftestSent", lang))}"`
+    + ` data-ml-selftest-failed="${e(t("mail.wizard.selftestFailed", lang))}">${e(t("mail.wizard.selftest", lang))}</button>`
+    + "</div>";
+}
+
 /** One account's card: its label, address, status and every control the owner may use on it. */
 function accountCard(account, { senders = [], lang, tz }) {
   const id = String(account?.id ?? "");
@@ -191,11 +242,20 @@ function accountCard(account, { senders = [], lang, tz }) {
   const typedLabel = typedLabelOf(account);
   const address = typeof account?.address === "string" ? account.address : "";
   const checked = account?.localModelsOnly ? " checked" : "";
-  const update = account?.status === "auth_failed" ? updatePasswordHtml(id, lang) : "";
+  const isOauth = account?.authKind === "xoauth2";
+  const update = account?.status === "auth_failed" && !isOauth ? updatePasswordHtml(id, lang) : "";
+  // A grant Google will end (the reconnect watch's predicate) or a sign-in that already stopped: both
+  // are fixed by the same one-tap sign-in, so both draw the same control — and only when the account
+  // names a provider that sign-in can be started for.
+  const canReconnect = isOauth && typeof account?.oauthProvider === "string" && account.oauthProvider !== "";
+  const reconnect = canReconnect && (account?.reconnectDue === true || account?.status === "auth_failed")
+    ? reconnectHtml(account, lang)
+    : "";
   return `<section class="ml-card" data-ml-account="${e(id)}">
       <h2 class="ml-card-title">${e(label)}</h2>
       <p class="ml-note ml-address">${e(address)}</p>
       ${statusHtml(account, lang)}
+      ${reconnect}
       ${lastSyncHtml(account?.lastSyncAt, { lang, tz })}
       <label class="ml-field"><span class="ml-field-label">${e(t("mail.fieldLabel", lang))}</span>
         <input class="ml-input" type="text" name="label" data-ml-rename data-account="${e(id)}" value="${e(typedLabel)}"></label>
@@ -207,6 +267,7 @@ function accountCard(account, { senders = [], lang, tz }) {
         <p class="ml-help">${e(t("mail.localModelsOnlyHelp", lang))}</p>
       </div>
       ${sentCopyHtml(account, lang)}
+      ${selftestHtml(id, lang)}
       ${update}
       ${allowListHtml(id, senders, lang)}
       ${removeAccountHtml(id, lang)}
@@ -214,8 +275,8 @@ function accountCard(account, { senders = [], lang, tz }) {
 }
 
 /**
- * The add-account form: the smallest set a password account needs, with `ssl` and `starttls` only.
- * Plan 5 replaces this whole function's body; the page above it does not change.
+ * The generic add-account form, kept for every provider the wizard cards do not cover (plan 5): the
+ * smallest set a password account needs, with `ssl` and `starttls` only.
  *
  * The form is a set of fields for the client script, which cancels the submit and posts them to the
  * mail API's accounts route itself (that route is hardcoded in the script, not read from this markup,
@@ -247,14 +308,30 @@ export function addAccountForm(lang = "en") {
 }
 
 /**
+ * The add-account area: the Gmail card, the Microsoft card, then the generic form.
+ *
+ * @param {string} [lang]
+ * @param {string|null} [redirectUri] this instance's callback address, or null when it has none
+ * @returns {string}
+ */
+export function addAccountArea(lang = "en", redirectUri = null) {
+  return wizardsHtml({ lang, redirectUri }) + addAccountForm(lang);
+}
+
+/**
  * The settings view: the "Mail is set up on <instance>" lines for mail another live instance holds,
- * one card per account (any status — an account held elsewhere still needs its remove control), and
- * the add-account form, which stays available even when every account is held elsewhere: only the
- * same address is refused, by the connect route itself.
+ * one card per account (any status — an account held elsewhere still needs its remove control), the
+ * owner-wide mail settings, and the add-account area, which stays available even when every account is
+ * held elsewhere: only the same address is refused, by the connect route itself.
+ *
+ * `redirectUri` is the address the sign-in wizards must show. Left out, it is computed from this
+ * process's own environment with `dashboardRedirectUri` — the same answer the redirect-uri route
+ * gives; a caller that knows the request (the panel, which also knows whether it arrived through
+ * Funnel) passes it in. `mailStatus` is the callback's fixed key from `?mailStatus=`.
  *
  * @param {{
  *   accounts?: object[], elsewhere?: {instanceName?: string}[], allow?: Record<string, string[]>,
- *   lang?: string, tz?: string
+ *   lang?: string, tz?: string, redirectUri?: string|null, mailStatus?: string
  * }} [options]
  * @returns {string}
  */
@@ -264,6 +341,8 @@ export function settingsHtml({
   allow = {},
   lang = "en",
   tz = undefined,
+  redirectUri = undefined,
+  mailStatus = "",
 } = {}) {
   const held = (Array.isArray(elsewhere) ? elsewhere : []).map((entry) => {
     const name = typeof entry?.instanceName === "string" && entry.instanceName.trim() !== ""
@@ -274,12 +353,14 @@ export function settingsHtml({
   const cards = (Array.isArray(accounts) ? accounts : [])
     .map((account) => accountCard(account, { senders: allow?.[account?.id] ?? [], lang, tz }))
     .join("");
+  const uri = redirectUri === undefined ? dashboardRedirectUri(process.env).redirectUri : redirectUri;
   return `<div class="ml" data-ml>
     <div class="ml-page-head">
       <h1 class="ml-title">${e(t("mail.title", lang))}</h1>
       ${mailGearLink(lang)}
     </div>
-    <div class="ml-settings" data-ml-settings>${held}${mailSettingsHtml(lang)}${cards}${addAccountForm(lang)}</div>
+    <div class="ml-settings" data-ml-settings>${held}${mailStatusHtml({ status: mailStatus, lang })}${mailSettingsHtml(lang)}${cards}${addAccountArea(lang, uri)}</div>
+    ${mailWizardClientJs(lang)}
   </div>`;
 }
 

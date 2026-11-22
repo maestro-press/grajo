@@ -541,6 +541,26 @@ test("AUTH_FAILED marks the account, notices once, stops retrying, and syncNow r
   assert.equal((await h.supervisor.status(h.accountId)).watching, true);
 });
 
+test("an XOAUTH2 account's sign-in notice is C29, never the app-password sentence, and carries no address", async () => {
+  const h = await setup({ authKind: "xoauth2", provider: "gmail" });
+  h.fake.failNext("listFolders", new MailError("AUTH_FAILED"));
+  await h.supervisor.syncNow(h.accountId);
+
+  assert.equal((await getAccount(h.db, h.accountId)).status, "auth_failed");
+  assert.equal(h.notices.length, 1);
+  assert.equal(h.notices[0].title, "Crow Mail cannot sign in");
+  assert.equal(
+    h.notices[0].body,
+    "The sign-in for this account stopped working. Reconnect to keep mail syncing.",
+    "C29, the approved sentence for an OAuth account",
+  );
+  assert.equal(h.notices[0].body.includes("password"), false, "nothing about a password for a grant");
+  for (const text of [h.notices[0].title, h.notices[0].body]) {
+    assert.equal(text.includes(h.account.address), false, "the notice carries no address");
+    assert.equal(text.includes("example.com"), false, "not even the domain");
+  }
+});
+
 test("H1: a token provider that fails with NETWORK leaves the account active, backs off and rings nothing", async () => {
   const h = await setup({
     start: false,

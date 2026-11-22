@@ -3,11 +3,16 @@
  * plus the addresses another live Crow instance holds.
  *
  * The shape carries nothing from the connection settings — no host, no port, no username, no secret,
- * no claim key or hash. It is what the owner typed (a label), the mailbox address, the stored status,
- * when mail last synced, and two derived facts: `unreadCount` and, for an account this Crow may not
- * sync, `heldBy` — the winning instance's name, the same name the "already connected on <name>"
- * sentence carries. A separate function so plan 2's panel can draw the same thing without the HTTP
- * layer.
+ * no client id, no claim key or hash. It is what the owner typed (a label), the mailbox address, the
+ * stored status, when mail last synced, and five derived facts: `unreadCount`, `heldBy` — for an
+ * account this Crow may not sync, the winning instance's name, the same name the "already connected on
+ * <name>" sentence carries — and the three plan 5's settings card needs to offer the right control:
+ * `authKind`, `oauthProvider` (`google`/`microsoft`, null for a password account) and `reconnectDue`
+ * (the reconnect watch's predicate over the grant's own label, `mail/oauth/watch.js`). None of the
+ * three is a credential: the kind of sign-in, the provider's name, and whether Google is about to end
+ * the grant. The client id and the client secret stay in the sealed keychain and are read server-side
+ * by the route a reconnect posts to. A separate function so plan 2's panel can draw the same thing
+ * without the HTTP layer.
  *
  * `unreadCount` is one per logical message, not one per row: a Gmail label copy stored in two folders
  * is one unread message (the dedupe `searchLocal` and the thread counts use). A row with no
@@ -18,6 +23,8 @@
  * this read never writes.
  */
 import { checkClaim, listForeignClaims } from "./claims.js";
+import { getOauthMeta } from "./oauth/meta.js";
+import { dueForReconnect, oauthProviderOf } from "./oauth/watch.js";
 import { listAccounts } from "./store/accounts.js";
 
 /** Unread messages per account, grouped into logical messages (account_id + message_id, or the row). */
@@ -36,11 +43,24 @@ const UNREAD_SQL = `
    GROUP BY account_id`;
 
 /**
+ * The reconnect watch's predicate for one account, read from its grant's own label. A label that cannot
+ * be read (a busy database, a broken entry) is not a reason to fail the page: it answers `false`.
+ */
+async function reconnectDueFor(db, accountId, now) {
+  try {
+    return dueForReconnect(await getOauthMeta(db, accountId), now);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * @param {object} db the Crow db client
- * @param {{localInstanceId: string}} options this instance's id (the claim winner is computed against it)
+ * @param {{localInstanceId: string, now?: number|(() => number)}} options this instance's id (the
+ *   claim winner is computed against it) and the clock the reconnect predicate reads
  * @returns {Promise<{accounts: object[], elsewhere: {instanceName: string, claimedAt: number|null}[]}>}
  */
-export async function accountsOverview(db, { localInstanceId } = {}) {
+export async function accountsOverview(db, { localInstanceId, now = Date.now } = {}) {
   const [accounts, unreadRows, elsewhere] = await Promise.all([
     listAccounts(db),
     db.execute({ sql: UNREAD_SQL, args: [] }),
@@ -69,6 +89,12 @@ export async function accountsOverview(db, { localInstanceId } = {}) {
       digestOptIn: account.digestOptIn,
       lastSyncAt: account.lastSyncAt,
       unreadCount: unread.get(account.id) ?? 0,
+      // What kind of sign-in this account has, and — for an OAuth one — whether Google is about to end
+      // its grant. A label that cannot be read answers `false` rather than failing the whole page: an
+      // account with no usable label is one the watch says nothing about either.
+      authKind: account.authKind,
+      oauthProvider: account.authKind === "xoauth2" ? oauthProviderOf(account.provider) : null,
+      reconnectDue: account.authKind === "xoauth2" ? await reconnectDueFor(db, account.id, now) : false,
     });
   }
 
