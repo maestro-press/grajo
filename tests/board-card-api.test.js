@@ -937,3 +937,81 @@ test("edit: a matching expected_status saves; an unchanged status needs no expec
   assert.deepEqual(cardRow(created.id), { title: "moved", status: "in_progress" });
   assert.deepEqual(mutationsFor(created.id).map((m) => m.verb), ["create", "update", "update", "move"]);
 });
+
+// ---- The shell's New card sheet: the shape it posts, refused before any write ----
+
+function cardCount() {
+  const d = new Database(process.env.CROW_TASKS_DB_PATH);
+  try { return d.prepare("SELECT COUNT(*) AS n FROM tasks_items").get().n; } finally { d.close(); }
+}
+
+function postCreate(body) {
+  return fetch(base + "/card", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+test("create: a blank title is refused 400 'title is required' before anything is written", async () => {
+  const before = cardCount();
+  const r = await postCreate({ title: "  " });
+  assert.equal(r.status, 400);
+  assert.equal((await r.json()).error, "title is required");
+  assert.equal(cardCount(), before, "no card was created");
+});
+
+test("create: a non-numeric project_id is refused 400 'bad project_id'", async () => {
+  const before = cardCount();
+  const r = await postCreate({ title: "x", project_id: "abc" });
+  assert.equal(r.status, 400);
+  assert.equal((await r.json()).error, "bad project_id");
+  assert.equal(cardCount(), before);
+});
+
+test("create: an autonomy value other than gated/auto is refused 400", async () => {
+  const before = cardCount();
+  const r = await postCreate({ title: "x", autonomy: "yolo" });
+  assert.equal(r.status, 400);
+  assert.match(String((await r.json()).error), /autonomy/);
+  assert.equal(cardCount(), before);
+});
+
+test("create: the shell sheet's shaped body (blanks as null) is accepted", async () => {
+  const r = await postCreate({
+    title: "shell shaped card",
+    description: null,
+    due_date: null,
+    owner: null,
+    tags: null,
+    project_id: null,
+    autonomy: "gated",
+  });
+  assert.equal(r.status, 200);
+  const body = await r.json();
+  assert.deepEqual(Object.keys(body).sort(), ["id", "ok"], "{ok,id} as ever");
+  assert.equal(body.ok, true);
+  assert.ok(Number.isInteger(body.id));
+  const d = new Database(process.env.CROW_TASKS_DB_PATH);
+  try {
+    const row = d.prepare("SELECT title, description, due_date, owner, tags, project_id, autonomy FROM tasks_items WHERE id=?").get(body.id);
+    // Every field the sheet sent lands as sent. project_id is not asserted:
+    // the sheet sends null, and createCard adopts the instance's only board
+    // project when there is exactly one (card-service's soleProjectId) — a
+    // fact about this store, not about the request.
+    assert.deepEqual(
+      { ...row, project_id: undefined },
+      { title: "shell shaped card", description: null, due_date: null, owner: null, tags: null, autonomy: "gated", project_id: undefined },
+    );
+  } finally { d.close(); }
+});
+
+test("the Board tab's New card sheet posts to /dashboard/bot-board-api/card — there is no shell-api create route", async () => {
+  const { boardClientJs } = await import("../servers/gateway/dashboard/panels/board/client.js");
+  const src = boardClientJs();
+  assert.ok(src.includes("/dashboard/bot-board-api/card"), "one create route, the card API's");
+  assert.ok(!src.includes("'/dashboard/shell-api/cards'"), "no bare shell-api cards route (that one is /lane only)");
+  for (const key of ["title", "description", "due_date", "owner", "tags", "project_id", "autonomy"]) {
+    assert.ok(src.includes(key), "the request body names " + key);
+  }
+});

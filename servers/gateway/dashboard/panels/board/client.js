@@ -18,7 +18,7 @@
  */
 
 export function boardClientJs() {
-  return laneTabsJs() + laneMovesJs();
+  return laneTabsJs() + laneMovesJs() + newCardJs();
 }
 
 function laneTabsJs() {
@@ -349,6 +349,156 @@ function laneMovesJs() {
   document.addEventListener('turbo:before-render', function release(){
     if(fine){ if(fine.removeEventListener) fine.removeEventListener('change', onFine); else if(fine.removeListener) fine.removeListener(onFine); }
     document.removeEventListener('turbo:before-render', release);
+  });
+})();</script>`;
+}
+
+/**
+ * The New card button, sheet and its one request (html.js newCardSheetHtml).
+ * The openers ([data-sb-newcard]: the phone's round button and the desktop
+ * header button) open the sheet as a modal dialog with the title focused.
+ * Save posts the card to the EXISTING card API, POST
+ * /dashboard/bot-board-api/card, with the seven fields the sheet collects:
+ * title (trimmed, and required — nothing is sent without one), description,
+ * due date, owner and tags (blank is null), the project (the scope's own,
+ * read off the form's data-project-id, or the picker's value, blank meaning
+ * no project) and autonomy. CSRF rides on layout.js's fetch wrapper.
+ *
+ * A created card closes the sheet, says so in the board's status line and
+ * re-renders the tab a moment later (a Turbo replace visit, or a reload); a
+ * refusal keeps the sheet open with the server's reason (or the generic
+ * failure) in the sheet's own error line, and nothing is re-rendered.
+ * Closing the sheet any way (Cancel, Close, Escape, the backdrop) gives focus
+ * back to the button that opened it.
+ *
+ * Turbo re-runs this per visit and on a restored snapshot: its init flag is
+ * cleared before Turbo caches the page (data-sb-nc-init, distinct from the
+ * lanes' own flags).
+ *
+ * NOTE: template-literal code: never use a backtick inside it.
+ */
+function newCardJs() {
+  return `<script>(function(){
+  var root=document.querySelector('[data-sb-board]');
+  if(!root||root.getAttribute('data-sb-nc-init')) return;
+  root.setAttribute('data-sb-nc-init','1');
+  var sheet=root.querySelector('[data-sb-newcard-sheet]');
+  if(!sheet) return;
+  var statusEl=root.querySelector('[data-sb-status]');
+  var form=sheet.querySelector('form');
+  var titleEl=sheet.querySelector('[data-sb-nc-title]');
+  var descEl=sheet.querySelector('[data-sb-nc-desc]');
+  var dueEl=sheet.querySelector('[data-sb-nc-due]');
+  var ownerEl=sheet.querySelector('[data-sb-nc-owner]');
+  var tagsEl=sheet.querySelector('[data-sb-nc-tags]');
+  var autoEl=sheet.querySelector('[data-sb-nc-autonomy]');
+  var projEl=sheet.querySelector('#sb-nc-project');
+  var errEl=sheet.querySelector('[data-sb-nc-error]');
+  var opener=null, busy=false;
+
+  // The sheet's own copy, escaped into data-msg-* by html.js.
+  function msg(name){ var v=sheet.getAttribute('data-msg-'+name); return v==null?'':v; }
+  function say(text){ if(statusEl) statusEl.textContent=text||''; }
+  function fail(text){ if(errEl) errEl.textContent=text||msg('failed'); }
+  function clearErr(){ if(errEl) errEl.textContent=''; }
+  function val(el){ return el&&typeof el.value==='string' ? el.value : ''; }
+  function isOpen(){ return sheet.hasAttribute('open'); }
+
+  // Where the card goes: the scope's project (html.js data-project-id), else
+  // the picker, whose blank option is No project.
+  function projectId(){
+    var raw=form ? form.getAttribute('data-project-id') : null;
+    if(raw!=null&&raw!==''){ var n=Number(raw); return isNaN(n) ? null : n; }
+    var picked=val(projEl);
+    if(!picked) return null;
+    var p=Number(picked); return isNaN(p) ? null : p;
+  }
+  function rerender(){
+    if(window.Turbo&&window.Turbo.visit) window.Turbo.visit(location.href,{action:'replace'});
+    else location.reload();
+  }
+  function restoreFocus(){
+    var o=opener; opener=null;
+    if(o&&document.contains(o)&&o.focus) o.focus();
+  }
+  function closeSheet(){
+    if(typeof sheet.close==='function'&&isOpen()){ sheet.close(); return; }
+    if(isOpen()) sheet.removeAttribute('open');
+    restoreFocus();
+  }
+  function openSheet(btn){
+    opener=btn||null;
+    clearErr();
+    if(titleEl) titleEl.value='';
+    if(descEl) descEl.value='';
+    if(dueEl) dueEl.value='';
+    if(ownerEl) ownerEl.value='';
+    if(tagsEl) tagsEl.value='';
+    if(autoEl) autoEl.value='gated';
+    if(projEl) projEl.value='';
+    if(typeof sheet.showModal==='function') sheet.showModal(); else sheet.setAttribute('open','');
+    if(titleEl&&titleEl.focus) titleEl.focus();
+  }
+  function created(){
+    closeSheet();
+    say(msg('created'));
+    setTimeout(rerender,300);
+  }
+  function save(){
+    if(busy) return;
+    var title=(val(titleEl)||'').trim();
+    if(!title){ fail(msg('title-required')); if(titleEl&&titleEl.focus) titleEl.focus(); return; }
+    clearErr();
+    busy=true;
+    var body={
+      title:title,
+      description:val(descEl)||null,
+      due_date:val(dueEl)||null,
+      owner:val(ownerEl)||null,
+      tags:val(tagsEl)||null,
+      project_id:projectId(),
+      autonomy:val(autoEl)||'gated'
+    };
+    fetch('/dashboard/bot-board-api/card',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      .then(function(r){
+        return r.json().catch(function(){ return {}; }).then(function(j){ return {ok:r.ok,status:r.status,j:j}; });
+      })
+      .then(function(res){
+        busy=false;
+        if(res.ok){ created(); return; }
+        fail((res.j&&(res.j.error||res.j.reason))||msg('failed'));
+      }, function(){ busy=false; fail(msg('failed')); });
+  }
+
+  sheet.addEventListener('close', restoreFocus);
+  // A tap outside the sheet closes it; a tap in its own padding does not
+  // (the typed card would be lost).
+  function onBackdrop(e){
+    if(typeof sheet.getBoundingClientRect!=='function') return false;
+    var r=sheet.getBoundingClientRect();
+    if(!r.width&&!r.height) return false;
+    return e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom;
+  }
+  sheet.addEventListener('click', function(e){
+    var t=e.target;
+    if(t===sheet){ if(onBackdrop(e)) closeSheet(); return; }
+    if(!t.closest) return;
+    if(t.closest('[data-sb-nc-cancel]')||t.closest('[data-sb-nc-close]')){ closeSheet(); return; }
+    if(t.closest('[data-sb-nc-save]')) save();
+  });
+  if(form) form.addEventListener('submit', function(e){ e.preventDefault(); save(); });
+  root.addEventListener('click', function(e){
+    var btn=e.target.closest&&e.target.closest('[data-sb-newcard]');
+    if(!btn) return;
+    e.preventDefault();
+    openSheet(btn);
+  });
+
+  document.addEventListener('turbo:before-cache', function uncache(){
+    if(isOpen()) closeSheet();
+    clearErr(); say('');
+    root.removeAttribute('data-sb-nc-init');
+    document.removeEventListener('turbo:before-cache', uncache);
   });
 })();</script>`;
 }

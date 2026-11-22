@@ -140,8 +140,84 @@ export function boardCss() {
     background: var(--crow-accent); color: var(--crow-accent-contrast); text-decoration: none;
   }
 
+  /* ─── The New card button and sheet ───────────────────────────────────
+     Two openers, one visual at a time: the round button floats above the
+     tab bar on the phone (fixed, so it covers nothing and scrolls with no
+     lane), and from 1024 px it goes away while the board's head row shows
+     the header button instead. Both backgrounds are the accent with its
+     contrast colour, so they read in light and dark alike. */
+  body.shell .sb-board-head {
+    display: flex; align-items: center; justify-content: flex-end;
+    gap: 8px; margin: 0;
+  }
+  body.shell .sb-fab {
+    position: fixed; right: 16px; bottom: calc(var(--shell-tabs-h, 56px) + 16px);
+    /* Above the page, below the tab bar (900) and so below every dialog. */
+    z-index: 890;
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 56px; height: 56px; padding: 0;
+    border: 0; border-radius: 50%;
+    background: var(--crow-accent); color: var(--crow-accent-contrast);
+    font: inherit; font-size: 1.6rem; line-height: 1; cursor: pointer;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.24);
+  }
+  body.shell .sb-newcard-btn {
+    display: none;
+    align-items: center; justify-content: center;
+    min-height: 44px; padding: 0 16px;
+    border: 0; border-radius: var(--crow-radius-control, 10px);
+    background: var(--crow-accent); color: var(--crow-accent-contrast);
+    font: inherit; font-weight: 600; cursor: pointer;
+  }
+  body.shell .sb-fab:focus-visible,
+  body.shell .sb-newcard-btn:focus-visible { outline: 2px solid var(--crow-accent); outline-offset: 2px; }
+
+  /* The sheet is the tab's bottom sheet (the Move sheet's shell), scrolled
+     rather than taller than the screen on a short phone. */
+  body.shell .sb-newcard { max-height: 90vh; overflow: auto; }
+  body.shell .sb-nc-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  body.shell .sb-nc-close {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-height: 44px; min-width: 44px; padding: 0 8px;
+    border: 0; background: none; color: var(--crow-accent); font: inherit; font-size: 0.85rem; cursor: pointer;
+  }
+  body.shell .sb-nc-goes { margin: 4px 0 0; font-size: 0.85rem; color: var(--crow-text-secondary); overflow-wrap: anywhere; }
+  body.shell .sb-nc-label { display: block; margin: 12px 0 4px; font-size: 0.85rem; color: var(--crow-text-secondary); }
+  body.shell .sb-newcard input,
+  body.shell .sb-newcard select,
+  body.shell .sb-newcard textarea {
+    display: block; width: 100%; min-height: 44px; padding: 8px 10px; box-sizing: border-box;
+    border: 1px solid var(--crow-border); border-radius: var(--crow-radius-control, 10px);
+    background: var(--crow-bg-surface); color: var(--crow-text-primary); font: inherit;
+  }
+  body.shell .sb-newcard textarea { resize: vertical; }
+  body.shell .sb-nc-more { margin: 12px 0 0; }
+  body.shell .sb-nc-more > summary {
+    display: flex; align-items: center; min-height: 44px;
+    color: var(--crow-accent); font-size: 0.9rem; cursor: pointer;
+  }
+  body.shell .sb-nc-error { margin: 8px 0 0; font-size: 0.85rem; color: var(--crow-error); }
+  body.shell .sb-nc-error:empty { display: none; }
+  body.shell .sb-nc-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 16px 0 0; }
+  body.shell .sb-nc-btn {
+    min-height: 44px; padding: 8px 12px;
+    border: 1px solid var(--crow-border); border-radius: var(--crow-radius-control, 10px);
+    background: var(--crow-bg-surface); color: var(--crow-text-primary); font: inherit; cursor: pointer;
+  }
+  body.shell .sb-nc-save { border-color: var(--crow-accent); color: var(--crow-accent); font-weight: 600; }
+  body.shell .sb-nc-btn:focus-visible,
+  body.shell .sb-nc-close:focus-visible,
+  body.shell .sb-nc-more > summary:focus-visible,
+  body.shell .sb-newcard input:focus-visible,
+  body.shell .sb-newcard select:focus-visible,
+  body.shell .sb-newcard textarea:focus-visible { outline: 2px solid var(--crow-accent); outline-offset: 2px; }
+
   @media (min-width: 1024px) {
     body.shell .sb-sheet { margin: auto; border-radius: var(--crow-radius-card, 12px); }
+    /* The head row's button is the desktop opener; the round one is the phone's. */
+    body.shell .sb-board-head { margin: 0 0 8px; }
+    body.shell .sb-fab { display: none; }
+    body.shell .sb-newcard-btn { display: inline-flex; }
     body.shell .sb-chips { display: none; }
     body.shell .sb-lanes { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
     body.shell .sb-lane + .sb-lane { margin-top: 0; }

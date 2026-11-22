@@ -144,6 +144,93 @@ function laneHtml(lane, board, lang) {
     body + more + `</section>`;
 }
 
+/**
+ * The New card openers. Twice on purpose, one visual at a time: the round
+ * button floats above the tab bar on the phone, the header button sits in the
+ * board's head row from 1024 px (css.js shows exactly one of them). Both open
+ * the same sheet (newCardSheetHtml) and are named for a screen reader; the
+ * client (client.js newCardJs) binds to [data-sb-newcard].
+ */
+function newCardOpenersHtml(lang) {
+  const label = escapeHtml(t("botboard.drawerNewCard", lang));
+  return `<div class="sb-board-head">` +
+      `<button type="button" class="sb-newcard-btn" data-sb-newcard aria-haspopup="dialog">+ ${label}</button>` +
+    `</div>` +
+    `<button type="button" class="sb-fab" data-sb-newcard aria-haspopup="dialog" aria-label="${label}">+</button>`;
+}
+
+/**
+ * The New card sheet: title, description and autonomy in the open, the rest
+ * (due date, owner, tags) behind More options. There is no bot / assignee /
+ * give-to control: a card is created unassigned, and every string is an
+ * existing i18n key.
+ *
+ * Where the card goes is the shell scope's answer, never a question:
+ *   - a project scope names its project ("Goes in X.") and the form carries
+ *     data-project-id, so the client sends that id;
+ *   - Everything and Unassigned offer a project picker instead, No project
+ *     first and chosen (the client sends null for it).
+ * `projects` is the list panels/board.js hands over ({ id, slug, name },
+ * every live project (panels/board.js activeProjects), whether or not it has
+ * a card yet). A projectId that names no project in that list falls back to
+ * the picker.
+ *
+ * Project names are operator-written: each one is escaped exactly once — the
+ * option's text, and the name filled into the already-escaped "Goes in"
+ * sentence. The three client messages ride on data-msg-* attributes, escaped.
+ */
+export function newCardSheetHtml(lang, scope, projects = []) {
+  const list = (projects || []).map((p) => ({ id: Number(p.id), name: String(p.name == null ? "" : p.name) }));
+  const scoped = scope && scope.projectId != null
+    ? list.find((p) => p.id === Number(scope.projectId)) || null
+    : null;
+  const goes = scoped
+    ? `<p class="sb-nc-goes" data-sb-nc-goes>${fill(escapeHtml(t("shell.newCardGoesIn", lang)), { project: escapeHtml(scoped.name) })}</p>`
+    : "";
+  const picker = scoped ? "" :
+    `<label class="sb-nc-label" for="sb-nc-project">${escapeHtml(t("shell.newCardProject", lang))}</label>` +
+    `<select id="sb-nc-project" data-sb-nc-project>` +
+      `<option value="" selected>${escapeHtml(t("shell.newCardUnassigned", lang))}</option>` +
+      list.map((p) => `<option value="${p.id}">${escapeHtml(p.name)}</option>`).join("") +
+    `</select>`;
+  return `<dialog class="sb-sheet sb-newcard" data-sb-newcard-sheet aria-labelledby="sb-newcard-h"` +
+      ` data-msg-title-required="${escapeHtml(t("botboard.jsTitleRequired", lang))}"` +
+      ` data-msg-created="${escapeHtml(t("shell.cardCreated", lang))}"` +
+      ` data-msg-failed="${escapeHtml(t("shell.cardCreateFailed", lang))}">` +
+    `<div class="sb-nc-head">` +
+      `<h2 class="sb-sheet-h" id="sb-newcard-h">${escapeHtml(t("botboard.drawerNewCard", lang))}</h2>` +
+      `<button type="button" class="sb-nc-close" data-sb-nc-close>${escapeHtml(t("common.close", lang))}</button>` +
+    `</div>` +
+    goes +
+    `<form novalidate${scoped ? ` data-project-id="${scoped.id}"` : ""}>` +
+      picker +
+      `<label class="sb-nc-label" for="sb-nc-title">${escapeHtml(t("botboard.labelTitle", lang))}</label>` +
+      `<input id="sb-nc-title" type="text" data-sb-nc-title required aria-required="true" autocomplete="off">` +
+      `<label class="sb-nc-label" for="sb-nc-desc">${escapeHtml(t("botboard.labelDescription", lang))}</label>` +
+      `<textarea id="sb-nc-desc" data-sb-nc-desc rows="3"></textarea>` +
+      `<label class="sb-nc-label" for="sb-nc-autonomy">${escapeHtml(t("board.autonomy", lang))}</label>` +
+      `<select id="sb-nc-autonomy" data-sb-nc-autonomy>` +
+        `<option value="gated" selected>${escapeHtml(t("board.autonomyGated", lang))}</option>` +
+        `<option value="auto">${escapeHtml(t("board.autonomyAuto", lang))}</option>` +
+      `</select>` +
+      `<details class="sb-nc-more">` +
+        `<summary>${escapeHtml(t("shell.newCardMore", lang))}</summary>` +
+        `<label class="sb-nc-label" for="sb-nc-due">${escapeHtml(t("botboard.labelDueDate", lang))}</label>` +
+        `<input id="sb-nc-due" type="date" data-sb-nc-due>` +
+        `<label class="sb-nc-label" for="sb-nc-owner">${escapeHtml(t("botboard.labelOwner", lang))}</label>` +
+        `<input id="sb-nc-owner" type="text" data-sb-nc-owner autocomplete="off">` +
+        `<label class="sb-nc-label" for="sb-nc-tags">${escapeHtml(t("botboard.labelTags", lang))}</label>` +
+        `<input id="sb-nc-tags" type="text" data-sb-nc-tags autocomplete="off">` +
+      `</details>` +
+      `<p class="sb-nc-error" data-sb-nc-error role="alert"></p>` +
+      `<div class="sb-nc-actions">` +
+        `<button type="button" class="sb-nc-btn sb-nc-cancel" data-sb-nc-cancel>${escapeHtml(t("common.cancel", lang))}</button>` +
+        `<button type="button" class="sb-nc-btn sb-nc-save" data-sb-nc-save>${escapeHtml(t("botboard.btnCreateCard", lang))}</button>` +
+      `</div>` +
+    `</form>` +
+  `</dialog>`;
+}
+
 /** The empty board's sentence for a scope: a project, Unassigned, or Everything. */
 function emptyKey(scope) {
   if (scope && scope.projectId != null) return "shell.boardEmpty";
@@ -153,14 +240,20 @@ function emptyKey(scope) {
 
 /**
  * The whole board. `board` is panels/board.js loadBoard()'s result; `scope`
- * is the shell scope it was loaded for (req.crowScope; Everything if absent).
+ * is the shell scope it was loaded for (req.crowScope; Everything if absent);
+ * `projects` is every live project (panels/board.js activeProjects) — the
+ * same sheet and openers on an empty board, so a card can be made there
+ * too.
  */
-export function boardHtml(board, lang, scope = { all: true }) {
+export function boardHtml(board, lang, scope = { all: true }, projects = []) {
   const total = LANES.reduce((s, l) => s + (board.counts[l] || 0), 0);
   if (!total) {
-    return `<div class="sb-board sb-board-empty">` +
+    return `<div class="sb-board sb-board-empty" data-sb-board>` +
+      newCardOpenersHtml(lang) +
       `<p class="sb-empty">${escapeHtml(t(emptyKey(scope), lang))}</p>` +
       `<p><a class="sb-chat-link" href="/dashboard/perch">${escapeHtml(t("shell.boardEmptyChat", lang))}</a></p>` +
+      `<p class="sb-status" role="status" aria-live="polite" data-sb-status></p>` +
+      newCardSheetHtml(lang, scope, projects) +
       `</div>`;
   }
   const chips = LANES.map((l) =>
@@ -168,11 +261,13 @@ export function boardHtml(board, lang, scope = { all: true }) {
     `<span class="sb-chip-label">${escapeHtml(t(LANE_LABEL_KEY[l], lang))}</span> ` +
     `<span class="sb-chip-count">${board.counts[l] || 0}</span></a>`).join("");
   return `<div class="sb-board" data-sb-board data-reasons="${escapeHtml(JSON.stringify(reasonTexts(lang)))}">` +
+    newCardOpenersHtml(lang) +
     `<div class="sb-chips" aria-label="${escapeHtml(t("shell.boardLanes", lang))}">${chips}</div>` +
     `<p class="sb-status" role="status" aria-live="polite" data-sb-status></p>` +
     `<div class="sb-lanes">${LANES.map((l) => laneHtml(l, board, lang)).join("")}</div>` +
     moveSheetHtml(lang) +
     confirmHtml(lang) +
+    newCardSheetHtml(lang, scope, projects) +
     `</div>`;
 }
 

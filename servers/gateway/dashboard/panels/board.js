@@ -15,6 +15,12 @@
  * card drawer stay on the classic board, which Details opens on the card
  * (board/html.js detailsHref). Requested outside the shell (classic mode),
  * this page redirects to the Bot Board.
+ *
+ * New card: the tab's own button and sheet (board/html.js newCardSheetHtml,
+ * board/client.js newCardJs) post to the EXISTING card API, POST
+ * /dashboard/bot-board-api/card. A project scope's sheet says where the card
+ * goes; Everything and Unassigned offer the live projects (activeProjects)
+ * instead of asking a second time.
  */
 
 import { existsSync } from "node:fs";
@@ -222,9 +228,13 @@ export default {
     if (req.crowMode && req.crowMode.mode === "classic") return res.redirect(302, "/dashboard/bot-board");
     const scope = req.crowScope || { all: true };
     const board = await loadBoard(db, scope, engine);
+    // The New card sheet's project picker: every live project, so a fresh
+    // project can get its first card from Everything. A project scope names
+    // its own project instead of offering the picker.
+    const projects = await activeProjects(db);
     return layout({
       title: t("shell.tabBoard", lang),
-      content: boardCss() + boardHtml(board, lang, scope) + boardClientJs(),
+      content: boardCss() + boardHtml(board, lang, scope, projects) + boardClientJs(),
     });
   },
 };

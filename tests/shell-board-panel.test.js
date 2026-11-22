@@ -462,3 +462,41 @@ test("a card's conversation link carries ?project=<slug> for a card filed in a l
   assert.equal(cardHref({ id: 8, project_id: 9 }, threads, new Map(), slugs), "/dashboard/perch#perchlive-y", "not a live project: no project");
   assert.equal(cardHref({ id: 7, project_id: 3 }, threads, new Map()), "/dashboard/perch#perchlive-x", "no slug map (project home rewrites its own)");
 });
+
+// The New card button + sheet, rendered by the real panel handler: its scope
+// comes from the URL the operator is on, so a project's board names the
+// project and Everything offers the live projects only.
+test("the New card button and sheet follow the shell scope", async () => {
+  const proj = (await render({ project: slug1 })).html;
+  assert.ok(proj.includes('class="sb-fab" data-sb-newcard'), "the phone's round button is on a project's board");
+  assert.ok(proj.includes('class="sb-newcard-btn" data-sb-newcard'), "and the desktop header button");
+  assert.ok(proj.includes('<dialog class="sb-sheet sb-newcard" data-sb-newcard-sheet'), "and the sheet");
+  assert.ok(proj.includes("Goes in Alpha."), "a project's board says where the card goes");
+  assert.ok(!proj.includes("data-sb-nc-project"), "and offers no project picker");
+
+  const all = (await render({ project: "all" })).html;
+  assert.ok(!all.includes("Goes in "), "no 'goes in' line outside a project scope");
+  const select = all.match(/<select[^>]*data-sb-nc-project[^>]*>([\s\S]*?)<\/select>/);
+  assert.ok(select, "Everything offers a project picker");
+  const options = [...select[1].matchAll(/<option value="([^"]*)"([^>]*)>([^<]*)<\/option>/g)]
+    .map((m) => ({ value: m[1], selected: /\sselected/.test(m[2]), text: m[3] }));
+  assert.deepEqual(options[0], { value: "", selected: true, text: "No project" }, "No project first, and chosen");
+  // Every live project, name-ordered as activeProjects returns them: Alpha and
+  // Beta (with cards) plus Epsilon (created live above, yet to get a card).
+  assert.deepEqual(options.slice(1).map((o) => o.text), ["Alpha", "Beta", "Epsilon", "Gamma"], "every live project, even one with no cards yet");
+  assert.ok(!options.some((o) => o.text === "Delta"), "the archived project is never offered");
+
+  // The same on an empty board, reached by renaming the store out of the way
+  // (the fixture trick of 'an empty board says what is empty').
+  const moved = TASKS + ".away";
+  renameSync(TASKS, moved);
+  try {
+    const empty = (await render({ project: "all" })).html;
+    assert.ok(empty.includes("data-sb-board"), "the empty board carries the client's hook");
+    assert.ok(empty.includes('class="sb-fab" data-sb-newcard'), "the button is there on an empty board");
+    assert.ok(empty.includes('<dialog class="sb-sheet sb-newcard" data-sb-newcard-sheet'), "and the sheet");
+    assert.ok(empty.includes("data-sb-status"), "and the status line the client writes into");
+  } finally {
+    renameSync(moved, TASKS);
+  }
+});

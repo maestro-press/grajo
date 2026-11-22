@@ -5093,6 +5093,13 @@ export const translations = {
   "shell.confirmNotFullSuccess": { en: "This result isn't a full success. Accept it and close the card?", es: "Este resultado no es un éxito completo. ¿Aceptarlo y cerrar la tarjeta?" },
   "shell.confirmAcceptYes": { en: "Yes, accept it", es: "Sí, aceptarlo" },
   "shell.confirmAcceptNo": { en: "No, leave it", es: "No, dejarlo" },
+  // The New card button and sheet (Board tab)
+  "shell.newCardMore": { en: "More options", es: "Más opciones" },
+  "shell.newCardProject": { en: "Project", es: "Proyecto" },
+  "shell.newCardUnassigned": { en: "No project", es: "Sin proyecto" },
+  "shell.newCardGoesIn": { en: "Goes in {project}.", es: "Va en {project}." },
+  "shell.cardCreated": { en: "Card created.", es: "Tarjeta creada." },
+  "shell.cardCreateFailed": { en: "That card wasn't created. Try again.", es: "No se pudo crear la tarjeta. Inténtalo de nuevo." },
 
   // ─── Doc ↔ card (P6) ───
   "shell.documentNumbered": { en: "Document {id}", es: "Documento {id}" },
