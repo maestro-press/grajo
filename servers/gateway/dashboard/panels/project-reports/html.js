@@ -65,15 +65,26 @@ function stateChip(state, lang) {
 }
 
 /**
+ * The word a report carries in its next-run place when it is not running a time: a live report whose
+ * approval does not verify runs nothing, so it carries the same word a paused report does, and any other
+ * report carries its own status word. One rule, for the list row and the page's schedule section alike.
+ */
+function notRunningWord(report) {
+  return report.status === "live" ? "paused" : statusWord(report.status);
+}
+
+/** The status sentence a report that is not running carries in its next-run place. */
+function notRunningLine(report, lang) {
+  return escapeHtml(t(`projectReports.status.${notRunningWord(report)}`, lang));
+}
+
+/**
  * The sentence in the next-run place. A time is named only for a report that is live AND whose approval
  * verifies (`report.live`): a report whose seal no longer verifies runs nothing, so it carries the same
  * word a paused report does instead of a time nobody will see.
  */
 function nextRunLine(report, lang) {
-  if (report.status !== "live" || report.live !== true) {
-    const word = report.status === "live" ? "paused" : statusWord(report.status);
-    return escapeHtml(t(`projectReports.status.${word}`, lang));
-  }
+  if (report.status !== "live" || report.live !== true) return notRunningLine(report, lang);
   if (report.nextRunText) return escapeHtml(fill(t("projectReports.nextRun", lang), { when: report.nextRunText }));
   return escapeHtml(t("projectReports.noSchedule", lang));
 }
@@ -207,14 +218,23 @@ function controls(report, owner, lang) {
     </section>`;
 }
 
-/** The schedule: the next run in the report's own zone, and the cron and zone the owner may save. */
+/**
+ * The schedule: the next run in the report's own zone, and the cron and zone the owner may save.
+ *
+ * A next-run time is named only for a report that is actually running (./data.js names one only for a live
+ * report whose approval verifies), so its absence is not the same thing as having no schedule. With a
+ * schedule row the section reads exactly what the list row reads beside it — the time, the word a report
+ * that runs nothing carries ("Draft", "Paused"), or "No schedule yet." for a live report whose approval
+ * verifies but whose window has passed (or whose row is switched off) — and only a report with no schedule
+ * row at all reads "No schedule yet." for that reason alone.
+ */
 function scheduleSection(report, owner, lang) {
   if (!owner) return "";
   const schedule = report.schedule;
   const cron = schedule ? schedule.cron : "";
   const tz = schedule ? schedule.tz || "" : "";
-  const next = report.nextRunText
-    ? escapeHtml(fill(t("projectReports.nextRun", lang), { when: report.nextRunText }))
+  const next = schedule
+    ? nextRunLine(report, lang)
     : escapeHtml(t("projectReports.noSchedule", lang));
   return `<section class="rp-section" id="schedule">
       <h3 class="rp-label">${escapeHtml(t("projectReports.section.schedule", lang))}</h3>

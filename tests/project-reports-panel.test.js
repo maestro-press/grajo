@@ -938,3 +938,80 @@ test("a pause banner needs a paused report, not a leftover reason", () => {
   }
   assert.ok(page("paused", false).includes('<div class="rp-banner"'), "a paused report with a reason shows it");
 });
+
+/** The Schedule section's own next-run line (the <p> before the cron form), for one page body. */
+function scheduleLineOf(html) {
+  const start = html.indexOf('<section class="rp-section" id="schedule">');
+  assert.ok(start > 0, "the owner's page has a schedule section");
+  const section = html.slice(start, html.indexOf("</section>", start));
+  return section.slice(0, section.indexOf("<form"));
+}
+
+test("the schedule section names a report's state unless it has no schedule at all", () => {
+  const SCHEDULE = { cron: "0 9 * * 1", tz: "Asia/Tokyo", nextRunText: null };
+  const page = (report) => projectReportPageHtml({
+    project: PROJECT,
+    owner: true,
+    report: {
+      id: LISTINGS, title: "Weekly listings", status: "draft", live: false, pauseReason: null,
+      nextRunText: null, schedule: null,
+      deliveryMode: "email_link", commentTierDefault: "c", commentVisibility: "own", aiCommentary: false,
+      recipe: [], sender: null, recipients: [], steps: [], hosts: [], preview: null, runs: [],
+      ...report,
+    },
+  }, "en");
+  const line = (report) => scheduleLineOf(page(report));
+
+  // A draft that HAS a schedule row is not a report with no schedule: no next run is named for it (it is
+  // not running), so it reads the word the list row shows beside it.
+  const draft = line({ status: "draft", live: false, schedule: SCHEDULE });
+  assert.match(draft, /<p class="rp-meta">Draft<\/p>/, "a draft with a schedule says Draft");
+  assert.ok(!draft.includes("No schedule yet."), "and never that it has no schedule");
+
+  // A report with no schedule row at all keeps the old sentence.
+  assert.match(line({ status: "draft", live: false, schedule: null }), /<p class="rp-meta">No schedule yet\.<\/p>/);
+
+  // A live report whose approval verifies and whose window is ahead reads the time, and never a word.
+  const live = line({
+    status: "live", live: true, schedule: { ...SCHEDULE, nextRunText: "Jan 15, 2099, 9:00 AM GMT+9" },
+    nextRunText: "Jan 15, 2099, 9:00 AM GMT+9",
+  });
+  assert.match(live, /<p class="rp-meta">Next run: Jan 15, 2099, 9:00 AM GMT\+9<\/p>/);
+  assert.ok(!live.includes("No schedule yet."), "a live report with a future window names its time");
+
+  // A paused report with a schedule reads the paused word, and a live one whose seal does not verify the
+  // same word (the list row's rule), never "No schedule yet.".
+  const paused = line({ status: "paused", live: false, schedule: SCHEDULE });
+  assert.match(paused, /<p class="rp-meta">Paused<\/p>/);
+  assert.ok(!paused.includes("No schedule yet."));
+  const stale = line({ status: "live", live: false, schedule: SCHEDULE });
+  assert.match(stale, /<p class="rp-meta">Paused<\/p>/, "a live report whose approval does not verify");
+});
+
+test("a live report with a schedule row and no next run says what its list row says", () => {
+  // A live report whose approval verifies but whose window has passed (or whose row is switched off): no
+  // next-run time is named for it, and its list row reads "No schedule yet." rather than the word a report
+  // that runs nothing carries. With a schedule row on hand the schedule section must say exactly that too —
+  // not "Paused".
+  const SCHEDULE = { cron: "0 9 * * 1", tz: "Asia/Tokyo", nextRunText: null };
+  const listRow = {
+    id: LISTINGS, title: "Weekly listings", status: "live", live: true, pauseReason: null,
+    schedule: SCHEDULE, nextRunText: null, lastRun: null, latestRun: null, recipientCount: 1,
+  };
+  const list = projectReportsListHtml({ project: PROJECT, owner: true, reports: [listRow] }, "en");
+  assert.ok(list.includes('<span class="rp-meta">No schedule yet.</span>'), "the list row says No schedule yet.");
+
+  const page = projectReportPageHtml({
+    project: PROJECT,
+    owner: true,
+    report: {
+      id: LISTINGS, title: "Weekly listings", status: "live", live: true, pauseReason: null,
+      nextRunText: null, schedule: SCHEDULE,
+      deliveryMode: "email_link", commentTierDefault: "c", commentVisibility: "own", aiCommentary: false,
+      recipe: [], sender: null, recipients: [], steps: [], hosts: [], preview: null, runs: [],
+    },
+  }, "en");
+  const line = scheduleLineOf(page);
+  assert.match(line, /<p class="rp-meta">No schedule yet\.<\/p>/, "the schedule section says the same thing");
+  assert.ok(!line.includes("Paused"), "never the word a report that runs nothing carries");
+});
