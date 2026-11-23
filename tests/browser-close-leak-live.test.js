@@ -101,7 +101,7 @@ import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 
 import {
   blankPagesOnExit,
@@ -112,6 +112,7 @@ import {
 import { createPageOwnership } from "../bundles/browser/server/page-ownership.js";
 import { findChrome } from "./fixtures/headless-chrome.mjs";
 import { pickFreeDisplay, stopXvfb } from "./helpers/xvfb-display.mjs";
+import { bundleChromium, describeBrowserVersions, playwrightCoreDirs } from "./fixtures/chromium-pin.mjs";
 
 const REQUIRE_CHROME = process.env.CROW_REQUIRE_TEST_CHROME === "1";
 
@@ -129,16 +130,28 @@ function skipOrFail(t, why) {
 
 /**
  * Where playwright-core may live: an explicit dir first, then the installed
- * bundle's, then the repo's own bundles/browser/node_modules copy.
+ * bundle's, then the repo's own bundles/browser/node_modules copy. Shared with
+ * the Chromium pin (tests/fixtures/chromium-pin.mjs), so the client whose
+ * version we report is resolved exactly like the client we load.
  */
 function playwrightDirs() {
-  return [
-    process.env.CROW_TEST_PLAYWRIGHT_DIR,
-    join(homedir(), ".crow", "bundles", "browser", "node_modules", "playwright-core"),
-    fileURLToPath(
-      new URL("../bundles/browser/node_modules/playwright-core", import.meta.url),
-    ),
-  ].filter((dir) => typeof dir === "string" && dir.length > 0);
+  return playwrightCoreDirs(process.env);
+}
+
+/**
+ * The playwright-core version of whichever dir loadPlaywright resolved: the
+ * first dir that has a package.json version, in playwrightDirs order.
+ */
+function playwrightClientVersion() {
+  for (const dir of playwrightDirs()) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+      if (pkg && typeof pkg.version === "string" && pkg.version) return pkg.version;
+    } catch {
+      // not an installed playwright-core — try the next dir
+    }
+  }
+  return null;
 }
 
 /**
@@ -184,12 +197,23 @@ async function loadPlaywright() {
 function findHeadfulChrome(env = process.env) {
   if (env.CROW_TEST_FULL_CHROME) return existsSync(env.CROW_TEST_FULL_CHROME) ? env.CROW_TEST_FULL_CHROME : null;
   const base = env.PLAYWRIGHT_BROWSERS_PATH || join(homedir(), ".cache", "ms-playwright");
+  // The revision the browser bundle's locked playwright pins FIRST — the headful
+  // case must run the same browser a Crow install would (tests/fixtures/chromium-pin.mjs).
+  const pinned = bundleChromium(env);
+  const pinnedDir = pinned && pinned.revision ? join(base, `chromium-${pinned.revision}`) : null;
+  if (pinnedDir) {
+    for (const sub of ["chrome-linux", "chrome-linux64"]) {
+      const bin = join(pinnedDir, sub, "chrome");
+      if (existsSync(bin)) return bin;
+    }
+  }
   let dirs = [];
   try {
     dirs = readdirSync(base)
       .filter((d) => d.startsWith("chromium-")) // NOT chromium_headless_shell-
       .sort((a, b) => Number(b.slice("chromium-".length)) - Number(a.slice("chromium-".length)))
-      .map((d) => join(base, d));
+      .map((d) => join(base, d))
+      .filter((dir) => dir !== pinnedDir);
   } catch {
     return null;
   }
@@ -240,6 +264,42 @@ function chromeArgs({ profile, headless, extraFeatures = [], extraArgs = [] }) {
     ...extraArgs,
     "about:blank",
   ];
+}
+
+/* Set once per test process: the version lines go in every suite log exactly once. */
+let chromiumPinLogged = false;
+/* Same, for the warning line. */
+let chromiumPinWarned = false;
+
+/**
+ * Print (once per process) which playwright launched which Chromium, and whether
+ * it is the browser the bundle's locked playwright ships. Under
+ * CROW_REQUIRE_TEST_CHROME=1 a major mismatch is a failure, not a note: the
+ * suite would otherwise be green on a browser no Crow install runs.
+ */
+function reportChromiumPin(browser) {
+  let launched = null;
+  try {
+    launched = typeof browser.version === "function" ? browser.version() : null;
+  } catch {
+    launched = null;
+  }
+  const pinned = bundleChromium();
+  const report = describeBrowserVersions({
+    clientVersion: playwrightClientVersion(),
+    launched,
+    expected: pinned ? pinned.version : null,
+    require: REQUIRE_CHROME,
+  });
+  if (!chromiumPinLogged) {
+    chromiumPinLogged = true;
+    for (const line of report.lines) console.log(`[chromium-pin] ${line}`);
+  }
+  if (report.status === "warn" && !chromiumPinWarned) {
+    chromiumPinWarned = true;
+    console.log(`[chromium-pin] WARNING: ${report.message}`);
+  }
+  return report;
 }
 
 /**
@@ -298,6 +358,14 @@ async function launchBrowser({ chromium, headful = false, display = null, timeou
   }
   try {
     const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: timeoutMs });
+    // Which Chromium did playwright actually launch? A major mismatch with the
+    // bundle's locked playwright is a failure in CI (skipOrFail turns the error
+    // into one), never a suite that quietly drives the wrong browser.
+    const pin = reportChromiumPin(browser);
+    if (pin.status === "fail") {
+      await close();
+      return { error: pin.message };
+    }
     return { browser, child, profile, port, close };
   } catch (err) {
     await close();
@@ -955,8 +1023,10 @@ test("live headful: closing the last page exits Chromium; a fresh survivor keeps
     skipOrFail(t, "Xvfb is not installed (no X display for a headful Chromium)");
     return;
   }
-  // CI has a full Chrome via CROW_TEST_FULL_CHROME; a missing one is not a
-  // CI-only skip, it fails under CROW_REQUIRE_TEST_CHROME=1 like any other
+  // CI installs the full Chromium with the browser bundle's own playwright CLI
+  // (findHeadfulChrome finds it in the pinned chromium-<revision> dir);
+  // CROW_TEST_FULL_CHROME is only a local override. A missing one is not a
+  // CI-only skip: it fails under CROW_REQUIRE_TEST_CHROME=1 like any other
   // missing browser.
   const headfulBin = findHeadfulChrome();
   if (!headfulBin) {

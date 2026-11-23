@@ -16,14 +16,26 @@
  *
  * Resolution order for the binary:
  *   1. CROW_TEST_CHROME            explicit path
- *   2. ~/.cache/ms-playwright      newest chromium_headless_shell-*, then chromium-*
+ *   2. ~/.cache/ms-playwright      the revision the browser bundle's locked
+ *                                 playwright pins (chromium_headless_shell-<rev>,
+ *                                 then chromium-<rev>), else the newest
+ *                                 chromium_headless_shell-*, then chromium-*
  *   3. system chromium / chrome    (NOT under GitHub Actions — see below)
  * No binary → null, and the caller skips exactly as it did with no :9223.
  *
+ * The revision pin (tests/fixtures/chromium-pin.mjs) comes from
+ * bundles/browser's own lock, so the suite drives the same browser a Crow
+ * install runs. `opts.revisions` overrides it ({headlessShell, chromium}; the
+ * key present with a null value means "no pin" — the old newest-first choice).
+ * An un-downloaded pin never leaves the suite without a browser: it falls back
+ * to the newest dir, exactly as before.
+ *
  * Under GITHUB_ACTIONS the system Chrome on the runner image is ignored unless
- * CROW_TEST_CHROME names it. CI provides a pinned Chrome Headless Shell via
- * `npx playwright@<pinned> install chromium-headless-shell` (step 2 above), so
- * the runner's image Chrome never decides what the layout tests see.
+ * CROW_TEST_CHROME names it. CI provisions the browser with the bundle's own
+ * locked playwright CLI —
+ * `bundles/browser/node_modules/.bin/playwright install --with-deps chromium chromium-headless-shell`
+ * (step 2 above) — so neither a separately pinned playwright's download nor the
+ * runner's image Chrome decides what the layout tests see.
  *
  * CROW_REQUIRE_TEST_CHROME=1 (set in CI): no browser, or one that fails to
  * start, THROWS instead of returning null, so the live tests fail loudly
@@ -38,6 +50,10 @@ import { mkdtempSync, rmSync, readdirSync, existsSync, readFileSync, writeFileSy
 import { join } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { createPipeCdp } from "../../servers/gateway/preview/cdp-pipe.js";
+import { bundleChromium } from "./chromium-pin.mjs";
+
+const HEADLESS_SHELL_SUBS = ["chrome-linux", "chrome-headless-shell-linux64", "chrome-linux64"];
+const CHROMIUM_SUBS = ["chrome-linux", "chrome-linux64"];
 
 function newestDir(base, prefix) {
   try {
@@ -48,17 +64,47 @@ function newestDir(base, prefix) {
   } catch { return []; }
 }
 
-export function findChrome(env = process.env) {
+/** The binary inside <base>/<dirName>, across the layouts playwright has used. */
+function browserIn(base, dirName, subs, binary) {
+  for (const sub of subs) {
+    const p = join(base, dirName, sub, binary);
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+
+/** The bundle's revisions as findChrome's `opts.revisions` shape (null: no pin). */
+function bundleRevisions(env) {
+  const pinned = bundleChromium(env);
+  return pinned ? { headlessShell: pinned.headlessShellRevision, chromium: pinned.revision } : null;
+}
+
+export function findChrome(env = process.env, opts = {}) {
   if (env.CROW_TEST_CHROME) return existsSync(env.CROW_TEST_CHROME) ? env.CROW_TEST_CHROME : null;
   const pw = env.PLAYWRIGHT_BROWSERS_PATH || join(homedir(), ".cache", "ms-playwright");
+  // The pinned revision first: the suite must drive the browser the browser
+  // bundle's locked playwright ships, not whichever download is newest here.
+  const revisions = Object.hasOwn(opts, "revisions") ? opts.revisions : bundleRevisions(env);
+  if (revisions) {
+    if (revisions.headlessShell) {
+      const p = browserIn(pw, `chromium_headless_shell-${revisions.headlessShell}`, HEADLESS_SHELL_SUBS, "chrome-headless-shell");
+      if (p) return p;
+    }
+    if (revisions.chromium) {
+      const p = browserIn(pw, `chromium-${revisions.chromium}`, CHROMIUM_SUBS, "chrome");
+      if (p) return p;
+    }
+  }
+  // The pinned revision is not installed here: never leave the suite without a
+  // browser, fall back to the newest download exactly as before.
   for (const dir of newestDir(pw, "chromium_headless_shell-")) {
-    for (const sub of ["chrome-linux", "chrome-headless-shell-linux64", "chrome-linux64"]) {
+    for (const sub of HEADLESS_SHELL_SUBS) {
       const p = join(dir, sub, "chrome-headless-shell");
       if (existsSync(p)) return p;
     }
   }
   for (const dir of newestDir(pw, "chromium-")) {
-    for (const sub of ["chrome-linux", "chrome-linux64"]) {
+    for (const sub of CHROMIUM_SUBS) {
       const p = join(dir, sub, "chrome");
       if (existsSync(p)) return p;
     }

@@ -68,8 +68,18 @@ jobs:
           fi
       # Live layout tests (phone-width checks, Perch @412x730 …) drive a private
       # headless Chrome (tests/fixtures/headless-chrome.mjs), found under
-      # ~/.cache/ms-playwright. Pinned: playwright 1.63.0 = Chrome Headless
-      # Shell 153.0.8010.12 (build 1243). --with-deps installs its system libs.
+      # ~/.cache/ms-playwright. The live BROWSER tests run the Chromium that the
+      # browser bundle's LOCKED playwright ships (bundles/browser) — the product
+      # image does `npx playwright install chromium` from that same lock — so the
+      # download is provisioned by the bundle's own CLI below and the cache is
+      # keyed by bundles/browser/package-lock.json. The exact playwright and
+      # Chromium versions are never hard-coded here: the "Headless Chrome for the
+      # live layout tests" step prints them (the "bundle playwright …" line), and
+      # the live tests print the playwright client and the launched browser
+      # versions on their "[chromium-pin]" lines. tests/fixtures/chromium-pin.mjs
+      # reads that lock, and under CROW_REQUIRE_TEST_CHROME=1 a major mismatch
+      # FAILS instead of warning (a profile from another major is not one a Crow
+      # install can open).
       # Slow-mirror days (2026-10-26: ffmpeg alone hung 20 min) made setup eat
       # the whole limit. Reuse the .deb files and the browser from earlier
       # runs so installs rarely touch the mirror, retry apt, and cap each
@@ -83,23 +93,65 @@ jobs:
           path: |
             ~/apt-debs
             ~/.cache/ms-playwright
-          key: ci-setup-${{ runner.os }}-pw1.63.0-${{ github.run_id }}
-          restore-keys: ci-setup-${{ runner.os }}-pw1.63.0-
+          key: ci-setup-${{ runner.os }}-pw-${{ hashFiles('bundles/browser/package-lock.json') }}-${{ github.run_id }}
+          # The lock-keyed entry first, then any earlier one: a lock bump must
+          # still restore the .deb files (and playwright install prunes the
+          # browsers the new version no longer references).
+          restore-keys: |
+            ci-setup-${{ runner.os }}-pw-${{ hashFiles('bundles/browser/package-lock.json') }}-
+            ci-setup-${{ runner.os }}-pw-
       - name: Point apt at the restored packages (retries, keep downloads)
         run: |
           printf '%s\n' 'Acquire::Retries "3";' 'Acquire::http::Timeout "30";' 'Acquire::https::Timeout "30";' 'APT::Keep-Downloaded-Packages "true";' 'Binary::apt::APT::Keep-Downloaded-Packages "true";' | sudo tee /etc/apt/apt.conf.d/80-crow-ci >/dev/null
           sudo rm -f /etc/apt/apt.conf.d/docker-clean
           if ls ~/apt-debs/*.deb >/dev/null 2>&1; then sudo cp ~/apt-debs/*.deb /var/cache/apt/archives/ && echo "restored $(ls ~/apt-debs/*.deb | wc -l) cached packages"; fi
-      # Cache miss: download the browser and its system libs. Cache hit: only
-      # the system libs (the browser binary is already in ~/.cache).
+      # The browser bundle's locked playwright-core, for the live browser tests
+      # (tests/browser-close-leak-live.test.js resolves it from
+      # bundles/browser/node_modules) AND the CLI that provisions the browser in
+      # the next step. --ignore-scripts means no browser download here.
+      - name: Browser bundle deps (locked playwright, for the live tests)
+        run: npm ci --prefix bundles/browser --omit=optional --ignore-scripts --no-audit --no-fund
+      # The bundle's OWN playwright installs the browser, so the live tests and a
+      # real Crow install drive the same Chromium. A cached browser is skipped by
+      # playwright itself; --with-deps still installs/refreshes the system libs.
       - name: Headless Chrome for the live layout tests
         timeout-minutes: 12
         run: |
-          if ls ~/.cache/ms-playwright/chromium_headless_shell-* >/dev/null 2>&1; then
-            npx --yes playwright@1.63.0 install-deps chromium-headless-shell
-          else
-            npx --yes playwright@1.63.0 install --with-deps chromium-headless-shell
-          fi
+          node -e 'const p=require("./bundles/browser/node_modules/playwright-core/package.json");const b=require("./bundles/browser/node_modules/playwright-core/browsers.json").browsers.filter((x)=>/^chromium/.test(x.name));console.log("bundle playwright "+p.version+": "+b.map((x)=>x.name+" "+x.browserVersion+" (revision "+x.revision+")").join(", "));'
+          bundles/browser/node_modules/.bin/playwright install --with-deps chromium chromium-headless-shell
+      # The job image sets CROW_TEST_FULL_CHROME=/opt/google/chrome/chrome (a
+      # Google Chrome stable kept in the image for other uses), and
+      # findHeadfulChrome() in tests/browser-close-leak-live.test.js returns that
+      # variable FIRST — so without this step the headful live test would drive
+      # the image's Chrome instead of the Chromium the browser bundle's locked
+      # playwright ships (and the pin check would rightly fail it). Resolve the
+      # bundle's own FULL Chromium from the revision its browsers.json pins and
+      # override the variable for every later step. A missing binary FAILS this
+      # step: the suite must never quietly fall back to the image's Chrome.
+      - name: Point the live browser tests at the bundle's Chromium
+        run: |
+          BIN="$(node --input-type=module -e '
+            import { existsSync } from "node:fs";
+            import { homedir } from "node:os";
+            import { join } from "node:path";
+            import { bundleChromium } from "./tests/fixtures/chromium-pin.mjs";
+            const pinned = bundleChromium();
+            if (!pinned) {
+              console.error("::error::the browser bundle has no playwright-core browsers.json to pin a Chromium revision against (run npm ci --prefix bundles/browser first)");
+              process.exit(1);
+            }
+            const base = process.env.PLAYWRIGHT_BROWSERS_PATH || join(homedir(), ".cache", "ms-playwright");
+            for (const sub of ["chrome-linux64", "chrome-linux"]) {
+              const bin = join(base, `chromium-${pinned.revision}`, sub, "chrome");
+              if (existsSync(bin)) { console.log(bin); process.exit(0); }
+            }
+            console.error(`::error::the browser bundle Chromium ${pinned.version} (revision ${pinned.revision}) is not installed under ${base}: expected chromium-${pinned.revision}/chrome-linux64/chrome or chromium-${pinned.revision}/chrome-linux/chrome`);
+            process.exit(1);
+          ')"
+          CHROMIUM_DIR="$(dirname "$(dirname "$BIN")")"
+          REVISION="${CHROMIUM_DIR##*/chromium-}"
+          echo "CROW_TEST_FULL_CHROME=$BIN" >> "$GITHUB_ENV"
+          echo "live browser tests run the browser bundle's Chromium revision $REVISION: $BIN"
       # The SunVox engine tests (tests/sunvox-studio.test.js) load the bundle's
       # vendored native library through koffi, which lives in the bundle's own
       # node_modules. Install it with exactly the flags the Extensions page
@@ -115,11 +167,6 @@ jobs:
           sudo apt-get install -y -qq ffmpeg libasound2t64 || sudo apt-get install -y -qq ffmpeg libasound2 || { sudo apt-get update -qq && { sudo apt-get install -y -qq ffmpeg libasound2t64 || sudo apt-get install -y -qq ffmpeg libasound2; }; }
           npm ci --prefix bundles/sunvox-studio --omit=optional --ignore-scripts --no-audit --no-fund
           npm ci --prefix bundles/studio --omit=optional --ignore-scripts --no-audit --no-fund
-          # The browser bundle's locked playwright-core, for the live browser
-          # tests (tests/browser-close-leak-live.test.js resolves it from
-          # bundles/browser/node_modules). No browser download: the tests drive
-          # the Chrome already provisioned above.
-          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci --prefix bundles/browser --omit=optional --ignore-scripts --no-audit --no-fund
       - name: Collect the downloaded apt packages for the cache
         if: always()
         run: mkdir -p ~/apt-debs && cp /var/cache/apt/archives/*.deb ~/apt-debs/ 2>/dev/null; echo "$(ls ~/apt-debs/*.deb 2>/dev/null | wc -l) packages to cache"
@@ -130,7 +177,7 @@ jobs:
           path: |
             ~/apt-debs
             ~/.cache/ms-playwright
-          key: ci-setup-${{ runner.os }}-pw1.63.0-${{ github.run_id }}
+          key: ci-setup-${{ runner.os }}-pw-${{ hashFiles('bundles/browser/package-lock.json') }}-${{ github.run_id }}
       # GITHUB_ACTIONS=true applies tests/ci-exclusions.json (empty today);
       # host-bound tests self-skip via in-file capability guards instead.
       # CROW_REQUIRE_TEST_CHROME: a browser that fails to start fails the live
