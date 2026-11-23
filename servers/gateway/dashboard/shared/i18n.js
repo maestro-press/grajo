@@ -4707,6 +4707,8 @@ export const translations = {
   "perch.artifactStateProposed": { en: "v{n} proposed", es: "v{n} propuesta" },
   "perch.artifactOpenComments": { en: "{n} open comments", es: "{n} comentarios abiertos" },
   "perch.artifactContactComments": { en: "{n} from {who}", es: "{n} de {who}" },
+  // 6a C5: a report recipient who commented and has no display name.
+  "perch.artifactRecipientLabel": { en: "Recipient", es: "Destinatario" },
   "perch.artifactActionFailed": { en: "That action didn't go through. Try again from the Artifacts page.", es: "Esa acción no se completó. Inténtalo de nuevo en la página de Artefactos." },
   "perch.artifactGone": { en: "This artifact is no longer available.", es: "Este artefacto ya no está disponible." },
   "perch.artifactLinkAsk": { en: "Link \u201c{title}\u201d to this chat?", es: "\u00bfVincular \u201c{title}\u201d a este chat?" },
@@ -6398,6 +6400,10 @@ export const translations = {
   "projectReports.settings.delivery": { en: "Delivery", es: "Entrega" },
   "projectReports.settings.tier": { en: "Comments", es: "Comentarios" },
   "projectReports.settings.visibility": { en: "Who sees comments", es: "Quién ve los comentarios" },
+  // 6a C4: how many recent runs keep comments open. The wording is a whole sentence, so the
+  // settings row on the report page reads it as its own text (with {n} filled) rather than as a label
+  // beside a value.
+  "projectReports.settings.commentWindow": { en: "Comments stay open for the last {n} reports", es: "Los comentarios siguen abiertos en los últimos {n} informes" },
   "projectReports.settings.ai": { en: "AI commentary", es: "Comentario de la IA" },
   "projectReports.settings.on": { en: "On", es: "Activado" },
   "projectReports.settings.off": { en: "Off", es: "Desactivado" },
@@ -6421,6 +6427,9 @@ export const translations = {
   "projectReports.recipients.approve": { en: "Approve", es: "Aprobar" },
   "projectReports.recipients.refuse": { en: "Refuse", es: "Rechazar" },
   "projectReports.recipients.revoke": { en: "Revoke", es: "Revocar" },
+  "projectReports.recipients.revokeLinks": { en: "Revoke links", es: "Revocar enlaces" },
+  "projectReports.recipients.revokeLinksConfirm": { en: "Links already sent to {name} stop working now. The next report sends new ones.", es: "Los enlaces que ya recibió {name} dejan de funcionar ahora. El próximo informe enviará otros nuevos." },
+  "projectReports.recipients.linksRevoked": { en: "Links revoked.", es: "Enlaces revocados." },
   "projectReports.section.recipe": { en: "Recipe", es: "Receta" },
   "projectReports.recipe.empty": { en: "No blocks yet.", es: "Aún no hay bloques." },
   "projectReports.section.steps": { en: "Steps", es: "Pasos" },

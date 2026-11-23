@@ -605,6 +605,104 @@ test("the report page reads out the recipe, the settings and the recipient state
   assert.match(r.body, /id="history"/);
 });
 
+test("the approved recipient offers Revoke links, and a reader's page offers nothing", async () => {
+  const ownerPage = await get(pagePath(LISTINGS));
+  assert.equal(ownerPage.status, 200);
+  assert.match(
+    ownerPage.body,
+    /data-rp-action="revoke-links" data-rp-report="rpt-0000000000000001" data-rp-recipient="rrc-0000000000000001" data-rp-name="person@example\.com">Revoke links</,
+    "the row carries the control, the recipient and the name its confirmation uses",
+  );
+  assert.equal((ownerPage.body.match(/data-rp-action="revoke-links"/g) || []).length, 1,
+    "one control, for the one approved recipient");
+  // The proposal waiting for an answer has no links: it offers Approve and Refuse instead.
+  const proposedRow = ownerPage.body.slice(ownerPage.body.indexOf(PROPOSED));
+  assert.ok(!proposedRow.slice(0, 400).includes("revoke-links"), "a proposed recipient has no links to revoke");
+
+  for (const path of [pagePath(LISTINGS), listPath()]) {
+    const reader = await get(path, { session: GUEST });
+    assert.equal(reader.status, 200, path);
+    assert.ok(!reader.body.includes("revoke-links"), `${path}: no control for a reader`);
+    assert.ok(!reader.body.includes("Revoke links"), `${path}: and not its words either`);
+    assert.ok(!reader.body.includes("data-rp-name"), `${path}: no name handed to a client either`);
+  }
+});
+
+test("only an approved recipient's row offers Revoke links", () => {
+  const page = (state, over = {}) => projectReportPageHtml({
+    project: PROJECT,
+    owner: true,
+    report: {
+      id: LISTINGS, title: "Weekly listings", status: "live", live: true, pauseReason: null,
+      nextRunText: null, schedule: null, deliveryMode: "email_link", commentTierDefault: "c",
+      commentVisibility: "own", commentWindowRuns: 4, aiCommentary: false, recipe: [], sender: null,
+      steps: [], hosts: [], preview: null, runs: [],
+      recipients: [{
+        id: "rrc-0000000000000001", address: "alex@example.com", displayName: "Alex", state, tier: "b",
+      }],
+      ...over,
+    },
+  }, "en");
+  for (const state of ["proposed", "refused", "revoked"]) {
+    assert.ok(!page(state).includes("revoke-links"), `${state}: no links to revoke`);
+  }
+  const approved = page("approved");
+  assert.match(approved,
+    /data-rp-action="revoke-links"[^>]*data-rp-recipient="rrc-0000000000000001"[^>]*data-rp-name="Alex"/,
+    "the confirmation names the person by their display name when the row has one");
+  assert.match(approved, />Revoke links</);
+  // A row with no display name names the address, which is all the page knows about that person.
+  const unnamed = page("approved", {
+    recipients: [{ id: "rrc-0000000000000001", address: "alex@example.com", displayName: null, state: "approved", tier: "b" }],
+  });
+  assert.match(unnamed, /data-rp-name="alex@example\.com"/);
+});
+
+test("the settings section reads out how many recent runs keep comments open", async () => {
+  const r = await get(pagePath(LISTINGS));
+  assert.equal(r.status, 200);
+  const panel = panelOf(r.body);
+  // The report's own column (4 by default), in the read-only row after the visibility row.
+  assert.match(panel, /Comments stay open for the last 4 reports/);
+  const settings = panel.slice(panel.indexOf('<section class="rp-section" id="settings">'));
+  const visibility = settings.indexOf("Each person sees only their own");
+  const windowRow = settings.indexOf("Comments stay open for the last 4 reports");
+  assert.ok(visibility > -1 && windowRow > visibility, "the row sits after the visibility row");
+  assert.ok(!settings.slice(0, windowRow).includes("<input"), "it is read-only, like every other row");
+  // The number is the report's own: a view that carries another one prints that one.
+  const page = projectReportPageHtml({
+    project: PROJECT,
+    owner: true,
+    report: {
+      id: LISTINGS, title: "Weekly listings", status: "draft", live: false, pauseReason: null,
+      nextRunText: null, schedule: null, deliveryMode: "email_link", commentTierDefault: "c",
+      commentVisibility: "own", commentWindowRuns: 7, aiCommentary: false, recipe: [], sender: null,
+      recipients: [], steps: [], hosts: [], preview: null, runs: [],
+    },
+  }, "en");
+  assert.match(page, /Comments stay open for the last 7 reports/);
+});
+
+test("the Spanish page says the revoke links control and the comment window in Spanish", async () => {
+  const { writeSetting } = await import("../servers/gateway/dashboard/settings/registry.js");
+  const { createDbClient } = await import("../servers/db.js");
+  const db = createDbClient();
+  try {
+    await writeSetting(db, "language", "es");
+    const body = (await get(pagePath(LISTINGS))).body;
+    assert.match(body, />Revocar enlaces</);
+    assert.match(body, /Los comentarios siguen abiertos en los últimos 4 informes/);
+    const strings = dataBlockOf(body)?.strings || {};
+    assert.equal(strings["projectReports.recipients.revokeLinksConfirm"],
+      t("projectReports.recipients.revokeLinksConfirm", "es"), "the confirmation is Spanish too");
+    assert.equal(strings["projectReports.recipients.linksRevoked"],
+      t("projectReports.recipients.linksRevoked", "es"));
+  } finally {
+    await writeSetting(db, "language", "en");
+    db.close();
+  }
+});
+
 test("an unknown slug and an unknown report id are the project's missing page", async () => {
   for (const path of [listPath("nowhere"), listPath("attic"), pagePath(LISTINGS, "nowhere"), pagePath(ELSEWHERE), pagePath("rpt-ffffffffffffffff")]) {
     const r = await get(path);
@@ -763,6 +861,51 @@ test("go live posts the sender the page showed", async () => {
   assert.equal(s.reloads(), 1, "a go-live that landed re-renders the page");
 });
 
+test("revoke links asks first, then posts to the recipient's link route and says it is done", async () => {
+  const view = reportView();
+  view.report.recipients = [{
+    id: "rrc-0000000000000001", address: "alex@example.com", displayName: "Alex", state: "approved", tier: "b",
+  }];
+  const s = boot({
+    html: projectReportPageHtml(view, "en") + CLIENT_DATA_SCRIPT(view, "en"),
+    fetchImpl: () => ({ status: 200, body: { ok: true, revoked: 1 } }),
+  });
+  const asked = [];
+  s.window.confirm = (text) => { asked.push(text); return true; };
+  const btn = s.document.querySelector('[data-rp-action="revoke-links"]');
+  assert.ok(btn, "the approved recipient's control is on the page");
+  assert.equal(btn.textContent, "Revoke links");
+  s.click(btn);
+  await s.settle();
+  assert.deepEqual(asked,
+    [translations["projectReports.recipients.revokeLinksConfirm"].en.replace("{name}", "Alex")],
+    "the confirmation is the page's own sentence, naming the person");
+  assert.equal(s.calls.length, 1);
+  assert.equal(s.calls[0].method, "POST");
+  assert.equal(s.calls[0].url, `/dashboard/api/reports/${LISTINGS}/recipients/rrc-0000000000000001/link/revoke`);
+  assert.equal(s.calls[0].headers["X-Crow-Csrf"], "csrf-abc");
+  assert.equal(s.document.querySelector("[data-rp-status]").textContent,
+    translations["projectReports.recipients.linksRevoked"].en);
+  assert.equal(s.reloads(), 1, "a revoke that landed re-renders the page");
+});
+
+test("a declined revoke links confirmation posts nothing and keeps the page", async () => {
+  const view = reportView();
+  view.report.recipients = [
+    { id: "rrc-0000000000000001", address: "alex@example.com", displayName: null, state: "approved", tier: "b" },
+  ];
+  const s = boot({ html: projectReportPageHtml(view, "en") + CLIENT_DATA_SCRIPT(view, "en") });
+  const asked = [];
+  s.window.confirm = (text) => { asked.push(text); return false; };
+  s.click(s.document.querySelector('[data-rp-action="revoke-links"]'));
+  await s.settle();
+  assert.deepEqual(asked,
+    [translations["projectReports.recipients.revokeLinksConfirm"].en.replace("{name}", "alex@example.com")],
+    "a recipient with no display name is named by their address");
+  assert.equal(s.calls.length, 0, "nothing was sent");
+  assert.equal(s.reloads(), 0);
+});
+
 test("go live with no sender posts the empty sender", async () => {
   const view = goLiveView({ senderAccountId: "", sender: null });
   const s = boot({ html: projectReportPageHtml(view, "en") + CLIENT_DATA_SCRIPT(view, "en"), fetchImpl: () => ({ status: 200, body: { report: {} } }) });
@@ -869,8 +1012,8 @@ test("every projectReports key has English and Spanish, and a different Spanish"
   }
 });
 
-test("the approved copy is what the page says", () => {
-  // The sentences the copy review changed, inlined here on purpose (the page does not read the brief).
+test("the fixed wording is what the page says", () => {
+  // These sentences are inlined here on purpose: a wording change has to fail here, not drift silently.
   assert.deepEqual(translations["projectReports.status.live"], { en: "Live", es: "En vivo" });
   assert.deepEqual(translations["projectReports.tier.a"], {
     en: "Comment through a private link", es: "Comentar con un enlace privado",

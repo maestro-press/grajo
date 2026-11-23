@@ -26,8 +26,9 @@
  *      or an owner edit can sit at current, and a mail link is a promise about one version. The pin may
  *      be null (a failed run wrote no version).
  *   5. Each APPROVED recipient (state `approved` AND a seal that still verifies) gets at most one send
- *      row for this run. Its link comes from `links.js`: a recipient with no link kind, or with a link
- *      that is not an absolute http(s) URL, is SKIPPED with no row and no mail. A `sent`, `sending` or
+ *      row for this run. Its link comes from `links.js`, ASKED BEFORE THE CLAIM AND MINTED AFTER IT
+ *      (see THE LINK'S OWN ORDER below): a recipient with no link kind, or with a link that is not an
+ *      absolute http(s) URL, is SKIPPED with no row and no mail. A `sent`, `sending` or
  *      `unknown` row means this one is already spoken for, whatever else the log holds, so the recipient
  *      is SKIPPED and never mailed twice. Otherwise a `pending` row is REUSED: it is the row "Send to
  *      the rest" wrote, and the log often holds the `failed` or `refused` row of an attempt that did
@@ -41,7 +42,12 @@
  *      stops the others.
  *   7. A send that ended `sent` or `unknown` HOLDS the pinned version for `reports.link_days` (default
  *      180 days), through the artifacts store's `holdVersion`, so retention never deletes what a mail
- *      still points at. A hold that fails changes no count and is not thrown: the mail already went.
+ *      still points at. A hold that fails changes no count and is not thrown: the mail already went. A
+ *      send that ended `failed` or `refused` REVOKES that row's link token instead (`links.js`
+ *      `revokeLinkTokens`, which releases the link's own version hold too): a mail that did not go must
+ *      not leave a working link behind, and the token is dead whether the recipient never saw it or saw
+ *      it and the reader was refused. That sweep is best effort, like the hold: it never changes the
+ *      outcome, and the token's expiry bounds it either way.
  *   8. If any send ended failed, unknown or refused, the owner gets ONE more essential notice with the
  *      counts, so a partly delivered run is never silent.
  *   9. A recipient skipped for want of a LINK (no link kind yet, or no dashboard base because this
@@ -51,10 +57,31 @@
  *      That count is kept apart from the other skips: a recipient this run is already spoken for is not
  *      a miss and rings nothing.
  *
- * HONEST RUNS: a failed or empty run still mails every approved recipient, with the honest line and the
- * link. A failed run's email carries the honest line and NOTHING ELSE (`document: null`): a half report
- * is worse than no report, and the reader is told what happened.
+ * THE LINK'S OWN ORDER, and why: a link is first PROBED (`sendId: null`, which mints nothing), then the
+ * send row is CLAIMED, and only then is the token MINTED for that row id. A public token is minted per
+ * send row, so it cannot exist before the row, and asking first means a recipient this instance cannot
+ * make a link for (a tier `a` or `b` recipient with no public origin configured, a tier `c` one with no
+ * dashboard base) is skipped WITHOUT a row: nothing is claimed for a mail that has nowhere to point. A
+ * mint that fails after the claim is the one case with a row and no mail: the row ends `failed` with the
+ * short reason `link_mint_failed`, so it never stays `pending` (a later pass would mail it without a
+ * token) and never reaches `sent` without one. The raw token exists only in the email body: it is never
+ * stored, logged, put in a notice or returned by this module.
  *
+ * A FAILED RUN WROTE NO VERSION, SO A TIER `a` OR `b` READER GETS NO LINK. That run's mail is the honest
+ * line the layout writes for a failed run (`RUN_FAILED_FALLBACK_LINE`, or the recorded error text), which
+ * is what a reader needs to hear, and there is no page behind it to open. The probe still runs first (with
+ * no public origin that recipient is still skipped, exactly as before), but after the claim such a
+ * recipient's mail is built WITHOUT a link and NO token is minted, so the row goes out as `sent` (or
+ * `unknown`) like any other instead of settling `failed` / `link_mint_failed` for a mail nobody refused.
+ * Only that one case is linkless: a run that DID write a version, and whose mint fails for any other
+ * reason, still ends its row `failed` / `link_mint_failed` (below), because there a working link was owed
+ * and could not be made.
+ * *
+ * HONEST RUNS: a failed or empty run still mails every approved recipient, with the honest line and the
+ * link (and a failed run that wrote no version with the honest line alone; see A FAILED RUN WROTE NO
+ * VERSION above). A failed run's email carries NOTHING ELSE (`document: null`): a half report is worse
+ * than no report, and the reader is told what happened.
+ * *
  * "SEND TO THE REST" ROWS ARE SENT BY `deliverPending`, NOT BY `deliver`: the owner's tap on a finished
  * report's send log writes `pending` rows for the recipients that run did not mail (`send-log.js`), and
  * `deliverPending(db, deps, {reportId, runId})` is the one function that sends exactly those rows. It
@@ -73,7 +100,8 @@
  * when absent: `sendMail` (the door), `adapterFor` (boot's mail adapter source), `approvals` (the seal
  * seed the recipient check reads), `notify` (`createNotification`), `holdVersion` (the artifacts store's
  * own), `linkFor` (`links.js`), `getRun` (`run.js`, read by `deliverPending`), `now`, `getSecrets`,
- * `localInstanceId` and `baseUrl`.
+ * `localInstanceId`, `baseUrl` and `artifacts` (the bundle runtime a mint's version hold goes through,
+ * threaded on to `linkFor` as its own `deps`).
  */
 import { randomBytes } from "node:crypto";
 import { createNotification } from "../../shared/notifications.js";
@@ -89,7 +117,9 @@ import {
   EMAILS_SKIPPED_BODY, emailsNotSentNotice, emailsSkippedNotice, runEmptyNotice, runFailedNotice,
   runReadyNotice,
 } from "./email/copy.js";
-import { commentTierOf, isAbsoluteHttpUrl, linkFor, reportPagePath } from "./links.js";
+import {
+  DASHBOARD_TIER, commentTierOf, isAbsoluteHttpUrl, linkFor, reportPagePath, revokeLinkTokens,
+} from "./links.js";
 import { SENDABLE_RUN_STATUSES } from "./send-log.js";
 import { getRun } from "./run.js";
 import { getReport } from "./store.js";
@@ -205,6 +235,9 @@ function resolveDeps(db, deps) {
     notify: fn("notify", createNotification),
     holdVersion: fn("holdVersion", (args) => defaultHoldVersion(db, given, args)),
     linkFor: fn("linkFor", linkFor),
+    // The bundle runtime `links.js` needs for a mint's version hold (and the release of a replaced one).
+    // It is not used here: it rides along on the deps object `linkFor` is handed.
+    artifacts: given.artifacts,
     getRun: fn("getRun", getRun),
     now: fn("now", Date.now),
     getSecrets: fn("getSecrets", defaultGetSecrets),
@@ -371,7 +404,9 @@ async function claimSendRow(db, { report, run, recipient, now }) {
  * One recipient's mail, built and handed to the door.
  *
  * A failed run's email carries the honest line and nothing else, so `document` is null there whatever the
- * caller passed: the layout's own failure line is the body.
+ * caller passed: the layout's own failure line is the body. `link` may be null for the one mail that has
+ * nothing to point at (a failed run with no version a public reader could open): the layout builds that
+ * mail with no footer at all.
  *
  * @returns {Promise<"sent"|"refused"|"failed"|"unknown">} the door's own outcome, or `failed` for a mail
  *   this module could not build or a door that threw
@@ -385,7 +420,7 @@ async function sendOne(db, deps, {
       report,
       run,
       document: status === "failed" ? null : document,
-      link: link.url,
+      link: link == null ? "" : text(link.url),
       deliveryMode: text(report.delivery_mode),
       tier: commentTierOf(report, recipient),
       allowedLinks,
@@ -412,41 +447,133 @@ async function sendOne(db, deps, {
 }
 
 /**
+ * Did this run write a version a recipient could be shown? A failed run that stopped before its version
+ * step wrote none, which is the one case a public reader's mail goes out with no link (see the module
+ * comment). A read that fails answers `true`: "it wrote one" runs the mint path and settles
+ * `link_mint_failed` exactly as before, which is the answer that never mails a link that does not work.
+ *
+ * @param {object} db a libsql-shaped client
+ * @param {string} reportId
+ * @param {string} runId
+ * @returns {Promise<boolean>}
+ */
+async function runWroteVersion(db, reportId, runId) {
+  if (!reportId || !runId) return true;
+  try {
+    const { rows } = await db.execute({
+      sql: `SELECT 1 FROM report_versions
+             WHERE run_id = ? AND report_id = ? AND "trigger" <> 'preview' LIMIT 1`,
+      args: [runId, reportId],
+    });
+    return rows.length > 0;
+  } catch {
+    return true;
+  }
+}
+
+/**
  * One recipient's whole delivery: the link, the row it goes through, the mail and the hold.
  *
  * This is the per-recipient part of `deliver`, and it is shared with `deliverPending` so the two cannot
  * drift apart. `sendId` is that existing `pending` row when the caller has one (`deliverPending`); with
  * none it is `claimSendRow` that decides whether this run still owes this recipient an attempt.
  *
+ * THE ORDER IS PROBE, CLAIM, MINT (see the module comment): the probe mints nothing, so a recipient
+ * this instance cannot make a link for is skipped with no row at all, and the token a public link
+ * carries is minted for the row id that already exists. A mint that fails after the claim settles that
+ * row `failed` / `link_mint_failed` here, before anything is mailed, so the row can never be picked up
+ * later without a token. The one exception is a FAILED run that wrote no version: a tier `a` or `b`
+ * recipient's mail is then built with no link and no token (see the module comment), so the row goes out
+ * like any other.
+ *
  * @returns {Promise<"sent"|"refused"|"failed"|"unknown"|"nolink"|"skipped">} the door's own outcome,
- *   `failed` for a mail this module could not build or a door that threw, `nolink` for a recipient this
- *   instance cannot make an absolute link for (nothing was claimed), and `skipped` for a recipient the
- *   run is already spoken for
+ *   `failed` for a mail this module could not build, a door that threw, or a token that could not be
+ *   minted for a claimed row, `nolink` for a recipient this instance cannot make an absolute link for
+ *   (nothing was claimed), and `skipped` for a recipient the run is already spoken for
  */
 async function deliverToRecipient(db, d, {
   report, run, status, recipient, document, allowedLinks, override, artifactId, pinned, now, linkDays,
   sendId = null,
 }) {
+  const tier = commentTierOf(report, recipient);
+  const reportId = text(report == null ? "" : report.id);
+  const runId = text(run == null ? "" : run.id);
+
+  // The probe: `sendId: null` asks only whether a link of this recipient's kind can be made, and writes
+  // nothing. A tier `a` or `b` recipient has no link until this instance has a public origin configured
+  // (`links.js` `publicOriginOf`), and a tier `c` one has none without a dashboard base; either way
+  // nothing is claimed and nothing is mailed, and the owner hears about it in the skip notice. A failed
+  // run with no version a public reader could open is the one mail that goes WITHOUT a link, and the
+  // probe still decides whether this instance could have made one at all.
   let link = null;
   try {
     link = await d.linkFor(db, {
-      report, recipient, run, sendId, baseUrl: d.baseUrl, localInstanceId: d.localInstanceId,
+      report, recipient, run, sendId: null, baseUrl: d.baseUrl, localInstanceId: d.localInstanceId,
+      deps: d,
     });
   } catch {
     link = null;
   }
-  // No link kind for this recipient (tiers a and b until PR 6a), or a link a mail client could not open:
-  // nothing is claimed and nothing is mailed.
   if (link == null || typeof link.url !== "string" || !isAbsoluteHttpUrl(link.url)) return "nolink";
 
   const rowId = sendId ?? await claimSendRow(db, { report, run, recipient, now });
   if (!rowId) return "skipped";
 
+  // A failed run that wrote no version has no page a public reader could open, so its mail is the honest
+  // line alone: no link, no token, and the row goes out like any other. A tier `c` reader keeps the
+  // dashboard link (this instance's own run page, which exists without a version), exactly as before.
+  const failedForPublicReader = status === "failed" && tier !== DASHBOARD_TIER
+    && !(await runWroteVersion(db, reportId, runId));
+  let mailLink = failedForPublicReader ? null : link;
+
+  // The mint, for the one kind that carries a token and only now that the row it is minted per exists.
+  // A tier `c` link is this instance's own dashboard page and needs no token, so it keeps the link the
+  // probe already answered and no second read is made.
+  if (tier !== DASHBOARD_TIER && !failedForPublicReader) {
+    let minted = null;
+    try {
+      minted = await d.linkFor(db, {
+        report, recipient, run, sendId: rowId, baseUrl: d.baseUrl, localInstanceId: d.localInstanceId,
+        deps: d,
+      });
+    } catch {
+      // A mint failure (and any other throw) is the same answer: there is no token for this row. The
+      // error's own text never reaches the row, a notice or the log, because a mint error is about a
+      // link and could name its URL; the row gets the fixed short reason instead.
+      minted = null;
+    }
+    if (minted == null || typeof minted.url !== "string" || !isAbsoluteHttpUrl(minted.url)) {
+      // The row is claimed and cannot go: it settles `failed` / `link_mint_failed` (guarded on
+      // `pending`, so a row another pass moved is never rewritten), and the count is `failed` so the
+      // owner's "some emails were not sent" notice rings. Leaving it `pending` would mail it later with
+      // no token, and reaching `sent` without one would break the link in the mail.
+      await settlePendingRow(db, rowId, "failed", "link_mint_failed", Number(now));
+      return "failed";
+    }
+    mailLink = minted;
+  }
+
   const outcome = await sendOne(db, d, {
-    report, run, status, recipient, link, sendId: rowId, document, allowedLinks, override,
+    report, run, status, recipient, link: mailLink, sendId: rowId, document, allowedLinks, override,
   });
 
-  if ((outcome === "sent" || outcome === "unknown") && pinned != null && artifactId) {
+  // A mail that did not go leaves no working link: the token this row minted is revoked, and the version
+  // hold it carried goes with it, so a failed or refused attempt cannot be opened later by anybody. Best
+  // effort: the send row is the record, the outcome is what the caller counts, and a sweep that could not
+  // run never changes either. A linkless mail (a failed run with no version) has no token to stamp, so
+  // this sweep answers 0 and nothing is written.
+  if (outcome !== "sent" && outcome !== "unknown") {
+    try {
+      await revokeLinkTokens(db, d, { reportId, sendId: rowId });
+    } catch {
+      // The token still expires on its own (`reports.link_days`), and the row says what happened.
+    }
+  }
+
+  // The hold is the mail's own promise about one version, so a mail that points at nothing promises
+  // nothing: a failed run with no version is not held.
+  if ((outcome === "sent" || outcome === "unknown") && pinned != null && artifactId
+    && !failedForPublicReader) {
     try {
       await d.holdVersion({
         artifactId,
@@ -654,8 +781,10 @@ async function alreadySpokenFor(db, runId, recipientId) {
  *
  * The statuses and reasons are the send door's own vocabulary: `refused` with `recipient_not_approved`
  * (the words the door uses for the same refusal) or `not_pending` (the mail is already spoken for), and
- * `failed` with `no_link` (this instance cannot make a link for that recipient, so nothing was mailed).
- * All three are internal codes; a person reads the notice, never the row.
+ * `failed` with `no_link` (this instance cannot make a link for that recipient, so nothing was mailed)
+ * or with `link_mint_failed` (a row was claimed and the token its public link carries could not be
+ * minted, so nothing was mailed either). All of them are internal codes; a person reads the notice,
+ * never the row.
  *
  * A write that fails leaves the row exactly as it is: the next pass offers it again.
  *
@@ -701,8 +830,10 @@ async function pendingSendRows(db, reportId, runId) {
  * settles `refused` / `not_pending`. Every other row this pass cannot send settles too, by
  * `settlePendingRow`: `refused` / `recipient_not_approved` for a recipient that is no longer approved or
  * whose seal no longer verifies, and `failed` / `no_link` for one this instance has no link for, which
- * still counts as a skip and still rings the one skipped-emails notice. A row settles only from
- * `pending`, so nothing a door or another pass moved is ever rewritten here.
+ * still counts as a skip and still rings the one skipped-emails notice. A row whose link could not be
+ * minted settles `failed` / `link_mint_failed` instead, and that one counts as a FAILED send, so the
+ * counts notice rings: a row was claimed and a mail the owner expected did not go. A row settles only
+ * from `pending`, so nothing a door or another pass moved is ever rewritten here.
  *
  * A preview run and a run that has not finished send nothing. `crow_only` sends nothing either: that
  * report has no mail, so every `pending` row of its run settles `refused` / `not_live` (nothing will

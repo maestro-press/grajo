@@ -51,8 +51,7 @@ export const PROXY_SOCKET_PATH = "/run/crow-proxy/gateway.sock";
 const FIRST_LISTEN_FD = 3;
 
 /**
- * The inherited listening fd for our socket, or null when systemd did not
- * activate us.
+ * The inherited listening fd NAMED `unitName`, or null when systemd did not activate it.
  *
  * systemd sets LISTEN_PID to the pid it passed the fds to, LISTEN_FDS to how
  * many there are (numbered from fd 3), and LISTEN_FDNAMES to their unit names,
@@ -60,11 +59,16 @@ const FIRST_LISTEN_FD = 3;
  * (that is the documented guard: an env inherited by a child must never make it
  * listen on someone else's socket).
  *
+ * The unit name is a parameter rather than a constant so a SECOND activation
+ * socket (the public reports door, servers/gateway/reports/public-door.js) can
+ * use the same rule: one socket per unit, picked by NAME, never by position.
+ *
+ * @param {string} unitName the socket unit's own name, as LISTEN_FDNAMES spells it
  * @param {Record<string, string|undefined>} env
  * @param {number} pid
  * @returns {number|null}
  */
-export function pickProxyFd(env = process.env, pid = process.pid) {
+export function pickActivatedFd(unitName, env = process.env, pid = process.pid) {
   const listenPid = String(env.LISTEN_PID ?? "").trim();
   if (!listenPid || listenPid !== String(pid)) return null;
   const count = Number.parseInt(String(env.LISTEN_FDS ?? "").trim(), 10);
@@ -74,12 +78,24 @@ export function pickProxyFd(env = process.env, pid = process.pid) {
   // was not handed over by the installer's unit (review: exact match only).
   if (!names) return null;
   const list = names.split(":");
-  const idx = list.findIndex((n) => n.trim() === PROXY_SOCKET_UNIT);
+  const idx = list.findIndex((n) => n.trim() === unitName);
   if (idx >= 0) return idx < count ? FIRST_LISTEN_FD + idx : null;
   // Names that do not mention our unit: refuse. Another activated socket (say a
   // TCP one) must never be taken for the proxy socket, where every connection
   // is trusted to name its client (review: the operator could add one).
   return null;
+}
+
+/**
+ * The inherited listening fd for the proxy socket, or null when systemd did not
+ * activate us.
+ *
+ * @param {Record<string, string|undefined>} env
+ * @param {number} pid
+ * @returns {number|null}
+ */
+export function pickProxyFd(env = process.env, pid = process.pid) {
+  return pickActivatedFd(PROXY_SOCKET_UNIT, env, pid);
 }
 
 /** An http server serving `app`, marking every accepted connection. */

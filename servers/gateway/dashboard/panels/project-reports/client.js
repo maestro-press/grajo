@@ -13,6 +13,9 @@
  *   data-rp-action="send-rest" + data-rp-run         POST .../runs/<runId>/send-rest (201)
  *   data-rp-action="approve" | "refuse" | "revoke"
  *                    + data-rp-recipient            POST .../recipients/<rid>/<action>
+ *   data-rp-action="revoke-links" + data-rp-recipient + data-rp-name
+ *                                                   POST .../recipients/<rid>/link/revoke, after the
+ *                                                   owner confirms the sentence naming that person
  *   the schedule form (data-rp-schedule)             PUT  .../schedule {cron, tz}
  *
  * Every request sends the dashboard's server-bound CSRF token in X-Crow-Csrf (window.crowCsrf, the
@@ -31,8 +34,14 @@
  */
 import { t } from "../../shared/i18n.js";
 
-/** The copy the client itself can show: the preview line and the two failure lines. */
-const CLIENT_KEYS = ["projectReports.previewStarted", "projectReports.error.generic", "projectReports.error.goLiveNeeded"];
+/** The copy the client itself can show: the preview line, the revoke-links pair and the failure lines. */
+const CLIENT_KEYS = [
+  "projectReports.previewStarted",
+  "projectReports.recipients.revokeLinksConfirm",
+  "projectReports.recipients.linksRevoked",
+  "projectReports.error.generic",
+  "projectReports.error.goLiveNeeded",
+];
 
 /** What the client needs from the page, exactly as project-services carries it in its own JSON block. */
 export function projectReportsData({ project, lang = "en" } = {}) {
@@ -162,6 +171,20 @@ const CLIENT_LINES = [
   '    write(btn, reportId, "/recipients/" + encodeURIComponent(recipientId) + "/" + action, "POST", {}, reload);',
   '  }',
   '',
+  '  // Revoke links names the person the page showed (the display name, else the address) and asks first:',
+  '  // the links already in a mail stop working, and the next report sends new ones. A yes shows the line',
+  '  // and re-renders the page, like every other decision.',
+  '  function revokeLinks(btn, reportId, recipientId) {',
+  '    if (!recipientId) return;',
+  '    var name = btn.getAttribute("data-rp-name") || "";',
+  '    var ask = T("projectReports.recipients.revokeLinksConfirm").split("{name}").join(name);',
+  '    if (!window.confirm(ask)) return;',
+  '    write(btn, reportId, "/recipients/" + encodeURIComponent(recipientId) + "/link/revoke", "POST", {}, function () {',
+  '      status(T("projectReports.recipients.linksRevoked"));',
+  '      reload();',
+  '    });',
+  '  }',
+  '',
   '  function saveSchedule(form) {',
   '    var reportId = form.getAttribute("data-rp-report") || "";',
   '    if (!reportId) return;',
@@ -196,6 +219,7 @@ const CLIENT_LINES = [
   '    if (action === "preview") { preview(btn, reportId); return; }',
   '    if (action === "go-live") { goLive(btn, reportId); return; }',
   '    if (action === "send-rest") { sendRest(btn, reportId, btn.getAttribute("data-rp-run") || ""); return; }',
+  '    if (action === "revoke-links") { revokeLinks(btn, reportId, btn.getAttribute("data-rp-recipient") || ""); return; }',
   '    if (action === "approve" || action === "refuse" || action === "revoke") {',
   '      decide(btn, reportId, action, btn.getAttribute("data-rp-recipient") || "");',
   '    }',

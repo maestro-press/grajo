@@ -1,14 +1,14 @@
 // The reports store and the daily caps: a report row, its recipe revisions, its own key/value state,
 // its approval audit trail, and the counters that bound what a report can spend in a day. Every test
-// works in a scratch DB built from REPORTS_DDL with its own dashboard_settings table, so nothing
-// touches a real Crow data dir.
+// works in a scratch DB built from REPORTS_DDL, plus the late comment_window_runs column both rails
+// add, with its own dashboard_settings table, so nothing touches a real Crow data dir.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDbClient } from "../servers/db.js";
-import { REPORTS_DDL } from "../servers/shared/reports-schema.js";
+import { REPORTS_COMMENT_WINDOW_COLUMN, REPORTS_DDL } from "../servers/shared/reports-schema.js";
 import { blockRegistry } from "../servers/gateway/reports/blocks/index.js";
 import { recipeHash, sourcesHash } from "../servers/gateway/reports/recipe-hash.js";
 import {
@@ -31,6 +31,9 @@ async function freshDb() {
   dirs.push(dir);
   const db = createDbClient(join(dir, "crow.db"));
   await db.executeMultiple(REPORTS_DDL);
+  // reports.comment_window_runs reaches an existing store by ALTER (scripts/init-db.js), never by
+  // REPORTS_DDL, and the store's own SELECT names it: without this the reads below would fail.
+  await db.execute(REPORTS_COMMENT_WINDOW_COLUMN.ddl);
   await db.executeMultiple(`
     CREATE TABLE IF NOT EXISTS dashboard_settings (
       key TEXT PRIMARY KEY,

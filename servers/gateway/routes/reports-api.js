@@ -62,6 +62,7 @@ import {
 import { buildApprovalsDeps } from "../reports/approvals-deps.js";
 import { buildReportCardView, computeReportChanges } from "../reports/card-view.js";
 import { deleteReport } from "../reports/delete.js";
+import { revokeLinkTokens } from "../reports/links.js";
 import { clearReportSchedule } from "../reports/schedule-clear.js";
 import { setReportSchedule } from "../reports/schedule-set.js";
 import { listRuns } from "../reports/run.js";
@@ -75,7 +76,7 @@ import {
   proposeHost, proposeStep, refuseStep, revokeCredential, revokeHost, revokeStep, saveAsset,
   stepDetail, stepDiff,
 } from "../reports/steps.js";
-import { createReport, getReport, listReports } from "../reports/store.js";
+import { createReport, getReport, listReports, recordAudit } from "../reports/store.js";
 
 /** The mount point. */
 export const REPORTS_API_PREFIX = "/dashboard/api/reports";
@@ -697,6 +698,38 @@ export function reportsApiRouter(dashboardAuth, deps = {}) {
   router.post(`${REPORTS_API_PREFIX}/:id/recipients/:rid/revoke`, decide(
     "POST /:id/recipients/:rid/revoke",
     (db, rid) => revokeRecipient(db, approvalsDeps, { recipientId: rid, actor: { kind: "owner" } }),
+  ));
+
+  // POST /:id/recipients/:rid/link/revoke — the owner turns off the report links already sent to one
+  // person. It decides nothing about the recipient: the row keeps its state (an approved person stays
+  // approved, with its seal and nonce intact), so the next run mints fresh links as usual. Only the
+  // tokens already in a mail stop opening, and their version holds are released. The answer says how
+  // many tokens were stamped and nothing else: never a token and never a hash.
+  //
+  // The neighbours' revoke routes each write the decision they took (approvals.js, steps.js,
+  // source-approvals.js), so this one writes its own row too, under kind `link` with the recipient id
+  // as its subject. Two revokes in a row are two answers (the second one revokes 0) and the audit says
+  // the owner asked twice.
+  router.post(`${REPORTS_API_PREFIX}/:id/recipients/:rid/link/revoke`, route(
+    "POST /:id/recipients/:rid/link/revoke",
+    async (db, req, res) => {
+      const id = idOf(req, res);
+      if (!id) return;
+      const rid = recipientIdOf(req, res);
+      if (!rid) return;
+      if (!(await getReport(db, id))) return sendError(res, 404, "not_found");
+      const row = await recipientInReport(db, res, id, rid);
+      if (!row) return;
+      const revoked = await revokeLinkTokens(db, approvalsDeps, { reportId: id, recipientId: rid });
+      await recordAudit(db, {
+        reportId: id,
+        kind: "link",
+        subject: rid,
+        actor: "owner",
+        decided: "revoked",
+      });
+      res.json({ ok: true, revoked });
+    },
   ));
 
   /* ------------------------------------------------------------------- the send log */

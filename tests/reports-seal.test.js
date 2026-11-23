@@ -34,6 +34,7 @@ function sample(kind, overrides = {}) {
       deliveryMode: "email_link",
       commentTierDefault: "c",
       commentVisibility: "own",
+      commentWindowRuns: 4,
       aiCommentary: 0,
       modelRef: "",
       nonce,
@@ -106,7 +107,8 @@ test("the domain, the kinds and each kind's field order are fixed", () => {
   assert.deepEqual([...SEAL_FIELDS.live], [
     "reportId", "rev", "recipeHash", "sourcesHash", "cron", "tz", "senderAccountId",
     "botId", "projectId", "artifactId", "scheduleId",
-    "deliveryMode", "commentTierDefault", "commentVisibility", "aiCommentary", "modelRef", "nonce",
+    "deliveryMode", "commentTierDefault", "commentVisibility", "commentWindowRuns", "aiCommentary",
+    "modelRef", "nonce",
   ]);
   assert.equal(SEAL_FIELDS.live.includes("title"), false,
     "a title is a label, not something the owner approves");
@@ -127,13 +129,15 @@ test("the domain, the kinds and each kind's field order are fixed", () => {
 });
 
 /**
- * The four kinds whose field lists did not change when `step` and `credential` grew one digest each. A
- * seal is a MAC over the version, the kind tag and the length-prefixed fields, so pinning one value per
- * untouched kind pins that whole encoding: a bump to the payload version, a reordered list, a different
- * tag or a different framing would change every one of these. The values were read from a run of
- * `approvalSeal` before that change, over a fixed nonce and a fixed seed.
+ * The kinds whose field lists have not changed since the pinned values were read, and the `live` kind,
+ * whose `commentWindowRuns` field was added when it entered the seal. A seal is a MAC over the version,
+ * the kind tag and the length-prefixed fields, so pinning one value per kind pins that whole encoding: a
+ * bump to the payload version, a reordered list, a different tag or a different framing would change
+ * every one of these. The values were read from a run of `approvalSeal` over a fixed nonce and a fixed
+ * seed (the `live` one after the comment window joined the live set), and are recomputed, never weakened:
+ * a seal that no longer matches its fields is a broken seal.
  */
-test("the seals of the unchanged kinds are byte-identical to their values before step and credential grew", () => {
+test("each kind's pinned seal is byte-identical to the value it was recorded with", () => {
   const nonce = "0f".repeat(16);
   const pinned = {
     live: {
@@ -152,10 +156,11 @@ test("the seals of the unchanged kinds are byte-identical to their values before
         deliveryMode: "email_link",
         commentTierDefault: "c",
         commentVisibility: "own",
+        commentWindowRuns: 4,
         aiCommentary: 0,
         modelRef: "",
       },
-      seal: "cbbdffe4a9ce8aa839b53199313672ba734d5560bc51f6aab082408ccf3b924b",
+      seal: "230146d3e1e1cf3a6de8dabf3386fd0046e2e2a1b126bf29bf0163a0e1dc038e",
     },
     recipient: {
       fields: {

@@ -389,7 +389,41 @@ export async function listThreads(db, artifactId) {
   const taint = await anchorTaintMap(db, artifactId);
   const names = await botNames(db, comments);
   for (const c of comments) if (c.author_kind === "bot" && c.author_id) c.author_name = names.get(String(c.author_id)) || String(c.author_id);
-  return threads.map((t) => ({ ...t, anchor: JSON.parse(t.anchor_json), anchor_tainted: anchorTainted(t, taint), comments: by.get(Number(t.id)) || [] }));
+  // A report recipient who commented carries the display name the report's own recipient row holds,
+  // when it has one: the owner's chat card names that person by it instead of by an id. Without a name
+  // (or without the table) the row carries none, and the card shows its own label.
+  const people = await recipientNames(db, threads);
+  return threads.map((t) => {
+    const row = { ...t, anchor: JSON.parse(t.anchor_json), anchor_tainted: anchorTainted(t, taint), comments: by.get(Number(t.id)) || [] };
+    if (t.author_kind === "contact" && t.author_id != null) {
+      const name = people.get(String(t.author_id));
+      if (name) row.author_name = name;
+    }
+    return row;
+  });
+}
+
+/** The id shape a report recipient row carries (`reports/approvals.js`), which is what a recipient's
+ *  comment thread names as its author id. */
+const RECIPIENT_AUTHOR_RE = /^rrc-[0-9a-f]{16}$/;
+
+/** recipient_id -> sanitized display name, one query for the distinct recipients that commented. A
+ *  missing table (an instance without Reports), a missing row and an empty name simply yield no entry,
+ *  so the caller falls back to its own label. The cap is the same kind of short label botNames makes:
+ *  a display name is a few words, never a paragraph. */
+async function recipientNames(db, threads) {
+  const ids = [...new Set(threads
+    .filter((t) => t.author_kind === "contact" && typeof t.author_id === "string" && RECIPIENT_AUTHOR_RE.test(t.author_id))
+    .map((t) => String(t.author_id)))];
+  const out = new Map();
+  if (!ids.length) return out;
+  let rows = [];
+  try { rows = (await db.execute({ sql: `SELECT id, display_name FROM report_recipients WHERE id IN (${ids.map(() => "?").join(",")})`, args: ids })).rows; } catch { return out; }
+  for (const r of rows) {
+    const n = String(r.display_name ?? "").replace(/[\p{Cc}\p{Cf}]/gu, "").trim().slice(0, 60).trim();
+    if (n) out.set(String(r.id), n);
+  }
+  return out;
 }
 
 /** bot_id -> sanitized display name, one query for the distinct bots. A missing

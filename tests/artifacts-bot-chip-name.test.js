@@ -57,3 +57,37 @@ test("bot comments carry author_name from display_name; fallbacks and sanitizing
 test("authorName falls back to the id without author_name", () => {
   assert.equal(authorName({ author_kind: "bot", author_id: "hank" }), "hank · bot");
 });
+
+test("a report recipient's thread carries the display name its recipient row holds", async () => {
+  // The same reader (listThreads) names a bot by pi_bot_defs and a report recipient by
+  // report_recipients: the table it reads is the real one, from the reports schema.
+  const { REPORTS_SEND_DDL } = await import("../servers/shared/reports-schema.js");
+  await db.executeMultiple(REPORTS_SEND_DDL);
+  const recipient = (id, displayName) => db.execute({
+    sql: `INSERT INTO report_recipients (id, report_id, address, display_name, state, proposed_by, created_at)
+          VALUES (?, 'rpt-0000000000000001', ?, ?, 'approved', 'owner', 1)`,
+    args: [id, `${id}@example.com`, displayName],
+  });
+  await recipient("rrc-0000000000000001", "Alex Rivera");
+  await recipient("rrc-0000000000000002", null);
+  await recipient("rrc-0000000000000003", `Ev\nil\u202egnp ${"x".repeat(70)}`);
+  for (const [index, id] of ["rrc-0000000000000001", "rrc-0000000000000002", "rrc-0000000000000003"].entries()) {
+    const r = await db.execute({
+      sql: `INSERT INTO artifact_threads (artifact_id,version_n,anchor_json,author_kind,author_id,anchor_from_version)
+            VALUES ('a2',1,'{"kind":"whole"}','contact',?,1)`,
+      args: [id],
+    });
+    await db.execute({
+      sql: "INSERT INTO artifact_comments (thread_id,author_kind,author_id,text,ts) VALUES (?,?,?,?,?)",
+      args: [Number(r.lastInsertRowid), "contact", id, `c${index}`, Date.now()],
+    });
+  }
+  const threads = await listThreads(db, "a2");
+  const by = (id) => threads.find((row) => row.author_id === id);
+  assert.equal(by("rrc-0000000000000001").author_name, "Alex Rivera");
+  assert.equal(by("rrc-0000000000000002").author_name, undefined, "no name on the row, no name on the thread");
+  const cleaned = by("rrc-0000000000000003").author_name;
+  assert.ok(!/[\n\u202e]/.test(cleaned), "control characters are stripped");
+  assert.ok(cleaned.length <= 60, "and the name is capped");
+  assert.ok(cleaned.startsWith("Evilgnp"), cleaned);
+});

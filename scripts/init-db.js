@@ -13,7 +13,10 @@ import {
 } from "../servers/shared/project-services-schema.js";
 import { SATELLITE_DDL } from "../servers/shared/satellite-schema.js";
 import { MAIL_DDL, MAIL_ACCOUNT_SEND_COLUMNS, MAIL_DRAFTS_DDL } from "../servers/shared/mail-schema.js";
-import { REPORTS_DDL, REPORTS_RUNS_DDL, REPORTS_VERSIONS_DDL, REPORTS_SEND_DDL, REPORTS_STEPS_DDL } from "../servers/shared/reports-schema.js";
+import {
+  REPORTS_DDL, REPORTS_RUNS_DDL, REPORTS_VERSIONS_DDL, REPORTS_SEND_DDL, REPORTS_STEPS_DDL,
+  REPORTS_LINKS_DDL, REPORTS_COMMENT_WINDOW_COLUMN,
+} from "../servers/shared/reports-schema.js";
 import {
   MESSAGE_DRAFTS_LATE_COLUMNS, MESSAGE_DRAFTS_DDL, MESSAGE_DRAFTS_CHAT_THREAD_INDEX_DDL,
 } from "../servers/shared/message-drafts-schema.js";
@@ -3161,6 +3164,26 @@ await initTable("reports send tables", REPORTS_SEND_DDL);
 // servers/shared/reports-schema.js, which scripts/migrations/0035-reports-steps.mjs also runs — one
 // shape, two rails; additive, no SCHEMA_GENERATION bump. The earlier reports constants are untouched.
 await initTable("reports steps tables", REPORTS_STEPS_DDL);
+
+// reports links tables: the per-recipient, per-run link (a token minted for one run and one recipient,
+// stored only as its SHA-256, naming the artifact version it opens and the scope of page, the send row,
+// the approval nonce it was bound to, the expiry and a revoke stamp) and the comments a reader leaves
+// through that link (the artifacts comment id and thread id, the report, the run and the recipient they
+// belong to, how they got there and when). Epoch-ms times; scopes, `via` words and states are validated
+// in the reports modules (no CHECK, no FK). LOCAL ONLY (instance-sync LOCAL_ONLY_TABLES): a token is a
+// way into one report and a comment is somebody's words about it, and a report never leaves its
+// instance.
+// Same DDL as REPORTS_LINKS_DDL in servers/shared/reports-schema.js, which
+// scripts/migrations/0039-reports-links.mjs also runs, one shape, two rails; additive, no
+// SCHEMA_GENERATION bump. The earlier reports constants are untouched.
+await initTable("reports links tables", REPORTS_LINKS_DDL);
+
+// reports.comment_window_runs (how many runs back a reader may still comment on; 1 to 50, four by
+// default): in REPORTS_LINKS_DDL's tables it is not, because 0031 already executes REPORTS_DDL and a
+// store built from that string has the `reports` table already, where CREATE TABLE IF NOT EXISTS never
+// adds a column. This is the same ALTER 0039 runs, from the one constant, and it gives an existing row
+// its default of 4 without a backfill.
+await ensureSchemaColumn(REPORTS_COMMENT_WINDOW_COLUMN);
 
 // message draft tables (Crow Messages): the draft of a message to one conversation — a contact or a
 // room — with the body, the version an autosave compares against and the sealed recipient set, plus

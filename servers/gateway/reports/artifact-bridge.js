@@ -112,12 +112,15 @@ export const PREVIEW_ARTIFACT_STATE_KEY = "preview_artifact_id";
  * The `report_state` keys the bridge and the approval rails own and write themselves.
  *
  * A recipe block's `setState` (a bot-authored recipe) MUST refuse every key in this list: the bridge
- * trusts what it finds under `preview_artifact_id` to decide where a run writes, and the approval rails
- * trust `sender_seal` to say which mail account the owner chose for the report, so a bot must not be able
- * to name either. The block write path reads this list and `RESERVED_STATE_PREFIXES` (below); a new
- * reserved key is added here, once.
+ * trusts what it finds under `preview_artifact_id` to decide where a run writes, the approval rails
+ * trust `sender_seal` to say which mail account the owner chose for the report, and the recipient
+ * comments module trusts `recipient_comments_notice_day` to say the owner was already told that readers
+ * cannot start a new thread, so a bot must not be able to name any of them. The block write path reads
+ * this list and `RESERVED_STATE_PREFIXES` (below); a new reserved key is added here, once.
  */
-export const RESERVED_STATE_KEYS = Object.freeze([PREVIEW_ARTIFACT_STATE_KEY, SENDER_SEAL_KEY]);
+export const RESERVED_STATE_KEYS = Object.freeze([
+  PREVIEW_ARTIFACT_STATE_KEY, SENDER_SEAL_KEY, "recipient_comments_notice_day",
+]);
 
 /**
  * The `report_state` key prefixes the approval rails own, so no recipe block may write under them.

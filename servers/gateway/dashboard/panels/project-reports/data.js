@@ -35,7 +35,7 @@
 import { ACTIVE_PROJECT_WHERE } from "../../../../shared/shell-items.js";
 import { getSecretValues } from "../../../../shared/secret-values.js";
 import { redactSecrets } from "../../../../shared/redact-secrets.js";
-import { isLive, listRecipients } from "../../../reports/approvals.js";
+import { isLive, listRecipients, DEFAULT_COMMENT_WINDOW_RUNS } from "../../../reports/approvals.js";
 import { buildApprovalsDeps } from "../../../reports/approvals-deps.js";
 import { listRuns } from "../../../reports/run.js";
 import { listSends } from "../../../reports/send-log.js";
@@ -484,6 +484,7 @@ export async function loadReportPage(db, { project, reportId, viewer = "member",
     deliveryMode: text(report.delivery_mode),
     commentTierDefault: text(report.comment_tier_default),
     commentVisibility: text(report.comment_visibility),
+    commentWindowRuns: Number(report.comment_window_runs) || DEFAULT_COMMENT_WINDOW_RUNS,
     aiCommentary: Number(report.ai_commentary) === 1,
     recipe: recipeBlocks(report),
     sender: await senderOf(db, report),
@@ -512,13 +513,18 @@ async function senderOf(db, report) {
   }
 }
 
-/** The report's recipient list, addresses and all (owner only). */
+/**
+ * The report's recipient list, addresses and all (owner only). `displayName` rides along because the
+ * owner's own controls name a person by it when they have one (the "Revoke links" confirmation), and an
+ * empty name stays null so the page falls back to the address.
+ */
 async function recipientsOf(db, report, deps) {
   try {
     const rows = await listRecipients(db, report.id, deps);
     return rows.map((row) => ({
       id: row.id,
       address: text(row.address),
+      displayName: row.displayName == null ? null : text(row.displayName),
       state: text(row.state),
       tier: row.commentTier == null ? null : text(row.commentTier),
     }));

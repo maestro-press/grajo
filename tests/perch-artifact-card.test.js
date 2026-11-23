@@ -237,6 +237,21 @@ test("artifactCardState: comment counts, the contact name head, and key sensitiv
   assert.notEqual(st4.key, st.key, "a new version is a new key");
 });
 
+test("artifactCardState: a report recipient's comment thread is named by its display name, else by the C5 label", async () => {
+  const api = mountCard().sandbox.__exportedApi;
+  const threads = [
+    { id: 1, status: "open", author_kind: "contact", author_id: "rrc-0000000000000001" },
+  ];
+  assert.equal(api.artifactCardState(row({ threads })).contactWho, translations["perch.artifactRecipientLabel"].en,
+    "an rrc author with no name is a recipient, not the id's first token");
+  const named = [{ ...threads[0], author_name: "Alex Rivera" }];
+  assert.equal(api.artifactCardState(row({ threads: named })).contactWho, "Alex Rivera",
+    "a display name the server found wins over the label");
+  const other = [{ id: 1, status: "open", author_kind: "contact", author_id: "alex@example" }];
+  assert.equal(api.artifactCardState(row({ threads: other })).contactWho, "alex",
+    "any other contact id keeps the name-head behaviour");
+});
+
 // ---------------------------------------------------------------------------
 // behaviour: refetch → render, dedupe, actions, replay
 // ---------------------------------------------------------------------------
@@ -636,6 +651,23 @@ test("review L6: authored titles are literal — no $-pattern expansion, no plac
   const fb = texts(byClass(hub.transcript, "artfb")[0]).join("|");
   assert.ok(ask.includes(evil), ask);
   assert.ok(fb.includes(evil) && fb.includes("v3"), fb);
+});
+
+test("M6: a display name lands literally in the badge, never as a replacement pattern ($&, $1, $$)", async () => {
+  const hub = mountCard();
+  const api = hub.sandbox.__exportedApi;
+  // A reader's display name is their own text: `$&` and `$$` are replacement PATTERNS to a string
+  // replacer, so a name holding them must not be rewritten into the label's own text.
+  const name = "$& $1 $$ {n} Dara";
+  const threads = [
+    { id: 1, status: "open", author_kind: "contact", author_id: "rrc-0000000000000001", author_name: name },
+  ];
+  api.upsertArtifactCard(row({ threads }), hub.sandbox.current.sid);
+  const badge = byClass(hub.transcript, "art-badges")[0];
+  assert.ok(badge, "the contact badge is drawn");
+  assert.ok(badge.textContent.includes(name), badge.textContent);
+  assert.ok(badge.textContent.includes("1 from"), "and its count is still filled in");
+  assert.equal(badge.textContent.includes("{who}"), false, "no placeholder survived");
 });
 
 // ---------------------------------------------------------------------------

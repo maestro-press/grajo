@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
 import * as mod from "../scripts/migrations/0031-reports-core.mjs";
+import * as links from "../scripts/migrations/0039-reports-links.mjs";
 import { discoverMigrations } from "../scripts/migrations/runner.mjs";
 import { REPORTS_DDL, REPORTS_TABLES } from "../servers/shared/reports-schema.js";
 
@@ -99,6 +100,9 @@ test("the shape matches what init-db produces", () => {
 
   const dbPath = freshDb("reports-fresh-");
   assert.equal(run({ dbPath, log: () => {} }).applied, true);
+  // 0039 adds reports.comment_window_runs (and the two link tables) on top, and init-db runs that same
+  // ALTER on its own rail: the two `reports` tables only match once both are applied.
+  assert.equal(links.run({ dbPath, log: () => {} }).applied, true);
   const got = reportObjects(dbPath);
 
   assert.deepEqual(got.map((o) => o.name), want.map((o) => o.name), "the same objects exist");
@@ -122,6 +126,8 @@ test("the defaults are the ones the stores read back", () => {
   assert.equal(reports.delivery_mode.dflt_value, "'email_link'");
   assert.equal(reports.comment_tier_default.dflt_value, "'c'");
   assert.equal(reports.comment_visibility.dflt_value, "'own'");
+  assert.equal(reports.comment_window_runs.dflt_value, "4", "the comment window defaults to four runs");
+  assert.equal(reports.comment_window_runs.notnull, 1, "and every row carries one");
   assert.equal(reports.ai_commentary.dflt_value, "0");
   assert.equal(reports.notify_every_run.dflt_value, "0");
   assert.equal(reports.pending_free_change.dflt_value, "0");

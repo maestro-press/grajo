@@ -56,6 +56,9 @@
  *     `email`), so the outgoing step builds the mail from the run's own content and not from a re-read.
  *   - `writeVersion(db, {report, run, live, result})` -> `{artifactVersion}`: optional; absent, the run
  *     keeps no artifact version.
+ *   - `autoResolveRecipientThreads(db, {report})`: optional, and only ever called for a non-preview run;
+ *     the default closes the reader threads the report's comment window has passed. Best effort: its
+ *     outcome never changes the run's status.
  *   - `getSecrets()`: literal secret values to scrub. Absent, this instance's display list.
  *   - `now()`: epoch ms for every row this module writes, so a test's clock moves them.
  *
@@ -146,6 +149,17 @@ function blockSeam(given, resolved) {
   return { ...(given.approvals ?? {}), ...given, ...resolved };
 }
 
+/**
+ * The default comment-window pass (see `recipient-comments.js`): the reader threads a finished run closed
+ * on its own. Imported lazily at the moment it runs, because the recipient module reaches the report
+ * store and the artifacts bridge, and this engine's static graph is imported by delivery and the
+ * scheduler hook; a dynamic import changes neither.
+ */
+async function defaultAutoResolveRecipientThreads(db, deps, input) {
+  const { autoResolveRecipientThreads } = await import("./recipient-comments.js");
+  return autoResolveRecipientThreads(db, deps, input);
+}
+
 /** `deps` with every member present; a member that is absent falls back to the real thing. */
 function resolveDeps(deps) {
   const given = deps == null ? {} : deps;
@@ -155,6 +169,8 @@ function resolveDeps(deps) {
     runBlocks: null,
     deliver: typeof given.deliver === "function" ? given.deliver : null,
     writeVersion: typeof given.writeVersion === "function" ? given.writeVersion : null,
+    autoResolveRecipientThreads: fn("autoResolveRecipientThreads",
+      (dbArg, input) => defaultAutoResolveRecipientThreads(dbArg, given, input)),
     getSecrets: fn("getSecrets", defaultGetSecrets),
     now: fn("now", Date.now),
   };
@@ -658,6 +674,17 @@ async function runClaimed(db, d, runId, processRunId) {
     } catch (err) {
       const note = `Delivery failed: ${redactedText(err?.message || "unknown error", secrets, MESSAGE_MAX)}`;
       errorText = redactedText(errorText ? `${errorText} ${note}` : note, secrets);
+    }
+  }
+
+  // The comment window: every finished non-preview run closes the reader threads its window has passed
+  // (and the ones the bot already answered), so a reader's open-thread cap is never spent on threads
+  // nobody will look at again. Best effort: bookkeeping never changes a run's outcome.
+  if (run.trigger !== "preview") {
+    try {
+      await d.autoResolveRecipientThreads(db, { report });
+    } catch {
+      // A pass that cannot run is not a failed run.
     }
   }
 

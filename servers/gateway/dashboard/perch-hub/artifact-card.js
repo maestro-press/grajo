@@ -46,6 +46,9 @@ export function perchArtifactCardJs(lang = "en") {
   var ART_ST_PROPOSED='${tJs("perch.artifactStateProposed", lang)}';
   var ART_COMMENTS='${tJs("perch.artifactOpenComments", lang)}';
   var ART_CONTACT='${tJs("perch.artifactContactComments", lang)}';
+  /* 6a C5: a report recipient who commented and has no display name (their thread's author id is an
+     rrc- id). A display name, when the server found one, wins over this label. */
+  var ART_RECIPIENT='${tJs("perch.artifactRecipientLabel", lang)}';
   var ART_FAILED='${tJs("perch.artifactActionFailed", lang)}';
   var ART_GONE='${tJs("perch.artifactGone", lang)}';
   var ART_LINK_ASK='${tJs("perch.artifactLinkAsk", lang)}';
@@ -62,6 +65,16 @@ export function perchArtifactCardJs(lang = "en") {
   var ART_FB_NOCHANGE='${tJs("perch.artifactFbNoChange", lang)}';
   var ART_FB_TIMEDOUT='${tJs("perch.artifactFbTimedOut", lang)}';
   var ART_TYPES={ page:'${tJs("perch.artifactTypePage", lang)}', document:'${tJs("perch.artifactTypeDocument", lang)}', diagram:'${tJs("perch.artifactTypeDiagram", lang)}' };
+
+  /* Fill a label's placeholders from a map, in ONE pass with a FUNCTION replacer: an
+     authored value holding $&, $1 or $$ is inserted literally (a string replacer
+     would read those as replacement patterns), and a value holding {n} is never
+     substituted again. */
+  function artFill(tpl,values){
+    return String(tpl).replace(/\\{([a-z]+)\\}/g,function(m,key){
+      return Object.prototype.hasOwnProperty.call(values,key)?String(values[key]):m;
+    });
+  }
 
   /* artifactId -> {node,key} for THIS transcript. Dies with the transcript at
      the same seams as fileSeen and phoneCards. */
@@ -201,13 +214,13 @@ export function perchArtifactCardJs(lang = "en") {
     var text='';
     if(st==='working'||st==='delivering'||st==='pending'||st==='queued') text=ART_FB_WORKING;
     else if(st==='timed-out') text=ART_FB_TIMEDOUT;
-    else if(st==='done') text=v?ART_FB_READY.replace('{n}',String(v)):ART_FB_NOCHANGE;
+    else if(st==='done') text=v?artFill(ART_FB_READY,{n:v}):ART_FB_NOCHANGE;
     rec.line.textContent=text;
     if(rec.show&&rec.show.parentNode) rec.show.parentNode.removeChild(rec.show);
     rec.show=null;
     if(v&&(st==='done'||st==='timed-out')){
       var b=document.createElement('button'); b.type='button'; b.className='art-fb-showv';
-      b.textContent=ART_FB_SHOWV.replace('{n}',String(v));
+      b.textContent=artFill(ART_FB_SHOWV,{n:v});
       b.onclick=function(){ openArtifactPane(c.artifactId,sid,v); };
       rec.acts.appendChild(b); rec.show=b;
     }
@@ -217,7 +230,7 @@ export function perchArtifactCardJs(lang = "en") {
     var node=document.createElement('div'); node.className='entry artfb';
     var k=Number(c.count)||0;
     var ct=String(c.title||'');
-    var head=(k===1?ART_FB_ONE:ART_FB).replace('{n}',String(Number(c.version)||0)).replace('{k}',String(k)).replace('{title}',function(){ return ct; });
+    var head=artFill(k===1?ART_FB_ONE:ART_FB,{title:ct,n:String(Number(c.version)||0),k:k});
     node.appendChild(line('art-eyebrow',ART_LABEL));
     node.appendChild(line('art-title',head));
     var stLine=line('art-fb-status','');
@@ -295,8 +308,8 @@ export function perchArtifactCardJs(lang = "en") {
     /* Review L6: authored values go in with a function replacer (no $-pattern
        expansion), and the title last (a title holding {bot} stays literal). */
     var qt=String(q.title||''), qb=String(q.botId||'');
-    node.appendChild(line('art-title',ART_LINK_ASK.replace('{title}',function(){ return qt; })));
-    node.appendChild(line('art-meta',ART_LINK_WHY.replace('{bot}',function(){ return qb; })));
+    node.appendChild(line('art-title',artFill(ART_LINK_ASK,{title:qt})));
+    node.appendChild(line('art-meta',artFill(ART_LINK_WHY,{bot:qb})));
     var acts=document.createElement('div'); acts.className='art-actions';
     var decide=function(accept){
       return function(){
@@ -385,7 +398,10 @@ export function perchArtifactCardJs(lang = "en") {
       if(t.author_kind==='contact'){
         contactOpen++;
         if(!who&&typeof t.author_id==='string'&&t.author_id){
-          who=t.author_id.split(/[^\\p{L}\\p{N}]/u)[0].slice(0,20);
+          var named=(typeof t.author_name==='string')?t.author_name.trim():'';
+          if(named){ who=named; }
+          else if(/^rrc-[0-9a-f]{16}$/.test(t.author_id)){ who=ART_RECIPIENT; }
+          else { who=t.author_id.split(/[^\\p{L}\\p{N}]/u)[0].slice(0,20); }
         }
       }
     }
@@ -393,8 +409,8 @@ export function perchArtifactCardJs(lang = "en") {
     var typeLabel=Object.prototype.hasOwnProperty.call(ART_TYPES,type)?ART_TYPES[type]:type;
     var chip,pill;
     if(flagged){ chip=ART_ST_FLAGGED; pill='err'; }
-    else if(round){ chip=ART_ST_REVISING.replace('{n}',String(Number(round.id)||0)); pill='wait'; }
-    else if(proposed){ chip=ART_ST_PROPOSED.replace('{n}',String(Number(proposed.n)||0)); pill='warn'; }
+    else if(round){ chip=artFill(ART_ST_REVISING,{n:String(Number(round.id)||0)}); pill='wait'; }
+    else if(proposed){ chip=artFill(ART_ST_PROPOSED,{n:String(Number(proposed.n)||0)}); pill='warn'; }
     else if(scriptsOff){ chip=ART_ST_SCRIPTS_OFF; pill='warn'; }
     else { chip=ART_ST_READY; pill='ok'; }
     var curN=cur?Number(cur.n):(a.current_version==null?null:Number(a.current_version));
@@ -437,8 +453,8 @@ export function perchArtifactCardJs(lang = "en") {
     rec.node.appendChild(line('art-meta','v'+String(st.curN==null?'?':st.curN)));
     if(st.openComments>0||st.contactOpen>0){
       var parts=[];
-      if(st.openComments>0) parts.push(ART_COMMENTS.replace('{n}',String(st.openComments)));
-      if(st.contactOpen>0) parts.push(ART_CONTACT.replace('{n}',String(st.contactOpen)).replace('{who}',st.contactWho||'?'));
+      if(st.openComments>0) parts.push(artFill(ART_COMMENTS,{n:String(st.openComments)}));
+      if(st.contactOpen>0) parts.push(artFill(ART_CONTACT,{n:String(st.contactOpen),who:st.contactWho||'?'}));
       rec.node.appendChild(line('art-badges',parts.join(' · ')));
     }
     var acts=document.createElement('div'); acts.className='art-actions';

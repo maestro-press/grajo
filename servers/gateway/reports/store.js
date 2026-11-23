@@ -45,14 +45,15 @@ export const EMPTY_RECIPE_JSON = '{"blocks":[]}';
 
 const REPORT_COLUMNS = `id, project_id, owner, bot_id, title, status, recipe_json, recipe_rev,
   recipe_hash, sources_hash, schedule_id, delivery_mode, comment_tier_default, comment_visibility,
-  ai_commentary, model_ref, pause_reason, notify_every_run, sender_account_id, artifact_id, live_rev,
-  live_seal, live_nonce, approved_preview_run, pending_free_change, created_at, updated_at`;
+  comment_window_runs, ai_commentary, model_ref, pause_reason, notify_every_run, sender_account_id,
+  artifact_id, live_rev, live_seal, live_nonce, approved_preview_run, pending_free_change, created_at,
+  updated_at`;
 
 /** A list row is the same head without the recipe body: a list never needs every block's settings. */
 const REPORT_LIST_COLUMNS = `id, project_id, owner, bot_id, title, status, recipe_rev, recipe_hash,
-  sources_hash, schedule_id, delivery_mode, comment_tier_default, comment_visibility, ai_commentary,
-  model_ref, pause_reason, notify_every_run, sender_account_id, artifact_id, live_rev, live_seal,
-  live_nonce, approved_preview_run, pending_free_change, created_at, updated_at`;
+  sources_hash, schedule_id, delivery_mode, comment_tier_default, comment_visibility, comment_window_runs,
+  ai_commentary, model_ref, pause_reason, notify_every_run, sender_account_id, artifact_id, live_rev,
+  live_seal, live_nonce, approved_preview_run, pending_free_change, created_at, updated_at`;
 
 const REVISION_COLUMNS = `report_id, rev, recipe_json, recipe_hash, sources_hash, author_kind,
   created_at`;
@@ -64,7 +65,8 @@ const REVISION_COLUMNS = `report_id, rev, recipe_json, recipe_hash, sources_hash
  */
 const WRITABLE_COLUMNS = Object.freeze([
   "bot_id", "title", "status", "schedule_id", "delivery_mode", "comment_tier_default",
-  "comment_visibility", "ai_commentary", "model_ref", "pause_reason", "notify_every_run",
+  "comment_visibility", "comment_window_runs", "ai_commentary", "model_ref", "pause_reason",
+  "notify_every_run",
   "sender_account_id", "artifact_id", "live_rev", "live_seal", "live_nonce", "approved_preview_run",
   "pending_free_change",
 ]);

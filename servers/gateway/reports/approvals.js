@@ -82,6 +82,10 @@
  *   - `linkFor(db, {report, recipient, run, sendId})`: the link one recipient's mail opens, or null when
  *     this PR cannot make one for that recipient (`reports/links.js`). Go-live asks it about every
  *     approved recipient, so a report that would mail a link going nowhere is never taken live.
+ *   - `revokeLinkTokens(db, deps, {reportId, recipientId})`: the sweep a refusal or a revocation runs over
+ *     that recipient's link tokens (`reports/links.js`). It defaults to the real one and is a seam only
+ *     so a test can make that write FAIL: the sweep is best effort on purpose, and the token's own
+ *     approval-nonce binding is what takes an older link out of service when it does.
  *
  * Every refusal is an Error with a `code`: `owner_only`, `not_found`, `bad_input`, `bad_recipe`,
  * `keychain_key_missing`, `preview_missing`, `preview_stale`, `preview_failed`, `no_schedule`,
@@ -103,7 +107,7 @@ import { approvalSeal, newApprovalNonce, verifyApprovalSeal } from "./seal.js";
 import { sealAuthorRevision } from "./revision-author.js";
 import { SENDER_SEAL_KEY, sealSender, senderSealVerifies } from "./sender-seal.js";
 import { getReport, getRevision, recordAudit, saveRecipe, setState, updateReportColumns } from "./store.js";
-import { linkFor } from "./links.js";
+import { linkFor, revokeLinkTokens } from "./links.js";
 import { loadKeychainKey } from "../keychain/key.js";
 import { resolveProviderConfig } from "../ai/resolve-profile.js";
 import { getSecretValues } from "../../shared/secret-values.js";
@@ -131,12 +135,13 @@ export const COMMENT_VISIBILITIES = Object.freeze(["own", "all"]);
 /** The head columns `updateSettings` may write. */
 export const REPORT_SETTING_KEYS = Object.freeze([
   "sender_account_id", "delivery_mode", "comment_tier_default", "comment_visibility", "ai_commentary",
-  "title", "notify_every_run",
+  "comment_window_runs", "title", "notify_every_run",
 ]);
 
-/** The five settings that are part of the live set: changing one on a live report stops it. */
+/** The six settings that are part of the live set: changing one on a live report stops it. */
 const LIVE_SETTING_KEYS = Object.freeze([
   "sender_account_id", "delivery_mode", "comment_tier_default", "comment_visibility", "ai_commentary",
+  "comment_window_runs",
 ]);
 
 /** The pause reason a live-set settings change leaves (plain words, no dash). */
@@ -185,6 +190,24 @@ function text(value) {
 /** A 0/1 column as the number the seal carries. */
 function flagNumber(value) {
   return value === 1 || value === true ? 1 : 0;
+}
+
+/** How many runs back a reader may comment on when a row carries no value (the schema's own default). */
+export const DEFAULT_COMMENT_WINDOW_RUNS = 4;
+
+/** The widest and narrowest comment window `updateSettings` accepts. */
+export const COMMENT_WINDOW_MIN = 1;
+export const COMMENT_WINDOW_MAX = 50;
+
+/**
+ * `reports.comment_window_runs` as the number the seal carries. An old row written before the column
+ * existed reads NULL, and a value that is not a number at all is treated the same way: the report still
+ * seals, over the default the schema would have given it, rather than refusing to go live.
+ */
+function commentWindowNumber(value) {
+  if (value == null || value === "") return DEFAULT_COMMENT_WINDOW_RUNS;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : DEFAULT_COMMENT_WINDOW_RUNS;
 }
 
 /** The actor rule: every approving function needs the owner and nobody else. */
@@ -521,6 +544,7 @@ function resolveDeps(deps) {
     // "no registry at all" (every block source-bearing), which is the safe side to be wrong on.
     registry: given.registry === undefined ? blockRegistry : given.registry,
     linkFor: fn("linkFor", linkFor),
+    revokeLinkTokens: fn("revokeLinkTokens", revokeLinkTokens),
   };
 }
 
@@ -655,6 +679,7 @@ export async function liveSetFor(db, deps, report, overrides = {}) {
     deliveryMode: text(report.delivery_mode),
     commentTierDefault: text(report.comment_tier_default),
     commentVisibility: text(report.comment_visibility),
+    commentWindowRuns: commentWindowNumber(report.comment_window_runs),
     aiCommentary: flagNumber(report.ai_commentary),
     modelRef: over.modelRef !== undefined ? modelRefText(over.modelRef) : modelRefText(report.model_ref),
     nonce: text(over.nonce !== undefined ? over.nonce : report.live_nonce),
@@ -732,9 +757,40 @@ async function verifiedLiveSet(db, deps, report) {
   return verified ? verified.fields : null;
 }
 
-/** Does this report's seal still verify, whatever its status says? Never throws. */
-async function sealVerifies(db, deps, report) {
+/**
+ * Does this report's seal still verify, whatever its status says? Never throws.
+ *
+ * Exported because a reader outside this module has the same question and has no other way to ask it:
+ * `links.js` treats a report whose status word still says `live` over a seal that no longer verifies as a
+ * paused one (a direct UPDATE of a live-set column leaves exactly that shape behind). It is loaded by
+ * `links.js` on first use, so the export costs the import graph nothing.
+ */
+export async function sealVerifies(db, deps, report) {
   return (await verifiedLive(db, deps, report)) !== null;
+}
+
+/**
+ * The two comment settings a recipient's page and a recipient's post obey, taken from the VERIFIED live
+ * set, or null when the seal does not verify. Never throws.
+ *
+ * WHY THE SEALED VALUES AND NOT THE COLUMNS: `comment_visibility` and `comment_window_runs` are both part
+ * of the live set, so what the owner approved is what a reader's page shows and which versions still take
+ * comments. A direct UPDATE of either column would otherwise widen what a reader sees, or re-open pages the
+ * owner closed, without any approval at all. A null answer means the caller must use the NARROWEST values
+ * it knows (`own`, the default window), not the row's.
+ *
+ * @param {object} db
+ * @param {object} [deps] the approvals seam (the keychain seed decides whether the seal verifies)
+ * @param {object|null} report a report row
+ * @returns {Promise<{commentVisibility: string, commentWindowRuns: number}|null>}
+ */
+export async function verifiedCommentSettings(db, deps, report) {
+  const fields = await verifiedLiveSet(db, deps, report);
+  if (!fields) return null;
+  return {
+    commentVisibility: text(fields.commentVisibility),
+    commentWindowRuns: commentWindowNumber(fields.commentWindowRuns),
+  };
 }
 
 /**
@@ -1240,6 +1296,17 @@ function readFlag(value) {
 }
 
 /**
+ * One count setting: a whole number in range, and nothing else. A string spelling of a number and a
+ * fraction are both refused, because the column is an INTEGER and a value written as text would come
+ * back sealed differently from what the page sent.
+ */
+function readCommentWindow(value) {
+  if (typeof value !== "number" || !Number.isInteger(value)) return null;
+  if (value < COMMENT_WINDOW_MIN || value > COMMENT_WINDOW_MAX) return null;
+  return value;
+}
+
+/**
  * Clear a report's stored sender seal, best effort: it must never fail the settings write around it.
  * The value written is the JSON `null`, which every reader of the key already reads as "no seal".
  */
@@ -1282,11 +1349,12 @@ async function sealSenderOnSettings(db, d, report) {
 
 /**
  * The owner's settings write (route `PUT /settings`): the sender, the delivery rule, the comment
- * defaults, the AI switch, the title and the notify switch.
+ * defaults, the comment window, the AI switch, the title and the notify switch.
  *
  * An unknown key, a word outside an enum or a value of the wrong type is `bad_input` and writes
  * nothing. A sender that is not a send-ready Crow Mail account on this instance is `sender_not_ready`.
- * When a live report's sender, delivery, tier, visibility or AI switch actually changes, the report is
+ * When a live report's sender, delivery, tier, visibility, comment window or AI switch actually changes,
+ * the report is
  * paused with the fixed sentence AND its seal and nonce are nulled in the same write: the live seal no
  * longer describes what the report would do, and setting the column back must not revive the old
  * approval. Only a fresh preview and go-live re-approve it (`resumeReport` answers `go_live_needed`).
@@ -1343,6 +1411,12 @@ export async function updateSettings(db, deps, { reportId, settings, actor } = {
         if (!COMMENT_VISIBILITIES.includes(value)) throw fail("bad_input", key);
         patch.comment_visibility = value;
         break;
+      case "comment_window_runs": {
+        const window = readCommentWindow(value);
+        if (window == null) throw fail("bad_input", key);
+        patch.comment_window_runs = window;
+        break;
+      }
       case "ai_commentary":
       case "notify_every_run": {
         const flag = readFlag(value);
@@ -1364,9 +1438,13 @@ export async function updateSettings(db, deps, { reportId, settings, actor } = {
 
   const liveSetChanged = LIVE_SETTING_KEYS.some((key) => {
     if (!Object.hasOwn(patch, key)) return false;
-    return key === "ai_commentary"
-      ? flagNumber(patch[key]) !== flagNumber(report[key])
-      : text(patch[key]) !== text(report[key]);
+    if (key === "ai_commentary") return flagNumber(patch[key]) !== flagNumber(report[key]);
+    // An old row written before the column existed holds NULL, which the seal reads as the schema's own
+    // default: saving that same default over it is not a change and must not pause a live report.
+    if (key === "comment_window_runs") {
+      return commentWindowNumber(patch[key]) !== commentWindowNumber(report[key]);
+    }
+    return text(patch[key]) !== text(report[key]);
   });
   const liveChanged = report.status === REPORT_LIVE && liveSetChanged;
   // A pause keeps the seal so a resume can prove nothing moved while the report was stopped. A live-set
@@ -1721,6 +1799,15 @@ export async function approveRecipient(db, deps, { recipientId, actor } = {}) {
  *
  * The write is guarded by the state this read saw: a decision that landed in between answers
  * `recipient_changed` rather than being overwritten.
+ *
+ * THE LINK TOKENS GO WITH IT, best effort: every token this recipient still holds is stamped revoked and
+ * its version hold released (`links.js`'s `revokeLinkTokens`), because a person who was refused or
+ * revoked must not keep a working link. That call is the raw caller's deps, so a caller that mounts an
+ * artifacts runtime (`artifacts`) reaches the real store; one that does not gets the installed bundle's
+ * own. A failure there changes nothing here: the decision is the row's state, the seal is already
+ * NULLed, and `resolveLinkToken` refuses a recipient that is not approved with a verifying seal anyway.
+ * The nonce NULLed below is the second half of the same promise: every token minted before this write
+ * named the nonce it is replacing, so it reads unknown on its next click even if this sweep never ran.
  */
 async function decideRecipient(db, deps, { recipientId, actor, state, decided } = {}) {
   requireOwner(actor);
@@ -1745,6 +1832,11 @@ async function decideRecipient(db, deps, { recipientId, actor, state, decided } 
     decided,
     at,
   });
+  try {
+    await d.revokeLinkTokens(db, deps, { reportId: row.report_id, recipientId: row.id });
+  } catch {
+    // Best effort (see above): a link log that will not move never undoes a revoke.
+  }
   return mapRecipient(await getRecipientRow(db, row.id));
 }
 

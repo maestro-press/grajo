@@ -80,6 +80,10 @@ import { rejectFunneledMiddleware } from "./funnel.js";
 import { refuseRelayedInternal } from "./middleware/internal-guard.js";
 import { gatewayListenPort } from "./listen-port.js";
 import { startActivatedProxySocket, closeProxySocket } from "./proxy-socket.js";
+// Crow Recurring Reports' public door (a recipient's page and comment box), on its own
+// systemd-activated unix socket. Imported here because the gateway is the one process
+// that holds the keychain seed and the artifacts runtime a recipient page needs.
+import { closeDoorServer, startActivatedDoor } from "./reports/public-door.js";
 import { gatewayListenHost } from "./listen-host.js";
 
 import { validateRoomToken } from "../sharing/server.js";
@@ -927,6 +931,9 @@ app.use(bodyErrorHandler);
 const { installUnclaimedUpgradeFallback } = await import("../shared/ws-upgrade-claim.js");
 
 let proxyServer = null;
+// The reports door listener, when systemd handed this process its fd (null otherwise: no
+// activation fd means nothing listens on the door and nothing is logged at warn level).
+let reportsDoorServer = null;
 
 const server = app.listen(PORT, BIND, (error) => {
   if (error) {
@@ -957,6 +964,15 @@ const server = app.listen(PORT, BIND, (error) => {
   // servers/gateway/index.js` run). Never throws: a socket that cannot start
   // only costs the proxy path.
   if (!noAuth) proxyServer = startActivatedProxySocket(app, server);
+
+  // The public reports door: a recipient's page (`/r/<token>`) and its comment box, on its
+  // own systemd-owned unix socket (`crow-report-readers.socket`), never the dashboard's TCP
+  // listener and never a Funnel path. Same rule as the proxy socket above: with no activation
+  // fd (a dev run, an install whose door unit is not there yet) this listens on NOTHING and
+  // says nothing; a door that cannot start only costs the recipient pages, never the gateway.
+  // The db is the gateway's own crow.db handle, and deps are the real ones: the keychain seed
+  // through the approvals seam, and the artifacts bundle loaded at first click.
+  if (!noAuth) reportsDoorServer = startActivatedDoor({ db: relayDb });
 });
 
 // Upgrades to a path no handler owns get a 404 and a closed socket (see the import's
@@ -971,6 +987,7 @@ process.on("crow:shutdown", () => {
   // launcher must be told before the process goes away.
   markPlanned();
   closeProxySocket(proxyServer);
+  closeDoorServer(reportsDoorServer);
 });
 
 // --- Graceful Shutdown ---
@@ -1046,16 +1063,21 @@ async function gracefulShutdown() {
   const tcpClosed = closeAndWait(server);
   server.closeIdleConnections();
   const proxyClosed = closeProxySocket(proxyServer);
+  const listenersClosed = Promise.all([tcpClosed, proxyClosed]);
+  // The reports door is a third listener. It holds no SSE or Turbo-Stream socket (one JSON line
+  // per connection), so it is closed here and awaited with the others.
+  const doorClosed = closeDoorServer(reportsDoorServer);
 
   // Step 3 — wait for in-flight requests (drain window) on either listener
   await Promise.race([
-    Promise.all([tcpClosed, proxyClosed]),                     // fires when both are closed
+    Promise.all([listenersClosed, doorClosed]),                    // fires when all are closed
     new Promise((resolve) => setTimeout(resolve, CROW_SHUTDOWN_DRAIN_MS)),
   ]);
 
   // Step 4 — sever any remaining sockets (SSE/Turbo-Stream etc.) on either listener
   server.closeAllConnections();
   closeProxySocket(proxyServer, { force: true });
+  closeDoorServer(reportsDoorServer, { force: true });
 
   // Step 5 — session + proxy shutdown, same semantics as before
   const { shutdownAll } = await import("./proxy.js");

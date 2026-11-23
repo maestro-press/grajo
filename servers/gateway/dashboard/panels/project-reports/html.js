@@ -111,12 +111,14 @@ function visibilityText(value, lang) {
 /** A button the page's client wires: action, the report it is about, and the words on it. A go-live
  *  button also carries `data-rp-sender`, the sender account id the page showed (the empty string when
  *  the report has none), which the client hands back with the go-live so the route can compare it with
- *  the row it reads. */
-function actionButton(action, report, label, { run = null, recipient = null, sender = null } = {}) {
+ *  the row it reads. A recipient button may carry `data-rp-name`, the words a confirmation names that
+ *  person by (the display name when the row has one, else the address). */
+function actionButton(action, report, label, { run = null, recipient = null, sender = null, name = null } = {}) {
   const runAttr = run ? ` data-rp-run="${escapeHtml(run)}"` : "";
   const recipientAttr = recipient ? ` data-rp-recipient="${escapeHtml(recipient)}"` : "";
   const senderAttr = typeof sender === "string" ? ` data-rp-sender="${escapeHtml(sender)}"` : "";
-  return `<button type="button" class="rp-btn" data-rp-action="${escapeHtml(action)}" data-rp-report="${escapeHtml(report.id)}"${runAttr}${recipientAttr}${senderAttr}>${escapeHtml(label)}</button>`;
+  const nameAttr = typeof name === "string" ? ` data-rp-name="${escapeHtml(name)}"` : "";
+  return `<button type="button" class="rp-btn" data-rp-action="${escapeHtml(action)}" data-rp-report="${escapeHtml(report.id)}"${runAttr}${recipientAttr}${senderAttr}${nameAttr}>${escapeHtml(label)}</button>`;
 }
 
 /** A link that looks like the buttons beside it. */
@@ -254,6 +256,26 @@ function settingsRow(labelKey, value, lang) {
   return `<div class="rp-setting"><span class="rp-setting-label">${escapeHtml(t(labelKey, lang))}</span> <span class="rp-setting-value">${escapeHtml(value)}</span></div>`;
 }
 
+/**
+ * How many recent runs keep comments open, as the page reads it out. ./data.js already answers the
+ * report's own `comment_window_runs`, defaulted to the same number when the column is empty; this falls
+ * back to that number for a view a caller built by hand, so no page ever prints "{n}".
+ */
+const DEFAULT_COMMENT_WINDOW_RUNS = 4;
+
+function commentWindowRunsOf(report) {
+  const runs = Number(report.commentWindowRuns);
+  return Number.isInteger(runs) && runs > 0 ? runs : DEFAULT_COMMENT_WINDOW_RUNS;
+}
+
+/**
+ * One read-only settings row whose copy is a whole sentence rather than a label beside a value
+ * (the comment window, 6a C4): the sentence IS the row, its one placeholder filled here.
+ */
+function settingsSentenceRow(labelKey, params, lang) {
+  return `<div class="rp-setting"><span class="rp-setting-value">${escapeHtml(fill(t(labelKey, lang), params))}</span></div>`;
+}
+
 /** The settings the page reads out: delivery, comment defaults and the AI switch. */
 function settingsSection(report, owner, lang) {
   if (!owner) return "";
@@ -261,6 +283,7 @@ function settingsSection(report, owner, lang) {
     settingsRow("projectReports.settings.delivery", deliveryText(report.deliveryMode, lang), lang),
     settingsRow("projectReports.settings.tier", tierText(report.commentTierDefault, lang), lang),
     settingsRow("projectReports.settings.visibility", visibilityText(report.commentVisibility, lang), lang),
+    settingsSentenceRow("projectReports.settings.commentWindow", { n: commentWindowRunsOf(report) }, lang),
     settingsRow("projectReports.settings.ai", t(report.aiCommentary ? "projectReports.settings.on" : "projectReports.settings.off", lang), lang),
   ];
   return `<section class="rp-section" id="settings">
@@ -269,14 +292,21 @@ function settingsSection(report, owner, lang) {
     </section>`;
 }
 
-/** One recipient: the address, its state, its tier and the one decision that fits its state. */
+/**
+ * One recipient: the address, its state, its tier and the decisions that fit its state. An approved
+ * recipient has two: Revoke (the approval itself) and Revoke links (only the links already sent, which
+ * leaves the approval in place so the next run mints new ones). The links button names the person as
+ * the page knows them (the display name, else the address) for the confirmation the client asks first.
+ */
 function recipientRow(recipient, report, lang) {
   const actions = [];
+  const name = recipient.displayName || recipient.address;
   if (recipient.state === "proposed") {
     actions.push(actionButton("approve", report, t("projectReports.recipients.approve", lang), { recipient: recipient.id }));
     actions.push(actionButton("refuse", report, t("projectReports.recipients.refuse", lang), { recipient: recipient.id }));
   } else if (recipient.state === "approved") {
     actions.push(actionButton("revoke", report, t("projectReports.recipients.revoke", lang), { recipient: recipient.id }));
+    actions.push(actionButton("revoke-links", report, t("projectReports.recipients.revokeLinks", lang), { recipient: recipient.id, name }));
   }
   const tier = `<span class="rp-meta">${escapeHtml(tierText(recipient.tier, lang))}</span>`;
   return `<li class="rp-recipient">

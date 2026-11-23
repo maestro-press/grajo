@@ -28,7 +28,7 @@ const {
 } = await import("../servers/gateway/reports/delivery.js");
 const { DEFAULT_EMPTY_TEXT } = await import("../servers/gateway/reports/document.js");
 const { STORAGE_NEARLY_FULL_TEXT } = await import("../servers/gateway/reports/artifact-bridge.js");
-const { EMAILS_SKIPPED_BODY } = await import("../servers/gateway/reports/email/copy.js");
+const { EMAILS_SKIPPED_BODY, RUN_FAILED_FALLBACK_LINE } = await import("../servers/gateway/reports/email/copy.js");
 const {
   approveGoLive, approveRecipient, proposeRecipient, revokeRecipient, updateSettings,
 } = await import("../servers/gateway/reports/approvals.js");
@@ -41,12 +41,20 @@ const { registerReportsHook } = await import("../servers/gateway/reports/schedul
 const { createAccount } = await import("../servers/gateway/mail/store/accounts.js");
 const { MailError } = await import("../servers/gateway/mail/errors.js");
 const { initArtifactsTables } = await import("../bundles/artifacts/server/init-tables.js");
+// The bundle's own store, injected as the artifacts runtime a mint's version hold goes through.
+const artifactsStore = await import("../bundles/artifacts/server/store.js");
+const {
+  REPORTS_PUBLIC_ORIGIN_KEY, hashToken, linkFor: realLinkFor, resolveLinkToken,
+} = await import("../servers/gateway/reports/links.js");
 
 const OWNER = Object.freeze({ kind: "owner" });
 const SEED = Buffer.alloc(32, 7);
 const PROJECT = 7;
 const T0 = 1_700_000_000_000;
 const BASE = "https://crow.example.ts.net";
+const ORIGIN = "https://reports.example.com";
+/** A public report link carries a 32 byte token, base64url: 43 characters after `/r/`. */
+const TOKEN_URL = /https:\/\/reports\.example\.com\/r\/([A-Za-z0-9_-]{43})/;
 const DAY_MS = 86_400_000;
 const FOOTER = "Open this report: ";
 
@@ -1233,4 +1241,391 @@ test("concurrent deliverPending calls and hook passes send one pending row exact
   } finally {
     await hook.stop();
   }
+});
+
+/* ----------------------------------- the claimed row, the minted token, and the mail */
+//
+// A tier `a` or `b` link carries a token minted per SEND ROW, so the row has to exist before the token
+// does and the mail exists only once both do. These tests configure `reports.public_origin` and drive
+// the real `links.js` minting: the artifacts bundle's own tables (a token's version hold is a bundle
+// row) and the run's `report_versions` row are written here, and the artifacts runtime is injected
+// through the delivery deps, which is where a mint reads it from.
+
+/** The origin a public report link is built on, as the owner's setting carries it. */
+async function setReportsOrigin(db, value = ORIGIN) {
+  await db.execute({
+    sql: "INSERT OR REPLACE INTO dashboard_settings (key, value) VALUES (?, ?)",
+    args: [REPORTS_PUBLIC_ORIGIN_KEY, value],
+  });
+}
+
+/**
+ * A live report whose run wrote a version a recipient may be shown, with a public origin configured.
+ * `version: false` is a run with nothing a recipient could be shown (no token can be minted for it),
+ * and `origin: null` leaves the setting out, so a tier `a` or `b` recipient has no link at all.
+ */
+async function publicWorld({
+  tier = "a", address = "outside@example.com", version = true, origin = ORIGIN,
+} = {}) {
+  const w = await world();
+  await initArtifactsTables(w.db);
+  await w.db.execute({
+    sql: "INSERT INTO artifacts (id, title, type) VALUES ('art-1', 'Weekly listings', 'document')",
+    args: [],
+  });
+  await w.db.execute({
+    sql: `INSERT INTO artifact_versions (artifact_id, n, state, files_json, size, content_hash, made_by)
+          VALUES ('art-1', 1, 'past', '[]', 0, 'abc', 'user')`,
+    args: [],
+  });
+  if (version) {
+    await w.db.execute({
+      sql: `INSERT INTO report_versions
+              (artifact_id, n, report_id, run_id, "trigger", allowed_links_json, created_at)
+            VALUES ('art-1', 1, ?, ?, 'manual', '[]', ?)`,
+      args: [w.reportId, w.runId, T0],
+    });
+  }
+  if (origin) await setReportsOrigin(w.db, origin);
+  const recipient = await recipientFor(w.db, w.reportId, { address, tier });
+  return { ...w, recipient, report: { ...w.report, artifact_id: "art-1" } };
+}
+
+/**
+ * The delivery deps for a public-link world: the real artifacts store is the runtime a mint's hold goes
+ * through, so `holdVersion` is NOT stubbed here (an injected one would stand in for the mint's own hold).
+ */
+function publicDeps(over = {}) {
+  return deliveryDeps({ artifacts: { store: artifactsStore }, holdVersion: undefined, ...over });
+}
+
+/** The raw token one captured mail carries, or null. */
+function tokenIn(message) {
+  const found = TOKEN_URL.exec(String(message == null ? "" : message));
+  return found ? found[1] : null;
+}
+
+/** Every value this database holds, table by table, so one string can be searched across all of it. */
+async function databaseText(db) {
+  const tables = (await rowsOf(db, "SELECT name FROM sqlite_master WHERE type = 'table'"))
+    .map((row) => String(row.name));
+  const found = [];
+  for (const table of tables) {
+    if (table.startsWith("sqlite_")) continue;
+    const { rows } = await db.execute({ sql: `SELECT * FROM "${table}"`, args: [] });
+    for (const row of rows) {
+      for (const value of Object.values(row)) {
+        if (value != null) found.push(typeof value === "string" ? value : String(value));
+      }
+    }
+  }
+  return found.join("\n");
+}
+
+test("tier a: the row is claimed first, the token is minted for it, then the email carries it", async () => {
+  const w = await publicWorld({ tier: "a" });
+  // The mint is captured where it happens: a mint call names a send id, and that row already exists.
+  const mints = [];
+  const linkFor = async (db, input) => {
+    if (input.sendId) {
+      const rows = await rowsOf(db, "SELECT status FROM report_sends WHERE id = ?", [input.sendId]);
+      mints.push({ sendId: input.sendId, status: rows[0] == null ? null : rows[0].status });
+    }
+    return realLinkFor(db, input);
+  };
+  const mail = recorder({ settle: true });
+  const counts = await deliver(w.db, publicDeps({ linkFor, sendMail: mail.sendMail }), {
+    report: w.report, run: w.run, live: null, status: "ok", artifactVersion: null,
+  });
+  assert.deepEqual(counts, { sent: 1, refused: 0, failed: 0, unknown: 0, skipped: 0 });
+
+  const [row] = await sendRows(w.db, w.runId);
+  assert.equal(row.status, "sent");
+  assert.deepEqual(mints, [{ sendId: row.id, status: "pending" }],
+    "the token is minted for a row that already exists, and that row is still pending");
+
+  const tokens = await rowsOf(w.db, "SELECT * FROM report_link_tokens", []);
+  assert.equal(tokens.length, 1, "one token for one send row");
+  assert.equal(tokens[0].send_id, row.id, "the token names the send row it goes out in");
+  assert.equal(tokens[0].scope, "comment", "a tier a reader gets the comment page");
+  assert.equal(tokens[0].revoked_at, null);
+
+  assert.equal(mail.calls.length, 1);
+  const raw = tokenIn(mail.calls[0].text);
+  assert.ok(raw, mail.calls[0].text);
+  assert.ok(mail.calls[0].html.includes(`${ORIGIN}/r/${raw}`), "the html footer carries the same link");
+  assert.equal(hashToken(raw), tokens[0].token_hash, "only the hash was stored");
+  const opened = await resolveLinkToken(w.db, {
+    approvals: approvalsDeps(), now: () => T0, artifacts: { store: artifactsStore },
+  }, raw);
+  assert.equal(opened.status, "ok");
+  assert.equal(opened.token.scope, "comment", "a tier a link opens the comment scope");
+  assert.equal(opened.token.sendId, row.id);
+  assert.equal(opened.token.runId, w.runId, "and exactly the run the mail is about");
+});
+
+test("tier b: the token is a view-scope one, and the mail carries it", async () => {
+  const w = await publicWorld({ tier: "b", address: "sam@example.com" });
+  const mail = recorder({ settle: true });
+  const counts = await deliver(w.db, publicDeps({ sendMail: mail.sendMail }), {
+    report: w.report, run: w.run, live: null, status: "ok", artifactVersion: null,
+  });
+  assert.deepEqual(counts, { sent: 1, refused: 0, failed: 0, unknown: 0, skipped: 0 });
+
+  const tokens = await rowsOf(w.db, "SELECT * FROM report_link_tokens", []);
+  assert.equal(tokens.length, 1);
+  assert.equal(tokens[0].scope, "view", "a tier b reader only views");
+  const raw = tokenIn(mail.calls[0].text);
+  assert.ok(raw, mail.calls[0].text);
+  assert.ok(mail.calls[0].html.includes(`${ORIGIN}/r/${raw}`));
+
+  const opened = await resolveLinkToken(w.db, {
+    approvals: approvalsDeps(), now: () => T0, artifacts: { store: artifactsStore },
+  }, raw);
+  assert.equal(opened.status, "ok");
+  assert.equal(opened.token.scope, "view", "the scope a tier b link resolves to");
+  assert.equal(opened.token.sendId, tokens[0].send_id);
+});
+
+test("a mint that fails after the claim ends the row failed and mails nothing", async () => {
+  const cases = [
+    {
+      name: "no version a recipient may be shown",
+      world: await publicWorld({ tier: "a", version: false }),
+      over: {},
+      tokens: 0,
+    },
+    {
+      name: "a hold the store refuses",
+      world: await publicWorld({ tier: "a" }),
+      over: { holdVersion: async () => { throw new Error("the store refused the hold"); } },
+      tokens: 1,
+    },
+  ];
+  for (const one of cases) {
+    const w = one.world;
+    const mail = recorder();
+    const bell = notes();
+    const counts = await deliver(w.db, publicDeps({
+      sendMail: mail.sendMail, notify: bell.notify, ...one.over,
+    }), {
+      report: w.report, run: w.run, live: null, status: "ok", artifactVersion: null,
+    });
+    assert.deepEqual(counts, { sent: 0, refused: 0, failed: 1, unknown: 0, skipped: 0 }, one.name);
+    assert.deepEqual(mail.calls, [], `${one.name}: nothing is mailed without a token`);
+
+    const rows = await sendRows(w.db, w.runId);
+    assert.equal(rows.length, 1, `${one.name}: the row was claimed`);
+    assert.equal(rows[0].status, "failed", `${one.name}: never left pending, never sent`);
+    assert.equal(rows[0].reason, "link_mint_failed",
+      `${one.name}: the fixed short reason, never an error's own text`);
+
+    const tokens = await rowsOf(w.db, "SELECT id, revoked_at FROM report_link_tokens", []);
+    assert.equal(tokens.length, one.tokens, one.name);
+    for (const token of tokens) {
+      assert.ok(token.revoked_at != null, `${one.name}: no token is left live`);
+    }
+
+    const notSent = bell.list.filter((note) => /some emails were not sent/.test(note.title));
+    assert.equal(notSent.length, 1, `${one.name}: the owner's existing notice rings`);
+    assert.equal(notSent[0].body, "0 sent, 0 unknown, 1 not sent.", one.name);
+    assert.equal(bell.list.filter((note) => /no link$/.test(note.title)).length, 0,
+      `${one.name}: a claimed row is not a link skip`);
+  }
+});
+
+test("a failed run with no version mails the honest line, no link and no token", async () => {
+  for (const tier of ["a", "b"]) {
+    const w = await publicWorld({ tier, address: `${tier}@example.com`, version: false });
+    const mail = recorder({ settle: true });
+    const bell = notes();
+    const counts = await deliver(w.db, publicDeps({ sendMail: mail.sendMail, notify: bell.notify }), {
+      report: w.report,
+      run: { ...w.run, status: "failed", errorText: null },
+      live: null,
+      status: "failed",
+      artifactVersion: null,
+    });
+    assert.deepEqual(counts, { sent: 1, refused: 0, failed: 0, unknown: 0, skipped: 0 },
+      `${tier}: the failed-run mail still goes`);
+    assert.equal(mail.calls.length, 1, `${tier}: one mail`);
+    const { html, text } = mail.calls[0];
+    assert.ok(text.includes(RUN_FAILED_FALLBACK_LINE), `${tier}: the layout's own failed-run line`);
+    assert.ok(html.includes(RUN_FAILED_FALLBACK_LINE), `${tier}: in the html too`);
+    assert.equal(/\/r\//.test(text), false, `${tier}: no public link in the text`);
+    assert.equal(/\/r\//.test(html), false, `${tier}: and none in the html`);
+    assert.equal(text.includes(FOOTER), false, `${tier}: there is no footer to point at nothing`);
+    assert.equal((await rowsOf(w.db, "SELECT id FROM report_link_tokens", [])).length, 0,
+      `${tier}: a failed run never mints`);
+    const [row] = await sendRows(w.db, w.runId);
+    assert.equal(row.status, "sent", `${tier}: the row goes out like any other`);
+    assert.equal(row.reason, null, `${tier}: never link_mint_failed`);
+    assert.equal(bell.list.filter((note) => /some emails were not sent/.test(note.title)).length, 0,
+      `${tier}: nothing was refused, so the counts notice stays quiet`);
+  }
+});
+
+test("a failed run that did write a version still mails its link and token", async () => {
+  const w = await publicWorld({ tier: "a" });
+  const mail = recorder({ settle: true });
+  const counts = await deliver(w.db, publicDeps({ sendMail: mail.sendMail }), {
+    report: w.report,
+    run: { ...w.run, status: "failed", errorText: "Couldn't reach Mail." },
+    live: null,
+    status: "failed",
+    artifactVersion: null,
+  });
+  assert.deepEqual(counts, { sent: 1, refused: 0, failed: 0, unknown: 0, skipped: 0 });
+  const raw = tokenIn(mail.calls[0].text);
+  assert.ok(raw, "the run wrote a version, so the link is real and goes in the mail");
+  assert.equal((await rowsOf(w.db, "SELECT id FROM report_link_tokens", [])).length, 1);
+  assert.ok(mail.calls[0].text.includes("Couldn't reach Mail."), "and the mail names the failure");
+});
+
+test("the raw token appears only in the email body", async () => {
+  const w = await publicWorld({ tier: "a" });
+  const mail = recorder({ settle: true });
+  const bell = notes();
+
+  // Everything this call says anywhere: the console (and the two streams it writes) is captured around
+  // the delivery, and the writes are passed through so the test reporter is not starved.
+  const spoken = [];
+  const saved = { log: console.log, warn: console.warn, error: console.error };
+  const savedOut = process.stdout.write;
+  const savedErr = process.stderr.write;
+  console.log = (...args) => { spoken.push(args.map(String).join(" ")); };
+  console.warn = (...args) => { spoken.push(args.map(String).join(" ")); };
+  console.error = (...args) => { spoken.push(args.map(String).join(" ")); };
+  process.stdout.write = function capture(chunk, ...rest) {
+    spoken.push(String(chunk));
+    return savedOut.call(this, chunk, ...rest);
+  };
+  process.stderr.write = function capture(chunk, ...rest) {
+    spoken.push(String(chunk));
+    return savedErr.call(this, chunk, ...rest);
+  };
+  let counts;
+  try {
+    counts = await deliver(w.db, publicDeps({ sendMail: mail.sendMail, notify: bell.notify }), {
+      report: w.report, run: w.run, live: null, status: "ok", artifactVersion: null,
+    });
+  } finally {
+    console.log = saved.log;
+    console.warn = saved.warn;
+    console.error = saved.error;
+    process.stdout.write = savedOut;
+    process.stderr.write = savedErr;
+  }
+
+  assert.deepEqual(counts, { sent: 1, refused: 0, failed: 0, unknown: 0, skipped: 0 });
+  const raw = tokenIn(mail.calls[0].text);
+  assert.ok(raw, mail.calls[0].text);
+  assert.ok(mail.calls[0].html.includes(raw), "the html body carries the token");
+  assert.ok(mail.calls[0].text.includes(raw), "and so does the text body");
+
+  assert.equal((await databaseText(w.db)).includes(raw), false, "no row of any table holds it");
+  assert.equal(JSON.stringify(bell.list).includes(raw), false, "no notice carries it");
+  assert.equal(JSON.stringify(counts).includes(raw), false, "and neither does the result");
+  assert.equal(spoken.join("\n").includes(raw), false, "nothing wrote it out either");
+});
+
+test("a send that did not go revokes its token and releases the link's hold; a sent one keeps both", async () => {
+  for (const [status, counts] of [
+    ["refused", { sent: 0, refused: 1, failed: 0, unknown: 0, skipped: 0 }],
+    ["failed", { sent: 0, refused: 0, failed: 1, unknown: 0, skipped: 0 }],
+  ]) {
+    const w = await publicWorld({ tier: "a" });
+    const mail = recorder({ status });
+    const bell = notes();
+    const answer = await deliver(w.db, publicDeps({ sendMail: mail.sendMail, notify: bell.notify }), {
+      report: w.report, run: w.run, live: null, status: "ok", artifactVersion: null,
+    });
+    assert.deepEqual(answer, counts, status);
+    assert.equal(mail.calls.length, 1, `${status}: the mail was attempted`);
+
+    const tokens = await rowsOf(w.db, "SELECT id, revoked_at FROM report_link_tokens", []);
+    assert.equal(tokens.length, 1, `${status}: the mint wrote one token`);
+    assert.ok(tokens[0].revoked_at != null,
+      `${status}: a mail that did not go leaves no working link`);
+    const holds = await rowsOf(w.db, "SELECT holder FROM artifact_version_holds ORDER BY holder", []);
+    assert.deepEqual(holds.filter((hold) => String(hold.holder).startsWith("report-link:")), [],
+      `${status}: the link's own version hold went with the token`);
+  }
+
+  // The same world with a mail that went: the token stays live and BOTH holds are there.
+  const sent = await publicWorld({ tier: "a" });
+  const mail = recorder({ status: "sent", settle: true });
+  const answer = await deliver(sent.db, publicDeps({ sendMail: mail.sendMail }), {
+    report: sent.report, run: sent.run, live: null, status: "ok", artifactVersion: null,
+  });
+  assert.deepEqual(answer, { sent: 1, refused: 0, failed: 0, unknown: 0, skipped: 0 });
+  const tokens = await rowsOf(sent.db, "SELECT id, revoked_at FROM report_link_tokens", []);
+  assert.equal(tokens.length, 1);
+  assert.equal(tokens[0].revoked_at, null, "a link in a delivered mail stays open");
+  const holders = (await rowsOf(sent.db, "SELECT holder FROM artifact_version_holds", []))
+    .map((hold) => String(hold.holder));
+  assert.equal(holders.filter((holder) => holder.startsWith("report-link:")).length, 1,
+    "the link's version hold is kept");
+  assert.equal(holders.filter((holder) => holder.startsWith("report-send:")).length, 1,
+    "and so is the send's own hold");
+});
+
+test("tier a and b are skipped without a public origin", async () => {
+  const w = await publicWorld({ tier: "a", address: "alex@example.com", origin: null });
+  await recipientFor(w.db, w.reportId, { address: "sam@example.com", tier: "b" });
+  const settings = [["no setting", null], ["plain http", "http://reports.example.com"],
+    ["a path", `${ORIGIN}/r`]];
+  for (const [name, origin] of settings) {
+    if (origin == null) {
+      await w.db.execute({
+        sql: "DELETE FROM dashboard_settings WHERE key = ?",
+        args: [REPORTS_PUBLIC_ORIGIN_KEY],
+      });
+    } else {
+      await setReportsOrigin(w.db, origin);
+    }
+    const mail = recorder();
+    const bell = notes();
+    const counts = await deliver(w.db, publicDeps({ sendMail: mail.sendMail, notify: bell.notify }), {
+      report: w.report, run: w.run, live: null, status: "ok", artifactVersion: null,
+    });
+    assert.deepEqual(counts, { sent: 0, refused: 0, failed: 0, unknown: 0, skipped: 2 }, name);
+    assert.equal(mail.calls.length, 0, `${name}: nothing is mailed`);
+    assert.equal((await sendRows(w.db, w.runId)).length, 0, `${name}: and nothing is claimed`);
+    assert.equal((await rowsOf(w.db, "SELECT id FROM report_link_tokens", [])).length, 0,
+      `${name}: and nothing is minted`);
+    const skipped = bell.list.filter((note) => /no link$/.test(note.title));
+    assert.equal(skipped.length, 1, `${name}: the existing linkSkips notice rings`);
+  }
+});
+
+test("deliverPending probes claim-less but still mints for the row it was handed", async () => {
+  const w = await publicWorld({ tier: "a", address: "outside@example.com" });
+  await finishRun(w.db, w.runId);
+  const made = await createSendToRest(w.db, { approvals: approvalsDeps(), now: () => T0 }, {
+    reportId: w.reportId, runId: w.runId, actor: OWNER,
+  });
+  assert.equal(made.created.length, 1, "the tap wrote the row");
+  const pendingId = made.created[0];
+
+  const probes = [];
+  const linkFor = async (db, input) => {
+    probes.push(input.sendId ?? null);
+    return realLinkFor(db, input);
+  };
+  const mail = recorder({ settle: true });
+  const counts = await deliverPending(w.db, publicDeps({ linkFor, sendMail: mail.sendMail }), {
+    reportId: w.reportId, runId: w.runId,
+  });
+  assert.deepEqual(counts, { sent: 1, refused: 0, failed: 0, unknown: 0, skipped: 0 });
+  assert.deepEqual(probes, [null, pendingId],
+    "the probe mints nothing, and the mint names the row the tap wrote");
+  assert.equal(mail.calls[0].sendId, pendingId);
+
+  const tokens = await rowsOf(w.db, "SELECT * FROM report_link_tokens", []);
+  assert.equal(tokens.length, 1);
+  assert.equal(tokens[0].send_id, pendingId);
+  const raw = tokenIn(mail.calls[0].text);
+  assert.ok(raw, mail.calls[0].text);
+  assert.ok(mail.calls[0].html.includes(`${ORIGIN}/r/${raw}`));
 });

@@ -30,7 +30,7 @@ const { createDbClient } = await import("../servers/db.js");
 const {
   SETTINGS_CHANGED_PAUSE_REASON, applyPendingFreeChange, approveGoLive, approveRecipient, botSaveRecipe,
   isLive, liveSetFor, ownerSaveRecipe, pauseReport, pauseReportSystem, proposeRecipient, resumeReport,
-  updateSettings, verifyLive,
+  updateSettings, verifiedCommentSettings, verifyLive,
 } = await import("../servers/gateway/reports/approvals.js");
 const { senderReady } = await import("../servers/gateway/reports/sender-ready.js");
 const { saveCustomRole, setBinding } = await import("../servers/shared/model-roles-store.js");
@@ -248,10 +248,11 @@ test("a fresh conversation: liveSetFor reads the sealed revision's hashes, not t
   assert.equal(fields.sourcesHash, report.sourcesHash, "the sealed revision's own sources hash");
   assert.notEqual(fields.sourcesHash, live.sources_hash, "not the head's");
   assert.deepEqual(Object.keys(fields).sort(), [
-    "aiCommentary", "artifactId", "botId", "commentTierDefault", "commentVisibility", "cron",
-    "deliveryMode", "modelRef", "nonce", "projectId", "recipeHash", "reportId", "rev", "scheduleId",
-    "senderAccountId", "sourcesHash", "tz",
+    "aiCommentary", "artifactId", "botId", "commentTierDefault", "commentVisibility",
+    "commentWindowRuns", "cron", "deliveryMode", "modelRef", "nonce", "projectId", "recipeHash",
+    "reportId", "rev", "scheduleId", "senderAccountId", "sourcesHash", "tz",
   ]);
+  assert.equal(fields.commentWindowRuns, 4, "the comment window seals as its number");
   assert.equal(fields.cron, "0 7 * * 1");
   assert.equal(fields.tz, "Europe/Berlin");
   assert.equal(fields.botId, "bot-1", "the bot the seal was made for");
@@ -333,6 +334,7 @@ test("a direct UPDATE of any live-set column makes isLive false", async () => {
     ["delivery_mode", "email_full"],
     ["comment_tier_default", "a"],
     ["comment_visibility", "all"],
+    ["comment_window_runs", 10],
     ["ai_commentary", 1],
   ];
   for (const [column, value] of cases) {
@@ -903,6 +905,7 @@ test("a live-set settings change on a live report pauses it with the fixed sente
     ["delivery_mode", "email_full"],
     ["comment_tier_default", "a"],
     ["comment_visibility", "all"],
+    ["comment_window_runs", 10],
     ["ai_commentary", 1],
     ["sender_account_id", "ma-8899aabbccddeeff"],
   ];
@@ -914,6 +917,122 @@ test("a live-set settings change on a live report pauses it with the fixed sente
     assert.equal(String(updated[key]), String(value), `${key}: written`);
     assert.equal(await isLive(db, deps, updated), false, `${key}: not live`);
     assert.deepEqual((await auditRows(db, report.id)).at(-1), { kind: "live", actor: "owner", decided: "refused" });
+  }
+});
+
+test("a comment-window change on a live report pauses it, and a go-live re-approval seals the new value", async () => {
+  const { db, report, deps } = await liveReport();
+  const before = await row(db, report.id);
+  assert.equal(Number(before.comment_window_runs), 4, "the schema's own default");
+  const oldSeal = before.live_seal;
+  assert.equal((await liveSetFor(db, deps, before)).commentWindowRuns, 4);
+
+  const paused = await updateSettings(db, deps, {
+    reportId: report.id, settings: { comment_window_runs: 10 }, actor: OWNER,
+  });
+  assert.equal(paused.status, "paused", "the window is part of the live set");
+  assert.equal(paused.pause_reason, SETTINGS_CHANGED_PAUSE_REASON, "the same fixed sentence");
+  assert.equal(Number(paused.comment_window_runs), 10, "written");
+  assert.equal(paused.live_seal, null, "the approval no longer describes the report");
+  assert.equal(paused.live_nonce, null);
+  assert.equal(await isLive(db, deps, paused), false);
+  assert.deepEqual((await auditRows(db, report.id)).map((r) => [r.kind, r.actor, r.decided]), [
+    ["live", "owner", "approved"], ["live", "owner", "refused"],
+  ]);
+
+  // The seal the owner approved with the old window does not verify over the fields as they are now.
+  const fieldsAfter = await liveSetFor(db, deps, paused);
+  assert.equal(fieldsAfter.commentWindowRuns, 10, "the live set carries the new window");
+  assert.equal(verifyApprovalSeal("live", fieldsAfter, oldSeal, SEED), false,
+    "a seal made over another window is not this report's approval");
+
+  // Only a fresh preview and go-live re-approve it, and the new seal CARRIES the new value: setting the
+  // column back is a different report to approve again.
+  const relive = await goLive(db, report);
+  assert.deepEqual(relive.result, { ok: true, liveRev: report.rev });
+  const live = await row(db, report.id);
+  assert.equal(live.status, "live");
+  assert.notEqual(live.live_seal, oldSeal, "a new approval, not the old seal");
+  const sealed = await liveSetFor(db, deps, live);
+  assert.equal(sealed.commentWindowRuns, 10);
+  assert.equal(verifyApprovalSeal("live", sealed, live.live_seal, SEED), true);
+  assert.equal(verifyApprovalSeal("live", { ...sealed, commentWindowRuns: 4 }, live.live_seal, SEED), false,
+    "the seal names the window it was made over");
+});
+
+test("a direct UPDATE of comment_window_runs stops a live report without touching its status", async () => {
+  const { db, report, deps } = await liveReport();
+  const live = await row(db, report.id);
+  assert.equal(await isLive(db, deps, live), true, "starts live");
+  await db.execute({
+    sql: "UPDATE reports SET comment_window_runs = ? WHERE id = ?",
+    args: [10, report.id],
+  });
+  const moved = await row(db, report.id);
+  assert.equal(moved.status, "live", "the status word is not the gate");
+  assert.equal(await isLive(db, deps, moved), false, "the sealed window moved");
+  assert.equal(await verifyLive(db, deps, moved), null);
+});
+
+test("verifiedCommentSettings answers the SEALED comment settings, or null", async () => {
+  const { db, report, deps } = await liveReport();
+  // Before a go-live the same values sit on the row, but nothing approved them.
+  const draft = await prepare(db);
+  assert.equal(await verifiedCommentSettings(db, depsWith(), await row(db, draft.id)), null);
+
+  const live = await row(db, report.id);
+  assert.deepEqual(await verifiedCommentSettings(db, depsWith(), live),
+    { commentVisibility: "own", commentWindowRuns: 4 }, "a sealed report answers its own values");
+
+  // The columns moved, the seal did not: nothing a reader may then rely on.
+  await db.execute({
+    sql: "UPDATE reports SET comment_visibility = 'all', comment_window_runs = 9 WHERE id = ?",
+    args: [report.id],
+  });
+  assert.equal(await verifiedCommentSettings(db, depsWith(), await row(db, report.id)), null,
+    "a direct UPDATE of either field is not an approval");
+
+  // Re-approved over other values, it answers exactly what was sealed.
+  const widened = await updateSettings(db, depsWith(), {
+    reportId: report.id,
+    settings: { comment_visibility: "all", comment_window_runs: 10 },
+    actor: OWNER,
+  });
+  assert.equal(widened.status, "paused", "a live-set change stops the report");
+  await goLive(db, report);
+  assert.deepEqual(await verifiedCommentSettings(db, depsWith(), await row(db, report.id)),
+    { commentVisibility: "all", commentWindowRuns: 10 });
+
+  // A missing seed, a null row and garbage are the same answer: null, and never a throw.
+  assert.equal(await verifiedCommentSettings(db, depsWith({ loadSeed: () => null }), live), null);
+  assert.equal(await verifiedCommentSettings(db, depsWith(), null), null);
+  assert.equal(await verifiedCommentSettings(db, depsWith(), {}), null);
+  assert.equal(await verifiedCommentSettings(db, depsWith(), { id: report.id, live_rev: "1.5" }), null);
+});
+
+test("the comment window accepts only a whole number in range", async () => {
+  const { db, report, deps } = await liveReport();
+  for (const value of [0, 51, 2.5, "4", -1, null, true, Number.NaN]) {
+    await assert.rejects(
+      () => updateSettings(db, deps, {
+        reportId: report.id, settings: { comment_window_runs: value }, actor: OWNER,
+      }),
+      (err) => { assert.equal(err.code, "bad_input", `value ${JSON.stringify(value)}`); return true; },
+    );
+  }
+  const untouched = await row(db, report.id);
+  assert.equal(untouched.status, "live", "a refused window changed nothing");
+  assert.equal(Number(untouched.comment_window_runs), 4);
+  assert.equal(await isLive(db, deps, untouched), true);
+
+  // The two ends of the range are accepted, on a draft so nothing pauses.
+  const { db: draftDb } = await freshDb();
+  const draft = await prepare(draftDb);
+  for (const value of [1, 50]) {
+    const updated = await updateSettings(draftDb, depsWith(), {
+      reportId: draft.id, settings: { comment_window_runs: value }, actor: OWNER,
+    });
+    assert.equal(Number(updated.comment_window_runs), value, `value ${value} is written`);
   }
 });
 

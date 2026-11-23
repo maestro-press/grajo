@@ -31,6 +31,11 @@
  * REPORTS_SEND_DDL is the send half: the owner's recipients for one report, and the send log (one row
  * per run, recipient and attempt). Its own comment below spells out the states, the unique keys and why
  * neither table can ever be resent automatically.
+ *
+ * REPORTS_LINKS_DDL is the reader half: the link one recipient's email carries (a token minted per run
+ * and recipient, stored only as its hash) and the comments that reader leaves through it.
+ * REPORTS_COMMENT_WINDOW_COLUMN is the one late column on `reports` (how many runs back a reader may
+ * comment), added by ALTER on both rails because 0031 already executes REPORTS_DDL as it is.
  */
 export const REPORTS_DDL = `
   CREATE TABLE IF NOT EXISTS reports (
@@ -378,3 +383,106 @@ export const REPORTS_STEPS_TABLES = Object.freeze([
   "report_hosts",
   "report_credentials",
 ]);
+
+/**
+ * The reader half: the link one recipient's email carries, and the comments that reader leaves.
+ *
+ * `report_link_tokens` is the per-recipient, per-run link (spec R15). A tier `a` or tier `b` recipient
+ * gets a page on this instance that anybody with the link may open, so the link cannot name the report
+ * alone: it carries a TOKEN minted for one run and one recipient, and only the SHA-256 of that token is
+ * ever stored (`token_hash`, UNIQUE), so a reader of this database cannot turn a row back into a
+ * working link.
+ *
+ * THE VERSION IS PART OF THE ROW. `artifact_id` and `version_n` are read from the run's non-preview
+ * `report_versions` row at mint time and stored here, so a resolve opens EXACTLY the version the mail
+ * was sent for, never whatever the run would pin if it were asked again. `scope` is the page the token
+ * opens (`view` or `comment`), and the link a reader is mailed is derived from it
+ * (`public-view` for `view`, `public-comment` for `comment`): a stored `view` token never rises when a
+ * recipient's tier is raised. `send_id` names the `report_sends` row the link went out in, and
+ * `expires_at` is the moment the token stops opening anything (it is required: every link ages out).
+ *
+ * `approval_nonce` is the recipient's approval nonce as it stood at mint time: a resolve requires it to
+ * equal the recipient row's CURRENT nonce, so a revoke, a refusal or a re-approval takes every older
+ * token out of service even when that path's own token sweep failed (it is a best-effort write, this
+ * binding is not). It is required, because a token is not something a recipient with no approval can
+ * have. There is NO unique key over (report, run, recipient): a mint is per SEND, and the mint revokes
+ * the earlier unrevoked tokens of the same `send_id` before it writes the new one, so one send has at
+ * most one live link while its retries stay readable as revoked rows. Revoking is a stamp
+ * (`revoked_at`), never a delete: a dead link is a refusal a reader and the owner can both be told
+ * about, and the row is the audit trail of which send carried which link.
+ *
+ * `report_recipient_comments` is the side row for what a reader wrote through such a link: one row per
+ * comment, `comment_id` IS the artifacts comment id (an INTEGER, because the bundle's comment ids are)
+ * and `thread_id` is that comment's artifacts thread id as TEXT, so a visibility lookup joins the bundle
+ * store on `thread_id` and never has to re-read the comment. `via` says how the reader got there
+ * (`link`, and a later reply path may add its own word); `run_id` is the run the token opened. The daily
+ * cap counts these rows by (report, recipient, created_at), so the row is the log the cap reads. A
+ * comment is text one outside person wrote, so its length is bounded where it is accepted (the
+ * recipient route), never by a CHECK.
+ *
+ * Epoch-ms times; scopes, `via` words and recipient states are validated in the reports modules, never
+ * by a CHECK. No foreign keys: the reports store removes one report's rows itself (it keys on
+ * `report_id`, which both tables carry). Every table is LOCAL ONLY (instance-sync LOCAL_ONLY_TABLES): a
+ * token is a way into one report and a comment is somebody's words about it, so neither leaves the
+ * instance holding the report. Additive, no SCHEMA_GENERATION bump.
+ */
+export const REPORTS_LINKS_DDL = `
+  CREATE TABLE IF NOT EXISTS report_link_tokens (
+    id TEXT PRIMARY KEY,
+    report_id TEXT NOT NULL,
+    recipient_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    send_id TEXT,
+    artifact_id TEXT NOT NULL,
+    version_n INTEGER NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    scope TEXT NOT NULL,
+    approval_nonce TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    revoked_at INTEGER,
+    expires_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_report_link_tokens_recipient ON report_link_tokens(recipient_id);
+
+  CREATE INDEX IF NOT EXISTS idx_report_link_tokens_report ON report_link_tokens(report_id);
+
+  CREATE INDEX IF NOT EXISTS idx_report_link_tokens_send ON report_link_tokens(send_id);
+
+  CREATE TABLE IF NOT EXISTS report_recipient_comments (
+    comment_id INTEGER PRIMARY KEY,
+    thread_id TEXT NOT NULL,
+    report_id TEXT NOT NULL,
+    recipient_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    via TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_report_recipient_comments_thread
+    ON report_recipient_comments(thread_id);
+
+  CREATE INDEX IF NOT EXISTS idx_report_recipient_comments_report
+    ON report_recipient_comments(report_id, recipient_id);
+`;
+
+export const REPORTS_LINKS_TABLES = Object.freeze([
+  "report_link_tokens",
+  "report_recipient_comments",
+]);
+
+/**
+ * `reports.comment_window_runs`: how many runs back a reader may still comment on (a number, 1 to 50,
+ * four by default). It is part of the live set, so it seals with the rest of the report's settings: an
+ * owner who widens the window is approving a different thing to send.
+ *
+ * Its own constant because 0031 already executes REPORTS_DDL and its approved shape stays as it is: a
+ * store created from that string has the table already, and `CREATE TABLE IF NOT EXISTS` never adds a
+ * column. Both rails add it with this exact ALTER (scripts/init-db.js and
+ * scripts/migrations/0039-reports-links.mjs).
+ */
+export const REPORTS_COMMENT_WINDOW_COLUMN = Object.freeze({
+  table: "reports",
+  column: "comment_window_runs",
+  ddl: "ALTER TABLE reports ADD COLUMN comment_window_runs INTEGER NOT NULL DEFAULT 4",
+});

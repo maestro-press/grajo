@@ -29,6 +29,11 @@
  * also why the body is sanitised before the footer goes on: nothing in the body can rewrite, drop or
  * imitate the footer, and the footer is the last thing in both the html and the text.
  *
+ * A FAILED RUN MAY CARRY NO LINK AT ALL. A run that did not finish writes no version, so a reader whose
+ * page would be a public one has nothing to open: the failed-run mail is the honest line and nothing else,
+ * and it is built with no footer rather than a link that goes nowhere. Nothing else may be linkless: any
+ * other run without a link is a caller mistake and stays `bad_input`.
+ *
  * The subject is the report's title with its control characters removed, its whitespace collapsed and its
  * length bounded; a title with nothing usable in it becomes the fallback subject. A title is never put
  * into the html body, so markup in it cannot reach the email at all.
@@ -189,24 +194,28 @@ function footerText(link, tier) {
  * @param {{title?: string}|null} [input.report] the report row (its title is the subject)
  * @param {{status?: string, late?: boolean|number, errorText?: string}|null} [input.run] the run row
  * @param {{markdown?: string, title?: string}|null} [input.document] the run's document, or null
- * @param {string} input.link the recipient's link (never empty; the caller makes it)
+ * @param {string} input.link the recipient's link (required, except for a failed run, which has no version
+ *   to point at and is mailed without a footer)
  * @param {"email_full"|"email_link"|"both"} input.deliveryMode the report's approved delivery mode
  * @param {"a"|"b"|"c"|null} [input.tier] the recipient's tier, which picks the footer's comment line
  * @param {string[]|Set<string>} [input.allowedLinks] the URLs the run's own items carry
  * @param {{html?: string, text?: string}|null} [input.override] a custom step's own email body
  * @returns {{subject: string, html: string, text: string}}
- * @throws {Error} `bad_input` when the link is empty or the delivery mode is not one this layout builds
+ * @throws {Error} `bad_input` when the link is empty (on a run that did not fail) or the delivery mode is
+ *   not one this layout builds
  */
 export function defaultLayout(input) {
   const given = input != null && typeof input === "object" ? input : {};
   const { report = null, run = null, document = null, link = "", deliveryMode, tier = null, allowedLinks = [], override = null } = given;
+  const status = run != null && typeof run.status === "string" ? run.status : "";
   const url = typeof link === "string" ? link.trim() : "";
-  if (!url) throw fail("bad_input", "defaultLayout: the link is required");
+  // A failed run's body is the honest line and nothing else, so it is also the one mail that can be built
+  // with no link: the run wrote no version, and a link to nothing is worse than none.
+  if (!url && status !== "failed") throw fail("bad_input", "defaultLayout: the link is required");
   if (!LAYOUT_DELIVERY_MODES.includes(deliveryMode)) {
     throw fail("bad_input", `defaultLayout: ${String(deliveryMode)} is not a delivery mode this layout builds`);
   }
   const subject = subjectOf(report);
-  const status = run != null && typeof run.status === "string" ? run.status : "";
   const markdown = markdownOf(document);
   const withDocument = deliveryMode === "email_full" || deliveryMode === "both";
   // A failed run's body is the honest line and nothing else: a half report is worse than no report, and
@@ -247,10 +256,14 @@ export function defaultLayout(input) {
   // judged.
   bodyText = neutralizeTextRuns(bodyText, allowedLinks);
   // The footer goes on after the body is sanitised, so nothing in the body can drop it or pass for it.
-  const footer = { html: footerHtml(url, tier), text: footerText(url, tier) };
+  // A linkless failed-run mail has no footer at all: no link line, and no comment line pointing at a page
+  // that does not exist.
+  const footer = url
+    ? { html: footerHtml(url, tier), text: footerText(url, tier) }
+    : { html: "", text: "" };
   return {
     subject,
-    html: bodyHtml ? `${bodyHtml}\n${footer.html}` : footer.html,
-    text: bodyText ? `${bodyText}\n\n${footer.text}` : footer.text,
+    html: footer.html ? (bodyHtml ? `${bodyHtml}\n${footer.html}` : footer.html) : bodyHtml,
+    text: footer.text ? (bodyText ? `${bodyText}\n\n${footer.text}` : footer.text) : bodyText,
   };
 }

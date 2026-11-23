@@ -1,5 +1,6 @@
 // The owner API's recipient and send-log routes: `/dashboard/api/reports/:id/recipients`,
-// `.../:rid/approve|refuse|revoke`, `.../sends` and `.../runs/:runId/send-rest`.
+// `.../:rid/approve|refuse|revoke`, `.../:rid/link/revoke`, `.../sends` and
+// `.../runs/:runId/send-rest`.
 //
 // Harness: a real init-db'd scratch crow.db copied per test (CROW_DATA_DIR under a temp dir), an
 // ephemeral express app wired the way servers/gateway/index.js + dashboard/index.js wire it (the real
@@ -20,6 +21,7 @@ import { createHash } from "node:crypto";
 import { copyFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import http from "node:http";
 import Database from "better-sqlite3";
 import { markFromLaptop } from "./helpers/off-box.js";
@@ -41,12 +43,20 @@ const { fetchMetadataGate } = await import("../servers/gateway/dashboard/fetch-m
 const { reportsApiRouter, REPORTS_API_PREFIX, OWNER_LABEL } = await import(
   "../servers/gateway/routes/reports-api.js"
 );
-const { createReport, saveRecipe, updateReportColumns } = await import(
+const { createReport, getReport, saveRecipe, updateReportColumns } = await import(
   "../servers/gateway/reports/store.js"
 );
-const { listRecipients } = await import("../servers/gateway/reports/approvals.js");
+const { listRecipients, liveSetFor } = await import("../servers/gateway/reports/approvals.js");
+const { mintLinkToken, resolveLinkToken } = await import("../servers/gateway/reports/links.js");
+const { approvalSeal, newApprovalNonce } = await import("../servers/gateway/reports/seal.js");
 const { startRun } = await import("../servers/gateway/reports/run.js");
 const { SEND_LIST_LIMIT } = await import("../servers/gateway/reports/send-log.js");
+// The version a link holds is a bundle-owned row, so the artifacts tables and their store come from the
+// bundle itself (the shape tests/reports-links.test.js uses).
+const BUNDLE = join(REPO, "bundles", "artifacts", "server");
+const bundleImport = (f) => import(pathToFileURL(join(BUNDLE, f)).href);
+const bundleStore = await bundleImport("store.js");
+const { initArtifactsTables } = await bundleImport("init-tables.js");
 
 const OWNER = "owner-local-password-session";
 const SSO = "peer-sso-session";
@@ -151,6 +161,8 @@ async function setup({ ownerCheck = undefined } = {}) {
   process.env.CROW_TASKS_DB_PATH = join(dir, "tasks.db");
   const db = createDbClient(crow);
   open.push(db);
+  // A link's version hold is a bundle row, so init-db does not make that table: a mint needs it.
+  await initArtifactsTables(db);
 
   const openDb = () => createDbClient(crow);
   const approvalsDeps = {
@@ -159,6 +171,8 @@ async function setup({ ownerCheck = undefined } = {}) {
     registry: REGISTRY,
     getRun: async () => null,
     senderReady: async () => true,
+    // The artifacts runtime the link routes hold and release versions through.
+    artifacts: { store: bundleStore },
   };
 
   const app = express();
@@ -256,6 +270,7 @@ test("a non-owner session is 403 owner_only on every recipient and send route, w
     ["POST", `${reportPath(report.id)}/recipients/${rid}/approve`, {}],
     ["POST", `${reportPath(report.id)}/recipients/${rid}/refuse`, {}],
     ["POST", `${reportPath(report.id)}/recipients/${rid}/revoke`, {}],
+    ["POST", `${reportPath(report.id)}/recipients/${rid}/link/revoke`, {}],
     ["GET", `${reportPath(report.id)}/sends?run=${runId}`, undefined],
     ["POST", `${reportPath(report.id)}/runs/${runId}/send-rest`, {}],
   ];
@@ -428,6 +443,167 @@ test("a recipient id of another report, or a malformed one, is 404", async () =>
     }
   }
   // The other report's recipient was never moved by any of it.
+  const listed = await get(`${reportPath(other.id)}/recipients`);
+  assert.equal(listed.json.recipients[0].state, "approved");
+});
+
+/* ---------------------------------------------------------------- revoke links */
+
+/** The link seam a mint and a resolve share: the real artifacts store (version holds), this test's own
+ *  approval seed and clock, and nothing to scrub. */
+function linkSeam() {
+  return {
+    artifacts: { store: bundleStore },
+    approvals: {
+      loadSeed: () => ({ seed: SEED }),
+      now: () => T0,
+      registry: REGISTRY,
+      getRun: async () => null,
+      senderReady: async () => true,
+    },
+    now: () => T0,
+  };
+}
+
+/**
+ * Seal one report live over the values its row holds now: the write `approveGoLive` makes, minus the
+ * preview run and the sender a go-live insists on. A token only opens a report that is live over a seal
+ * that still verifies (see THE REPORT'S OWN STANDING in links.js), so a link test's report has to carry a
+ * real seal. Idempotent: an already sealed report is left as it is.
+ */
+async function sealedLive(db, reportId) {
+  const row = await getReport(db, reportId);
+  if (row.status === "live" && row.live_seal) return row;
+  const saved = await saveRecipe(db, {
+    reportId, recipe: RECIPE, authorKind: "owner", registry: REGISTRY,
+  });
+  const fresh = await getReport(db, reportId);
+  const nonce = newApprovalNonce();
+  const fields = await liveSetFor(db, linkSeam().approvals, fresh, { rev: saved.rev, nonce });
+  await updateReportColumns(db, reportId, {
+    status: "live",
+    live_rev: saved.rev,
+    live_nonce: nonce,
+    live_seal: approvalSeal("live", fields, SEED),
+  });
+  return getReport(db, reportId);
+}
+
+/**
+ * What a delivered run leaves behind (one finished run, one artifact version, the run-to-version map row
+ * and the send row the mail went out in) and the link token that mail carried, minted for real so its hold
+ * and its resolve are the product's own.
+ */
+async function mintedLink(db, reportId, recipientId, { sendId = "rsd-00000000000000e1", artifactId = "art-revoke-1" } = {}) {
+  const runId = await runFor(db, reportId, { trigger: "manual" });
+  await db.execute({
+    sql: "INSERT INTO artifacts (id, title, type) VALUES (?, 'Weekly listings', 'document')",
+    args: [artifactId],
+  });
+  await db.execute({
+    sql: `INSERT INTO artifact_versions (artifact_id, n, state, files_json, size, content_hash, made_by)
+          VALUES (?, 1, 'past', '[]', 0, 'hash', 'user')`,
+    args: [artifactId],
+  });
+  await db.execute({
+    sql: `INSERT INTO report_versions (artifact_id, n, report_id, run_id, "trigger", allowed_links_json, created_at)
+          VALUES (?, 1, ?, ?, 'schedule', '[]', ?)`,
+    args: [artifactId, reportId, runId, T0],
+  });
+  await db.execute({
+    sql: `INSERT INTO report_sends
+            (id, run_id, report_id, recipient_id, attempt, account_id, status, created_at, updated_at)
+          VALUES (?, ?, ?, ?, 1, ?, 'sent', ?, ?)`,
+    args: [sendId, runId, reportId, recipientId, SENDER, T0, T0],
+  });
+  const report = await sealedLive(db, reportId);
+  const recipient = (await listRecipients(db, reportId, linkSeam().approvals))
+    .find((row) => row.id === recipientId);
+  const minted = await mintLinkToken(db, linkSeam(), { report, recipient, run: { id: runId }, sendId });
+  assert.ok(minted && minted.token, "a token was minted for that send");
+  return { runId, sendId, ...minted };
+}
+
+/** The version holds one token still carries. */
+async function holdsOf(db, tokenId) {
+  return (await db.execute({
+    sql: "SELECT holder FROM artifact_version_holds WHERE holder = ?",
+    args: [`report-link:${tokenId}`],
+  })).rows;
+}
+
+test("the owner's revoke links stamps one recipient's tokens, releases their holds and keeps the approval",
+  async () => {
+    const world = await setup();
+    const report = await prepareReport(world.db);
+    const added = await addRecipient(report.id, { address: "alex@example.com", commentTier: "a" });
+    const rid = added.json.recipient.id;
+    const also = await addRecipient(report.id, { address: "second@example.com", commentTier: "a" });
+    const theirs = await mintedLink(world.db, report.id, rid, { sendId: "rsd-00000000000000e1" });
+    const other = await mintedLink(world.db, report.id, also.json.recipient.id, {
+      sendId: "rsd-00000000000000e2", artifactId: "art-revoke-2",
+    });
+
+    assert.equal((await resolveLinkToken(world.db, linkSeam(), theirs.token)).status, "ok",
+      "the link opens before the revoke");
+    assert.equal((await holdsOf(world.db, theirs.tokenId)).length, 1, "and holds the version it opens");
+
+    const r = await post(`${reportPath(report.id)}/recipients/${rid}/link/revoke`, {});
+    assert.equal(r.status, 200, r.text);
+    assert.deepEqual(r.json, { ok: true, revoked: 1 }, "one token of that recipient's was stamped");
+    assert.equal(r.text.includes(theirs.token), false, "no token in the answer");
+    assert.equal(r.text.includes(hashToken(theirs.token)), false, "no token hash either");
+    assertNoSeal(r, "the revoke links answer");
+
+    assert.deepEqual(await resolveLinkToken(world.db, linkSeam(), theirs.token), { status: "unknown" });
+    assert.equal((await holdsOf(world.db, theirs.tokenId)).length, 0, "the version hold went with it");
+    assert.equal((await resolveLinkToken(world.db, linkSeam(), other.token)).status, "ok",
+      "another recipient's link is untouched");
+
+    // The decision was about the LINKS: the recipient keeps its approval, its seal and its nonce, so the
+    // next run mints fresh links as usual.
+    const listed = await get(`${reportPath(report.id)}/recipients`);
+    const row = listed.json.recipients.find((candidate) => candidate.id === rid);
+    assert.equal(row.state, "approved");
+    assert.equal(row.verified, true);
+    const raw = (await world.db.execute({
+      sql: "SELECT approval_seal, approval_nonce FROM report_recipients WHERE id = ?", args: [rid],
+    })).rows[0];
+    assert.ok(raw.approval_seal, "the seal stays");
+    assert.ok(raw.approval_nonce, "and its nonce");
+
+    // The audit says what the owner did. It names the recipient, never a token.
+    const { rows: audit } = await world.db.execute({
+      sql: "SELECT subject, actor, decided FROM report_approvals_audit WHERE report_id = ? AND kind = 'link'",
+      args: [report.id],
+    });
+    assert.deepEqual(audit.map((a) => [a.subject, a.actor, a.decided]), [[rid, "owner", "revoked"]]);
+
+    // A second tap is an answer too, and revokes nothing.
+    const again = await post(`${reportPath(report.id)}/recipients/${rid}/link/revoke`, {});
+    assert.equal(again.status, 200, again.text);
+    assert.deepEqual(again.json, { ok: true, revoked: 0 });
+  });
+
+test("a link revoke for another report's recipient, or a malformed id, is 404 and decides nothing", async () => {
+  const world = await setup();
+  const mine = await prepareReport(world.db);
+  const other = await prepareReport(world.db, { title: "Another report" });
+  const otherRecipient = await addRecipient(other.id);
+  const rid = otherRecipient.json.recipient.id;
+
+  const crossed = await post(`${reportPath(mine.id)}/recipients/${rid}/link/revoke`, {});
+  assert.equal(crossed.status, 404, crossed.text);
+  assert.deepEqual(crossed.json, { error: "not_found", message: "Not found." });
+  for (const bad of ["rrc-123", "rrc-zzzzzzzzzzzzzzzz", "not-a-recipient", "rrc-00000000000000"]) {
+    const r = await post(`${reportPath(mine.id)}/recipients/${bad}/link/revoke`, {});
+    assert.equal(r.status, 404, `${bad}: ${r.status} ${r.text}`);
+  }
+  const { rows } = await world.db.execute({
+    sql: "SELECT COUNT(*) AS n FROM report_approvals_audit WHERE kind = 'link'", args: [],
+  });
+  assert.equal(Number(rows[0].n), 0, "not one link decision was written");
+  // The other report's recipient was never touched.
   const listed = await get(`${reportPath(other.id)}/recipients`);
   assert.equal(listed.json.recipients[0].state, "approved");
 });

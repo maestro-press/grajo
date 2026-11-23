@@ -187,6 +187,21 @@ async function seedReport(db, home, reportId, label) {
           VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
     args: [`rsd-${label}`, runId, reportId, recipientId, T0, T0],
   });
+  // The reader half: the link that recipient's mail carried, and the comment they left through it.
+  await db.execute({
+    sql: `INSERT INTO report_link_tokens
+            (id, report_id, recipient_id, run_id, send_id, artifact_id, version_n, token_hash, scope,
+             approval_nonce, created_at, expires_at)
+          VALUES (?, ?, ?, ?, ?, ?, 1, ?, 'comment', ?, ?, ?)`,
+    args: [`rlt-${label}`, reportId, recipientId, runId, `rsd-${label}`, `art-${label}`,
+      label.repeat(64), "e".repeat(32), T0, T0 + 86_400_000],
+  });
+  await db.execute({
+    sql: `INSERT INTO report_recipient_comments
+            (comment_id, thread_id, report_id, recipient_id, run_id, via, created_at)
+          VALUES (?, '3', ?, ?, ?, 'link', ?)`,
+    args: [label === "a" ? 1 : 2, reportId, recipientId, runId, T0],
+  });
   await db.execute({
     sql: `INSERT INTO report_custom_steps (report_id, step_key, rev, language, entry, files_json, proposed_by, created_at)
           VALUES (?, 'fetch', 1, 'python', 'run.py', ?, 'owner', ?)`,
@@ -239,6 +254,7 @@ test("deleting a report revokes its keychain rows and removes every row it owns"
   for (const name of [
     "reports", "report_recipe_revisions", "report_state", "report_usage", "report_approvals_audit",
     "report_runs", "report_run_requests", "report_versions", "report_recipients", "report_sends",
+    "report_link_tokens", "report_recipient_comments",
     "report_custom_steps", "report_assets", "report_hosts", "report_credentials",
   ]) {
     assert.ok(beforeGone.includes(name), `${name} held a row for the report before the delete`);

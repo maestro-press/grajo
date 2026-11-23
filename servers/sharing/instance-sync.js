@@ -204,7 +204,9 @@ export const SYNCED_TABLES = [
 // names a report and its run, so it stays with them; the report send tables: a recipient is a person the
 // owner writes to and a send names that person, the sender account and the provider's reply; the report
 // step tables: a step bundle, an asset, a host and a credential binding all describe one report, and a
-// credential binding names a keychain row of this instance; the artifact
+// credential binding names a keychain row of this instance; the report link tables: a token is a way into
+// one report and a comment is somebody's words about it, so neither leaves the instance holding the
+// report; the artifact
 // family: the Crow Artifacts tables live
 // in crow.db but are not in SYNCED_TABLES at all (nothing about an artifact, its versions or its links
 // replicates), and artifact_version_holds — the retention state that keeps a sent version rendering — is
@@ -226,7 +228,7 @@ export const LOCAL_ONLY_TABLES = Object.freeze([
   "mail_drafts", "mail_draft_revisions", "mail_draft_comments", "mail_draft_voice",
   "reports", "report_recipe_revisions", "report_state", "report_usage", "report_approvals_audit",
   "report_runs", "report_run_requests", "report_versions",
-  "report_recipients", "report_sends",
+  "report_recipients", "report_sends", "report_link_tokens", "report_recipient_comments",
   "report_custom_steps", "report_assets", "report_hosts", "report_credentials",
   "artifact_version_holds",
   "message_drafts", "message_draft_audit",
