@@ -255,7 +255,7 @@ test("per-peer grants are read at check time: revoking one peer's grant re-denie
 test("an expired grant is refused at check time; a live one still works (time injected)", async () => {
   const t0 = Date.now();
   await trustPeer("peer-e");
-  await remedy({ capability: "funkwhale", requestingInstance: "peer-e", days: 30 }, { db, item: cardFor("peer-e") });
+  await remedy({ capability: "funkwhale", requestingInstance: "peer-e", days: 30 }, { db, item: cardFor("peer-e"), actionId: "expose-capability-30d" });
   assert.equal(await isCapabilityExposedToPeer(db, "funkwhale", "peer-e", { now: t0 + 29 * DAY }), true);
   assert.equal(await isCapabilityExposedToPeer(db, "funkwhale", "peer-e", { now: t0 + 31 * DAY }), false);
 
@@ -267,7 +267,7 @@ test("an expired grant is refused at check time; a live one still works (time in
 test('"until I remove it" never expires', async () => {
   const t0 = Date.now();
   await trustPeer("peer-f");
-  await remedy({ capability: "funkwhale", requestingInstance: "peer-f", untilRemoved: true }, { db, item: cardFor("peer-f") });
+  await remedy({ capability: "funkwhale", requestingInstance: "peer-f", untilRemoved: true }, { db, item: cardFor("peer-f"), actionId: "expose-capability-forever" });
   assert.equal((await getPeerExposures(db)).get("peer-f").get("funkwhale").expiresAt, null);
   assert.equal(await isCapabilityExposedToPeer(db, "funkwhale", "peer-f", { now: t0 + 3650 * DAY }), true);
   assert.equal((await gate("peer-f", { now: t0 + 3650 * DAY })).ok, true);
@@ -276,7 +276,7 @@ test('"until I remove it" never expires', async () => {
 test("an expired grant is still stored (Settings can renew or remove it) and a malformed expiry fails closed", async () => {
   const t0 = Date.now();
   await trustPeer("peer-g");
-  await remedy({ capability: "funkwhale", requestingInstance: "peer-g", days: 7 }, { db, item: cardFor("peer-g") });
+  await remedy({ capability: "funkwhale", requestingInstance: "peer-g", days: 7 }, { db, item: cardFor("peer-g"), actionId: "expose-capability-7d" });
   assert.ok((await getPeerExposures(db)).get("peer-g").get("funkwhale"), "expired grants are kept, not pruned");
   assert.equal(await isCapabilityExposedToPeer(db, "funkwhale", "peer-g", { now: t0 + 8 * DAY }), false);
 
@@ -294,7 +294,7 @@ test("an expired grant is still stored (Settings can renew or remove it) and a m
 test("Settings lists each one-device allowance with its peer and expiry, and renews/removes it", async () => {
   const t0 = Date.now();
   await trustPeer("peer-abc123");
-  await remedy({ capability: "funkwhale", requestingInstance: "peer-abc123", days: 1 }, { db, item: cardFor("peer-abc123") });
+  await remedy({ capability: "funkwhale", requestingInstance: "peer-abc123", days: 7 }, { db, item: cardFor("peer-abc123"), actionId: "expose-capability-7d" });
   // Age the grant past its expiry to prove the expired state is shown.
   const stored = (await getPeerExposures(db)).get("peer-abc123").get("funkwhale");
   const past = new Date(t0 - DAY).toISOString();
@@ -509,7 +509,7 @@ test("the per-peer store is local-only: it never syncs to other instances", asyn
 
 test("a remedy whose card carries no verified peer id refuses instead of widening", async () => {
   await db.execute("DELETE FROM fix_it_items");
-  const r = await remedy({ capability: "funkwhale", requestingInstance: "Victim Device" }, { db });
+  const r = await remedy({ capability: "funkwhale", requestingInstance: "Victim Device" }, { db, actionId: "expose-capability-30d" });
   assert.equal(r.resolved, false);
   assert.equal((await getExposedCapabilities(db)).has("funkwhale"), false);
   assert.equal((await getPeerExposures(db)).size, 0);
@@ -699,7 +699,7 @@ test("S1 (fix round 3): an old-shape Allow card with NO pairing tag refuses inst
   // Fix round 3 changed this from a grant to a refusal: without a tag there is
   // no way to tell the pairing that asked from a re-pair under the same id, and
   // a refusal is the safe default.
-  const refused = await remedy({ capability: "funkwhale", days: 30 }, { db, item: card });
+  const refused = await remedy({ capability: "funkwhale", days: 30 }, { db, item: card, actionId: "expose-capability-30d" });
   assert.equal(refused.resolved, false, "a card with no pairing tag grants nothing");
   assert.match(refused.message, /pairing has changed/);
   assert.equal((await getPeerExposures(db)).size, 0, "no allowance was written, for this peer or any other");
@@ -871,7 +871,7 @@ test("N-a: the Allow remedy refuses for a peer that is not a currently trusted p
   // A revoke written by ANOTHER process lands on the row only: the card is still
   // pending here, so the remedy itself must refuse.
   await db.execute({ sql: "UPDATE crow_instances SET status = 'revoked' WHERE id = ?", args: [peer] });
-  const revoked = await remedy({ capability: "funkwhale", requestingInstance: peer, days: 30 }, { db, item: card });
+  const revoked = await remedy({ capability: "funkwhale", requestingInstance: peer, days: 30 }, { db, item: card, actionId: "expose-capability-30d" });
   assert.equal(revoked.resolved, false, "a revoked peer is refused");
   assert.match(revoked.message, /trusted peer/, "and the refusal says why");
   assert.equal((await getPeerGrantedCapabilities(db, peer)).size, 0, "nothing granted");
@@ -880,10 +880,10 @@ test("N-a: the Allow remedy refuses for a peer that is not a currently trusted p
   // Paused (an owner's reversible sync hold) and untrusted rows are not trusted
   // either, and neither is an id with no row at all.
   await db.execute({ sql: "UPDATE crow_instances SET status = 'paused', trusted = 1 WHERE id = ?", args: [peer] });
-  assert.equal((await remedy({ capability: "funkwhale", requestingInstance: peer }, { db })).resolved, false, "paused refused");
+  assert.equal((await remedy({ capability: "funkwhale", requestingInstance: peer }, { db, actionId: "expose-capability-30d" })).resolved, false, "paused refused");
   await db.execute({ sql: "UPDATE crow_instances SET status = 'active', trusted = 0 WHERE id = ?", args: [peer] });
-  assert.equal((await remedy({ capability: "funkwhale", requestingInstance: peer }, { db })).resolved, false, "untrusted refused");
-  const neverPaired = await remedy({ capability: "funkwhale", requestingInstance: "peer-never-paired" }, { db });
+  assert.equal((await remedy({ capability: "funkwhale", requestingInstance: peer }, { db, actionId: "expose-capability-30d" })).resolved, false, "untrusted refused");
+  const neverPaired = await remedy({ capability: "funkwhale", requestingInstance: "peer-never-paired" }, { db, actionId: "expose-capability-30d" });
   assert.equal(neverPaired.resolved, false, "a peer with no row is not a trusted peer");
   assert.match(neverPaired.message, /trusted peer/);
   assert.equal((await getPeerExposures(db)).size, 0, "no allowance was written by any of them");
@@ -893,7 +893,7 @@ test("N-a: the Allow remedy refuses for a peer that is not a currently trusted p
   // This card was raised by a pairing that is gone (it carries no tag, which is
   // what every card written before this round carries), so the remedy refuses.
   await db.execute({ sql: "UPDATE crow_instances SET status = 'active', trusted = 1, auth_token_hash = ? WHERE id = ?", args: ["reissued", peer] });
-  const repaired = await remedy({ capability: "funkwhale", requestingInstance: peer, days: 30 }, { db, item: card });
+  const repaired = await remedy({ capability: "funkwhale", requestingInstance: peer, days: 30 }, { db, item: card, actionId: "expose-capability-30d" });
   assert.equal(repaired.resolved, false, "a card from the old pairing is refused after a re-pair");
   assert.match(repaired.message, /pairing has changed/);
   assert.equal((await getPeerGrantedCapabilities(db, peer)).size, 0, "nothing granted");
@@ -939,7 +939,7 @@ test("same pairing: a card raised under the current pairing still grants, exactl
   await emitDenied(peer, "funkwhale");
   const card = (await store.listPending(db))[0];
 
-  assert.equal((await remedy({ capability: "funkwhale", requestingInstance: peer, days: 30 }, { db, item: card })).resolved, true);
+  assert.equal((await remedy({ capability: "funkwhale", requestingInstance: peer, days: 30 }, { db, item: card, actionId: "expose-capability-30d" })).resolved, true);
   assert.equal((await getPeerGrantedCapabilities(db, peer)).has("funkwhale"), true);
   assert.equal((await getExposedCapabilities(db)).has("funkwhale"), false, "still never the all-peer list");
 });
@@ -977,7 +977,7 @@ test("a denial queued when a revoke sweeps is carded afterwards, and cannot gran
 
   // `peerTrust` passes now (the row is active/trusted again) — the pairing tag is
   // what refuses the click.
-  const outcome = await remedy({ capability: "funkwhale", requestingInstance: peer, days: 30 }, { db, item: pending[0] });
+  const outcome = await remedy({ capability: "funkwhale", requestingInstance: peer, days: 30 }, { db, item: pending[0], actionId: "expose-capability-30d" });
   assert.equal(outcome.resolved, false, "the old pairing's card grants nothing after the re-pair");
   assert.match(outcome.message, /pairing has changed/);
   assert.equal((await getPeerGrantedCapabilities(db, peer)).size, 0, "no grant for the re-paired id");
@@ -1014,7 +1014,7 @@ test("row-only revoke, then a re-pair with a new hash: the old pending card is r
     args: ["repaired-token-hash-2", peer],
   });
 
-  const outcome = await remedy({ capability: "funkwhale", requestingInstance: peer, days: 30 }, { db, item: card });
+  const outcome = await remedy({ capability: "funkwhale", requestingInstance: peer, days: 30 }, { db, item: card, actionId: "expose-capability-30d" });
   assert.equal(outcome.resolved, false, "the card that outlived the revoke cannot grant the re-paired id");
   assert.match(outcome.message, /pairing has changed/);
   assert.equal((await getPeerGrantedCapabilities(db, peer)).size, 0, "nothing granted");
@@ -1087,7 +1087,7 @@ test("the card's tag is the VERIFIED pairing's, even when the current row holds 
 
   // The remedy compares the card's tag with the tag of the CURRENT row (H2):
   // they differ, so the click refuses — the H1 device is not the H2 device.
-  const outcome = await remedy({ capability: "funkwhale", requestingInstance: peer, days: 30 }, { db, item: card });
+  const outcome = await remedy({ capability: "funkwhale", requestingInstance: peer, days: 30 }, { db, item: card, actionId: "expose-capability-30d" });
   assert.equal(outcome.resolved, false, "the card outlived its pairing and is refused");
   assert.match(outcome.message, /pairing has changed/);
   assert.equal((await getPeerGrantedCapabilities(db, peer)).size, 0, "nothing granted");
@@ -1101,7 +1101,7 @@ test("a verified instance with no hash raises an UNTAGGED card, and the remedy r
   const card = await denyWithVerifiedHash(peer, null);
   assert.equal(card.context.pairingTag, null, "no hash on the verified row → no tag, never the current row's");
 
-  const outcome = await remedy({ capability: "funkwhale", requestingInstance: peer, days: 30 }, { db, item: card });
+  const outcome = await remedy({ capability: "funkwhale", requestingInstance: peer, days: 30 }, { db, item: card, actionId: "expose-capability-30d" });
   assert.equal(outcome.resolved, false, "fail closed: an untagged card grants nothing");
   assert.match(outcome.message, /pairing has changed/);
   assert.equal((await getPeerGrantedCapabilities(db, peer)).size, 0, "nothing granted");

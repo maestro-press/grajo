@@ -50,7 +50,7 @@ import {
   dedupKeyFor,
 } from "../peer-card-policy.js";
 
-const SOURCE = "remote-exposure";
+export const SOURCE = "remote-exposure";
 
 /** The decide-then-upsert body, run under the per-peer lock. */
 async function decideAndStore({ capability, peerId, peerName, toolName, tag, store, now }) {

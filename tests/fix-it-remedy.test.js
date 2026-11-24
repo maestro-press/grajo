@@ -54,12 +54,12 @@ const cardFor = (id) => ({ context: { requestingInstance: id, pairingTag: pairin
 
 test("expose-capability grants the capability to the requesting peer ONLY (idempotent), marks resolved", async () => {
   await trustPeer("peer-a");
-  const r1 = await remedy({ capability: "funkwhale", requestingInstance: "peer-a", days: 30 }, { db, item: cardFor("peer-a") });
+  const r1 = await remedy({ capability: "funkwhale", requestingInstance: "peer-a", days: 30 }, { db, item: cardFor("peer-a"), actionId: "expose-capability-30d" });
   assert.equal(r1.resolved, true);
   const granted = await getPeerGrantedCapabilities(db, "peer-a");
   assert.ok(granted.has("funkwhale"));
   // Idempotent: a second identical click re-grants, it does not duplicate.
-  const r2 = await remedy({ capability: "funkwhale", requestingInstance: "peer-a", days: 30 }, { db, item: cardFor("peer-a") });
+  const r2 = await remedy({ capability: "funkwhale", requestingInstance: "peer-a", days: 30 }, { db, item: cardFor("peer-a"), actionId: "expose-capability-30d" });
   assert.equal(r2.resolved, true);
   assert.deepEqual([...((await getPeerExposures(db)).get("peer-a").keys())], ["funkwhale"]);
   // N1b-8: the all-trusted-peers allowlist is never touched by a card.
@@ -71,7 +71,7 @@ test("expose-capability grants the capability to the requesting peer ONLY (idemp
 test("no verified requesting peer → refused, and NOTHING is exposed to every peer", async () => {
   const before = await getExposedCapabilities(db);
   for (const requestingInstance of [undefined, null, "", "Some Device", { id: "peer-a" }]) {
-    const r = await remedy({ capability: "crow-memory", requestingInstance }, { db });
+    const r = await remedy({ capability: "crow-memory", requestingInstance }, { db, actionId: "expose-capability-30d" });
     assert.equal(r.resolved, false, `refused for ${JSON.stringify(requestingInstance)}`);
   }
   const after = await getExposedCapabilities(db);
@@ -80,7 +80,7 @@ test("no verified requesting peer → refused, and NOTHING is exposed to every p
 });
 
 test("a blank capability or a peer that is not trusted here → refused, nothing written", async () => {
-  const blank = await remedy({ capability: "", requestingInstance: "peer-a" }, { db });
+  const blank = await remedy({ capability: "", requestingInstance: "peer-a" }, { db, actionId: "expose-capability-30d" });
   assert.equal(blank.resolved, false);
 
   // Review round 2 (N-a): a peer whose row fails the one trust predicate
@@ -89,7 +89,7 @@ test("a blank capability or a peer that is not trusted here → refused, nothing
     sql: "INSERT OR REPLACE INTO crow_instances (id, name, crow_id, status, trusted) VALUES (?, ?, ?, 'revoked', 1)",
     args: ["peer-revoked", "Revoked Peer", "crow-test"],
   });
-  const revoked = await remedy({ capability: "crow-memory", requestingInstance: "peer-revoked", days: 30 }, { db });
+  const revoked = await remedy({ capability: "crow-memory", requestingInstance: "peer-revoked", days: 30 }, { db, actionId: "expose-capability-30d" });
   assert.equal(revoked.resolved, false);
   assert.match(revoked.message, /trusted peer/);
   assert.equal(await isCapabilityExposedToPeer(db, "crow-memory", "peer-revoked"), false);
@@ -97,7 +97,7 @@ test("a blank capability or a peer that is not trusted here → refused, nothing
 });
 
 test("a federation peer's proxy key (instance-<id>) is never exposed (queue item 38)", async () => {
-  const r = await remedy({ capability: "instance-p2", requestingInstance: "peer-a" }, { db });
+  const r = await remedy({ capability: "instance-p2", requestingInstance: "peer-a" }, { db, actionId: "expose-capability-30d" });
   assert.equal(r.resolved, false);
   assert.ok(!(await getExposedCapabilities(db)).has("instance-p2"));
   assert.equal(await isCapabilityExposedToPeer(db, "instance-p2", "peer-a"), false);
@@ -106,13 +106,13 @@ test("a federation peer's proxy key (instance-<id>) is never exposed (queue item
 test("duration: 7 days expires, untilRemoved never does; the grant records expires_at", async () => {
   await trustPeer("peer-7");
   const now = Date.now();
-  await remedy({ capability: "crow-blog", requestingInstance: "peer-7", days: 7 }, { db, item: cardFor("peer-7") });
+  await remedy({ capability: "crow-blog", requestingInstance: "peer-7", days: 7 }, { db, item: cardFor("peer-7"), actionId: "expose-capability-7d" });
   const grant = (await getPeerExposures(db)).get("peer-7").get("crow-blog");
   assert.ok(grant.expiresAt && Date.parse(grant.expiresAt) > now + 6 * DAY);
   assert.equal(await isCapabilityExposedToPeer(db, "crow-blog", "peer-7", { now: now + 6 * DAY }), true);
   assert.equal(await isCapabilityExposedToPeer(db, "crow-blog", "peer-7", { now: now + 8 * DAY }), false);
 
-  await remedy({ capability: "crow-storage", requestingInstance: "peer-7", untilRemoved: true }, { db, item: cardFor("peer-7") });
+  await remedy({ capability: "crow-storage", requestingInstance: "peer-7", untilRemoved: true }, { db, item: cardFor("peer-7"), actionId: "expose-capability-forever" });
   const forever = (await getPeerExposures(db)).get("peer-7").get("crow-storage");
   assert.equal(forever.expiresAt, null, "until I remove it stores no expiry");
   assert.equal(await isCapabilityExposedToPeer(db, "crow-storage", "peer-7", { now: now + 3650 * DAY }), true);
@@ -124,15 +124,15 @@ test("duration: 7 days expires, untilRemoved never does; the grant records expir
 test("a card from another pairing (or with no tag at all) refuses, and grants nothing", async () => {
   await trustPeer("peer-tag");
   const other = { context: { requestingInstance: "peer-tag", pairingTag: pairingTag("some-other-pairing") } };
-  const mismatched = await remedy({ capability: "funkwhale", requestingInstance: "peer-tag", days: 30 }, { db, item: other });
+  const mismatched = await remedy({ capability: "funkwhale", requestingInstance: "peer-tag", days: 30 }, { db, item: other, actionId: "expose-capability-30d" });
   assert.equal(mismatched.resolved, false, "a card from a previous pairing is refused");
   assert.match(mismatched.message, /pairing has changed/);
 
-  const untagged = await remedy({ capability: "funkwhale", requestingInstance: "peer-tag", days: 30 }, { db, item: { context: { requestingInstance: "peer-tag" } } });
+  const untagged = await remedy({ capability: "funkwhale", requestingInstance: "peer-tag", days: 30 }, { db, item: { context: { requestingInstance: "peer-tag" } }, actionId: "expose-capability-30d" });
   assert.equal(untagged.resolved, false, "a card written before tags existed is refused");
   assert.match(untagged.message, /pairing has changed/);
 
-  const noCard = await remedy({ capability: "funkwhale", requestingInstance: "peer-tag", days: 30 }, { db });
+  const noCard = await remedy({ capability: "funkwhale", requestingInstance: "peer-tag", days: 30 }, { db, actionId: "expose-capability-30d" });
   assert.equal(noCard.resolved, false, "no card context at all is refused too");
   assert.match(noCard.message, /pairing has changed/);
 

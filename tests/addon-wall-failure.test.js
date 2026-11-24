@@ -421,7 +421,9 @@ test("a forged card with a genuine ref but another source is refused", async () 
 
   const before = wallsBytes();
   const redirected = await clickRemedy(forgedId);
-  assert.match(redirected, /flash=fixit_addon_stale/);
+  // Since item 80, a remote-exposure card refuses any remedy it does not
+  // render — before that remedy's own staleness check ever runs.
+  assert.match(redirected, /flash=fixit_error/);
   const after = wallsBytes();
   if (before === null) assert.equal(after, null);
   else assert.deepEqual(after, before, "nothing was written");

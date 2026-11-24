@@ -194,7 +194,10 @@ test("every redirect path honours the return target", async () => {
 
 test("a resolving remedy ends in fixit_done, a sharing remedy in fixit_fixed", async () => {
   registry.registerRemedy("test-fix-it-resolves", async () => ({ resolved: true }));
-  const plain = await card({ remedies: [{ actionId: "test-fix-it-resolves", kind: "instant", label: "Fix it" }] });
+  // A non-exposure card: the action handler now runs an expose action only on a
+  // remote-exposure card, so a test remedy lives on a card of another source (the
+  // sharing card below is a genuine remote-exposure one).
+  const plain = await card({ source: "test-source", remedies: [{ actionId: "test-fix-it-resolves", kind: "instant", label: "Fix it" }] });
   assert.equal(await click({ action: "remedy", item_id: String(plain), action_id: "test-fix-it-resolves" }),
     "/dashboard/nest?flash=fixit_done");
 

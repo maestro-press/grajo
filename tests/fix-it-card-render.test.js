@@ -1153,9 +1153,19 @@ test("ES: the unchanged dashboard labels the cards share stay exactly as they ar
  * The add-on wall is deliberately absent: that card is CODE-HELD (it renders the
  * live failure record, never the row), so it has no legacy text to fall back to —
  * the same reason retired-bundle and sharing-bot-acl are out of scope.
+ *
+ * `codeLabels: true` marks the ONE source whose BUTTON words are code-held even
+ * without `context.card` (see tests/fix-it-remote-exposure-labels.test.js): its
+ * legacy row still renders its stored title and body, but each genuine action id
+ * renders the approved label for the dashboard's language.
  */
+const REMOTE_EXPOSURE_LEGACY_LABELS = {
+  en: ["Allow for 30 days", "Allow for 7 days", "Allow until I remove it"],
+  es: ["Permitir durante 30 días", "Permitir durante 7 días", "Permitir hasta que yo lo quite"],
+};
+
 const LEGACY_SAMPLES = [
-  { source: "remote-exposure", caseKey: "remote-exposure/named-peer" },
+  { source: "remote-exposure", caseKey: "remote-exposure/named-peer", codeLabels: true },
   { source: "boot-guard", caseKey: "boot-guard/recorder" },
   { source: "caddy-proxy-socket", caseKey: "caddy-proxy-socket" },
   { source: "caddy-admin-socket", caseKey: "caddy-admin-socket" },
@@ -1175,7 +1185,7 @@ function readBaseline() {
   return JSON.parse(readFileSync(FIXTURE, "utf8"));
 }
 
-test("legacy rows (no context.card) render their stored English text in every language", async () => {
+test("legacy rows (no context.card) render their stored English text in every language, apart from a code-held button", async () => {
   const baseline = readBaseline();
   // A link remedy stores only its actionId; the href is code-held (LINK_REMEDIES).
   const hrefToAction = Object.fromEntries(Object.entries(idx.LINK_REMEDIES).map(([id, href]) => [href, id]));
@@ -1209,14 +1219,19 @@ test("legacy rows (no context.card) render their stored English text in every la
       assert.ok(model, `${lang}: the legacy ${sample.source} row is not modelled`);
       assert.equal(model.title, shape.title, `${lang}: a legacy ${sample.source} row renders its stored title`);
       assert.equal(model.why, shape.why, `${lang}: a legacy ${sample.source} row renders its stored body`);
-      assert.deepEqual(model.remedies.map((r) => r.label), shape.remedies.map((r) => r.label),
-        `${lang}: a legacy ${sample.source} row keeps its stored button labels`);
+      const expectedLabels = sample.codeLabels
+        ? REMOTE_EXPOSURE_LEGACY_LABELS[lang]
+        : shape.remedies.map((r) => r.label);
+      assert.deepEqual(model.remedies.map((r) => r.label), expectedLabels,
+        sample.codeLabels
+          ? `${lang}: a legacy ${sample.source} row's genuine buttons carry the code labels`
+          : `${lang}: a legacy ${sample.source} row keeps its stored button labels`);
     }
   }
   await resetForCase();
 });
 
-test("a malformed or unknown context.card falls back to the stored text", async () => {
+test("a malformed or unknown context.card falls back to the stored title and body", async () => {
   // A real card first: its stored context.card gives us the code the renderer knows.
   await resetForCase();
   await raiseRemote({ capability: "funkwhale", peerId: "peer-glasses", peerName: "Glasses" });
@@ -1247,8 +1262,14 @@ test("a malformed or unknown context.card falls back to the stored text", async 
       const model = models.find((m) => m.id === row.id);
       assert.equal(model.title, "Stored title", `${lang}: ${what} falls back to the stored title`);
       assert.equal(model.why, "Stored body", `${lang}: ${what} falls back to the stored body`);
-      assert.deepEqual(model.remedies.map((r) => r.label), ["Stored button"],
-        `${lang}: ${what} keeps the stored button label`);
+      // The button words are NOT part of the fallback for this source: a
+      // remote-exposure button's label is code-held by its action id for every
+      // row, with or without a usable context.card (see
+      // tests/fix-it-remote-exposure-labels.test.js). A source that does fall
+      // back keeps its stored label — pinned there too.
+      assert.deepEqual(model.remedies.map((r) => r.label),
+        [lang === "es" ? "Permitir durante 30 días" : "Allow for 30 days"],
+        `${lang}: ${what} still labels the button from its action id`);
     }
     await db.execute({ sql: "DELETE FROM fix_it_items WHERE dedup_key = ?", args: [dedupKey] });
   }

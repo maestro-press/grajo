@@ -10,7 +10,7 @@
  */
 import * as registry from "../../shared/fix-it/registry.js";
 import * as store from "../../shared/fix-it/store.js";
-import remoteExposureDetector from "./detectors/remote-exposure.js";
+import remoteExposureDetector, { SOURCE as REMOTE_EXPOSURE_SOURCE } from "./detectors/remote-exposure.js";
 import caddyProxySocketDetector from "./detectors/caddy-proxy-socket.js";
 import caddyAdminSocketDetector from "./detectors/caddy-admin-socket.js";
 import bootGuardDetector from "./detectors/boot-guard.js";
@@ -28,8 +28,8 @@ import addonWallDetector, {
   SOURCE as ADDON_WALL_SOURCE,
   whyTextForRecord as addonWallWhyTextForRecord,
 } from "./detectors/addon-wall.js";
-import { renderStoredCard } from "./card-copy.js";
-import exposeCapabilityRemedy from "./remedies/expose-capability.js";
+import { cardRemedyLabel, renderStoredCard } from "./card-copy.js";
+import exposeCapabilityRemedy, { LEGACY_ACTION_ID as LEGACY_EXPOSE_ACTION_ID } from "./remedies/expose-capability.js";
 import restoreBundleCompose, {
   ACTION_ID as RESTORE_COMPOSE_ACTION,
   ALREADY_RESTARTING_FLASH,
@@ -96,7 +96,8 @@ export function wireFixIt() {
   registry.registerRemedy("addon-keep-off", keepOffRemedy);
   // N1b-8: the peer-scoped card offers three durations, and each button needs
   // its own actionId (the POST carries only action_id). All three run the same
-  // one-device grant; the duration rides in the stored args.
+  // one-device grant; the duration comes from the CLICKED action id (the stored
+  // args may only agree with it).
   for (const actionId of CARD_ACTION_IDS) registry.registerRemedy(actionId, exposeCapabilityRemedy);
   // A bundle Crow retired that is still installed: one click runs the product's own
   // uninstall for it (keeps its data folder; no undo beyond that).
@@ -343,9 +344,10 @@ const LANG = (lang) => (lang === "es" ? "es" : "en");
  * The stored-row remedy, as a model entry (null when it can never render).
  *
  * `ownLabel(r)` is the code-held label for this card KIND, in the dashboard's
- * language (fix-it/card-copy.js `renderStoredCard`): it wins over the stored
- * label, so a button whose words the card owns agrees with the body around it.
- * It answers null for an actionId the kind does not own.
+ * language (`renderStoredCard` for a card with a usable `context.card`, and
+ * `cardRemedyLabel` for every remote-exposure row — see cardModel): it wins over
+ * the stored label, so a button whose words the card owns agrees with the body
+ * around it. It answers null for an actionId the kind does not own.
  */
 function storedRemedyModel(r, lang, ownLabel = null) {
   if (!r || typeof r !== "object") return null;
@@ -461,7 +463,25 @@ function cardModel(item, lang) {
   // show, and it stays the answer for every row written before `context.card`
   // existed (and for one whose code or values are not usable).
   const copy = renderStoredCard(item, lang);
-  const remedies = (item.remedies || []).map((r) => storedRemedyModel(r, lang, copy?.remedyLabel)).filter(Boolean);
+  // ONE source is stricter: a remote-exposure card's button words are ALWAYS the
+  // code's, keyed by the actionId the button posts, for EVERY row — one written
+  // before `context.card` existed, one with a malformed card context, one forged.
+  // A stored label is a crow.db value, and this card's buttons grant a peer access
+  // to a capability, so its words must say what the click does: the label for
+  // `expose-capability-forever` is "Allow until I remove it" whatever a crow.db
+  // writer stored beside it (a Spanish dashboard renders the approved Spanish,
+  // the same `lang` renderStoredCard just used). A remedy whose actionId this
+  // source does not own (an invented duration, or the pre-N1b legacy
+  // "expose-capability" id) is not rendered at all: there are no code-held words
+  // for it, and a button with no code-held words has no place on this card.
+  const codeHeldLabels = item.source === REMOTE_EXPOSURE_SOURCE;
+  const remedyLabel = (r) => (codeHeldLabels
+    ? cardRemedyLabel(REMOTE_EXPOSURE_SOURCE, r?.actionId, lang)
+    : copy?.remedyLabel?.(r) ?? null);
+  const remedies = (item.remedies || [])
+    .filter((r) => !codeHeldLabels || remedyLabel(r))
+    .map((r) => storedRemedyModel(r, lang, remedyLabel))
+    .filter(Boolean);
   return {
     ...base,
     title: copy ? copy.title : item.title,
@@ -609,6 +629,24 @@ export async function handleFixItAction(req, res, { db }) {
       }
       const entry = (item.remedies || []).find((r) => r.actionId === body.action_id);
       if (!entry) return returnTo("fixit_error");
+      // An expose action grants a peer access to a capability, so it runs only
+      // on the card that owns it: `item.remedies` is a crow.db column the
+      // add-ons sharing the database can write, and a card of another source
+      // must not be able to hand out an allowance. The legacy pre-N1b id is
+      // still REGISTERED (an old stored card posts it), so it is refused here
+      // too rather than by the registry.
+      if ((CARD_ACTION_IDS.includes(entry.actionId) || entry.actionId === LEGACY_EXPOSE_ACTION_ID)
+        && item.source !== REMOTE_EXPOSURE_SOURCE) {
+        return returnTo("fixit_error");
+      }
+      // A remote-exposure card renders only the buttons its copy holds words
+      // for, so the handler refuses the same entries: an action id the renderer
+      // hides (the legacy id, an invented duration) has no button the operator
+      // could have pressed, and must never run from a hand-made POST.
+      if (item.source === REMOTE_EXPOSURE_SOURCE
+        && cardRemedyLabel(REMOTE_EXPOSURE_SOURCE, entry.actionId, "en") === null) {
+        return returnTo("fixit_error");
+      }
       if (entry.kind && entry.kind !== "instant") {
         // v1 only runs instant remedies; confirm/guided are gated.
         return returnTo("fixit_error");
@@ -617,7 +655,7 @@ export async function handleFixItAction(req, res, { db }) {
       if (!fn) return returnTo("fixit_error");
       // `req` rides along for a remedy that must prove the OWNER at this machine's
       // dashboard (the compose restore): it is the request, never stored card data.
-      const result = await fn(entry.args || {}, { db, item, req });
+      const result = await fn(entry.args || {}, { db, item, req, actionId: entry.actionId });
       const ownFlash = result && typeof result.flash === "string" && REMEDY_FLASHES.includes(result.flash)
         ? result.flash
         : null;

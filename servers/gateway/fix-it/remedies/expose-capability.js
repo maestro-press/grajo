@@ -21,8 +21,11 @@
  *     request; the remedy refuses unless it equals the tag of the peer's
  *     CURRENT hash. A card with no tag (written before this round) refuses as
  *     well — fail closed, on a mismatch and on an unreadable row alike;
- *   - the grant carries `expires_at` (`days` from now, default 30) or is
- *     permanent ("until I remove it": `untilRemoved` / `days: null`).
+ *   - the grant's duration comes from the CLICKED action id (the card's own
+ *     buttons, `CARD_DURATIONS`), never from the stored card's args: those are
+ *     a snapshot of the detector's write, not the operator's choice at click
+ *     time, so a stored `untilRemoved`/`days` could stretch a 30-day button
+ *     into a permanent grant. Args that disagree with the action id refuse.
  *
  * Local-only: writes this instance's own settings; never a cross-instance write,
  * never synced.
@@ -30,9 +33,14 @@
 import { grantPeerCapability } from "../../peer-exposure-store.js";
 import { normalizePeerId, normalizePairingTag, pairingTag } from "../../../shared/peer-id.js";
 import { peerTrust } from "../../../shared/peer-trust.js";
+import { CARD_DURATIONS } from "../peer-card-policy.js";
 
-const DEFAULT_DAYS = 30;
-const MAX_DAYS = 3650;
+/** The duration each button's actionId means (`days: null` = until removed). */
+const DAYS_BY_ACTION = new Map(CARD_DURATIONS.map((d) => [d.actionId, d.days]));
+/** The id old cards posted, before the card offered a duration per button. */
+export const LEGACY_ACTION_ID = "expose-capability";
+/** What that old single button meant: the 30-day entry's duration. */
+const LEGACY_DAYS = DAYS_BY_ACTION.get("expose-capability-30d");
 
 /**
  * The refusal for a card raised by a pairing that is gone (re-pair, token
@@ -41,13 +49,30 @@ const MAX_DAYS = 3650;
 export const PAIRED_AGAIN_MESSAGE =
   "That device's pairing has changed since it asked, so nothing was shared. If it still needs this, it will ask again.";
 
-/** Resolve the grant duration from the card's remedy args. */
-export function resolveDuration(args) {
-  if (!args || typeof args !== "object") return { untilRemoved: false, days: DEFAULT_DAYS };
-  if (args.untilRemoved === true || args.days === null) return { untilRemoved: true, days: null };
-  const n = Number(args.days);
-  if (!Number.isFinite(n) || n <= 0) return { untilRemoved: false, days: DEFAULT_DAYS };
-  return { untilRemoved: false, days: Math.min(Math.floor(n), MAX_DAYS) };
+/**
+ * The duration the clicked action id means, or `undefined` when it means none
+ * (an id this card never posts, or no id at all).
+ */
+function durationForAction(actionId) {
+  if (typeof actionId !== "string") return undefined;
+  if (actionId === LEGACY_ACTION_ID) return LEGACY_DAYS;
+  return DAYS_BY_ACTION.has(actionId) ? DAYS_BY_ACTION.get(actionId) : undefined;
+}
+
+/**
+ * Whether the stored args carry a duration that is NOT the clicked one. Args
+ * with no duration field make no claim and agree; args that claim BOTH
+ * "until removed" and a finite day count claim nothing coherent, so they
+ * disagree with every button (including the forever one).
+ */
+function argsDisagree(args, days) {
+  if (!args || typeof args !== "object") return false;
+  const untilRemoved = args.untilRemoved === true;
+  const hasDays = args.days !== undefined;
+  if (!untilRemoved && !hasDays) return false;
+  if (untilRemoved && args.days != null) return true;
+  const argDays = untilRemoved || args.days === null ? null : Number(args.days);
+  return argDays !== days;
 }
 
 export default async function exposeCapability(args, ctx) {
@@ -56,6 +81,14 @@ export default async function exposeCapability(args, ctx) {
   // A federation peer's proxy entry (instance-<id>) is never a capability of
   // this instance: exposing it would let one peer reach another through us.
   if (capability.startsWith("instance-")) return { resolved: false, message: "That is another instance, not a capability of this one." };
+
+  // The duration is the operator's choice AT CLICK TIME: the action id of the
+  // button they pressed. The stored args only describe what the detector wrote
+  // when the card was raised, so a duration in them that contradicts the button
+  // is a forged/stale card — refuse it before anything is read or written.
+  const days = durationForAction(ctx?.actionId);
+  if (days === undefined) return { resolved: false, message: "Could not record the allowance." };
+  if (argsDisagree(args, days)) return { resolved: false, message: "Could not record the allowance." };
 
   // The peer that asked, as recorded on the card from the verified request
   // identity. Never a name, never a value taken from the peer's own request.
@@ -93,7 +126,7 @@ export default async function exposeCapability(args, ctx) {
     return { resolved: false, message: PAIRED_AGAIN_MESSAGE };
   }
 
-  const { untilRemoved, days } = resolveDuration(args);
+  const untilRemoved = days == null;
   const now = Date.now();
   const expiresAt = untilRemoved ? null : new Date(now + days * 86_400_000).toISOString();
   const result = await grantPeerCapability(db, { peerId, capability, expiresAt, now });
