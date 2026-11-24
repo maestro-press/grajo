@@ -3,7 +3,14 @@
  *
  * Uses the Gemini REST API with streaming (streamGenerateContent).
  * Native fetch(), no SDK dependency.
+ *
+ * The request goes through `guardedFetch` (../adapter-guard.js): the own-host
+ * path rule, the credential drop and DNS pinning are the ADAPTER's. A Gemini
+ * URL always carries a query (`alt=sse&key=…`), so an own-host Gemini target
+ * can never satisfy the no-query half of the rule — it is refused.
  */
+
+import { guardedFetch } from "../adapter-guard.js";
 
 const DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -107,11 +114,12 @@ export default function createGoogleAdapter(config) {
 
       const url = `${baseUrl}/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
 
-      const response = await fetch(url, {
+      const response = await guardedFetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
         signal: options.signal,
+        guard: config.guard,
       });
 
       if (!response.ok) {

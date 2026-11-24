@@ -14,6 +14,7 @@ import { createDbClient } from "../db.js";
 import { localizeDbBaseUrl } from "../shared/native-locality.js";
 import { getOrCreateLocalInstanceId } from "../gateway/instance-registry.js";
 import { resolveProviderForTask, EMBED_TASKS } from "../shared/provider-task.js";
+import { guardedFetch } from "../gateway/ai/adapter-guard.js";
 
 const EMBED_TASK_SET = new Set(EMBED_TASKS);
 
@@ -93,8 +94,15 @@ export async function loadProviderFromDb(id, { ownInstanceIdFn = getOrCreateLoca
 /**
  * Embed a single text (or array of texts).
  * Returns Float32Array (for single) or Float32Array[] (for array).
+ *
+ * The row this reads (`providers.base_url` / `api_key`) is BOT-WRITABLE — a
+ * contained bot has crow.db bound read-write — so the request goes through the
+ * same guard as every model call (`gateway/ai/adapter-guard.js`, `kind:
+ * "model"`: `/v1/embeddings` is one of the allowed own-host operations) and an
+ * own-host embedding server never receives the row's key. `guard` is the test
+ * seam the adapters use too.
  */
-export async function embedText(text, { providerName } = {}) {
+export async function embedText(text, { providerName, guard } = {}) {
   const cfg = await resolveEmbedConfig(providerName || (await resolveDefaultProvider()));
   const isArray = Array.isArray(text);
   const input = isArray ? text : [text];
@@ -108,11 +116,13 @@ export async function embedText(text, { providerName } = {}) {
   let lastErr;
   for (let attempt = 0; attempt <= FETCH_RETRIES; attempt++) {
     try {
-      const res = await fetch(cfg.baseUrl.replace(/\/+$/, "") + "/embeddings", {
+      const res = await guardedFetch(cfg.baseUrl.replace(/\/+$/, "") + "/embeddings", {
         method: "POST",
         headers,
         body,
         signal: AbortSignal.timeout(EMBED_TIMEOUT_MS),
+        timeoutMs: EMBED_TIMEOUT_MS,
+        guard,
       });
       if (!res.ok) {
         lastErr = new Error(`embed HTTP ${res.status} from ${cfg.name}`);
@@ -131,12 +141,18 @@ export async function embedText(text, { providerName } = {}) {
 /**
  * Query the health/config of an embedding provider.
  * Returns { ok, model, dim, baseUrl } or { ok: false, error }.
+ *
+ * Same guarded request as `embedText`: the probe may read `/v1/models` on this
+ * host (`kind: "probe"`) and never takes the row's key there.
  */
-export async function embedProviderInfo(providerName) {
+export async function embedProviderInfo(providerName, { guard } = {}) {
   try {
     const cfg = await resolveEmbedConfig(providerName || (await resolveDefaultProvider()));
-    const res = await fetch(cfg.baseUrl.replace(/\/+$/, "") + "/models", {
+    const res = await guardedFetch(cfg.baseUrl.replace(/\/+$/, "") + "/models", {
+      method: "GET",
       signal: AbortSignal.timeout(3000),
+      timeoutMs: 3000,
+      guard: { ...guard, kind: "probe" },
     });
     if (!res.ok) return { ok: false, error: `http ${res.status}` };
     const data = await res.json();

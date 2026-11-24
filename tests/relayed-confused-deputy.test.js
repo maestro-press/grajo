@@ -19,7 +19,10 @@
  * What stays: the gateway's own `/llm/v1` door, which is a bot door already (a
  * bot may call it with no bearer at all) — the `crow-llm` provider row
  * (base_url http://localhost:3001/llm/v1) keeps working, with NO Authorization
- * header attached, and a plain (non-relayed) caller is untouched everywhere.
+ * header attached. The rules hold for EVERY caller now, not only a relayed one:
+ * an operator voice turn or a background job reads the same bot-writable row, so
+ * its forward is judged by the same path rule and a rebindable DNS name is
+ * resolved once and pinned (tests/forward-parity.test.js).
  *
  * Real sockets (the client binds the relay mark with `localAddress`, exactly how
  * the relay opens its upstream connections), real routers, a real upstream
@@ -283,11 +286,12 @@ test("RELAYED door call on the host's own non-loopback address: the same refusal
   assert.deepEqual(started, []);
 });
 
-test("the SAME door call from plain loopback behaves as before (it is not the relay's problem)", async () => {
+test("the SAME door call from plain loopback is refused TOO (the rule is every caller's)", async () => {
   started = []; providers = { attack: attackRow("127.0.0.1") };
   const r = await doorCall("attack");
-  assert.equal(r.status, 200, r.body);
-  assert.deepEqual(started, ["m"], "an operator-side caller keeps today's behaviour");
+  assert.equal(r.status, 403, r.body);
+  assert.equal(r.json?.error?.code, "SELF_TARGET_REFUSED");
+  assert.deepEqual(started, [], "a non-relayed caller no longer runs the model lifecycle route either");
 });
 
 test("a RELAYED door call to a real loopback model server on its own port still forwards", async () => {
@@ -496,13 +500,14 @@ test("RELAYED voice turn whose fast key resolves to this gateway's port: refused
   }
 });
 
-test("the same voice turn from plain loopback behaves as before", async () => {
+test("the same voice turn from plain loopback is refused TOO (the rule is every caller's)", async () => {
   started = [];
   voiceUp = { baseUrl: `http://127.0.0.1:${gwPort}/llm/models/m/start?x=`, model: "m", apiKey: "bot-chosen-key" };
   try {
     const r = await chatCall();
-    assert.equal(r.status, 200, r.body);
-    assert.deepEqual(started, ["m"]);
+    assert.equal(r.status, 403, r.body);
+    assert.equal(r.json?.error?.code, "SELF_TARGET_REFUSED");
+    assert.deepEqual(started, [], "a non-relayed voice turn never runs the model lifecycle route either");
   } finally {
     voiceUp = null;
   }

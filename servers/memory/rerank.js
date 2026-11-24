@@ -9,6 +9,7 @@
 import { loadProviders } from "../shared/providers.js";
 import { resolveProviderForTask, RERANK_TASKS } from "../shared/provider-task.js";
 import { loadProviderFromDb } from "./embeddings.js";
+import { guardedFetch } from "../gateway/ai/adapter-guard.js";
 
 const RERANK_TIMEOUT_MS = 10_000;
 const RERANK_TASK_SET = new Set(RERANK_TASKS);
@@ -38,10 +39,15 @@ async function resolveRerankConfig(providerName) {
  * @param {object} opts
  * @param {number} [opts.topK=10]
  * @param {string} [opts.providerName]
+ * @param {object} [opts.guard]  the adapter guard's test seam (as in the chat adapters)
  * @returns {Promise<Array>} sorted desc by relevance_score, augmented with { relevance: number }
  *   On reranker failure, returns candidates in original order without a relevance field.
+ *
+ * The provider row is bot-writable, so the request goes through the same guard
+ * as every model call (`gateway/ai/adapter-guard.js`; `/v1/rerank` is one of the
+ * allowed own-host operations, and an own-host reranker never receives the key).
  */
-export async function rerank(query, candidates, { topK = 10, providerName } = {}) {
+export async function rerank(query, candidates, { topK = 10, providerName, guard } = {}) {
   if (!candidates || candidates.length === 0) return [];
   providerName = providerName || (await resolveDefaultRerankProvider());
 
@@ -63,11 +69,13 @@ export async function rerank(query, candidates, { topK = 10, providerName } = {}
   }
 
   try {
-    const res = await fetch(cfg.baseUrl.replace(/\/+$/, "") + "/rerank", {
+    const res = await guardedFetch(cfg.baseUrl.replace(/\/+$/, "") + "/rerank", {
       method: "POST",
       headers,
       body,
       signal: AbortSignal.timeout(RERANK_TIMEOUT_MS),
+      timeoutMs: RERANK_TIMEOUT_MS,
+      guard,
     });
     if (!res.ok) return candidates.slice(0, topK);
     const json = await res.json();

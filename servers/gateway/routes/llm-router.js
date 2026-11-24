@@ -71,6 +71,7 @@
 
 import express from "express";
 import { Readable } from "node:stream";
+import dns from "node:dns";
 import { createDbClient } from "../../db.js";
 import { resolveProviderConfig } from "../ai/resolve-profile.js";
 import { maybeAcquireLocalProvider, warmProviderByName } from "../gpu-orchestrator.js";
@@ -84,14 +85,15 @@ import { extractUsageFromOpenAIResponse, recordUsageEvent } from "../../shared/m
 import { resolveTenantId } from "../../shared/tenancy.js";
 import { loadProviders } from "../../shared/providers.js";
 import { validateLocalToken, validateModelsToken } from "../local-token.js";
-import { resolveDoorTarget, listDoorModels, isTrustedDoorRequest, isTrustedDoorSource, isDoorUrl, forwardedAddrs, DOOR_PROVIDER_HEADER, DOOR_HOP_HEADER } from "../models/door-resolve.js";
+import { resolveDoorTarget, listDoorModels, isTrustedDoorRequest, isTrustedDoorSource, isDoorUrl, forwardedAddrs, isLocalClassTarget, DOOR_PROVIDER_HEADER, DOOR_HOP_HEADER } from "../models/door-resolve.js";
 import { classifyDoorCaller, DOOR_CLASS, recordDoorShadow, ownerTailnetLogin, doorEnforceOn } from "../models/door-identity.js";
 import { classifyPeer, normalizeAddr } from "../../shared/peer-class.js";
 import { classifyIp } from "../../shared/ip-classify.js";
 import { isForeignInstanceHost } from "../../shared/provider-host.js";
 import { getOrCreateLocalInstanceId, validateInstanceToken } from "../instance-registry.js";
 import { providerDoorUrl } from "../models/door.js";
-import { ownTargetOf, isAllowedSelfPath, isRebindableHost } from "../models/self-target.js";
+import { ownTargetOf, pinnedTargetOf, pinnedLookup, isAllowedSelfPath, isAllowedSelfForward, isRebindableHost, gatewayListenPorts, isForbiddenSelfTarget } from "../models/self-target.js";
+import { safeRequest, readJson } from "../models/safe-upstream.js";
 import { createCloudDoor, CLOUD_DOOR_DEFAULTS } from "../models/cloud-door.js";
 import { validateLlmCloudToken } from "../local-token.js";
 import { readCloudConsent, readCloudConsentSalt } from "../../shared/cloud-consent.js";
@@ -545,26 +547,33 @@ async function forwardDoor(req, res, target, op, deps) {
   const url = `${base}/${op}`;
   // THE CONFUSED DEPUTY (security review 2026-11). `base` came from a providers
   // row — bot-writable in every field (base_url, api_key, gpu_policy) — so a
-  // relayed caller (a contained bot, or a walled add-on: isRelayedSocket) could
-  // point it at this BOX with a path that is not a model operation
-  // (`/llm/models/<m>/start?x=`, `/llm/acquire`, the kiosk announce routes …)
-  // and hand it an api_key it chose. The forward then leaves as a fresh,
+  // caller could point it at this BOX with a path that is not a model operation
+  // (`/llm/models/<m>/start?x=`, `/llm/acquire`, the kiosk announce routes …) and
+  // hand it an api_key the row carries. The forward then leaves as a fresh,
   // UNMARKED loopback socket, so every "a relayed socket never authenticates as
   // the owner" rule is bypassed in one hop. Refused BEFORE acquireFn, so a
   // refused forward never starts or evicts a model either.
   //
-  // The rule is a PATH rule, not a port rule: co-hosted sibling gateways exist
-  // (crow :3001 and crow-r4 :3008 on one box), so "any port" is judged, and the
-  // only targets allowed on this host are `/v1/<op>` (a model server's own port)
-  // and `/llm/v1/<op>` (this gateway's own door, which a bot may already call),
-  // with no query and no fragment (models/self-target.js isAllowedSelfPath).
-  // A name we could not resolve is refused too: our lookup and the fetch's are
-  // two resolutions of the same name.
-  const own = await ownTargetOf(url);
-  if (isRelayedSocket(req.socket)) {
-    if (own.unresolved || (own.own && !isAllowedSelfPath(url))) {
-      return res.status(403).json({ error: { code: "SELF_TARGET_REFUSED", message: `provider "${target.providerId}" points at this gateway; a relayed caller may not use it as a forward` } });
-    }
+  // THE PATH RULE applies to EVERY caller, not only a relayed one: the row is
+  // the same bot-writable row whoever asks, and an operator voice turn or a
+  // `completeText` job would run the same unmarked loopback work. The rule is a
+  // PATH rule, not a port rule: co-hosted sibling gateways exist (crow :3001 and
+  // crow-r4 :3008 on one box), so "any port" is judged, and the only targets
+  // allowed on this host are `/v1/<op>` (a model server's own port) and
+  // `/llm/v1/<op>` (this gateway's own door, which a bot may already call), with
+  // no query and no fragment (models/self-target.js isAllowedSelfPath). For a
+  // RELAYED caller `/llm/v1/<op>` is limited further to this gateway's OWN listen
+  // ports (`own.self`): a sibling's model door is not a door this gateway hands a
+  // bot (`isAllowedSelfForward`). A name we could not resolve is refused for
+  // EVERY caller (N1), not only a relayed one: our lookup and the fetch's are
+  // two resolutions of the same name, and the request would fail on the second
+  // one anyway. The name is resolved through the same `deps.lookupFn` seam the
+  // voice path (`handleChat`) and `completeText` use, so it is judged here and
+  // not by the fetch's own lookup.
+  const relayed = isRelayedSocket(req.socket);
+  const own = await ownTargetOf(url, { lookupFn: deps.lookupFn, ports: deps.listenPortsFn() });
+  if (own.unresolved || (own.own && !isAllowedSelfForward(url, { relayed, self: own.self }))) {
+    return res.status(403).json({ error: { code: "SELF_TARGET_REFUSED", message: `provider "${target.providerId}" points at this gateway${relayed ? "; a relayed caller may not use it as a forward" : ""}` } });
   }
   // Unconditional (relayed or not, and the one thing every own-host target gets):
   // a provider's api_key never travels to a forward that lands on this box. The
@@ -833,6 +842,68 @@ async function voiceKeysFor(deps) {
 export const resolveVoiceKey = (key) => resolveKey(key);
 
 /**
+ * THE VOICE PATH'S TARGET RULE — the door's rule for EVERY caller.
+ *
+ * This path resolves its upstream from the same bot-writable `providers` row
+ * (resolveKeyFn) as the door, so it gets the same two rules, and it applies them
+ * BEFORE `maybeAcquireLocalProvider` (a refused turn must not start or evict a
+ * model):
+ *
+ *   a) THE PATH RULE (`isAllowedSelfForward`): on this host (any port, co-hosted
+ *      siblings included) only an exact `/v1/<op>` or `/llm/v1/<op>` model call
+ *      with no query and no fragment. For a RELAYED caller `/llm/v1/<op>` is
+ *      limited to this gateway's own listen ports (`self`), and
+ *      `own.unresolved` — a name the resolver did not answer for, `*.ts.net`
+ *      included — is refused for EVERY caller (N1): our lookup and the fetch's
+ *      are two resolutions of the name, and the request would fail on the
+ *      second one anyway.
+ *   a2) THE FORBIDDEN-ADDRESS RULE, for EVERY caller: link-local (169.254/16,
+ *      cloud metadata) and the named metadata hosts are refused whatever the
+ *      path, judged on the target's own address. An IP-literal row used to be
+ *      called "not this host" and dialled.
+ *   b) REBINDING: a DNS name other than localhost/*.localhost/*.ts.net is
+ *      resolved ONCE here (`pinnedTargetOf`, 2 s cap) and the connection is
+ *      pinned to that answer (`pinned`); a name that answers with this host,
+ *      does not resolve, or has no dialable answer is refused. A relayed caller
+ *      may not use a rebindable name at all (the door's own address class: an
+ *      IP literal, localhost or a tailnet name), nor a query or a fragment.
+ *      The Authorization strip stays unconditional: no provider api_key travels
+ *      to a forward that lands on this box.
+ *
+ * `refusal` is `{ status, code, message }` (existing codes and messages only);
+ * otherwise `{ own, pinned }` is what the caller forwards with.
+ */
+async function voiceTargetGuard(req, key, url, deps) {
+  const relayed = isRelayedSocket(req.socket);
+  const notForwardable = () => ({ refusal: { status: 400, code: "NOT_FORWARDABLE", message: `the model key ${key} is not on a loopback, private or tailnet address; the door never forwards to the internet` } });
+  const selfRefused = () => ({ refusal: { status: 403, code: "SELF_TARGET_REFUSED", message: `the model key ${key} points at this gateway${relayed ? "; a relayed caller may not use it as a forward" : ""}` } });
+  const forbidden = () => ({ refusal: { status: 400, code: "FORBIDDEN_TARGET", message: `the model key ${key} points at a link-local or metadata address; the door refuses it` } });
+  // The address class is EVERY caller's: the operator's own voice turn reads the
+  // same bot-writable row as a relayed one.
+  if (isForbiddenSelfTarget(url)) return forbidden();
+  if (relayed) {
+    if (isRebindableHost(url)) return notForwardable();
+    if (!isLocalClassTarget(url)) return notForwardable();
+  }
+  const own = await pinnedTargetOf(url, { lookupFn: deps.lookupFn, ports: deps.listenPortsFn() });
+  // A name nobody answered for is refused for EVERY caller (N1), never forwarded.
+  if (own.unresolved || (own.own && !isAllowedSelfForward(url, { relayed, self: own.self }))) return selfRefused();
+  if (relayed) {
+    // No query and no fragment on ANY relayed target: `${base}/chat/completions`
+    // turns a base_url carrying `?x=` into a POST to another route on the far end.
+    // (An own-host target with a query was already refused by the path rule above.)
+    let parsed;
+    try { parsed = new URL(url); } catch { return notForwardable(); }
+    if (parsed.search || parsed.hash) return notForwardable();
+  }
+  if (isRebindableHost(url)) {
+    if (own.unresolved || own.own || own.forbidden || !own.pinned) return selfRefused();
+    return { own, pinned: own.pinned };
+  }
+  return { own, pinned: null };
+}
+
+/**
  * One raw `provider/model` key resolved against the given db client: resolveKey's answer plus the row's
  * `host` (the owner check needs it), uncached. `resolveKeyFrom(dbc)` is the same resolution bound to a
  * CALLER'S db, for a caller that must not read the gateway's own: the reports model blocks resolve the
@@ -886,7 +957,8 @@ export const probeVoiceReady = (baseUrl) => defaultProbeReady(baseUrl);
  * @returns {Promise<string>}
  */
 export async function completeText({ model, prompt, maxTokens = 400, timeoutMs = 60_000 } = {}, {
-  resolveKeyFn = resolveDirectKey, fetchFn = fetch, recordUsageFn = (event) => recordUsageEvent(db(), event),
+  resolveKeyFn = resolveDirectKey, fetchFn = fetch, requestFn = safeRequest, lookupFn = dns.lookup,
+  recordUsageFn = (event) => recordUsageEvent(db(), event),
   ownInstanceIdFn = getOrCreateLocalInstanceId, reservationFn = () => readReservation(),
 } = {}) {
   if (!model || typeof prompt !== "string") throw new Error("completeText: model and prompt are required");
@@ -907,6 +979,35 @@ export async function completeText({ model, prompt, maxTokens = 400, timeoutMs =
   // row, or a co-hosted peer's) is that instance's to start, not ours.
   if (isDoorUrl(up.baseUrl)) throw new Error("completeText: refused, the model is behind a door");
   if (isForeignInstanceHost(up.host, ownInstanceIdFn)) throw new Error("completeText: refused, another instance's model");
+  // THE PATH RULE, for EVERY caller — a scheduled job is not a privileged
+  // caller: this URL came from the same bot-writable providers row, and
+  // `${base}/chat/completions` turns `http://127.0.0.1:3001/llm/models/m/start?x=`
+  // into a POST to the model START route on a fresh, unmarked loopback socket.
+  // On this host only the operations a forward may run are allowed
+  // (models/self-target.js isAllowedSelfPath), judged BEFORE any fetch.
+  const url = `${up.baseUrl}/chat/completions`;
+  // THE FORBIDDEN-ADDRESS RULE, for EVERY caller: a scheduled job is not a
+  // privileged caller either, and the row it reads is bot-writable. Judged on the
+  // address, so an IP-literal metadata endpoint is refused before any socket.
+  if (isForbiddenSelfTarget(url)) {
+    throw Object.assign(new Error("Crow will not contact that address"), { code: "FORBIDDEN_TARGET" });
+  }
+  const own = await pinnedTargetOf(url, { lookupFn });
+  const selfRefused = () => Object.assign(new Error("completeText: refused, the model is on this gateway"), { code: "SELF_TARGET_REFUSED" });
+  // A name the resolver did not answer for is refused for EVERY caller (N1):
+  // never a forward that leaves the only resolution of it to the fetch.
+  if (own.unresolved) throw selfRefused();
+  if (own.own && !isAllowedSelfPath(url)) throw selfRefused();
+  // REBINDING, for every caller: a DNS name is resolved ONCE above and the
+  // connection is pinned to that answer (the 2 s lookup cap is self-target.js's).
+  // A name that answers with this host, does not resolve, or has no dialable
+  // answer is refused here; a public cloud host keeps its Authorization because
+  // the socket is pinned to the address that was vetted.
+  let pinned = null;
+  if (isRebindableHost(url)) {
+    if (own.own || own.forbidden || !own.pinned) throw selfRefused();
+    pinned = own.pinned;
+  }
   const body = { model: up.model, messages: [{ role: "user", content: prompt }], max_tokens: maxTokens, temperature: 0.2, stream: false };
   // A reasoning model (qwen3.x) spent the whole max_tokens thinking and answered "" (every session
   // summary ended empty_output, 2026-10-30). This is short structured writing: no thinking. Only a
@@ -918,20 +1019,35 @@ export async function completeText({ model, prompt, maxTokens = 400, timeoutMs =
   // `redirect: "manual"` leaves a 3xx as an !ok status, so it answers the fixed
   // "upstream status" error below instead of being followed on a new socket.
   const headers = { "Content-Type": "application/json", ...authHeaders(up.apiKey) };
-  if ((await ownTargetOf(`${up.baseUrl}/chat/completions`)).own) delete headers.Authorization;
-  const res = await fetchFn(`${up.baseUrl}/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs),
-    redirect: "manual",
-  });
-  if (!res.ok) {
-    try { res.body?.cancel?.()?.catch?.(() => {}); } catch { /* the body is irrelevant */ }
-    throw new Error(`completeText: upstream status ${res.status}`);
-  }
+  if (own.own) delete headers.Authorization;
   let json;
-  try { json = await res.json(); } catch { throw new Error("completeText: invalid upstream body"); }
+  if (pinned) {
+    // A rebindable name: safeRequest opens the socket to the EXACT address vetted
+    // above (pinnedLookup), never to a second answer for the name. allowAddressFn
+    // is safe here because `pinned` already passed the own-host/forbidden vetting.
+    const r = await requestFn(url, {
+      method: "POST", headers, body: JSON.stringify(body), timeoutMs,
+      lookupFn: pinnedLookup(pinned), allowAddressFn: () => true,
+    });
+    if (r.status < 200 || r.status >= 300) {
+      try { r.stream?.destroy?.(); } catch { /* the body is irrelevant */ }
+      throw new Error(`completeText: upstream status ${r.status}`);
+    }
+    try { json = await readJson(r); } catch { throw new Error("completeText: invalid upstream body"); }
+  } else {
+    const res = await fetchFn(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: "manual",
+    });
+    if (!res.ok) {
+      try { res.body?.cancel?.()?.catch?.(() => {}); } catch { /* the body is irrelevant */ }
+      throw new Error(`completeText: upstream status ${res.status}`);
+    }
+    try { json = await res.json(); } catch { throw new Error("completeText: invalid upstream body"); }
+  }
   try {
     const usage = extractUsageFromOpenAIResponse(JSON.stringify(json));
     if (usage) {
@@ -1004,6 +1120,21 @@ async function handleChat(req, res, deps) {
   // before this task.
   let [providerId] = splitKey(key);
   const requester = requesterTag(req);
+
+  // Resolve and JUDGE the target BEFORE anything is started: a refused turn must
+  // never start or evict a model (the door refuses before its acquire too), and
+  // the row this reads is bot-writable, so the refusal cannot wait for it.
+  let up;
+  try {
+    up = await deps.resolveKeyFn(key);
+  } catch (e) {
+    return res.status(502).json({ error: { message: `model routing failed for ${key}: ${e.message}` } });
+  }
+  let guard = await voiceTargetGuard(req, key, `${up.baseUrl}/chat/completions`, deps);
+  if (guard.refusal) {
+    return res.status(guard.refusal.status).json({ error: { code: guard.refusal.code, message: guard.refusal.message } });
+  }
+
   try {
     await deps.acquireFn(providerId, { requester });
   } catch (err) {
@@ -1014,9 +1145,14 @@ async function handleChat(req, res, deps) {
       // (never a retry: this class of model never becomes available on its
       // own, so there is nothing to wait on).
       const fast = escalate ? await deps.resolveKeyFn(keys.fast).catch(() => null) : null;
-      if (fast && await deps.probeReadyFn(fast.baseUrl)) {
+      // The fallback is a forward too: it gets the same target rule, so a refused
+      // row is not dialled even though the acquire already ran.
+      const fastGuard = fast ? await voiceTargetGuard(req, keys.fast, `${fast.baseUrl}/chat/completions`, deps) : null;
+      if (fast && !fastGuard?.refusal && await deps.probeReadyFn(fast.baseUrl)) {
         key = keys.fast;
         [providerId] = splitKey(key);
+        up = fast;
+        guard = fastGuard;
         routeLabel = "degraded(serving_class)";
         body.messages = [
           ...(Array.isArray(body.messages) ? body.messages : []),
@@ -1035,9 +1171,12 @@ async function handleChat(req, res, deps) {
       // falls back to the resident fast model with a note; anything else (or
       // a cold fast model) gets a fast 503 the client can show or wait on.
       const fast = escalate ? await deps.resolveKeyFn(keys.fast).catch(() => null) : null;
-      if (fast && await deps.probeReadyFn(fast.baseUrl)) {
+      const fastGuard = fast ? await voiceTargetGuard(req, keys.fast, `${fast.baseUrl}/chat/completions`, deps) : null;
+      if (fast && !fastGuard?.refusal && await deps.probeReadyFn(fast.baseUrl)) {
         key = keys.fast;
         [providerId] = splitKey(key);
+        up = fast;
+        guard = fastGuard;
         routeLabel = "degraded(box_reserved)";
         body.messages = [
           ...(Array.isArray(body.messages) ? body.messages : []),
@@ -1053,44 +1192,15 @@ async function handleChat(req, res, deps) {
     }
   }
 
-  let up;
-  try {
-    up = await deps.resolveKeyFn(key);
-  } catch (e) {
-    return res.status(502).json({ error: { message: `model routing failed for ${key}: ${e.message}` } });
-  }
   // Forward to the chosen upstream, rewriting the model field to its real id.
+  // The target was already judged by voiceTargetGuard (path rule + rebinding),
+  // before the acquire: `guard.own` is that judgement, `guard.pinned` is the
+  // address a rebindable name resolved to and the socket must be opened to.
   body.model = up.model;
   const url = `${up.baseUrl}/chat/completions`;
-  // The same confused deputy the door refuses (forwardDoor): this path resolves
-  // its target from the same bot-writable providers row (resolveKeyFn), so a
-  // relayed caller could repoint the fast/escalate row at this box with a path
-  // that is not a model operation (`/llm/models/<m>/start?x=` is what
-  // `${base}/chat/completions` turns such a row into) and the forward would
-  // leave as a fresh, UNMARKED loopback socket.
-  //
-  // Two rules, relayed callers only (nothing else changes):
-  //
-  //  a) REBINDING. The row's host must be an IP literal (any), `localhost` or a
-  //     `*.ts.net` name — the same shape the door's own forward already requires
-  //     of a forwardable row. A relayed caller naming any OTHER DNS name is
-  //     refused HERE, on the host string alone, so no resolver is asked and no
-  //     request leaves this process (a name is a resolution the row's writer
-  //     does not control, and our lookup and the fetch's are two of them).
-  //  b) THE PATH RULE. A target on this HOST (any port, co-hosted siblings
-  //     included) is allowed only for `/v1/<op>` / `/llm/v1/<op>` with no query
-  //     and no fragment; a name we could not resolve is refused (fail closed).
-  // The Authorization strip below is unconditional — see the door's note.
-  const relayed = isRelayedSocket(req.socket);
-  if (relayed && isRebindableHost(up.baseUrl)) {
-    return res.status(400).json({ error: { code: "NOT_FORWARDABLE", message: `the model key ${key} is not on a loopback, private or tailnet address; the door never forwards to the internet` } });
-  }
-  const own = await ownTargetOf(url);
-  if (relayed && (own.unresolved || (own.own && !isAllowedSelfPath(url)))) {
-    return res.status(403).json({ error: { code: "SELF_TARGET_REFUSED", message: `the model key ${key} points at this gateway; a relayed caller may not use it as a forward` } });
-  }
+  const pinned = guard.pinned;
   const upHeaders = { "Content-Type": "application/json", Accept: "text/event-stream", ...authHeaders(up.apiKey) };
-  if (own.own) delete upHeaders.Authorization;
+  if (guard.own.own) delete upHeaders.Authorization;
   const t0 = Date.now();
   const role = roleOf();
   console.log(`[llm-router] route=${routeLabel} -> ${key} (${up.model})${role ? ` role=${role}` : ""} cloud=${cloudOf()} stream=${!!body.stream} requester=${requester}`);
@@ -1099,40 +1209,60 @@ async function handleChat(req, res, deps) {
   try {
     const t = connectTimeout(LLM_CONNECT_TIMEOUT_MS);
     // NO REDIRECTS (see forwardDoor): a 3xx is a 502, never followed.
-    upstream = t.disarm(await fetch(url, {
-      method: "POST",
-      headers: upHeaders,
-      body: JSON.stringify(body),
-      signal: t.signal,
-      redirect: "manual",
-    }));
+    upstream = t.disarm(pinned
+      // A rebindable name: safeRequest opens the socket to the EXACT address
+      // vetted by voiceTargetGuard (pinnedLookup), never to a second answer for
+      // the same name. allowAddressFn is safe: `pinned` already passed the
+      // own-host/forbidden vetting.
+      ? await deps.requestFn(url, {
+        method: "POST", headers: upHeaders, body: JSON.stringify(body),
+        signal: t.signal, timeoutMs: LLM_CONNECT_TIMEOUT_MS, idleTimeoutMs: 0,
+        lookupFn: pinnedLookup(pinned), allowAddressFn: () => true,
+      })
+      : await fetch(url, {
+        method: "POST",
+        headers: upHeaders,
+        body: JSON.stringify(body),
+        signal: t.signal,
+        redirect: "manual",
+      }));
   } catch (e) {
     const msg = isTimeoutError(e)
       ? `upstream connect timeout after ${Math.round(LLM_CONNECT_TIMEOUT_MS / 1000)}s`
       : `upstream ${url} unreachable: ${e.message}`;
     return res.status(502).json({ error: { message: msg } });
   }
-  if (upstream.status >= 300 && upstream.status < 400) {
-    try { upstream.body?.cancel?.()?.catch?.(() => {}); } catch { /* the body is irrelevant */ }
-    return res.status(502).json({ error: { code: "UPSTREAM_UNREACHABLE", message: `upstream ${url} unreachable: redirect ${upstream.status} not followed` } });
+  const upstreamStatus = upstream.status;
+  const upstreamType = pinned
+    ? (upstream.headers?.["content-type"] || "application/json")
+    : (upstream.headers.get("content-type") || "application/json");
+  if (upstreamStatus >= 300 && upstreamStatus < 400) {
+    try {
+      if (pinned) upstream.stream?.destroy?.();
+      else upstream.body?.cancel?.()?.catch?.(() => {});
+    } catch { /* the body is irrelevant */ }
+    return res.status(502).json({ error: { code: "UPSTREAM_UNREACHABLE", message: `upstream ${url} unreachable: redirect ${upstreamStatus} not followed` } });
   }
 
   // Mirror status + content-type; stream the body straight through (SSE or JSON).
-  res.status(upstream.status);
-  res.set("Content-Type", upstream.headers.get("content-type") || "application/json");
-  if (!upstream.body) return res.end();
+  res.status(upstreamStatus);
+  res.set("Content-Type", upstreamType);
+  // fetch hands a web stream, safeRequest a Node one; both are piped the same below.
+  const nodeUpstream = pinned ? upstream.stream : (upstream.body ? Readable.fromWeb(upstream.body) : null);
+  if (!nodeUpstream) return res.end();
   // Tap the pass-through to meter usage (voice/glasses). Bytes are forwarded
   // unchanged; we keep only a bounded tail because the OpenAI usage block rides
   // the final include_usage SSE frame (or is the whole non-streaming JSON body).
   // An injected companion turn goes through the echo guard (not an error body: that passes as it came); the
   // metering tap then reads the filtered bytes (the usage frame passes the filter untouched).
+  const ok = upstreamStatus >= 200 && upstreamStatus < 300;
   let captured = "";
   const CAP = 64 * 1024;
   const tap = (text) => { captured += text; if (captured.length > CAP) captured = captured.slice(-CAP); };
-  const xf = injected && upstream.ok ? echoTransform(upstream.headers.get("content-type"), injected) : null;
+  const xf = injected && ok ? echoTransform(upstreamType, injected) : null;
   try {
     await new Promise((resolve, reject) => {
-      const nodeStream = Readable.fromWeb(upstream.body);
+      const nodeStream = nodeUpstream;
       nodeStream.on("error", reject);
       // A client abort destroys the stream with "close", not "error", and res never emits "finish": resolve on
       // close too (as forwardDoor does), or the turn never settles.
@@ -1152,7 +1282,7 @@ async function handleChat(req, res, deps) {
       nodeStream.on("end", () => { const out = xf.end(); if (out) tap(out); res.end(out); });
     });
     // Metering: best-effort, never affects the proxied response.
-    if (upstream.ok) {
+    if (ok) {
       try {
         const usage = extractUsageFromOpenAIResponse(captured);
         if (usage) {
@@ -1224,6 +1354,14 @@ export default function llmRouterRouter(opts = {}) {
     nowFn: Date.now,
     // The census line's sink (tests inject their own; the gateway keeps stdout).
     logFn: (line) => console.log(line),
+    // The voice path's rebinding seam: a name target is resolved ONCE (this
+    // lookup) and the connection is pinned to that answer (`requestFn`).
+    // listenPortsFn is this gateway's own listen port(s) (PORT / CROW_GATEWAY_PORT,
+    // the same expression index.js binds), so a relayed forward to /llm/v1 is
+    // allowed only on OUR door and never a co-hosted sibling's.
+    lookupFn: dns.lookup,
+    requestFn: safeRequest,
+    listenPortsFn: () => gatewayListenPorts(),
     recordUsageFn: (event) => recordUsageEvent(db(), event),
     // The voice keys per request (m6): a seam, so router tests never need the db() singleton.
     resolveVoiceKeysFn: (dbc) => resolveVoiceKeys(dbc),

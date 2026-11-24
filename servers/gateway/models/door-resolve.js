@@ -59,6 +59,21 @@ export function isForbiddenTarget(url) {
   if (!h || FORBIDDEN_HOSTS.has(h)) return true;
   if (/^169\.254\./.test(h)) return true;                   // IPv4 link-local
   if (/^fe[89ab][0-9a-f]?:/.test(h)) return true;           // IPv6 link-local
+  // N2: an IPv4 carried INSIDE an IPv6 address decides too. canonicalTargetHost
+  // unwraps only the mapped/compatible spellings; NAT64 (`[64:ff9b::a9fe:a9fe]`
+  // = 169.254.169.254), SIIT, 6to4 and Teredo keep the IPv4 in their low (or,
+  // for Teredo, XOR-inverted) groups, and a translator or tunnel still delivers
+  // the packet to it. `classifyIp` (servers/shared/ip-classify.js) already
+  // decodes every one of those forms, so the decision is made on ITS embedded
+  // address, not on a string shape here.
+  if (isIP(h) === 6) {
+    const { cls, v4 } = classifyIp(h);
+    if (cls === "linklocal") return true;                   // the IPv6 class itself
+    if (v4) {
+      if (FORBIDDEN_HOSTS.has(v4)) return true;             // the metadata endpoints
+      if (/^169\.254\./.test(v4)) return true;              // IPv4 link-local, embedded
+    }
+  }
   return false;
 }
 

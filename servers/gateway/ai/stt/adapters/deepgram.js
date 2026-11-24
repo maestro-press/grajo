@@ -6,9 +6,18 @@
  *              linear16 PCM frames; server emits interim + final results.
  *
  * config.apiKey / baseUrl / defaultModel
+ *
+ * Both paths carry the profile's credential (`Authorization: Token …`), and the
+ * profile comes from bot-writable `dashboard_settings`, so both go through the
+ * guard: the batch POST through `guardedFetch`, and the LIVE CONNECT through
+ * `guardSocketTarget` (the same decision, plus a `lookup` pinned to the vetted
+ * address). A live socket to this box is refused: `/v1/listen` is not one of the
+ * reviewed own-host speech operations.
  */
 
 import WebSocket from "ws";
+import { guardedFetch, guardSocketTarget } from "../../adapter-guard.js";
+import { AI_TIMEOUT_MS } from "../../../../shared/http-timeout.js";
 
 const DEFAULT_BASE_URL = "https://api.deepgram.com";
 const DEFAULT_WS_URL = "wss://api.deepgram.com";
@@ -30,7 +39,7 @@ export default function createDeepgramSttAdapter(config) {
       url.searchParams.set("punctuate", "true");
       url.searchParams.set("smart_format", "true");
 
-      const res = await fetch(url.toString(), {
+      const res = await guardedFetch(url.toString(), {
         method: "POST",
         headers: {
           Authorization: `Token ${apiKey}`,
@@ -38,6 +47,8 @@ export default function createDeepgramSttAdapter(config) {
         },
         body: audioBuffer,
         signal: options.signal,
+        timeoutMs: AI_TIMEOUT_MS,
+        guard: { ...config.guard, kind: "speech" },
       });
       if (!res.ok) {
         const err = await res.text().catch(() => "");
@@ -72,8 +83,13 @@ export default function createDeepgramSttAdapter(config) {
       url.searchParams.set("smart_format", "true");
       if (options.language) url.searchParams.set("language", options.language);
 
+      // The CONNECT is judged too: guarded (this profile's base URL is bot-
+      // writable), and a rebindable name's socket is pinned to the vetted
+      // address — never to a second answer for the name.
+      const socket = await guardSocketTarget(url.toString(), { ...config.guard, kind: "speech" });
       const ws = new WebSocket(url.toString(), {
         headers: { Authorization: `Token ${apiKey}` },
+        ...socket,
       });
 
       // Pending messages queue, drained by the async iterator.

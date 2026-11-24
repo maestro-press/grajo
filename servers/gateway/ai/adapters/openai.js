@@ -5,7 +5,12 @@
  * provider that implements the OpenAI Chat Completions API.
  *
  * Uses native fetch() — no SDK dependency.
+ *
+ * Every request goes through `guardedFetch` (../adapter-guard.js): the own-host
+ * path rule and DNS pinning are the ADAPTER's, so a caller cannot bypass them.
  */
+
+import { guardedFetch } from "../adapter-guard.js";
 
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 
@@ -169,11 +174,12 @@ export default function createOpenAIAdapter(config) {
         headers["Authorization"] = `Bearer ${apiKey}`;
       }
 
-      const response = await fetch(`${baseUrl}/chat/completions`, {
+      const response = await guardedFetch(`${baseUrl}/chat/completions`, {
         method: "POST",
         headers,
         body: JSON.stringify(body),
         signal: options.signal,
+        guard: config.guard,
       });
 
       if (!response.ok) {

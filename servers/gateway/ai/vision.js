@@ -5,9 +5,16 @@
  *
  * Returns the text description. Throws on timeout or non-2xx. Callers pick
  * their own prompt (describe-for-voice, caption-for-library, OCR, etc.).
+ *
+ * One OpenAI-compatible model call, so it goes through the same adapter guard
+ * as the chat adapters (`adapter-guard.js`): an own-host `base_url` is allowed
+ * only at a model-operation path and never receives the row's key, and a DNS
+ * name is resolved once and pinned. `providerConfig` comes from a bot-writable
+ * `providers` row, exactly like an adapter's.
  */
 
 import { readFile } from "node:fs/promises";
+import { guardedFetch } from "./adapter-guard.js";
 
 /**
  * @param {object} opts
@@ -42,7 +49,7 @@ export async function analyzeImage({
     headers.Authorization = `Bearer ${providerConfig.apiKey}`;
   }
 
-  const resp = await fetch(`${providerConfig.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+  const resp = await guardedFetch(`${providerConfig.baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers,
     body: JSON.stringify({
@@ -57,6 +64,7 @@ export async function analyzeImage({
       max_tokens: maxTokens,
     }),
     signal: AbortSignal.timeout(timeoutMs),
+    guard: providerConfig.guard,
   });
 
   if (!resp.ok) {

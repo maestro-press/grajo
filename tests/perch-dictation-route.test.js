@@ -131,7 +131,11 @@ const P_LOCAL = () => ({ id: "p-local", name: "Local Whisper Box", provider: "fa
 const P_OTHER = () => ({ id: "p-other", name: "Other Box", provider: "fasterwhisper",
   baseUrl: `http://127.0.0.1:${other.port}/v1`, defaultModel: LARGE, language: "", isDefault: false });
 const P_GROQ = (isDefault = false, apiKey = "fake-test-key-123") => ({ id: "p-groq", name: "Groq Whisper", provider: "groq",
-  baseUrl: `http://127.0.0.1:${cloud.port}/openai/v1`, defaultModel: "whisper-large-v3-turbo", language: "",
+  // `/v1`, not Groq's real `/openai/v1`: the fake lives on loopback, and an
+  // own-host speech target is allowed at the EXACT speech paths only
+  // (gateway/models/self-target.js), so a loopback base of `/openai/v1` would be
+  // refused (tests/speech-adapter-target-guard.test.js pins that half).
+  baseUrl: `http://127.0.0.1:${cloud.port}/v1`, defaultModel: "whisper-large-v3-turbo", language: "",
   apiKey, isDefault });
 
 function seed(profiles) {
@@ -554,7 +558,12 @@ test("cloud profile: the fake cloud receives the clip ONLY when it is the config
     assert.equal(cloud.hits.transcribe, 1);
     assert.deepEqual(cloud.last.fileBytes, OGG);
     assert.equal(cloud.last.model, "whisper-large-v3-turbo", "a cloud profile keeps its own model");
-    assert.equal(cloud.last.auth, "Bearer fake-test-key-123");
+    // NO KEY ON THIS BOX. The fake "cloud" server stands in for Groq but lives on
+    // loopback, and a loopback endpoint IS this box: since the confused-deputy
+    // fix a speech request that lands here never carries the profile's key
+    // (gateway/ai/adapter-guard.js). A real api.groq.com endpoint keeps it; that
+    // half is pinned in tests/speech-adapter-target-guard.test.js.
+    assert.equal(cloud.last.auth, null, "no credential to a request that lands on this box");
     assert.equal(local.hits.transcribe, 1, "and the local box got nothing more");
   } finally { await a.close(); }
 });

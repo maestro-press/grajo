@@ -15,6 +15,7 @@
 
 import { readEnvFile, resolveEnvPath } from "../env-manager.js";
 import { resolveProviderConfig } from "./resolve-profile.js";
+import { guardedFetch } from "./adapter-guard.js";
 import { timeoutSignal, AI_TIMEOUT_MS } from "../../shared/http-timeout.js";
 
 // Lazy-loaded adapter modules
@@ -274,8 +275,21 @@ export function listProviders() {
  * Get an embedding vector for a text string.
  * Returns Float32Array or null if no embedding provider is available.
  * Supported: OpenAI (text-embedding-3-small), Ollama, Google.
+ *
+ * The request goes through the adapter guard (`adapter-guard.js`): the base URL
+ * is a model endpoint and gets the same own-host path rule, credential drop and
+ * DNS pinning as every chat adapter request.
+ *
+ * The Ollama leg is the ONE exception to the `/v1/<op>` path rule, and it is the
+ * adapter's own reviewed list (`kind: "ollama"`, `models/self-target.js`
+ * `SELF_OLLAMA_PATHS`): Ollama's embeddings live at `/api/embed`, and the store's
+ * Ollama bundle auto-configures provider "ollama" at `http://localhost:11434`, so
+ * an own-host Ollama is allowed on its own port (`OLLAMA_OWN_HOST_PORTS`, 11434 —
+ * the bundle's fixed published port) and on no other port of this box at all.
+ * `opts.guard` is the adapters' test seam (ownAddrs/lookupFn/transport);
+ * the kind is set here, not by a caller.
  */
-export async function getEmbedding(text) {
+export async function getEmbedding(text, { guard } = {}) {
   const config = getProviderConfig();
   if (!config) return null;
 
@@ -284,7 +298,7 @@ export async function getEmbedding(text) {
   try {
     if (provider === "openai" || provider === "openrouter") {
       const url = baseUrl || "https://api.openai.com/v1";
-      const res = await fetch(`${url}/embeddings`, {
+      const res = await guardedFetch(`${url}/embeddings`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -303,7 +317,7 @@ export async function getEmbedding(text) {
 
     if (provider === "ollama") {
       const url = baseUrl || "http://localhost:11434";
-      const res = await fetch(`${url}/api/embed`, {
+      const res = await guardedFetch(`${url}/api/embed`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -311,6 +325,7 @@ export async function getEmbedding(text) {
           input: text,
         }),
         signal: timeoutSignal(AI_TIMEOUT_MS),
+        guard: { ...(guard || {}), kind: "ollama" },
       });
       if (!res.ok) return null;
       const data = await res.json();
@@ -318,7 +333,7 @@ export async function getEmbedding(text) {
     }
 
     if (provider === "google") {
-      const res = await fetch(
+      const res = await guardedFetch(
         `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${apiKey}`,
         {
           method: "POST",

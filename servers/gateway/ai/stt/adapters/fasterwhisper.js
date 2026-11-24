@@ -7,7 +7,15 @@
  *
  * config.baseUrl — e.g. http://server-b:8000/v1
  * config.defaultModel — e.g. "Systran/faster-whisper-large-v3"
+ *
+ * The profile comes from bot-writable `dashboard_settings`, so the request goes
+ * through `guardedFetch` (../../adapter-guard.js, `kind: "speech"`). An own-host
+ * faster-whisper server is one of the allowed speech operations, and it never
+ * receives the profile's placeholder credential.
  */
+
+import { guardedFetch } from "../../adapter-guard.js";
+import { AI_TIMEOUT_MS } from "../../../../shared/http-timeout.js";
 
 export default function createFasterWhisperAdapter(config) {
   const baseUrl = (config.baseUrl || "http://localhost:8000/v1").replace(/\/+$/, "");
@@ -32,11 +40,15 @@ export default function createFasterWhisperAdapter(config) {
       if (options.hotwords) form.append("hotwords", options.hotwords);
       form.append("response_format", "verbose_json");
 
-      const res = await fetch(`${baseUrl}/audio/transcriptions`, {
+      const res = await guardedFetch(`${baseUrl}/audio/transcriptions`, {
         method: "POST",
         headers: { Authorization: `Bearer ${apiKey}` },
         body: form,
         signal: options.signal,
+        // Connect budget for the PINNED transport (a rebindable name): a box on
+        // the tailnet transcribing a long clip may take a while to answer.
+        timeoutMs: AI_TIMEOUT_MS,
+        guard: { ...config.guard, kind: "speech" },
       });
       if (!res.ok) {
         const err = await res.text().catch(() => "");

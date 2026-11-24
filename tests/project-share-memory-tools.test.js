@@ -267,11 +267,13 @@ test("a bot's search with no project stays home-only over the semantic path too"
   const looseId = await seedMemory(`${t} loose semantic row`, null);
 
   // A stub embedding provider: every row gets the same vector, so the semantic path ranks all
-  // three and only the fetch SQL's scope can keep two of them out.
+  // three and only the fetch SQL's scope can keep two of them out. The row's base_url ends in
+  // `/v1` — the shape every real provider row has, and the one the own-host rule allows
+  // (`/v1/embeddings`; gateway/ai/adapter-guard.js).
   const { vecToBlob } = await import("../servers/memory/embeddings.js");
   const vec = Float32Array.from([1, 0, 0, 0]);
   await db.execute({
-    sql: "INSERT OR REPLACE INTO providers (id, base_url, api_key, models) VALUES ('sharetests', 'http://127.0.0.1:9', 'none', ?)",
+    sql: "INSERT OR REPLACE INTO providers (id, base_url, api_key, models) VALUES ('sharetests', 'http://127.0.0.1:9/v1', 'none', ?)",
     args: [JSON.stringify([{ id: "share-embed", task: "embed", dim: 4 }])],
   });
   for (const id of [homeId, sharedId, looseId]) {

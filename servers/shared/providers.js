@@ -13,6 +13,7 @@
 import { readFileSync, existsSync, statSync } from "fs";
 import { createDbClient } from "../db.js";
 import { repoModelsJsonSearchPaths } from "./models-json-paths.js";
+import { guardedFetch } from "../gateway/ai/adapter-guard.js";
 
 // -----------------------------------------------------------------------
 // Cache layer — providers are read many times per orchestration; cache DB
@@ -124,8 +125,18 @@ function loadFromModelsJson() {
 /**
  * Probe a single provider's /v1/models endpoint.
  * Returns { ok, status, latencyMs, models?, error? }.
+ *
+ * The row it reads (`base_url`, `api_key`) is bot-writable — a contained bot has
+ * crow.db bound read-write — and this probe attaches the row's key, so it goes
+ * through the same guard as every other request-time read of that row
+ * (`gateway/ai/adapter-guard.js`, `kind: "probe"`): an own-host provider may be
+ * probed at `/v1/models` only and never receives the key, a forbidden address
+ * (link-local / cloud metadata) is refused, and a rebindable DNS name is
+ * resolved once and pinned. A refused probe is just `{ ok: false, error }` — the
+ * matrix keeps working, that provider reads as unreachable. `guard` is the
+ * adapters' test seam.
  */
-export async function probeProvider(name, cfg, { timeoutMs = 3000 } = {}) {
+export async function probeProvider(name, cfg, { timeoutMs = 3000, guard } = {}) {
   const started = Date.now();
   const out = { name, baseUrl: cfg.baseUrl, host: cfg.host || "local" };
 
@@ -142,9 +153,12 @@ export async function probeProvider(name, cfg, { timeoutMs = 3000 } = {}) {
     if (cfg.apiKey && cfg.apiKey !== "none") {
       headers.Authorization = `Bearer ${cfg.apiKey}`;
     }
-    const res = await fetch(url, {
+    const res = await guardedFetch(url, {
+      method: "GET",
       headers,
       signal: AbortSignal.timeout(timeoutMs),
+      timeoutMs,
+      guard: { ...guard, kind: "probe" },
     });
     const latencyMs = Date.now() - started;
     if (!res.ok) {

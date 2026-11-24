@@ -131,13 +131,16 @@ export function preflightRefused(url, { mode = "cloud", gatewayPortValue, ownAdd
  * response headers arrive; the caller reads (or destroys) `stream`.
  * `deadline` (epoch ms, start + timeoutMs) is the request's total budget:
  * `readJson` enforces it on the body, so a slow-drip body cannot outlast it.
- * `safeRequest` itself does not cut a body short, because the door streams.
+ * `safeRequest` itself does not cut a body short, because the door streams. A
+ * caller that streams a long answer passes `idleTimeoutMs: 0` (no post-headers
+ * idle cut, matching fetch's disarmed connect deadline); the default is
+ * `timeoutMs`.
  * `transport` is a test seam standing in for node:http / node:https.
  * `signal` (an AbortSignal) destroys the request, before or after the
  * response headers, with err.code ABORTED (the door passes a client abort on).
  */
 export function safeRequest(url, {
-  method = "GET", headers = {}, body, mode = "cloud", timeoutMs = 8000,
+  method = "GET", headers = {}, body, mode = "cloud", timeoutMs = 8000, idleTimeoutMs = timeoutMs,
   lookupFn = dns.lookup, allowAddressFn = () => false, transport, signal,
 } = {}) {
   return new Promise((resolve, reject) => {
@@ -163,7 +166,10 @@ export function safeRequest(url, {
       lookup: guardedLookup({ mode, lookupFn, allowAddressFn, port }),
     }, (res) => done(resolve, { status: res.statusCode, headers: res.headers, stream: res, deadline }));
     const timer = setTimeout(() => req.destroy(fail("TIMEOUT", `no answer in ${timeoutMs} ms`)), timeoutMs);
-    req.setTimeout(timeoutMs, () => req.destroy(fail("TIMEOUT", `idle for ${timeoutMs} ms`)));
+    // A socket with no byte for `idleTimeoutMs` is cut. The caller that streams a
+    // long answer sets 0: once the headers are in, a quiet SSE stream is not a
+    // failure (the same shape as fetch, whose connect deadline is disarmed).
+    if (idleTimeoutMs > 0) req.setTimeout(idleTimeoutMs, () => req.destroy(fail("TIMEOUT", `idle for ${idleTimeoutMs} ms`)));
     req.on("error", (err) => done(reject, err));
     if (signal) {
       const onAbort = () => req.destroy(fail("ABORTED", "the request was aborted"));

@@ -4,7 +4,21 @@
  * Uses Ollama's native /api/chat endpoint with streaming.
  * Falls back to the OpenAI-compat adapter if tool calling is needed
  * and the model doesn't support it natively.
+ *
+ * The request goes through `guardedFetch` (../adapter-guard.js) with
+ * `kind: "ollama"`. Ollama's native API is not the model-operation path every
+ * other own-host target must be (`/v1/<op>`), so it gets its own reviewed list
+ * (`models/self-target.js` `SELF_OLLAMA_PATHS`: `/api/chat` and `/api/embed`),
+ * allowed on an own-host OLLAMA port only (`OLLAMA_OWN_HOST_PORTS`, 11434 — the
+ * bundle's fixed published port): EVERY other own-host port is refused, a local
+ * Caddy's 80/443 and a co-hosted gateway's 3001/3002/3008 included, because
+ * `/api/...` there would be somebody else's route on a fresh unmarked loopback
+ * socket. The store's Ollama bundle auto-configures `http://localhost:11434`,
+ * which is exactly this case; a remote Ollama (LAN, tailnet, another container)
+ * is not this host and is unaffected. No credential ever rides either.
  */
+
+import { guardedFetch } from "../adapter-guard.js";
 
 const DEFAULT_BASE_URL = "http://localhost:11434";
 
@@ -73,11 +87,15 @@ export default function createOllamaAdapter(config) {
       const ollamaTools = mcpToolsToOllama(tools);
       if (ollamaTools) body.tools = ollamaTools;
 
-      const response = await fetch(`${baseUrl}/api/chat`, {
+      const response = await guardedFetch(`${baseUrl}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
         signal: options.signal,
+        // The OLLAMA path rule (models/self-target.js isAllowedSelfOllamaPath):
+        // this adapter's kind is not the caller's to change, so it is set after
+        // the spread — `config.guard` still supplies the transport/resolver seams.
+        guard: { ...(config.guard || {}), kind: "ollama" },
       });
 
       if (!response.ok) {

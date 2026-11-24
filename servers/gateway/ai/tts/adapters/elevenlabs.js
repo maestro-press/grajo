@@ -4,9 +4,14 @@
  * config.apiKey     — xi-api-key
  * config.baseUrl    — override (defaults to https://api.elevenlabs.io)
  * config.defaultVoice — default voice_id
+ *
+ * The profile is bot-writable, so every request goes through `guardedFetch`
+ * (../../adapter-guard.js, `kind: "speech"`): the hosted endpoint keeps its
+ * `xi-api-key`, and a request that lands on this box never receives one.
  */
 
 import { connectTimeout, composeSignals, TTS_TIMEOUT_MS } from "../../../../shared/http-timeout.js";
+import { guardedFetch } from "../../adapter-guard.js";
 
 const DEFAULT_BASE_URL = "https://api.elevenlabs.io";
 
@@ -24,7 +29,7 @@ export default function createElevenLabsTtsAdapter(config) {
       const format = options.format || "mp3_44100_128";
       const url = `${baseUrl}/v1/text-to-speech/${encodeURIComponent(voiceId)}/stream?output_format=${encodeURIComponent(format)}`;
       const t = connectTimeout(TTS_TIMEOUT_MS);
-      const res = t.disarm(await fetch(url, {
+      const res = t.disarm(await guardedFetch(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -37,6 +42,8 @@ export default function createElevenLabsTtsAdapter(config) {
           voice_settings: options.voiceSettings || { stability: 0.5, similarity_boost: 0.75 },
         }),
         signal: composeSignals(options.signal, t.signal),
+        timeoutMs: TTS_TIMEOUT_MS,
+        guard: { ...config.guard, kind: "speech" },
       }));
       if (!res.ok) {
         const err = await res.text().catch(() => "");
@@ -57,8 +64,11 @@ export default function createElevenLabsTtsAdapter(config) {
     async listVoices() {
       if (!apiKey) return [];
       try {
-        const res = await fetch(`${baseUrl}/v1/voices`, {
+        const res = await guardedFetch(`${baseUrl}/v1/voices`, {
+          method: "GET",
           headers: { "xi-api-key": apiKey, Accept: "application/json" },
+          timeoutMs: TTS_TIMEOUT_MS,
+          guard: { ...config.guard, kind: "speech" },
         });
         if (!res.ok) return [];
         const data = await res.json();

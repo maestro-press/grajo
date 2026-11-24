@@ -43,6 +43,25 @@ test("isForbiddenTarget: IPv4-mapped IPv6 and trailing-dot bypasses are closed (
   assert.equal(isForbiddenTarget("http://[::ffff:7f00:1]:18102/v1"), false, "a mapped loopback is not forbidden (it maps to 127.0.0.1)");
 });
 
+test("isForbiddenTarget: an IPv4 carried inside NAT64 / SIIT / 6to4 / Teredo decides too (N2)", () => {
+  // `[64:ff9b::a9fe:a9fe]` IS 169.254.169.254 through a NAT64 translator: the
+  // string prefix checks never saw it, so a row could name the cloud metadata
+  // endpoint in a form that classified as "not this host".
+  for (const u of [
+    "http://[64:ff9b::a9fe:a9fe]/latest",          // NAT64 (64:ff9b::/96) → 169.254.169.254
+    "http://[64:ff9b::a9fe:1]/",                   // NAT64 → 169.254.0.1
+    "http://[64:ff9b::a9fe:a9fe]:8080/v1",
+    "http://[::ffff:0:a9fe:a9fe]/",                // SIIT (::ffff:0:0:0/96)
+    "http://[2002:a9fe:a9fe::1]/",                 // 6to4 (2002::/16) → 169.254.169.254
+    "http://[2002:6464:64c8::1]/",                 // 6to4 → 100.100.100.200
+    "http://[2001:0:4136:e378:8000:63bf:5601:5601]/", // Teredo, client v4 stored inverted → 169.254.169.254
+  ]) assert.equal(isForbiddenTarget(u), true, u);
+  // A public IPv6 literal — and a NAT64 form of a PUBLIC IPv4 — stays allowed.
+  for (const u of [
+    "http://[2606:4700:4700::1111]/v1", "http://[64:ff9b::808:808]/v1", "http://[fd7a:115c:a1e0::1]:8003/v1",
+  ]) assert.equal(isForbiddenTarget(u), false, u);
+});
+
 test("header names are lower-case (express lower-cases incoming headers)", () => {
   assert.equal(DOOR_PROVIDER_HEADER, "x-crow-provider");
   assert.equal(DOOR_HOP_HEADER, "x-crow-door-hop");

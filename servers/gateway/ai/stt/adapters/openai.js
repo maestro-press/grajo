@@ -5,7 +5,13 @@
  * the same multipart schema. Batch-only (no streaming).
  *
  * config.apiKey / baseUrl / defaultModel
+ *
+ * The profile is bot-writable, so the request goes through `guardedFetch`
+ * (../../adapter-guard.js, `kind: "speech"`).
  */
+
+import { guardedFetch } from "../../adapter-guard.js";
+import { AI_TIMEOUT_MS } from "../../../../shared/http-timeout.js";
 
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 
@@ -30,11 +36,13 @@ export default function createOpenAISttAdapter(config) {
       form.append("response_format", "verbose_json");
       if (options.temperature !== undefined) form.append("temperature", String(options.temperature));
 
-      const res = await fetch(`${baseUrl}/audio/transcriptions`, {
+      const res = await guardedFetch(`${baseUrl}/audio/transcriptions`, {
         method: "POST",
         headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
         body: form,
         signal: options.signal,
+        timeoutMs: AI_TIMEOUT_MS,
+        guard: { ...config.guard, kind: "speech" },
       });
       if (!res.ok) {
         const err = await res.text().catch(() => "");

@@ -7,9 +7,17 @@
  *
  * config.baseUrl       — e.g. http://server-b:8880
  * config.defaultVoice  — e.g. af_bella
+ *
+ * The profile comes from bot-writable `dashboard_settings`, so both requests go
+ * through `guardedFetch` (../../adapter-guard.js, `kind: "speech"`). The final
+ * URLs are what the own-host rule is computed on: a prod profile of
+ * `http://localhost:8880/v1` yields `http://localhost:8880/v1/audio/speech`
+ * (-FastAPI's own shape), which is one of the allowed speech operations, and an
+ * own-host Kokoro never receives the profile's placeholder credential.
  */
 
 import { connectTimeout, composeSignals, TTS_TIMEOUT_MS } from "../../../../shared/http-timeout.js";
+import { guardedFetch } from "../../adapter-guard.js";
 
 export default function createKokoroTtsAdapter(config) {
   // Normalize: strip trailing slashes AND a trailing `/v1` so the same profile
@@ -37,7 +45,7 @@ export default function createKokoroTtsAdapter(config) {
         stream: true,
       };
       const t = connectTimeout(TTS_TIMEOUT_MS);
-      const res = t.disarm(await fetch(`${baseUrl}/v1/audio/speech`, {
+      const res = t.disarm(await guardedFetch(`${baseUrl}/v1/audio/speech`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -45,6 +53,8 @@ export default function createKokoroTtsAdapter(config) {
         },
         body: JSON.stringify(body),
         signal: composeSignals(options.signal, t.signal),
+        timeoutMs: TTS_TIMEOUT_MS,
+        guard: { ...config.guard, kind: "speech" },
       }));
       if (!res.ok) {
         const err = await res.text().catch(() => "");
@@ -64,8 +74,11 @@ export default function createKokoroTtsAdapter(config) {
 
     async listVoices() {
       try {
-        const res = await fetch(`${baseUrl}/v1/audio/voices`, {
+        const res = await guardedFetch(`${baseUrl}/v1/audio/voices`, {
+          method: "GET",
           headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+          timeoutMs: TTS_TIMEOUT_MS,
+          guard: { ...config.guard, kind: "speech" },
         });
         if (!res.ok) return [];
         const data = await res.json();

@@ -9,10 +9,20 @@
  * reimplement the protocol here, we exec the ubiquitous `edge-tts` CLI
  * (python package) via subprocess. The CLI must be installed on the host
  * running the gateway; we degrade gracefully if it isn't.
+ *
+ * WHAT THIS ADAPTER'S NETWORK LOOKS LIKE: synthesis is the `edge-tts`
+ * SUBPROCESS talking to Microsoft — unlike Deepgram's live path there is no
+ * socket of ours to judge, and no Crow credential goes with it (the CLI has
+ * none). The one HTTP request this adapter makes is the voice list below, and
+ * that goes through `guardedFetch` (../../adapter-guard.js, `kind: "speech"`)
+ * like every other speech request: it is a fixed public Microsoft URL and carries
+ * no header.
  */
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { guardedFetch } from "../../adapter-guard.js";
+import { VOICELIST_TIMEOUT_MS } from "../../../../shared/http-timeout.js";
 
 const VOICE_LIST_URL = "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list?trustedclienttoken=6A5AA1D4EAFF4E9FB37E23D68491D6F4";
 
@@ -33,8 +43,9 @@ function findEdgeTtsBinary() {
   return "edge-tts"; // fall through to PATH resolution
 }
 
-export default function createEdgeTtsAdapter(_config) {
+export default function createEdgeTtsAdapter(config) {
   const bin = findEdgeTtsBinary();
+  const guard = config?.guard;
 
   return {
     name: "edge-tts",
@@ -77,10 +88,11 @@ export default function createEdgeTtsAdapter(_config) {
     async listVoices() {
       if (_voiceCache && Date.now() - _voiceCacheTime < VOICE_CACHE_TTL) return _voiceCache;
       try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 8000);
-        const res = await fetch(VOICE_LIST_URL, { signal: controller.signal });
-        clearTimeout(timeout);
+        const res = await guardedFetch(VOICE_LIST_URL, {
+          method: "GET",
+          timeoutMs: VOICELIST_TIMEOUT_MS,
+          guard: { ...guard, kind: "speech" },
+        });
         if (!res.ok) return _voiceCache || [];
         const raw = await res.json();
         _voiceCache = raw.map(v => ({

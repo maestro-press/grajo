@@ -495,7 +495,8 @@ test("a RELAYED caller still forwards to a REMOTE peer (prod's trusted peers are
 });
 
 // ---------------------------------------------------------------------------
-// NO REDIRECTS, AND FAIL-CLOSED ON AN UNRESOLVABLE PEER NAME.
+// NO REDIRECTS, AND FAIL-CLOSED ON AN UNRESOLVABLE PEER NAME (N1: for EVERY
+// caller — the operator's own relay is not a privileged caller either).
 // ---------------------------------------------------------------------------
 
 test("refused: a peer answering 307 is never followed (the peer bearer does not ride a redirect)", async () => {
@@ -529,11 +530,14 @@ test("refused: a peer answering 307 is never followed (the peer bearer does not 
   }
 });
 
-test("refused: a RELAYED caller may not relay to a peer whose gateway_url does not resolve (fail closed)", async () => {
+test("refused: a peer whose gateway_url does not resolve is refused for EVERY caller (fail closed)", async () => {
   const { RELAY_SOURCE_V4 } = await import("../servers/shared/bot-doors.js");
   // A peer row whose NAME never resolves: ownTargetOf cannot clear it as "not
   // this box", and our lookup and the fetch's are two resolutions of the same
-  // name. A relayed caller fails closed; the operator's own relay is untouched.
+  // name, so the fetch would be the ONLY one — a rebinding window. N1: that is
+  // refused for EVERY caller, the operator's own relay included (the row is the
+  // same bot-writable row whoever asks, and the request would fail on the second
+  // lookup anyway). The resolver is a seam here, so no real DNS is asked.
   const UNRESOLVABLE = "inst-nemo-0007";
   const d = new Database(dbPath);
   const before = d.prepare("SELECT definition FROM pi_bot_defs WHERE bot_id = 'hank'").get().definition;
@@ -544,17 +548,223 @@ test("refused: a RELAYED caller may not relay to a peer whose gateway_url does n
     def.tools.remote_mcp.push(`${UNRESOLVABLE}::crow-memory`);
     d.prepare("UPDATE pi_bot_defs SET definition = ? WHERE bot_id = 'hank'").run(JSON.stringify(def));
   } finally { d.close(); }
+
+  const calls = [];
+  const asked = [];
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+  app.use(peerRelayRouter({
+    createDbClient: () => createDbClient(dbPath),
+    deps: {
+      keyLookup: () => null,
+      getCreds: (id) => (PEER_TOKENS[id] ? { auth_token: PEER_TOKENS[id], signing_key: null } : null),
+      localId: () => LOCAL,
+      // THE SEAM: every name is answered with nothing, so this test is hermetic.
+      lookupFn: (host, options, cb) => {
+        asked.push(host);
+        return cb(Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" }));
+      },
+      fetchImpl: async (url) => { calls.push({ url }); return { status: 200, headers: { get: () => null }, body: null }; },
+    },
+  }));
+  const srv = http.createServer(app);
+  const port = await listen(srv);
+  const base = `http://127.0.0.1:${port}`;
   try {
     seen.length = 0;
-    const r = await postFrom(RELAY_SOURCE_V4, `/peer-relay/${UNRESOLVABLE}/memory/mcp`, { headers: good() });
-    assert.equal(r.status, 403, r.text);
-    assert.match(r.json.error.message, /relayed caller may not relay to this gateway/);
-    assert.equal(seen.length, 0, "nothing was dialled");
+    // The relayed caller: its own refusal shape.
+    const relayed = await postFrom(RELAY_SOURCE_V4, `/peer-relay/${UNRESOLVABLE}/memory/mcp`, { headers: good(), base });
+    assert.equal(relayed.status, 403, relayed.text);
+    assert.equal(relayed.json?.jsonrpc, "2.0");
+    assert.match(relayed.json.error.message, /relayed caller may not relay to this gateway/);
+    // … and the operator's own relay: the SAME name rule, the existing shape
+    // (an unusable peer row), never a forward the fetch would resolve itself.
+    const own = await postFrom("127.0.0.1", `/peer-relay/${UNRESOLVABLE}/memory/mcp`, { headers: good(), base });
+    assert.equal(own.status, 404, own.text);
+    assert.equal(own.json?.jsonrpc, "2.0");
+    assert.match(own.json.error.message, /unknown or untrusted peer/);
+    assert.deepEqual(calls, [], "nothing was dialled");
+    assert.equal(seen.length, 0, "nothing reached a peer");
+    assert.ok(asked.includes("never-resolves.invalid"), "the name WAS judged by our resolver, not left to the fetch");
   } finally {
+    srv.closeAllConnections?.();
+    await new Promise((r) => srv.close(() => r()));
     const d2 = new Database(dbPath);
     try {
       d2.prepare("UPDATE pi_bot_defs SET definition = ? WHERE bot_id = 'hank'").run(before);
       d2.prepare("DELETE FROM crow_instances WHERE id = ?").run(UNRESOLVABLE);
     } finally { d2.close(); }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// THE NAME (and query) RULE for a relayed caller: the voice path's address
+// class. `crow_instances.gateway_url` is bot-writable, so a relayed caller may
+// relay only to an IP literal, `localhost` or a `*.ts.net` name — a name an
+// arbitrary resolver (or a rebind) picks the address for is refused, on the
+// string alone, before any lookup. A query or fragment on the row is refused
+// too: `${gateway_url}${mount}/mcp` would become another route on the peer.
+// The operator's own relay is untouched by THIS rule (it is about the rebindable
+// NAME), but every caller's row must still RESOLVE — see N1 above.
+// ---------------------------------------------------------------------------
+
+/** The peer's row pointed somewhere else for the duration of one test. */
+async function withPeerUrl(id, url, fn) {
+  const d = new Database(dbPath);
+  const was = d.prepare("SELECT gateway_url FROM crow_instances WHERE id = ?").get(id)?.gateway_url;
+  d.prepare("UPDATE crow_instances SET gateway_url = ? WHERE id = ?").run(url, id);
+  d.close();
+  try { return await fn(); } finally {
+    const d2 = new Database(dbPath);
+    try { d2.prepare("UPDATE crow_instances SET gateway_url = ? WHERE id = ?").run(was, id); } finally { d2.close(); }
+  }
+}
+
+/** A relay app with a stubbed upstream fetch (so a forward is provable) and a
+ *  resolver seam for the name rule (`ownTargetOf` asks it). */
+async function relayWithStub() {
+  const calls = [];
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+  app.use(peerRelayRouter({
+    createDbClient: () => createDbClient(dbPath),
+    deps: {
+      keyLookup: () => null,
+      getCreds: (id) => (PEER_TOKENS[id] ? { auth_token: PEER_TOKENS[id], signing_key: null } : null),
+      localId: () => LOCAL,
+      lookupFn: (host, options, cb) => {
+        if (host === "peer.example.test" || host === "peer.example.ts.net") {
+          const all = typeof options === "object" && options && options.all;
+          if (all) return cb(null, [{ address: "203.0.113.20", family: 4 }]);
+          return cb(null, "203.0.113.20", 4);
+        }
+        return cb(Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" }));
+      },
+      fetchImpl: async (url) => { calls.push({ url }); return { status: 200, headers: { get: () => null }, body: null }; },
+    },
+  }));
+  const srv = http.createServer(app);
+  const port = await listen(srv);
+  return { srv, base: `http://127.0.0.1:${port}`, calls };
+}
+
+test("refused: a RELAYED caller may not relay to a peer named by an ordinary DNS name (a rebindable name)", async () => {
+  const { RELAY_SOURCE_V4 } = await import("../servers/shared/bot-doors.js");
+  const { srv, base, calls } = await relayWithStub();
+  try {
+    await withPeerUrl(BRAVO, "http://peer.example.test:3001/", async () => {
+      const relayed = await postFrom(RELAY_SOURCE_V4, `/peer-relay/${BRAVO}/memory/mcp`, { headers: good(), base });
+      assert.equal(relayed.status, 403, relayed.text);
+      assert.equal(relayed.json?.jsonrpc, "2.0");
+      assert.match(relayed.json.error.message, /relayed caller may not relay to this gateway/);
+      assert.deepEqual(calls, [], "nothing was dialled");
+      // The operator's own relay is untouched: the same row forwards for a plain
+      // loopback caller (a non-relayed caller was never the rule's subject).
+      const ok = await postFrom("127.0.0.1", `/peer-relay/${BRAVO}/memory/mcp`, { headers: good(), base });
+      assert.equal(ok.status, 200, ok.text);
+      assert.deepEqual(calls, [{ url: "http://peer.example.test:3001/memory/mcp" }]);
+    });
+  } finally {
+    srv.closeAllConnections?.();
+    await new Promise((r) => srv.close(() => r()));
+  }
+});
+
+test("refused: a RELAYED caller may not relay to a gateway_url carrying a query or a fragment", async () => {
+  const { RELAY_SOURCE_V4 } = await import("../servers/shared/bot-doors.js");
+  const { srv, base, calls } = await relayWithStub();
+  try {
+    for (const url of ["http://192.0.2.11:3001/?x=1", "http://192.0.2.11:3001/#frag"]) {
+      await withPeerUrl(BRAVO, url, async () => {
+        const relayed = await postFrom(RELAY_SOURCE_V4, `/peer-relay/${BRAVO}/memory/mcp`, { headers: good(), base });
+        assert.equal(relayed.status, 403, `${url}: ${relayed.text}`);
+        assert.match(relayed.json.error.message, /relayed caller may not relay to this gateway/);
+        assert.deepEqual(calls, [], "nothing was dialled");
+      });
+    }
+  } finally {
+    srv.closeAllConnections?.();
+    await new Promise((r) => srv.close(() => r()));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// SCANNER B: the mark is judged on the RAW string, and the FINAL url is parsed
+// before the fetch. A row carrying a bare "?" or "#" URL-parses with an EMPTY
+// search/hash (`new URL("http://h/p?").search === ""`) but still swallows the
+// `${mount}/mcp` suffix into a query/fragment, so the raw string decides first;
+// then the URL the relay actually dials must be exactly the mount's own path,
+// with no search and no hash, for EVERY caller.
+// ---------------------------------------------------------------------------
+
+test("refused: a RELAYED caller may not relay to a raw gateway_url carrying a bare ? or # (empty search/hash after parsing)", async () => {
+  const { RELAY_SOURCE_V4 } = await import("../servers/shared/bot-doors.js");
+  const { srv, base, calls } = await relayWithStub();
+  try {
+    for (const url of ["http://192.0.2.11:3001/?", "http://192.0.2.11:3001/#", "http://192.0.2.11:3001/x?#"]) {
+      // The crafted shape: a raw "?"/"#" that parses CLEAN.
+      assert.equal(new URL(url).search, "", url);
+      assert.equal(new URL(url).hash, "", url);
+      assert.match(url, /[?#]/, url);
+      await withPeerUrl(BRAVO, url, async () => {
+        const relayed = await postFrom(RELAY_SOURCE_V4, `/peer-relay/${BRAVO}/memory/mcp`, { headers: good(), base });
+        assert.equal(relayed.status, 403, `${url}: ${relayed.text}`);
+        assert.equal(relayed.json?.jsonrpc, "2.0");
+        assert.match(relayed.json.error.message, /relayed caller may not relay to this gateway/);
+        assert.deepEqual(calls, [], "nothing was dialled");
+      });
+    }
+  } finally {
+    srv.closeAllConnections?.();
+    await new Promise((r) => srv.close(() => r()));
+  }
+});
+
+test("refused: a gateway_url whose final url is not the mount's own path (a query, a fragment) is refused for EVERY caller", async () => {
+  const { RELAY_SOURCE_V4 } = await import("../servers/shared/bot-doors.js");
+  const { srv, base, calls } = await relayWithStub();
+  try {
+    for (const url of ["http://192.0.2.11:3001/?x=1", "http://192.0.2.11:3001/#frag"]) {
+      await withPeerUrl(BRAVO, url, async () => {
+        // The operator's own relay (never relayed): the same final-URL check.
+        const own = await postFrom("127.0.0.1", `/peer-relay/${BRAVO}/memory/mcp`, { headers: good(), base });
+        assert.equal(own.status, 404, `${url}: ${own.text}`);
+        assert.equal(own.json?.jsonrpc, "2.0");
+        assert.match(own.json.error.message, /peer/);
+        assert.deepEqual(calls, [], "nothing was dialled");
+        // … and a relayed caller keeps its own refusal shape.
+        const relayed = await postFrom(RELAY_SOURCE_V4, `/peer-relay/${BRAVO}/memory/mcp`, { headers: good(), base });
+        assert.equal(relayed.status, 403, `${url}: ${relayed.text}`);
+        assert.deepEqual(calls, []);
+      });
+    }
+    // Positive control: the well-formed rows still forward, with the same base
+    // path the row names (CHARLIE's row carries /charlie).
+    const ok = await postFrom("127.0.0.1", `/peer-relay/${CHARLIE}/memory/mcp`, { headers: good(), base });
+    assert.equal(ok.status, 200, ok.text);
+    assert.deepEqual(calls, [{ url: `http://127.0.0.1:${upstreamPort}/charlie/memory/mcp` }]);
+  } finally {
+    srv.closeAllConnections?.();
+    await new Promise((r) => srv.close(() => r()));
+  }
+});
+
+test("a RELAYED caller still forwards to an IP literal and to a *.ts.net peer (the allowed shapes)", async () => {
+  const { RELAY_SOURCE_V4 } = await import("../servers/shared/bot-doors.js");
+  const { srv, base, calls } = await relayWithStub();
+  try {
+    // An IP literal: the row prod uses (ROMEO, 192.0.2.10).
+    const byIp = await postFrom(RELAY_SOURCE_V4, `/peer-relay/${ROMEO}/memory/mcp`, { headers: good(), base });
+    assert.equal(byIp.status, 200, byIp.text);
+    assert.deepEqual(calls.at(-1), { url: "http://192.0.2.10:3001/memory/mcp" });
+    // A tailnet name: not a rebindable name, and it resolves (the seam answers).
+    await withPeerUrl(BRAVO, "http://peer.example.ts.net:3001/", async () => {
+      const byName = await postFrom(RELAY_SOURCE_V4, `/peer-relay/${BRAVO}/memory/mcp`, { headers: good(), base });
+      assert.equal(byName.status, 200, byName.text);
+      assert.deepEqual(calls.at(-1), { url: "http://peer.example.ts.net:3001/memory/mcp" });
+    });
+  } finally {
+    srv.closeAllConnections?.();
+    await new Promise((r) => srv.close(() => r()));
   }
 });

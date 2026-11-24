@@ -174,13 +174,18 @@ test("GET /llm/v1/models lists companion ids then forwardable door models", asyn
   assert.equal(ids.some((i) => i.startsWith("qwen-cloud/")), false);
 });
 
-test("every door forward carries hop+1; a foreign bare /llm/v1 door is rewritten to the provider-scoped door (final review minors 1 and 5)", async () => {
+test("every door forward carries hop+1; an own-host row at a non-model door path is refused (the every-caller path rule)", async () => {
+  // The pre-plan-2 foreign row is rewritten to the provider-scoped door
+  // (`providerDoorUrl`, unit-tested in door-resolve.test.js). That rewrite exists
+  // for a REMOTE peer's door; this stub is on loopback, so the row is an
+  // own-host target at /llm/p/<id>/v1/<op> — a path a forward may not run against
+  // this box for any caller, and it is refused before the fetch.
   const r = await post("/llm/v1/chat/completions", { model: "peer-old/old-m", messages: [] });
-  assert.equal(r.status, 200);
-  assert.equal(seen[0].path, "/llm/p/peer-old/v1/chat/completions");
-  assert.equal(seen[0].headers["x-crow-door-hop"], "1");
-  assert.equal(seen[0].headers["x-crow-provider"], "peer-old");
+  assert.equal(r.status, 403);
+  assert.equal((await r.json()).error.code, "SELF_TARGET_REFUSED");
+  assert.equal(seen.length, 0, "nothing was dialled");
   await post("/llm/p/crow-local-27b/v1/chat/completions", { model: "qwen3.8-27b", messages: [] }, { "X-Crow-Door-Hop": "1" });
+  assert.equal(seen[0].path, "/v1/chat/completions");
   assert.equal(seen[0].headers["x-crow-door-hop"], "2", "a non-door upstream still gets the incremented hop");
   const third = await post("/llm/p/crow-local-27b/v1/chat/completions", { model: "qwen3.8-27b", messages: [] }, { "X-Crow-Door-Hop": "2" });
   assert.equal(third.status, 508);

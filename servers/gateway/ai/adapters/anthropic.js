@@ -3,7 +3,12 @@
  *
  * Uses native fetch() against the Anthropic Messages API with streaming.
  * Handles content_block_delta events for both text and tool_use.
+ *
+ * The request goes through `guardedFetch` (../adapter-guard.js): the own-host
+ * path rule, the credential drop and DNS pinning are the ADAPTER's.
  */
+
+import { guardedFetch } from "../adapter-guard.js";
 
 const DEFAULT_BASE_URL = "https://api.anthropic.com";
 const API_VERSION = "2023-06-01";
@@ -138,11 +143,12 @@ export default function createAnthropicAdapter(config) {
         "anthropic-version": API_VERSION,
       };
 
-      const response = await fetch(`${baseUrl}/v1/messages`, {
+      const response = await guardedFetch(`${baseUrl}/v1/messages`, {
         method: "POST",
         headers,
         body: JSON.stringify(body),
         signal: options.signal,
+        guard: config.guard,
       });
 
       if (!response.ok) {

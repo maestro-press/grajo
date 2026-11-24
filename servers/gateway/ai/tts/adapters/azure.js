@@ -6,9 +6,16 @@
  * config.apiKey    — Azure Speech subscription key
  * config.baseUrl   — region endpoint, e.g. "https://eastus.tts.speech.microsoft.com"
  * config.defaultVoice
+ *
+ * The profile is bot-writable, so every request goes through `guardedFetch`
+ * (../../adapter-guard.js, `kind: "speech"`). A region endpoint is a public host
+ * and keeps its `Ocp-Apim-Subscription-Key`; a request that lands on THIS box
+ * never carries one (and `/cognitiveservices/v1` is not one of the reviewed
+ * own-host speech operations).
  */
 
 import { connectTimeout, composeSignals, TTS_TIMEOUT_MS } from "../../../../shared/http-timeout.js";
+import { guardedFetch } from "../../adapter-guard.js";
 
 function escapeXml(s) {
   return String(s)
@@ -40,7 +47,7 @@ export default function createAzureTtsAdapter(config) {
       const ssml = `<speak version='1.0' xml:lang='${locale}'><voice xml:lang='${locale}' name='${escapeXml(v)}'>${escapeXml(text)}</voice></speak>`;
 
       const t = connectTimeout(TTS_TIMEOUT_MS);
-      const res = t.disarm(await fetch(`${baseUrl}/cognitiveservices/v1`, {
+      const res = t.disarm(await guardedFetch(`${baseUrl}/cognitiveservices/v1`, {
         method: "POST",
         headers: {
           "Ocp-Apim-Subscription-Key": apiKey || "",
@@ -50,6 +57,8 @@ export default function createAzureTtsAdapter(config) {
         },
         body: ssml,
         signal: composeSignals(options.signal, t.signal),
+        timeoutMs: TTS_TIMEOUT_MS,
+        guard: { ...config.guard, kind: "speech" },
       }));
       if (!res.ok) {
         const err = await res.text().catch(() => "");
@@ -70,8 +79,11 @@ export default function createAzureTtsAdapter(config) {
     async listVoices() {
       if (!baseUrl || !apiKey) return [];
       try {
-        const res = await fetch(`${baseUrl}/cognitiveservices/voices/list`, {
+        const res = await guardedFetch(`${baseUrl}/cognitiveservices/voices/list`, {
+          method: "GET",
           headers: { "Ocp-Apim-Subscription-Key": apiKey },
+          timeoutMs: TTS_TIMEOUT_MS,
+          guard: { ...config.guard, kind: "speech" },
         });
         if (!res.ok) return [];
         const data = await res.json();

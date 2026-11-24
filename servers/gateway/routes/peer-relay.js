@@ -31,10 +31,17 @@
  *      and the bot's row selected (instanceId, capability)          else 403
  *   6. a trusted peer row with a gateway_url                         else 404
  *      whose host is not THIS gateway when the caller is relayed
- *      (egress relay mark; any port — a confused deputy), and whose
- *      host resolves (a name we cannot resolve is not cleared as
- *      "not this box": fail closed)                                else 403
+ *      (egress relay mark; any port — a confused deputy), whose host is an
+ *      IP literal / localhost / a tailnet name (never a rebindable DNS name),
+ *      whose RAW string carries no "?" or "#" (a bare one parses with an empty
+ *      search yet still swallows `${mount}/mcp`), and whose
+ *      host resolves — for EVERY caller, not only a relayed one (a name the
+ *      resolver did not answer for is never cleared as "not this box": the
+ *      fetch's own lookup would then be the only resolution of it, so it fails
+ *      closed for the operator too)                              else 403/404
  *      and a peer bearer                                             else 502
+ *      and, for EVERY caller, the FINAL url `${base}${mount}/mcp` is that
+ *      mount's own path with no query and no fragment             else 404/403
  *   7. a JSON-RPC batch                                              -32600
  *   8. one forward, `redirect: "manual"` — a 3xx is answered as the same 502
  *      "the peer is unreachable" and never followed (a redirect would move the
@@ -53,7 +60,8 @@ import { signRemoteActor } from "../../shared/remote-actor.js";
 import { validatePeerRelayToken } from "../local-token.js";
 import { getOrCreateLocalInstanceId } from "../instance-registry.js";
 import { isRelayedSocket } from "../../shared/bot-doors.js";
-import { ownTargetOf } from "../models/self-target.js";
+import { ownTargetOf, isRebindableHost } from "../models/self-target.js";
+import dns from "node:dns";
 import { defaultPairKey } from "../../shared/sync-pair-binding.js";
 import { getPeerCreds } from "../../shared/peer-credentials.js";
 import { readSetting } from "../dashboard/settings/registry.js";
@@ -107,6 +115,9 @@ const header = (req, name) => {
 export function peerRelayRouter({ createDbClient, deps = {} } = {}) {
   if (typeof createDbClient !== "function") throw new TypeError("peerRelayRouter: createDbClient is required");
   const fetchImpl = deps.fetchImpl || ((...a) => globalThis.fetch(...a));
+  // The resolver a relayed caller's gateway_url is judged with (a test seam; the
+  // gateway uses the real one, and the 2 s cap lives in models/self-target.js).
+  const lookupFn = deps.lookupFn || dns.lookup;
   const keyLookup = deps.keyLookup || defaultPairKey;
   const getCreds = deps.getCreds || getPeerCreds;
   const localIdFn = typeof deps.localId === "function" ? deps.localId
@@ -214,14 +225,53 @@ export function peerRelayRouter({ createDbClient, deps = {} } = {}) {
       // peer bearer to an unmarked same-box socket — the relay mark is not on the
       // hop this route opens, so every "a relayed socket is never the owner/peer"
       // rule would be bypassed in one request. Any port counts (a co-hosted
-      // sibling gateway listens on another one). A gateway_url whose NAME does not
-      // resolve cannot be cleared either, and our lookup and the fetch's are two
-      // resolutions of the same name, so it is refused the same way (fail closed).
-      // Prod trusted peers are remote hosts, so nothing legitimate breaks; full
-      // host pinning is a later lane.
+      // sibling gateway listens on another one).
+      //
+      // The same address-class rule the voice path applies: a relayed caller may
+      // relay only to an IP literal, `localhost` or a `*.ts.net` name (never an
+      // arbitrary DNS name a resolver — or a rebind — picks the address for), and
+      // the row may carry no query or fragment (`${gateway_url}${mount}/mcp`
+      // would otherwise turn into another route on the peer). Judged on the string
+      // alone, before any lookup, with the same refusal shape as below.
+      const raw = String(peer.gateway_url);
       if (isRelayedSocket(req.socket)) {
-        const own = await ownTargetOf(peer.gateway_url, { ports: null });
-        if (own.own || own.unresolved) return refuse(res, 403, "a relayed caller may not relay to this gateway", { id });
+        // The RAW string first: `${gateway_url}${mount}/mcp` turns a row carrying
+        // a bare "?" or "#" into a query/fragment even when the row itself
+        // URL-parses with an EMPTY search and hash (`new URL("http://h/p?")`),
+        // so the character itself is what a relayed caller may not have.
+        let parsed = null;
+        try { parsed = new URL(raw); } catch { parsed = null; }
+        if (raw.includes("?") || raw.includes("#") || isRebindableHost(raw) || (parsed && (parsed.search || parsed.hash))) {
+          return refuse(res, 403, "a relayed caller may not relay to this gateway", { id });
+        }
+      }
+      // N1, for EVERY caller: a `gateway_url` whose NAME does not resolve is not
+      // cleared as "not this box" — our lookup and the fetch's are two resolutions
+      // of the same name, and leaving the only one to the fetch is the rebinding
+      // window this rule exists to close. The operator's own relay refuses it too:
+      // the row is the same bot-writable row whoever asks, and the request would
+      // fail on that second lookup anyway. Prod trusted peers are IP literals or
+      // tailnet names that resolve, so nothing legitimate breaks.
+      const own = await ownTargetOf(raw, { ports: null, lookupFn });
+      if (own.unresolved) {
+        if (isRelayedSocket(req.socket)) return refuse(res, 403, "a relayed caller may not relay to this gateway", { id });
+        return refuse(res, 404, "unknown or untrusted peer", { id });
+      }
+      if (own.own && isRelayedSocket(req.socket)) return refuse(res, 403, "a relayed caller may not relay to this gateway", { id });
+      // THE FINAL URL, for EVERY caller: what this relay is about to dial must be
+      // exactly the mount's own path on the peer, with no query and no fragment —
+      // anything else is another route on the peer, carrying the peer bearer this
+      // gateway minted. A row that cannot form that URL is not a peer we can use.
+      const peerBase = String(peer.gateway_url).replace(/\/+$/, "");
+      let finalUrl = null;
+      let expectedPath = null;
+      try {
+        finalUrl = new URL(`${peerBase}${mount}/mcp`);
+        expectedPath = `${new URL(peerBase).pathname.replace(/\/+$/, "")}${mount}/mcp`;
+      } catch { finalUrl = null; }
+      if (!finalUrl || finalUrl.search || finalUrl.hash || finalUrl.pathname !== expectedPath) {
+        if (isRelayedSocket(req.socket)) return refuse(res, 403, "a relayed caller may not relay to this gateway", { id });
+        return refuse(res, 404, "unknown or untrusted peer", { id });
       }
       let creds = null;
       try { creds = await getCreds(instanceId); } catch { creds = null; }
@@ -252,7 +302,7 @@ export function peerRelayRouter({ createDbClient, deps = {} } = {}) {
       try { db.close(); } catch {}
       db = null;
 
-      const url = `${String(peer.gateway_url).replace(/\/+$/, "")}${mount}/mcp`;
+      const url = `${peerBase}${mount}/mcp`;
       const ac = new AbortController();
       res.on("close", () => { if (!res.writableEnded) ac.abort(); });
       let upstream;
