@@ -22,6 +22,7 @@ import {
   appendAudit,
 } from "../shared/project-acl.js";
 import { slugify } from "../shared/slugify.js";
+import { newRowUuid } from "../shared/row-uuid.js";
 import { createProjectSpace, updateProjectSpaceMeta } from "../shared/project-spaces.js";
 import { assertCanChangeStatus } from "../shared/project-lifecycle.js";
 import { parseLaunchSpec, canonicalSpecText, PENDING_STATUS } from "../shared/data-backend-approval.js";
@@ -783,14 +784,17 @@ export function createProjectServer(dbPath, options = {}) {
       const generator = CITATION_GENERATORS[params.citation_format] || generateAPA;
       const primaryCitation = params.citation_apa || generator(params);
 
+      // uuid is the row's identity (sync and cross-peer share key on it) and init-db can only
+      // backfill it after the fact, so a new source carries its own from the start.
       const names = ["title", "source_type", "project_id", "backend_id", "url", "authors", "publication_date", "publisher",
-        "doi", "isbn", "abstract", "content_summary", "full_text", "citation_apa", "retrieval_method", "tags", "relevance_score"];
+        "doi", "isbn", "abstract", "content_summary", "full_text", "citation_apa", "retrieval_method", "tags", "relevance_score",
+        "uuid"];
       const args = [
         params.title, params.source_type, projectId, params.backend_id ?? null,
         url, params.authors ?? null, params.publication_date ?? null, params.publisher ?? null,
         params.doi ?? null, params.isbn ?? null, params.abstract ?? null, params.content_summary ?? null,
         params.full_text ?? null, primaryCitation, params.retrieval_method ?? null, params.tags ?? null,
-        params.relevance_score,
+        params.relevance_score, newRowUuid(),
       ];
       if (cols) {
         for (const c of FETCH_COLUMN_NAMES) { names.push(c); args.push(cols[c]); }

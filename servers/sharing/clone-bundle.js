@@ -21,6 +21,7 @@ import { resolve as resolvePath } from "node:path";
 import { resolveDataDir } from "../db.js";
 import { withoutProvenance } from "../research/provenance-schema.js";
 import { SHARED_SUMMARY_MAX } from "./shared-source-insert.js";
+import { newRowUuid } from "../shared/row-uuid.js";
 
 export function createCloneBundleHelpers(ctx) {
   const { db } = ctx;
@@ -220,7 +221,10 @@ export function createCloneBundleHelpers(ctx) {
           // Never verified here: a peer's verification is a claim about its copy, not ours.
           0, s.verification_notes ?? null,
           s.tags ?? null, s.relevance_score ?? 5,
-          s.uuid ?? null, bundle.origin_instance_id ?? null,
+          // A uuid that came WITH the bundle is that row's identity: keep it exactly. Only a
+          // bundle source with none (an older peer, a row written before inserts set it) gets a
+          // fresh one, so the clone is never uuid-less until the next init-db run.
+          typeof s.uuid === "string" && s.uuid ? s.uuid : newRowUuid(), bundle.origin_instance_id ?? null,
         ],
       });
       if (s.id != null) sourceIdMap.set(s.id, Number(r.lastInsertRowid));

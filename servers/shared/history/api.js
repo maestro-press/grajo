@@ -139,6 +139,7 @@ import { BOT_DEFINITION_KEYS, COVERED, columnValueExpr, tableColumns } from "./c
 import { erasureKeys, findEraseRefusalSync } from "./erase.js";
 import { AUTHOR_KINDS, withWriteContext } from "./write-context.js";
 import { lineDiff } from "../line-diff.js";
+import { newRowUuid } from "../row-uuid.js";
 
 /** The item type project workspace FILES answer to (not a table — see listVersions). */
 export const WORKSPACE_FILE_ITEM_TYPE = "workspace_file";
@@ -1420,7 +1421,14 @@ function tableHasColumn(run, table, column) {
  *   id would fail the whole restore. A store with no data_backends table at all
  *   has no such foreign key either, so the value is left as recorded.
  *
- * Mutates `values` in place, aligned with `columns`.
+ *   The row's OWN uuid is kept when the version has one; a version with none (a
+ *   snapshot taken before the row had one, or of a row an older insert path left
+ *   uuid-less) gets a fresh one, in init-db's format. uuid is the source's identity
+ *   for sync and cross-peer sharing, and SQLite gives the column no default, so a
+ *   re-created row would otherwise stay uuid-less until the next init-db run.
+ *
+ * Mutates `values` in place, aligned with `columns` (both, when a column has to be
+ * added to the INSERT).
  */
 function neutraliseRestoredSource(run, columns, values) {
   const set = (name, value) => {
@@ -1431,6 +1439,15 @@ function neutraliseRestoredSource(run, columns, values) {
   set("verification_method", null);
   set("verified_by", null);
   set("verification_notes", null);
+  if (tableHasColumn(run, "research_sources", "uuid")) {
+    const at = columns.indexOf("uuid");
+    if (at < 0) {
+      columns.push("uuid");
+      values.push(newRowUuid());
+    } else if (values[at] == null || values[at] === "") {
+      values[at] = newRowUuid();
+    }
+  }
   const at = columns.indexOf("backend_id");
   if (at < 0) return;
   const backendId = values[at];

@@ -7,8 +7,13 @@
 //
 // This runs inside initSharingRuntime, which the stdio crow-sharing server starts without
 // ensureProvenanceSchema, so the INSERT names only columns every DB has: it has to work during
-// the deploy window.
+// the deploy window. `uuid` is one of those — it predates migration 0013 (init-db's
+// addUuidColumn added it in the project-space redesign), so it is not a 0013 column.
+//
+// The row is OUR copy of the peer's reference, so it gets OUR uuid: init-db would backfill a
+// uuid-less row on the next run, and until then sync and sharing could not key on it.
 import { SOURCE_TYPES } from "../research/source-types.js";
+import { newRowUuid } from "../shared/row-uuid.js";
 
 const TITLE_MAX = 1000;
 // abstract / content_summary cap for peer-supplied rows (content_summary is FTS-indexed); the
@@ -49,9 +54,9 @@ export async function insertSharedSource(db, payload = {}) {
   const url = typeof p.url === "string" && p.url ? p.url : null;
 
   const result = await db.execute({
-    sql: `INSERT INTO research_sources (project_id, title, url, source_type, citation_apa, content_summary, verified)
-          VALUES (NULL, ?, ?, ?, ?, ?, 0)`,
-    args: [title, url, sourceType, citation, notes],
+    sql: `INSERT INTO research_sources (project_id, title, url, source_type, citation_apa, content_summary, verified, uuid)
+          VALUES (NULL, ?, ?, ?, ?, ?, 0, ?)`,
+    args: [title, url, sourceType, citation, notes, newRowUuid()],
   });
   return Number(result.lastInsertRowid);
 }
