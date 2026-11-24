@@ -14,6 +14,10 @@
  *     gateway, "unknown" and "pending" refuse: a satellite updates only to a knowably green sha
  *     (and since review round 1 "green" means ALL three required contexts reported green, not a
  *     subset — the satellite got stricter with the gateway, which is the correct direction).
+ *     G7: with any of the CROW_UPDATE_FORGE* variables set the origin is a self-hosted
+ *     Gitea/Forgejo instead, and its COMMIT STATUSES are read (classifyCommitStatuses, same
+ *     verdicts and the same green-only rule); a broken forge configuration reads as "unknown"
+ *     and therefore refuses, never falls through to GitHub.
  * Then (apply): satellite.db backup → `git merge --ff-only <target>` → `npm ci --omit=dev` only if
  * package-lock.json changed (systemd-run --user --scope -p MemoryMax=600M, nice, ionice; the MCP
  * children are paused first via `beforeInstall`, and resumed by `afterRollback` if the update
@@ -30,7 +34,8 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSy
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { run as execRun } from "../gateway/bundle-core.js";
-import { classifyCheckRuns, parseGithubRemote } from "../shared/ci-check-runs.js";
+import { classifyCheckRuns, classifyCommitStatuses, parseGithubRemote, unsafeGithubRemote } from "../shared/ci-check-runs.js";
+import { forgeConfigured, fetchForgeStatuses } from "../shared/ci-forge-status.js";
 import { SATELLITE_DB_FILE } from "./db.js";
 
 export const UPDATE_RESTART_EXIT_CODE = 75;
@@ -66,16 +71,42 @@ const backupDir = (satHome) => join(satHome, "backups", "satellite-db");
  * but it also means a satellite on a remote the regex could not read never updates at all.
  * `?per_page=100` (S3): the default 30 silently truncated a commit with more runs, which then
  * failed closed as an incomplete set.
+ *
+ * An unsafe owner/repo segment (`.`, `..`, a percent escape, whitespace) is refused BEFORE any
+ * request (review round 2): parseGithubRemote still parses such a remote — that keeps its safe
+ * answers unchanged — so the safety check has to be asked here, or a URL built from `../crow`
+ * would be sent. null is the refusal either way (→ "unknown" → ci_not_green).
  */
 export async function githubCheckRuns({ runner, appRoot, sha, fetchImpl = globalThis.fetch }) {
   try {
     const { stdout } = await runner("git", ["remote", "get-url", "origin"], { cwd: appRoot, timeout: 15000 });
-    const remote = parseGithubRemote(String(stdout || ""));
+    const remoteUrl = String(stdout || "");
+    if (unsafeGithubRemote(remoteUrl)) return null;
+    const remote = parseGithubRemote(remoteUrl);
     if (!remote) return null;
     const resp = await fetchImpl(`https://api.github.com/repos/${remote.owner}/${remote.repo}/commits/${sha}/check-runs?per_page=100`, {
       headers: { Accept: "application/vnd.github+json", "User-Agent": "crow-satellite-update" }, signal: AbortSignal.timeout(15000),
     });
     return resp.ok ? await resp.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Forge commit statuses for `sha` on origin's repo (G7), or null (not configured, unparseable
+ * origin, network, non-2xx, bad JSON, pagination that never ends).
+ *
+ * The forge-side twin of githubCheckRuns, and it fails the same way: null means "could not be
+ * read", which classifyCommitStatuses answers "unknown" to, which the satellite refuses. A
+ * satellite updates only to a knowably green sha, so a broken forge configuration is a refusal,
+ * never a fall-through to GitHub.
+ */
+export async function forgeCommitStatuses({ runner, appRoot, sha, fetchImpl = globalThis.fetch, env = process.env }) {
+  try {
+    const { stdout } = await runner("git", ["remote", "get-url", "origin"], { cwd: appRoot, timeout: 15000 });
+    const res = await fetchForgeStatuses({ remoteUrl: String(stdout || ""), sha, env, fetchImpl });
+    return res.ok ? res.statuses : null;
   } catch {
     return null;
   }
@@ -108,10 +139,12 @@ export function applyPendingDbRestore(satHome, log = console.warn) {
 
 export function createUpdater({
   db, satHome, appRoot = APP_ROOT, runner = execRun, now = Date.now, log = console.log,
-  fetchCheckRuns, exit = (code) => process.exit(code), nodePath = process.execPath, beforeInstall = async () => {}, afterRollback = async () => {},
+  fetchCheckRuns, fetchStatuses, exit = (code) => process.exit(code), nodePath = process.execPath, beforeInstall = async () => {}, afterRollback = async () => {},
 }) {
   const git = (args, timeout = 120000) => runner("git", args, { cwd: appRoot, timeout });
   const checkRuns = fetchCheckRuns || ((sha) => githubCheckRuns({ runner, appRoot, sha }));
+  // G7: the forge seam, sibling of fetchCheckRuns, so a test needs no network.
+  const statuses = fetchStatuses || ((sha) => forgeCommitStatuses({ runner, appRoot, sha }));
   const cli = join(appRoot, "servers", "satellite", "cli.js");
   const nodeCli = (cmd) => runner(nodePath, [cli, cmd], { cwd: appRoot, timeout: 120000, env: { ...process.env, CROW_HOME: satHome } });
   let busy = false;
@@ -134,7 +167,13 @@ export function createUpdater({
     if (!(await succeeds(() => git(["cat-file", "-e", `${target}^{commit}`], 15000)))) return refuse(409, "unknown_sha");
     if (!(await succeeds(() => git(["merge-base", "--is-ancestor", target, "origin/main"], 15000)))) return refuse(409, "not_on_main");
     if (!(await succeeds(() => git(["merge-base", "--is-ancestor", from, target], 15000)))) return refuse(409, "not_fast_forward");
-    const ci = classifyCheckRuns(await checkRuns(target));
+    // CI verdict: a self-hosted Gitea/Forgejo origin (forge mode) reports commit statuses instead
+    // of GitHub check-runs, and is read with the forge twin of the classifier. Env is read HERE,
+    // at call time. Both paths accept only "green": pending, red, unknown and an unreadable
+    // answer all refuse with ci_not_green.
+    const ci = forgeConfigured()
+      ? classifyCommitStatuses(await statuses(target))
+      : classifyCheckRuns(await checkRuns(target));
     if (ci !== "green") return refuse(409, "ci_not_green", { ci });
     let lockChanged;
     try {

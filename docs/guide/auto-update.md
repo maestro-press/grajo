@@ -133,6 +133,66 @@ GitHub's API (an offline install whose origin is still a GitHub URL), set
 `CROW_UPDATE_CI_GATE=0` in the unit's environment and restart Crow: the gate is
 then skipped entirely.
 
+### Self-hosted Gitea/Forgejo origin {#forge-origin}
+
+An origin on your own Gitea or Forgejo instance reports CI as **commit statuses**
+instead of GitHub check-runs. The gate reads those and never asks GitHub for such
+an origin, once the instance is configured — three variables in the gateway
+unit's environment:
+
+| Variable | What it holds |
+|---|---|
+| `CROW_UPDATE_FORGE` | `gitea` — or `forgejo`, which speaks the same API |
+| `CROW_UPDATE_FORGE_API` | the base URL of the forge API, e.g. `https://gitea.example.ts.net/api/v1` |
+| `CROW_UPDATE_FORGE_TOKEN_FILE` | path to a file holding a read token, e.g. `/path/to/token-file` |
+
+The token file is read on every check and has to be readable by the gateway's
+user. The token is sent as `Authorization: token …` and is never written to a
+log line, a recorded result or a notification. Use an **`https`** API base: with
+an `http` base the token travels to the forge unencrypted.
+
+**Any one of the three being set puts the updater in forge mode, and forge mode
+fails closed.** The forge name must be `gitea` or `forgejo`, the API must be an
+`http(s)` URL, and the token file must be readable and not empty: every other
+combination — including a partial one — is *unavailable*, so the tick is skipped.
+It never falls back to GitHub, and it is never "not applicable". The same holds
+for an origin that cannot be parsed, a non-2xx answer (`401`, `403`, `404`,
+`5xx`), a request that fails or times out (15 s per request) and a body that is
+not a JSON list. An empty list is *no CI*: an unverified commit is never
+deployed. The list is read 50 statuses per page and paged until a page comes
+back empty — a short page is not the end, because a forge may serve fewer
+entries than requested — and a list that is still non-empty after forty pages is
+*unavailable* rather than a truncated verdict. A redirect is never followed: a
+`3xx` answer counts as unavailable.
+
+A CI job only counts when its context has exactly this shape:
+
+```
+<workflow> / <jobkey> (push)
+```
+
+for example `Tests / suite (push)`, `Tests / static-checks (push)`,
+`Tests / audit (push)` — the job keys are the same `suite`, `static-checks` and
+`audit`. The match is on the job key only, so it does **not** pin the workflow
+name: any workflow that emits a job keyed `suite` counts.
+Contexts ending in `(pull_request)` are ignored, and so is every context
+whose job key is not exactly one of the three (`suite-extra` is not `suite`).
+Only the latest event per context counts, and **every** workflow reporting a key
+has to be green: a second workflow failing `suite` makes the commit red.
+`success` and `skipped` count as ok, `pending` waits for a later check, and
+`failure`, `error`, `warning` or an unrecognised state is red.
+
+A skipped result reads exactly like the GitHub one, with "the code host" where
+GitHub would be named:
+
+```
+Skipped: CI status unreadable for 3 checks in a row — updates are paused until the code host answers (or set CROW_UPDATE_CI_GATE=0)
+```
+
+`CROW_UPDATE_CI_GATE=0`, the 30-minute re-check for a still-running build and the
+Nest's Updates card behave the same in both modes. The same three variables drive
+a satellite's follow-the-primary update, which accepts only a green sha.
+
 ## Local changes
 
 An instance with local modifications (a development machine, or a hand-edited

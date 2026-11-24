@@ -15,7 +15,11 @@ import { dirname, join, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isSupervised } from "../shared/supervisor.js";
 import { isInstallSetRunning } from "./install-lock.js";
-import { classifyCheckRuns, parseGithubRemote, ciGateRuns, missingCiContexts, CI_GATE_CONTEXTS } from "../shared/ci-check-runs.js";
+import {
+  classifyCheckRuns, parseGithubRemote, unsafeGithubRemote, ciGateRuns, missingCiContexts, CI_GATE_CONTEXTS,
+  classifyCommitStatuses, missingStatusContexts,
+} from "../shared/ci-check-runs.js";
+import { forgeConfigured, fetchForgeStatuses } from "../shared/ci-forge-status.js";
 import { checkTreeImport, IMPORT_CHECK_ENV } from "./boot/import-check.js";
 import {
   activeUpdateQuarantine, evaluateUpdateQuarantine, writeUpdateQuarantine, FULL_SHA_RE,
@@ -1018,6 +1022,36 @@ export const CI_UNAVAILABLE_COUNT_KEY = "auto_update_ci_unavailable_count";
 export const CI_GATE_SETTING_KEY = "auto_update_ci_gate";
 
 /**
+ * Does the CI gate apply to this origin at all? The one decision both places
+ * use (the up-to-date tick's recorded reading and the not-applicable branch), so
+ * they cannot drift.
+ *
+ * In FORGE mode the gate applies whatever the origin looks like: a broken forge
+ * configuration is "unavailable", which must skip — so this can never answer
+ * "not-applicable" there. Otherwise it is the GitHub parse: a non-GitHub origin
+ * has no CI to ask and keeps updating.
+ *
+ * A GitHub origin with an UNSAFE owner/repo segment (`../crow`, `o/r%2Ex`) also
+ * applies (review round 2): it IS GitHub, so its reading must be cleared here
+ * and the gate must answer "unavailable" — recording "not-applicable" would put
+ * the origin back on the ungated path.
+ */
+function ciGateAppliesTo(remoteUrl) {
+  if (forgeConfigured()) return true;
+  if (unsafeGithubRemote(remoteUrl)) return true;
+  return Boolean(parseGithubRemote(remoteUrl));
+}
+
+/**
+ * The code host the CI gate reads, as it appears in a skip sentence: "GitHub",
+ * or "the code host" in forge mode. Only used where the sentence names the host
+ * — the GitHub wording stays byte-identical (tests pin it).
+ */
+function ciGateHostName() {
+  return forgeConfigured() ? "the code host" : "GitHub";
+}
+
+/**
  * Resolve the CI verdict for the sha the pull would land on.
  *
  * Five outcomes, and the difference between the last three is the whole point of
@@ -1041,6 +1075,12 @@ export const CI_GATE_SETTING_KEY = "auto_update_ci_gate";
  * missed `ssh://git@ssh.github.com:443/o/r.git`, a trailing slash and an
  * uppercase host — and a miss means not-applicable, i.e. deploy unverified.
  *
+ * A GitHub origin whose owner/repo segment is unsafe (`.`, `..`, a percent
+ * escape, whitespace, a control character) is "unavailable" with NO request
+ * (review round 2): parseGithubRemote still parses it — its safe answers are
+ * unchanged — so the safety check is asked first, and this branch can never turn
+ * such an origin into "not-applicable", which would deploy unverified code.
+ *
  * classifyCheckRuns' own "unknown" (a payload carrying no run for our three
  * contexts) becomes "no-ci": unverified is never green, and retrying it is what
  * resolves a push race on the next tick. A GitHub origin that strips our CI now
@@ -1050,12 +1090,54 @@ export const CI_GATE_SETTING_KEY = "auto_update_ci_gate";
  * One unauthenticated call per update tick — far under the anonymous limit.
  * `?per_page=100` (review S3): the default page of 30 could truncate a commit
  * with more runs, and a missing context now reads as pending forever.
+ *
+ * G7: with any of the CROW_UPDATE_FORGE* variables set ("forge mode") the origin
+ * is a self-hosted Gitea/Forgejo instead, and its COMMIT STATUSES are read by
+ * fetchForgeStatuses/classifyCommitStatuses. GitHub is then never asked about
+ * that origin, and every configuration or read failure is "unavailable" — never
+ * "not-applicable" (which would deploy unverified code).
  */
 async function resolveCiGate(remoteUrl, sha) {
   if (_ciVerdictOverride) return { verdict: _ciVerdictOverride, missing: [] };
+  const doFetch = _ciFetch || ((...a) => fetch(...a));
+  // Forge mode (G7): any of the CROW_UPDATE_FORGE* variables is set, so the
+  // origin is a self-hosted Gitea/Forgejo and GitHub is never asked about it.
+  // Every failure of that configuration or of the read is "unavailable" —
+  // never "not-applicable" (which would deploy unverified code), never green.
+  if (forgeConfigured()) {
+    // EVERYTHING in this branch is wrapped: a forge read fails closed, so a throw
+    // from anywhere in it (a body whose entries cannot be iterated, a classifier
+    // that chokes on a huge list, an unexpected internal error) is an unreadable
+    // answer — "unavailable", which counts toward the pause counter — never a
+    // verdict and never green.
+    try {
+      const res = await fetchForgeStatuses({ remoteUrl, sha, env: process.env, fetchImpl: doFetch });
+      if (!res.ok) return { verdict: "unavailable", missing: [] };
+      const statuses = res.statuses;
+      const verdict = classifyCommitStatuses(statuses);
+      const missing = missingStatusContexts(statuses);
+      // The same two shapes of "pending" the GitHub branch below distinguishes.
+      // "Nothing among the required keys is still pending" is read by classifying
+      // the PRESENT keys alone: a pending there means something may still report
+      // (keep waiting), green or unknown means nothing more is coming (no-ci).
+      const present = CI_GATE_CONTEXTS.filter((key) => !missing.includes(key));
+      const settledPartial = verdict === "pending" && missing.length > 0
+        && classifyCommitStatuses(statuses, present) !== "pending";
+      if (verdict === "unknown" || settledPartial) return { verdict: "no-ci", missing };
+      return { verdict, missing: [] };
+    } catch {
+      return { verdict: "unavailable", missing: [] };
+    }
+  }
+  // A GitHub host with an unsafe owner/repo segment (`.`, `..`, a percent escape,
+  // whitespace, a control character) answers "unavailable" here — never
+  // "not-applicable", which would deploy unverified code, and without building a
+  // request. This check cannot live inside parseGithubRemote (review round 2): a
+  // null parse in this function MEANS "not GitHub", so a parse that refused these
+  // made them not-applicable and DEPLOYED WITHOUT THE GATE.
+  if (unsafeGithubRemote(remoteUrl)) return { verdict: "unavailable", missing: [] };
   const remote = parseGithubRemote(remoteUrl);
   if (!remote) return { verdict: "not-applicable", missing: [] };
-  const doFetch = _ciFetch || ((...a) => fetch(...a));
   try {
     const resp = await doFetch(
       `https://api.github.com/repos/${remote.owner}/${remote.repo}/commits/${sha}/check-runs?per_page=100`,
@@ -1553,10 +1635,11 @@ export async function runLockedUpdate(log = (m) => console.log(`[auto-update] ${
     // next tick. Re-reading the origin is a local git call — no network, no
     // GitHub request — and it is the same parse the gate uses, so a non-GitHub
     // origin keeps "not-applicable" while a GitHub origin (or a changed origin)
-    // clears a stale reading.
+    // clears a stale reading. In FORGE mode the gate always applies, so the same
+    // reading is cleared there too (ciGateAppliesTo, the one decision).
     const originRemote = _ciRemoteUrl ?? (await git(["remote", "get-url", "origin"])).stdout;
     await saveSetting(CI_UNAVAILABLE_COUNT_KEY, "0");
-    await saveSetting(CI_GATE_SETTING_KEY, parseGithubRemote(originRemote) ? "" : "not-applicable");
+    await saveSetting(CI_GATE_SETTING_KEY, ciGateAppliesTo(originRemote) ? "" : "not-applicable");
     return { updated: false };
   }
 
@@ -1567,7 +1650,9 @@ export async function runLockedUpdate(log = (m) => console.log(`[auto-update] ${
   // completes); a non-GitHub origin has no CI to ask and proceeds; GitHub
   // failing to answer skips too — an unverified sha is not a green one (N1c-5),
   // and so does a payload with none of our three checks (review S2, "no-ci").
-  // CROW_UPDATE_CI_GATE=0 disables.
+  // CROW_UPDATE_CI_GATE=0 disables. In FORGE mode (G7) the answers come from the
+  // configured Gitea/Forgejo instead of GitHub, and any failure to read them is
+  // "unavailable" — the same skip, never a proceed.
   if (process.env.CROW_UPDATE_CI_GATE !== "0") {
     // `_ciRemoteUrl` is a test seam only: a fixture origin must stay a local
     // bare repo, and a local path containing `github.com/o/r` is not GitHub.
@@ -1596,7 +1681,7 @@ export async function runLockedUpdate(log = (m) => console.log(`[auto-update] ${
       // The first two ticks of an outage are transient (GitHub usually answers
       // again on its own); the third is a failure, which is what rings the bell.
       const msg = n >= CI_UNAVAILABLE_FAILURE_TICKS
-        ? `Skipped: CI status unreadable for ${n} checks in a row — updates are paused until GitHub answers (or set CROW_UPDATE_CI_GATE=0)`
+        ? `Skipped: CI status unreadable for ${n} checks in a row — updates are paused until ${ciGateHostName()} answers (or set CROW_UPDATE_CI_GATE=0)`
         : `Skipped: CI status could not be read for origin/main (${targetSha.slice(0, 9)}) — will retry next tick`;
       log(msg);
       await saveSetting("auto_update_last_check", new Date().toISOString());
