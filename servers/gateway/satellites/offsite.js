@@ -35,7 +35,8 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import Database from "better-sqlite3";
 import { decryptVault, encryptVault } from "../../shared/crow-vault.js";
-import { satelliteBaseUrl, readCapped, sendOnce } from "./client.js";
+import { readCapped, sendOnce } from "./client.js";
+import { satelliteBaseUrlFor } from "../../shared/satellite-pins.js";
 import { loadMgmtKey } from "./mgmt-keys.js";
 import { listSatellites } from "./store.js";
 import { signBytes, requestSigningString, signRequest, verifyResponse, sha256Hex } from "../../shared/satellite-protocol.js";
@@ -303,11 +304,14 @@ const caller = "owner-local"; // the vault is crow's own: never a bot, never a p
 
 /** Signed GET vault → the manifest array [{name, size, sha256, mtime}]. */
 export async function listVault({ sat, mgmtKey = null, fetchImpl = globalThis.fetch, env = process.env } = {}) {
+  // The pin gate is FIRST (it throws code "pin_refused", message fixed, no host): before the key
+  // is read and before anything is signed.
+  const base = satelliteBaseUrlFor(sat, { env });
   const key = mgmtKey || loadMgmtKey(sat.id, { env });
   if (!key) throw Object.assign(new Error("no management key"), { code: "no_mgmt_key" });
   const path = "/satellite/v1/vault";
   const headers = { Accept: "application/json", ...signRequest(key.ed25519_priv, { method: "GET", pathQuery: path, body: "", satelliteId: sat.id, caller }) };
-  const res = await sendOnce(fetchImpl, satelliteBaseUrl(sat.tailnet_host) + path, { method: "GET", headers, body: "", timeoutMs: 15000 });
+  const res = await sendOnce(fetchImpl, base + path, { method: "GET", headers, body: "", timeoutMs: 15000 });
   const raw = await readCapped(res, 1024 * 1024);
   const sig = res.headers.get("x-crow-sat-resp-sig");
   const ok = typeof sig === "string" && verifyResponse(sat.satellite_pubkey, { requestNonce: headers["X-Crow-Sat-Nonce"], status: res.status, bodySha256: sha256Hex(raw) }, sig);
@@ -337,6 +341,14 @@ function fingerprint(file) {
  * Resolves {status, json}; never throws (an unreachable satellite is status 0).
  */
 export async function putVaultFile({ sat, file, size, sha256, mgmtKey = null, fetchImpl = globalThis.fetch, env = process.env, timeoutMs = UPLOAD_TIMEOUT_MS } = {}) {
+  // The pin gate is FIRST, so a refusal never opens the file stream (a vault file is >100 MB) and
+  // never reads the management key.
+  let base;
+  try {
+    base = satelliteBaseUrlFor(sat, { env });
+  } catch (err) {
+    return { status: 0, json: { error: err?.code || "pin_refused" } };
+  }
   const key = mgmtKey || loadMgmtKey(sat.id, { env });
   if (!key) return { status: 0, json: { error: "no_mgmt_key" } };
   const path = `/satellite/v1/vault/${encodeURIComponent(basename(file))}`;
@@ -355,7 +367,7 @@ export async function putVaultFile({ sat, file, size, sha256, mgmtKey = null, fe
   };
   let res;
   try {
-    res = await fetchImpl(satelliteBaseUrl(sat.tailnet_host) + path, {
+    res = await fetchImpl(base + path, {
       method: "PUT",
       headers,
       body: createReadStream(file),
@@ -395,6 +407,13 @@ export async function downloadVaultFile({ sat, name, dest, size, sha256, mgmtKey
   if (!Number.isSafeInteger(size) || size < 0 || size > MAX_VAULT_FILE_BYTES || typeof sha256 !== "string" || !/^[0-9a-f]{64}$/.test(sha256)) {
     return { ok: false, code: "bad_manifest" };
   }
+  // The pin gate is FIRST: a refused satellite is never signed for and never dialled.
+  let base;
+  try {
+    base = satelliteBaseUrlFor(sat, { env });
+  } catch (err) {
+    return { ok: false, code: err?.code || "pin_refused" };
+  }
   const key = mgmtKey || loadMgmtKey(sat.id, { env });
   if (!key) return { ok: false, code: "no_mgmt_key" };
   const path = `/satellite/v1/vault/${encodeURIComponent(name)}`;
@@ -404,7 +423,7 @@ export async function downloadVaultFile({ sat, name, dest, size, sha256, mgmtKey
   };
   let res;
   try {
-    res = await sendOnce(fetchImpl, satelliteBaseUrl(sat.tailnet_host) + path, { method: "GET", headers, body: "", timeoutMs });
+    res = await sendOnce(fetchImpl, base + path, { method: "GET", headers, body: "", timeoutMs });
   } catch (err) {
     return { ok: false, code: err?.code || "unreachable" };
   }
@@ -449,11 +468,13 @@ export async function downloadVaultFile({ sat, name, dest, size, sha256, mgmtKey
 
 /** Signed DELETE of one vault file. */
 export async function deleteVaultFile({ sat, name, mgmtKey = null, fetchImpl = globalThis.fetch, env = process.env } = {}) {
+  // The pin gate is FIRST (it throws code "pin_refused"): before the key is read, nothing is signed.
+  const base = satelliteBaseUrlFor(sat, { env });
   const key = mgmtKey || loadMgmtKey(sat.id, { env });
   if (!key) throw Object.assign(new Error("no management key"), { code: "no_mgmt_key" });
   const path = `/satellite/v1/vault/${encodeURIComponent(name)}`;
   const headers = { Accept: "application/json", ...signRequest(key.ed25519_priv, { method: "DELETE", pathQuery: path, body: "", satelliteId: sat.id, caller }) };
-  const res = await sendOnce(fetchImpl, satelliteBaseUrl(sat.tailnet_host) + path, { method: "DELETE", headers, body: "", timeoutMs: 15000 });
+  const res = await sendOnce(fetchImpl, base + path, { method: "DELETE", headers, body: "", timeoutMs: 15000 });
   const raw = await readCapped(res, 64 * 1024);
   let json = null;
   try { json = JSON.parse(raw.toString("utf8")); } catch { json = { error: "bad_response" }; }
@@ -561,12 +582,14 @@ export async function runOffsiteUpload({
 
     // 5. Upload, then confirm the satellite's signed manifest reports what was sent.
     const put = await putVaultFile({ sat, file: vaultFile, size, sha256, fetchImpl, env });
-    if (put.status !== 200) return failed("upload_failed");
+    // A row that is not at its pinned address lands here as pin_refused: kept as its own reason so
+    // the recorded last_error is honest, while the notification text stays the existing one.
+    if (put.status !== 200) return failed(put.json?.error === "pin_refused" ? "pin_refused" : "upload_failed");
     let list;
     try {
       list = await listVault({ sat, fetchImpl, env });
-    } catch {
-      return failed("upload_failed");
+    } catch (err) {
+      return failed(err?.code === "pin_refused" ? "pin_refused" : "upload_failed");
     }
     const entry = list.find((e) => e?.name === name);
     if (!entry || entry.size !== size || entry.sha256 !== sha256) return failed("upload_failed");
@@ -649,8 +672,8 @@ export async function runOffsiteVerify({
   let list;
   try {
     list = await listVault({ sat, fetchImpl, env });
-  } catch {
-    return failed("unreachable");
+  } catch (err) {
+    return failed(err?.code === "pin_refused" ? "pin_refused" : "unreachable");
   }
   const entries = list.map((e) => ({ ...e, parsed: parseVaultName(e?.name) })).filter((e) => e.parsed);
   if (!entries.length) return failed("no_backups");

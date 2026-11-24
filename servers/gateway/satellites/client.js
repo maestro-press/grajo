@@ -9,9 +9,15 @@
  * by design). Calls go through an injectable `fetchImpl` with `redirect: "manual"` (a 3xx is a
  * protocol error), a timeout, and a byte cap enforced while reading.
  *
- * Errors carry err.code: "unreachable" | "bad_response_sig" | "protocol" | "no_mgmt_key".
+ * Errors carry err.code: "unreachable" | "bad_response_sig" | "protocol" | "no_mgmt_key" |
+ * "pin_refused".
+ *
+ * The destination is NEVER taken from the row: `satelliteBaseUrlFor(sat)` builds it from the host
+ * pinned outside crow.db (servers/shared/satellite-pins.js), and it is called before the management
+ * key is read, so a rewritten row reads no key and signs nothing.
  */
 import { signRequest, verifyResponse, sha256Hex, isValidCaller } from "../../shared/satellite-protocol.js";
+import { satelliteBaseUrlFor } from "../../shared/satellite-pins.js";
 import { loadMgmtKey } from "./mgmt-keys.js";
 
 export const DEFAULT_MAX_BYTES = 64 * 1024;
@@ -19,7 +25,12 @@ export const DEFAULT_TIMEOUT_MS = 15000;
 
 export const satFail = (code, message = code, extra = {}) => Object.assign(new Error(message), { code, ...extra });
 
-export const satelliteBaseUrl = (host) => `https://${host}`;
+/**
+ * `https://<host>` for a host the OWNER just typed in the pairing dialog (vetted by
+ * normalizeHost, kept in the in-memory pending record). Pre-pairing there is no pin to consult;
+ * every post-pairing call goes through satelliteBaseUrlFor instead.
+ */
+export const pairingBaseUrl = (host) => `https://${host}`;
 
 /** The full body as a Buffer, refusing more than `maxBytes` (declared or streamed). */
 export async function readCapped(res, maxBytes) {
@@ -75,6 +86,9 @@ export async function satelliteFetch(sat, {
   const m = String(method).toUpperCase();
   if (typeof path !== "string" || !path.startsWith("/satellite/v1/")) throw satFail("protocol", "bad satellite path");
   if (!isValidCaller(caller)) throw satFail("protocol", "bad caller");
+  // FIRST, before the key is read and before anything is signed: a row that is not at its pinned
+  // address is refused here (err.code "pin_refused"), so no key is read and no request is built.
+  const base = satelliteBaseUrlFor(sat, { env });
   const key = mgmtKey || loadMgmtKey(sat.id, { env });
   if (!key) throw satFail("no_mgmt_key", "no management key for this satellite");
   const text = body === undefined || body === null ? "" : typeof body === "string" ? body : JSON.stringify(body);
@@ -86,7 +100,7 @@ export async function satelliteFetch(sat, {
   }
   const headers = { Accept: "application/json", ...sigHeaders };
   if (text) headers["Content-Type"] = "application/json";
-  const res = await sendOnce(fetchImpl, satelliteBaseUrl(sat.tailnet_host) + path, { method: m, headers, body: text, timeoutMs });
+  const res = await sendOnce(fetchImpl, base + path, { method: m, headers, body: text, timeoutMs });
   assertJsonResponse(res);
   const raw = await readCapped(res, maxBytes);
   const sig = res.headers.get("x-crow-sat-resp-sig");

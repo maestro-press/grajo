@@ -3,18 +3,31 @@
  * (SAT-5): the unsigned /health clock read (spec §11.1) and a signed tools/list (§9.1).
  */
 import { RESULT_CAP_BYTES } from "../../shared/satellite-protocol.js";
-import { satelliteFetch, satelliteBaseUrl, satFail, readCapped } from "./client.js";
+import { satelliteBaseUrlFor } from "../../shared/satellite-pins.js";
+import { satelliteFetch, satFail, readCapped } from "./client.js";
 
 const BUNDLE_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
 /**
  * GET /health (unsigned): {protocol, time, skew_ms} where skew_ms = satellite time − crow time
  * at the midpoint of the call; null on any failure. Never trusted for anything but display.
+ *
+ * Unsigned, but still gated by the address pin: one rule for every dial, and without it this would
+ * be a probe any bot could point at a tailnet host of its choosing by rewriting the row. The gate
+ * IS the read: satelliteBaseUrlFor() reads the row's host inside the pin module and logs the
+ * refusal itself, so this file never touches the value. A row that is not at its pinned address
+ * reads as unreachable (null) and dials nothing.
  */
-export async function readHealth(sat, { fetchImpl = globalThis.fetch, now = Date.now, timeoutMs = 10000 } = {}) {
+export async function readHealth(sat, { fetchImpl = globalThis.fetch, now = Date.now, timeoutMs = 10000, env = process.env } = {}) {
+  let base;
+  try {
+    base = satelliteBaseUrlFor(sat, { env });
+  } catch {
+    return null; // pin_refused: the refusal was logged by the gate; nothing is dialled
+  }
   const t0 = now();
   try {
-    const res = await fetchImpl(`${satelliteBaseUrl(sat.tailnet_host)}/health`, {
+    const res = await fetchImpl(`${base}/health`, {
       method: "GET", headers: { Accept: "application/json" }, redirect: "manual", signal: AbortSignal.timeout(timeoutMs),
     });
     if (res.status !== 200) return null;

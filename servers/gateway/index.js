@@ -334,6 +334,20 @@ try {
   console.warn(`[peer-pin] backfill crashed: ${err?.message || err}`);
 }
 
+// Satellite ADDRESS pins (the peer pin's shape): a satellite is dialled only at the host recorded
+// in <CROW_HOME>/secrets/satellite-pins.json at pairing, never at whatever
+// satellites.tailnet_host says today (a contained bot can write that row). Rows that predate the
+// pin are pinned here ONCE, from their current row — the only moment that row is still the
+// operator's, before any route serves. Marker-gated in its own file, so a later rewrite can never
+// be backfilled; fail-soft (a failure never costs the boot, and leaves the marker unwritten so
+// the next boot retries). See boot/satellite-pin-backfill.js.
+try {
+  const { runSatellitePinBackfill } = await import("./boot/satellite-pin-backfill.js");
+  await runSatellitePinBackfill({ createDbClient });
+} catch (err) {
+  console.warn(`[satellite-pin] backfill crashed: ${err?.message || err}`);
+}
+
 // Record the sha this process booted on, for convergence. Captured once, here,
 // so every later comparison is against the code actually running rather than
 // whatever the shared checkout has since moved to. A null value makes

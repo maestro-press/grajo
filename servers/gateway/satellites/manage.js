@@ -139,7 +139,10 @@ export function createSatelliteManager({
       r = await satelliteFetch(sat, { method, path, body, caller: "owner-local", fetchImpl, env, ...(maxBytes ? { maxBytes } : {}) });
     } catch (err) {
       const code = err?.code || "unreachable";
-      throw no(code === "no_mgmt_key" ? 409 : 502, code);
+      // pin_refused: this satellite's row is not at its pinned address (a rewritten row, or a pair
+      // from before the pin). 409 with the code alone, like no_mgmt_key: the owner's action is to
+      // re-pin, not to retry.
+      throw no(code === "no_mgmt_key" || code === "pin_refused" ? 409 : 502, code);
     }
     // A 401 from the satellite is about crow's signature, not the owner's session.
     return { status: r.status === 401 ? 409 : r.status, json: r.json && typeof r.json === "object" ? r.json : {} };

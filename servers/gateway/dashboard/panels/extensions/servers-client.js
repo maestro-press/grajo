@@ -357,7 +357,7 @@ export function serversClientJS(lang) {
           var startBtn = btn('${T("connect")}', "btn-primary", function() {
             startBtn.disabled = true;
             say('${T("connecting")}');
-            api("POST", "/pair/start", { host: hostIn.value }).then(function(res) {
+            api("POST", "/pair/start", { host: hostIn.value.trim() }).then(function(res) {
               if (!res.ok) { startBtn.disabled = false; say(errText(res), true); return; }
               confirmStep(res.data);
             });

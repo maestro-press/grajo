@@ -29,6 +29,7 @@ const { issueCert } = await import("../servers/gateway/satellites/certs.js");
 const { createSatelliteManager } = await import("../servers/gateway/satellites/manage.js");
 const { default: satellitesRouter } = await import("../servers/gateway/routes/satellites.js");
 const { fakeIdentity } = await import("./helpers/fake-satellite.js");
+const { pinFixtureSatellite } = await import("./helpers/satellite-pin-fixture.js");
 const { startAgent } = await import("../servers/satellite/agent.js");
 const { ensureSatelliteKey, writeCert, writePinned } = await import("../servers/satellite/keys.js");
 const { readTextOrNull } = await import("../servers/satellite/status.js");
@@ -94,6 +95,8 @@ test("crow installs, pins, reads env and logs, and uninstalls a bundle on the re
     cert_json: JSON.stringify(cert), cert_serial: cert.payload.serial, cert_expires_at: cert.payload.expires_at,
     primary_url: cert.payload.primary_url, agent_protocol: P.AGENT_PROTOCOL, status: "active", created_at: new Date().toISOString(),
   });
+  // A row is dialled at the host pinned OUTSIDE crow.db.
+  pinFixtureSatellite(key.satellite_id, HOST);
   const crowApp = tmp("sate2e-crowapp-");
   writeBundle(crowApp, "demo");
   const paths = I.installPaths(tmp("sate2e-crowhome-"));

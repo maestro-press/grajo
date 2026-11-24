@@ -16,7 +16,8 @@ import { chmodSync, closeSync, constants as fsc, createReadStream, existsSync, l
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isSatelliteId, signRequest } from "../../shared/satellite-protocol.js";
-import { satelliteFetch, satelliteBaseUrl, sendOnce, satFail } from "./client.js";
+import { satelliteFetch, sendOnce, satFail } from "./client.js";
+import { satelliteBaseUrlFor } from "../../shared/satellite-pins.js";
 import { getSatellite } from "./store.js";
 import { loadMgmtKey } from "./mgmt-keys.js";
 
@@ -85,13 +86,21 @@ export async function pullNewestBackup(satId, bundle, {
     if (Number(f.bavail) * Number(f.bsize) < size + DISK_MARGIN_BYTES) return { pulled: false, code: "no_space" };
   } catch { return { pulled: false, code: "no_space" }; }
 
+  // The pin gate comes BEFORE the management key is read and before anything is signed: a row that
+  // is not at its pinned address pulls nothing (and no key exists to leak).
+  let base;
+  try {
+    base = satelliteBaseUrlFor(sat, { env });
+  } catch (err) {
+    return { pulled: false, code: err?.code || "pin_refused" };
+  }
   const key = loadMgmtKey(satId, { env });
   if (!key) return { pulled: false, code: "no_mgmt_key" };
   const path = `/satellite/v1/bundles/${bundle}/backups/${name}`;
   const headers = { Accept: "application/octet-stream", ...signRequest(key.ed25519_priv, { method: "GET", pathQuery: path, body: "", satelliteId: satId, caller: "owner-local" }) };
   let res;
   try {
-    res = await sendOnce(fetchImpl, satelliteBaseUrl(sat.tailnet_host) + path, { method: "GET", headers, body: "", timeoutMs });
+    res = await sendOnce(fetchImpl, base + path, { method: "GET", headers, body: "", timeoutMs });
   } catch (err) {
     return { pulled: false, code: err?.code || "unreachable" };
   }

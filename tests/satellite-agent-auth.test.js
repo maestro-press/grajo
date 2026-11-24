@@ -23,6 +23,7 @@ const { SATELLITE_DDL } = await import("../servers/shared/satellite-schema.js");
 const S = await import("../servers/gateway/satellites/store.js");
 const { createPairingService } = await import("../servers/gateway/satellites/pairing.js");
 const { fakeIdentity } = await import("./helpers/fake-satellite.js");
+const { pinFixtureSatellite } = await import("./helpers/satellite-pin-fixture.js");
 const { startAgent } = await import("../servers/satellite/agent.js");
 const { ensureSatelliteKey, writeCert, writePinned, stagedCertPath } = await import("../servers/satellite/keys.js");
 const { openSatelliteDb } = await import("../servers/satellite/db.js");
@@ -88,9 +89,13 @@ const serveFetch = (port) => async (url, init = {}) => {
 };
 
 const row = (a) => ({ id: a.satelliteId, tailnet_host: HOST, satellite_pubkey: a.key.ed25519_pub });
-const sfetch = (a, mgmt, opts) => satelliteFetch(row(a), {
-  caller: "owner-local", fetchImpl: serveFetch(a.port), mgmtKey: { ed25519_priv: mgmt.privHex }, ...opts,
-});
+const sfetch = (a, mgmt, opts) => {
+  // The row is dialled at the host pinned OUTSIDE crow.db, so the fixture pins it first.
+  pinFixtureSatellite(a.satelliteId, HOST);
+  return satelliteFetch(row(a), {
+    caller: "owner-local", fetchImpl: serveFetch(a.port), mgmtKey: { ed25519_priv: mgmt.privHex }, ...opts,
+  });
+};
 
 /**
  * A raw signed call for tampering. `sign` overrides what is signed; `send` what goes on the wire.
@@ -479,6 +484,7 @@ test("full loop: crow pairs with its real client, signed status over satelliteFe
   const start = await svc.startPairing({ host: HOST });
   const done = await svc.completePairing({ db, pairing_id: start.pairing_id, code, name: "vps" });
   const satRow = await S.getSatellite(db, done.satellite_id);
+  // No hand-written pin: the ceremony itself pinned the host it authenticated.
   const st = await satelliteFetch(satRow, { path: "/satellite/v1/status", caller: "owner-remote", fetchImpl: serveFetch(a.port) });
   assert.equal(st.status, 200);
   assert.equal(st.json.satellite_id, a.satelliteId);

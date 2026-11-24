@@ -2,7 +2,7 @@
 // signed satellite client and unpair. The satellite is the in-test fake (tests/helpers).
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, existsSync, statSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, statSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -20,6 +20,7 @@ const C = await import("../servers/gateway/satellites/certs.js");
 const { createPairingService } = await import("../servers/gateway/satellites/pairing.js");
 const { satelliteFetch } = await import("../servers/gateway/satellites/client.js");
 const { createFakeSatellite, fakeIdentity, FAKE_HOST } = await import("./helpers/fake-satellite.js");
+const Pins = await import("../servers/shared/satellite-pins.js");
 
 const dirs = [HOME, process.env.CROW_DATA_DIR];
 after(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true }); });
@@ -275,7 +276,8 @@ test("bad host, unreachable, pending cap", async () => {
   }
   assert.equal(fake.state.requests.length, 0);
   const { normalizeHost } = await import("../servers/gateway/satellites/pairing.js");
-  assert.equal(normalizeHost("Satellite.Example.TS.NET."), "satellite.example.ts.net");
+  assert.equal(normalizeHost("Satellite.Example.TS.NET."), null, "the pin form never strips a trailing dot (exact compare)");
+  assert.equal(normalizeHost("Satellite.Example.TS.NET"), "satellite.example.ts.net");
   assert.equal(normalizeHost("100.64.20.5"), "100.64.20.5");
   assert.equal(normalizeHost("100.127.255.254"), "100.127.255.254");
   const down = service(createFakeSatellite({ code: CODE, tamper: { unreachable: true } }));
@@ -312,6 +314,8 @@ async function pairedFixture(tamper) {
   const fake = createFakeSatellite({ code: CODE });
   const svc = service(fake);
   await svc.completePairing({ db, ...(await svc.startPairing({ host: FAKE_HOST })), code: CODE, name: "x" });
+  // No hand-written pin: the ceremony itself pinned the host it authenticated.
+  assert.equal(Pins.getSatellitePin(fake.satId), FAKE_HOST, "completePairing writes the pin");
   return { db, fake, svc, row: await S.getSatellite(db, fake.satId) };
 }
 
@@ -364,6 +368,7 @@ test("unpair: signed call, row revoked, signed revocation, key shredded, pins go
   assert.ok(after.revoked_at);
   assert.equal(existsSync(keyPath(row.id)), false);
   assert.equal(await S.getToolPin(db, row.id, "b"), null);
+  assert.equal(Pins.getSatellitePin(row.id), null, "unpair drops the pin, after crow's side succeeded");
   const rev = (await db.execute("SELECT * FROM satellite_revocations")).rows[0];
   assert.equal(rev.serial, row.cert_serial);
   assert.equal(P.verifyRevocation({ payload: JSON.parse(rev.payload_json), sig: rev.sig }, identity.ed25519Pubkey), true);
@@ -391,6 +396,7 @@ test("unpair then re-pair replaces the revoked row in place; revocation records 
   assert.equal(r2.name, "Back");
   assert.notEqual(r2.mgmt_pubkey, row.mgmt_pubkey);
   assert.notEqual(r2.cert_serial, row.cert_serial);
+  assert.equal(Pins.getSatellitePin(row.id), FAKE_HOST, "a re-pair writes a fresh pin");
   assert.equal(K.loadMgmtKey(row.id).ed25519_pub, r2.mgmt_pubkey);
   assert.equal((await S.listSatellites(db)).length, 1);
   const revs = (await db.execute("SELECT serial FROM satellite_revocations")).rows.map((x) => x.serial);
@@ -412,6 +418,7 @@ test("unpair: a failing revocation write still shreds the key and deletes pins",
   await assert.rejects(svc.unpairSatellite({ db: broken, id: row.id }), /disk full/);
   assert.equal(existsSync(keyPath(row.id)), false);
   assert.equal(await S.getToolPin(db, row.id, "b"), null);
+  assert.equal(Pins.getSatellitePin(row.id), FAKE_HOST, "a failed revocation keeps the pin (the row is not revoked either)");
 });
 
 test("unpair of an already revoked satellite still shreds a key left on disk", async () => {
@@ -420,4 +427,161 @@ test("unpair of an already revoked satellite still shreds a key left on disk", a
   K.createMgmtKey(row.id);
   await assert.rejects(svc.unpairSatellite({ db, id: row.id }), { code: "already_revoked" });
   assert.equal(existsSync(keyPath(row.id)), false);
+});
+
+// ── the ceremony's PIN (round 2) ────────────────────────────────────────────
+
+const HOST2 = "satellite2.example.ts.net";
+const MOVE = "moved.example.ts.net";
+
+/** A fake satellite that also answers for `host` (Serve's hop is the test's to simulate). */
+function svcFetch(host, fake) {
+  return (url, init) => fake.fetchImpl(String(url).replace(`https://${host}`, `https://${FAKE_HOST}`), init);
+}
+
+/** A pairing service whose ceremony host is `host` (mapped to the fake's own Serve name). */
+function serviceAnswering(host, fake, extra = {}) {
+  return service(fake, { fetchImpl: svcFetch(host, fake), ...extra });
+}
+
+test("completePairing writes the pin BEFORE the row exists", async () => {
+  const db = await freshDb();
+  const fake = createFakeSatellite({ code: CODE });
+  const svc = service(fake);
+  let pinAtInsert = "insert never ran";
+  const spy = new Proxy(db, {
+    get: (t, k) => (k === "execute"
+      ? async (arg) => {
+        if (/INSERT INTO satellites/i.test(String(arg?.sql ?? arg))) pinAtInsert = Pins.getSatellitePin(fake.satId);
+        return t.execute(arg);
+      }
+      : Reflect.get(t, k)),
+  });
+  const start = await svc.startPairing({ host: FAKE_HOST });
+  await svc.completePairing({ db: spy, pairing_id: start.pairing_id, code: CODE, name: "x" });
+  assert.equal(pinAtInsert, FAKE_HOST, "the pin was already in the store when the row was written");
+  assert.equal(Pins.getSatellitePin(fake.satId), FAKE_HOST);
+});
+
+test("a failing pin write fails the pairing, shreds the mgmt key and leaves no row", async () => {
+  const db = await freshDb();
+  const fake = createFakeSatellite({ code: CODE });
+  const svc = service(fake);
+  const start = await svc.startPairing({ host: FAKE_HOST });
+  // A pin store whose parent is a regular file cannot be created: the write fails.
+  const blocker = join(HOME, "pin-store-parent-is-a-file");
+  writeFileSync(blocker, "x");
+  const orig = process.env.CROW_SATELLITE_PINS_PATH;
+  process.env.CROW_SATELLITE_PINS_PATH = join(blocker, "satellite-pins.json");
+  try {
+    await assert.rejects(
+      svc.completePairing({ db, pairing_id: start.pairing_id, code: CODE, name: "x" }),
+      { code: "pin_failed", status: 500 },
+    );
+  } finally {
+    if (orig === undefined) delete process.env.CROW_SATELLITE_PINS_PATH;
+    else process.env.CROW_SATELLITE_PINS_PATH = orig;
+  }
+  assert.equal(await S.getSatellite(db, fake.satId), null, "no row exists without a pin");
+  assert.equal(existsSync(keyPath(fake.satId)), false, "the mgmt key was shredded");
+  assert.equal(Pins.getSatellitePin(fake.satId), null);
+});
+
+test("a failed row write puts the previous pin back", async () => {
+  const db = await freshDb();
+  const fake = createFakeSatellite({ code: CODE });
+  const svc = serviceAnswering(HOST2, fake);
+  assert.equal(Pins.pinSatelliteHost(fake.satId, FAKE_HOST), true, "a pin from an older pairing");
+  const broken = new Proxy(db, {
+    get: (t, k) => (k === "execute"
+      ? async (arg) => {
+        if (/INSERT INTO satellites/i.test(String(arg?.sql ?? arg))) throw new Error("disk full");
+        return t.execute(arg);
+      }
+      : Reflect.get(t, k)),
+  });
+  const start = await svc.startPairing({ host: HOST2 });
+  await assert.rejects(
+    svc.completePairing({ db: broken, pairing_id: start.pairing_id, code: CODE, name: "x" }),
+    /disk full/,
+  );
+  assert.equal(Pins.getSatellitePin(fake.satId), FAKE_HOST, "the previous pin was restored, not left on the ceremony host");
+  assert.equal(await S.getSatellite(db, fake.satId), null);
+  assert.equal(existsSync(keyPath(fake.satId)), false);
+});
+
+test("a losing re-pair (replaceRevokedSatellite wrote no row) restores the previous pin", async () => {
+  const db = await freshDb();
+  const fake = createFakeSatellite({ code: CODE });
+  const first = service(fake);
+  await first.completePairing({ db, ...(await first.startPairing({ host: FAKE_HOST })), code: CODE, name: "x" });
+  const svc = serviceAnswering(HOST2, fake);
+  await svc.unpairSatellite({ db, id: fake.satId });
+  assert.equal(Pins.getSatellitePin(fake.satId), null, "unpair dropped the pin");
+  assert.equal(Pins.pinSatelliteHost(fake.satId, FAKE_HOST), true, "a pin an older pairing left behind");
+  const broken = new Proxy(db, {
+    get: (t, k) => (k === "execute"
+      ? async (arg) => {
+        const sql = String(arg?.sql ?? arg);
+        if (/UPDATE satellites/i.test(sql) && /status = 'revoked'/i.test(sql)) {
+          return { rows: [], columns: [], rowsAffected: 0, lastInsertRowid: 0 };
+        }
+        return t.execute(arg);
+      }
+      : Reflect.get(t, k)),
+  });
+  const start = await svc.startPairing({ host: HOST2 });
+  await assert.rejects(
+    svc.completePairing({ db: broken, pairing_id: start.pairing_id, code: CODE, name: "x" }),
+    { code: "already_paired" },
+  );
+  assert.equal(Pins.getSatellitePin(fake.satId), FAKE_HOST, "the previous pin is back");
+  const after = await S.getSatellite(db, fake.satId);
+  assert.equal(after.status, "revoked");
+  assert.equal(after.tailnet_host, FAKE_HOST, "the row was not rewritten");
+  assert.equal(existsSync(keyPath(fake.satId)), false, "the failed attempt's key was shredded");
+});
+
+test("a re-pair of a revoked row writes the fresh ceremony host", async () => {
+  const db = await freshDb();
+  const fake = createFakeSatellite({ code: CODE });
+  const first = service(fake);
+  await first.completePairing({ db, ...(await first.startPairing({ host: FAKE_HOST })), code: CODE, name: "x" });
+  const svc = serviceAnswering(HOST2, fake);
+  await svc.unpairSatellite({ db, id: fake.satId });
+  const done = await svc.completePairing({ db, ...(await svc.startPairing({ host: HOST2 })), code: CODE, name: "Again" });
+  assert.equal(done.repaired, true);
+  assert.equal(Pins.getSatellitePin(fake.satId), HOST2, "a new ceremony writes its own host");
+  const row = await S.getSatellite(db, fake.satId);
+  assert.equal(row.status, "active");
+  assert.equal(row.tailnet_host, HOST2);
+  const st = await satelliteFetch(row, { method: "GET", path: "/satellite/v1/status", caller: "owner-local", fetchImpl: svcFetch(HOST2, fake) });
+  assert.equal(st.status, 200);
+});
+
+test("unpair of an already revoked row: no dial, the existing 409, and no pin is needed", async () => {
+  const { db, fake, svc, row } = await pairedFixture();
+  await svc.unpairSatellite({ db, id: row.id });
+  assert.equal(Pins.getSatellitePin(row.id), null, "the successful unpair removed the pin");
+  const before = fake.state.requests.length;
+  let calls = 0;
+  const counting = service({ fetchImpl: async (url, init) => { calls++; return fake.fetchImpl(url, init); } });
+  await assert.rejects(counting.unpairSatellite({ db, id: row.id }), { code: "already_revoked", status: 409 });
+  assert.equal(calls, 0, "an already revoked row is never dialled");
+  assert.equal(fake.state.requests.length, before, "no request reached the fake satellite");
+  assert.equal(Pins.getSatellitePin(row.id), null);
+});
+
+test("unpair whose row is no longer at its pin: no signed unpair, crow still revokes, the pin is removed", async () => {
+  const { db, fake, svc, row } = await pairedFixture();
+  // A bot rewrote the row's copy of the address; the pin stayed where the ceremony put it.
+  await db.execute({ sql: "UPDATE satellites SET tailnet_host = ? WHERE id = ?", args: [MOVE, row.id] });
+  const before = fake.state.requests.length;
+  const r = await svc.unpairSatellite({ db, id: row.id, reason: "owner" });
+  assert.equal(r.reached, false, "the signed unpair was not sent");
+  assert.equal(fake.state.requests.length, before, "nothing was dialled");
+  assert.equal((await S.getSatellite(db, row.id)).status, "revoked", "crow did its own side");
+  const rev = (await db.execute({ sql: "SELECT serial FROM satellite_revocations WHERE satellite_id = ?", args: [row.id] })).rows.map((x) => x.serial);
+  assert.ok(rev.includes(row.cert_serial), "the revocation record was written");
+  assert.equal(Pins.getSatellitePin(row.id), null, "the pin is removed");
 });

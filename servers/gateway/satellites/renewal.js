@@ -20,6 +20,7 @@
 import { createDbClient } from "../../db.js";
 import { createNotification } from "../../shared/notifications.js";
 import { needsRenewal } from "../../shared/satellite-protocol.js";
+import { satelliteRowAllowed, logSatellitePinRefusal } from "../../shared/satellite-pins.js";
 import { loadIdentityIfPresent } from "../../sharing/identity.js";
 import { satelliteFetch } from "./client.js";
 import { issueCert } from "./certs.js";
@@ -90,6 +91,13 @@ export function createCertRenewer({
 
   async function renewOneUnlocked(db, sat, { force = false } = {}) {
     if (!force && !needsRenewal(parseCert(sat), now())) return { renewed: false, code: "not_due" };
+    // The ADDRESS PIN is checked FIRST, before a cert is made and before any key is read: a row a
+    // bot pointed elsewhere must not get a fresh cert (with our signature on it) or a request.
+    const gate = satelliteRowAllowed(sat, { env });
+    if (!gate.ok) {
+      logSatellitePinRefusal(sat.id, gate.reason);
+      return { renewed: false, code: "pin_refused" };
+    }
     let cert;
     try { cert = newCert(sat, sat.mgmt_pubkey); } catch (err) { return { renewed: false, code: err.code || "cert_failed" }; }
     let r;
@@ -122,6 +130,13 @@ export function createCertRenewer({
   }
 
   async function rotateKeyUnlocked(db, sat) {
+    // The pin comes FIRST, before the live key is read, before a staged key is created and before
+    // the cert: a rewritten row gets no new key material at all.
+    const gate = satelliteRowAllowed(sat, { env });
+    if (!gate.ok) {
+      logSatellitePinRefusal(sat.id, gate.reason);
+      return { rotated: false, code: "pin_refused" };
+    }
     if (!loadMgmtKey(sat.id, { env })) return { rotated: false, code: "no_mgmt_key" };
     // A staged key from an earlier ambiguous rotation is settled first; while it cannot be,
     // a new rotation would destroy the only key the satellite may now accept (review M2).

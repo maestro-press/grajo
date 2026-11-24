@@ -40,6 +40,7 @@ const P = await import("../servers/shared/satellite-protocol.js");
 const { satelliteFetch } = await import("../servers/gateway/satellites/client.js");
 const { issueCert } = await import("../servers/gateway/satellites/certs.js");
 const { fakeIdentity } = await import("./helpers/fake-satellite.js");
+const { pinFixtureSatellite } = await import("./helpers/satellite-pin-fixture.js");
 const { startAgent } = await import("../servers/satellite/agent.js");
 const { ensureSatelliteKey, writeCert, writePinned } = await import("../servers/satellite/keys.js");
 const { loadKeychainKey } = await import("../servers/gateway/keychain/key.js");
@@ -138,10 +139,14 @@ const serveFetch = (port) => async (url, init = {}) => {
   const u = new URL(url);
   return fetch(`http://127.0.0.1:${port}${u.pathname}${u.search}`, { ...init, headers: { ...init.headers, ...serveHeaders(null, "100.64.20.5") } });
 };
-const call = (t, method, path, body) => satelliteFetch(
-  { id: t.a.satelliteId, tailnet_host: HOST, satellite_pubkey: t.a.key.ed25519_pub },
-  { method, path: `/satellite/v1/${path}`, body, caller: "owner-local", maxBytes: 1024 * 1024, fetchImpl: serveFetch(t.a.port), mgmtKey: { ed25519_priv: t.mgmt.privHex } },
-);
+const call = (t, method, path, body) => {
+  // The row is dialled at the host pinned OUTSIDE crow.db, so the fixture pins it first.
+  pinFixtureSatellite(t.a.satelliteId, HOST);
+  return satelliteFetch(
+    { id: t.a.satelliteId, tailnet_host: HOST, satellite_pubkey: t.a.key.ed25519_pub },
+    { method, path: `/satellite/v1/${path}`, body, caller: "owner-local", maxBytes: 1024 * 1024, fetchImpl: serveFetch(t.a.port), mgmtKey: { ed25519_priv: t.mgmt.privHex } },
+  );
+};
 
 async function waitJob(t, id) {
   for (let i = 0; i < 500; i++) {

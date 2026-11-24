@@ -25,6 +25,7 @@ const AU = await import("../servers/gateway/auto-update.js");
 const { satelliteFetch } = await import("../servers/gateway/satellites/client.js");
 const { issueCert } = await import("../servers/gateway/satellites/certs.js");
 const { fakeIdentity } = await import("./helpers/fake-satellite.js");
+const { pinFixtureSatellite } = await import("./helpers/satellite-pin-fixture.js");
 const { startAgent } = await import("../servers/satellite/agent.js");
 const { openSatelliteDb } = await import("../servers/satellite/db.js");
 const { ensureSatelliteKey, writeCert, writePinned } = await import("../servers/satellite/keys.js");
@@ -325,11 +326,15 @@ test("POST /satellite/v1/update: owners only, refusals signed, an accepted updat
     updateDeps: { runner, appRoot: tmp("satupd-agentapp-"), fetchCheckRuns: async () => green, exit: (code) => exits.push(code) },
   });
   closers.push(() => a.close());
-  const call = (body, caller = "owner-local") => satelliteFetch(
-    { id: a.satelliteId, tailnet_host: "satellite.example.ts.net", satellite_pubkey: a.key.ed25519_pub },
-    { method: "POST", path: "/satellite/v1/update", body, caller, mgmtKey: { ed25519_priv: mgmt.privHex },
-      fetchImpl: async (url, init = {}) => { const u = new URL(url); return fetch(`http://127.0.0.1:${a.port}${u.pathname}`, { ...init, headers: { ...init.headers, ...serveHeaders(null, "100.64.20.5") } }); } },
-  );
+  const call = (body, caller = "owner-local") => {
+    // The row is dialled at the host pinned OUTSIDE crow.db, so the fixture pins it first.
+    pinFixtureSatellite(a.satelliteId, "satellite.example.ts.net");
+    return satelliteFetch(
+      { id: a.satelliteId, tailnet_host: "satellite.example.ts.net", satellite_pubkey: a.key.ed25519_pub },
+      { method: "POST", path: "/satellite/v1/update", body, caller, mgmtKey: { ed25519_priv: mgmt.privHex },
+        fetchImpl: async (url, init = {}) => { const u = new URL(url); return fetch(`http://127.0.0.1:${a.port}${u.pathname}`, { ...init, headers: { ...init.headers, ...serveHeaders(null, "100.64.20.5") } }); } },
+    );
+  };
   const bot = await call({ target_sha: TARGET }, "bot:b1");
   assert.equal(bot.status, 403);
   assert.equal(bot.json.error, "owner_only");

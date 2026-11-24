@@ -13,6 +13,7 @@ import { createMgmtKey } from "../../servers/gateway/satellites/mgmt-keys.js";
 import { issueCert } from "../../servers/gateway/satellites/certs.js";
 import { insertSatellite } from "../../servers/gateway/satellites/store.js";
 import { fakeIdentity } from "./fake-satellite.js";
+import { pinFixtureSatellite } from "./satellite-pin-fixture.js";
 
 export const MGMT_HOST = "satellite.example.ts.net";
 export const PRIMARY_URL = "https://crow.example.ts.net:8444";
@@ -136,5 +137,7 @@ export async function makeSatelliteRow(db, fake, { name = "vps-1-test", env = pr
     primary_url: PRIMARY_URL, agent_protocol, status, created_at: new Date(now).toISOString(), last_seen_at: new Date(now).toISOString(),
   };
   await insertSatellite(db, row);
+  // A fixture row is dialled at the host pinned OUTSIDE crow.db (servers/shared/satellite-pins.js).
+  pinFixtureSatellite(row.id, row.tailnet_host);
   return { row, identity, mgmtKey, cert };
 }

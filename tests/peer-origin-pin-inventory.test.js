@@ -54,11 +54,11 @@ const NON_SENDERS = {
   "servers/shared/peer-credentials.js":
     "the credential store and the gate ITSELF: it defines peerUrlAllowed() and noRedirectFetch(); it never picks a destination",
   "servers/gateway/satellites/backup-pull.js":
-    "a SATELLITE call signed with a satellite ed25519 MANAGEMENT key (never a paired peer credential); its host comes from satellites.tailnet_host in crow.db, which is bot-writable — that is a KNOWN GAP tracked as a follow-up (a management-key signature is not bound to an origin, and a captured call replays once), not a reviewed destination; satelliteFetch already refuses redirects",
+    "a SATELLITE call signed with a satellite ed25519 MANAGEMENT key (never a paired peer credential); its destination is NOT a peer origin: it is the host pinned by servers/shared/satellite-pins.js (satelliteBaseUrlFor) from the pairing ceremony, not the bot-writable satellites.tailnet_host — this file is in NON_SENDERS only because this test's discovery sees a signature and a fetch, not because it carries a peer credential; satelliteFetch already refuses redirects",
   "servers/gateway/satellites/offsite.js":
-    "SATELLITE offsite vault calls signed with a satellite ed25519 management key, never a paired peer credential; the same KNOWN GAP as backup-pull.js (host from bot-writable satellites.tailnet_host), and every call goes through sendOnce (redirect: manual)",
+    "SATELLITE offsite vault calls signed with a satellite ed25519 management key, never a paired peer credential; the same address pin as backup-pull.js (servers/shared/satellite-pins.js satelliteBaseUrlFor, checked before any key read), and every call goes through sendOnce (redirect: manual)",
   "servers/gateway/satellites/client.js":
-    "the SATELLITE transport: satellite ed25519 management-key signing, redirect: manual, never a peer bearer (the bot-writable host it is handed is the KNOWN GAP described on backup-pull.js)",
+    "the SATELLITE transport: satellite ed25519 management-key signing, redirect: manual, never a peer bearer; its destination is the host pinned by servers/shared/satellite-pins.js (satelliteBaseUrlFor), not a bot-writable row — reviewed as a peer NON_SENDER only because this test discovers a signature plus a fetch",
   "scripts/cli/instance-pair.js":
     "the pairing CLI: its destination is the URL the OPERATOR typed (--peer-url) or pasted, never a stored row; it only PINS what it stores (pinPeerOrigin)",
   "bundles/media/panel/media.js":

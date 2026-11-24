@@ -90,7 +90,7 @@ export function createSatellitePoller({
   }
 
   async function pollOne(db, sat) {
-    const health = await readHealth(sat, { fetchImpl, now });
+    const health = await readHealth(sat, { fetchImpl, now, env });
     let r;
     try {
       r = await satelliteFetch(sat, { method: "GET", path: "/satellite/v1/status", caller: "owner-local", fetchImpl, env });

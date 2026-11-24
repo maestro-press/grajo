@@ -210,3 +210,28 @@ test("M2: rotations, renewals and resolves on one satellite never overlap; promo
   assert.equal(K.loadMgmtKey(a.fake.satId).ed25519_pub, a.fake.state.mgmtPub, "live key untouched");
   assert.equal(K.loadStagedMgmtKey(a.fake.satId).ed25519_pub, st.ed25519_pub);
 });
+
+test("a row flipped away from its pin: no rotation, no renewal, no staged key, no request", async () => {
+  // The fixture row is paired and pinned at the fake's host. A contained bot can rewrite the row
+  // (crow.db is bound read-write), so the row is pointed somewhere else while the pin stays put.
+  const a = await setup({ ageDays: 15 });
+  const livePub = a.made.mgmtKey.ed25519_pub;
+  await a.db.execute({ sql: "UPDATE satellites SET tailnet_host = ? WHERE id = ?", args: ["moved.example.ts.net", a.fake.satId] });
+
+  const r = await a.renewer.rotateKey(a.db, await store.getSatellite(a.db, a.fake.satId));
+  assert.deepEqual([r.rotated, r.code], [false, "pin_refused"], "a rotation refuses a row that is not at its pin");
+  assert.equal(K.loadStagedMgmtKey(a.fake.satId), null, "no staged key file was created");
+  assert.equal(K.loadMgmtKey(a.fake.satId).ed25519_pub, livePub, "the live key file is untouched");
+  assert.equal(a.fake.state.certs.length, 0, "no cert was made");
+  assert.equal(a.fake.state.requests.length, 0, "nothing was dialled");
+
+  const rr = await a.renewer.renewOne(a.db, await store.getSatellite(a.db, a.fake.satId), { force: true });
+  assert.deepEqual([rr.renewed, rr.code], [false, "pin_refused"], "a forced renewal refuses too");
+  assert.equal(a.fake.state.certs.length, 0);
+  assert.equal(a.fake.state.requests.length, 0);
+  assert.equal(K.loadStagedMgmtKey(a.fake.satId), null);
+  // The row itself is untouched: a refusal is not a repair.
+  const row = await store.getSatellite(a.db, a.fake.satId);
+  assert.equal(row.mgmt_pubkey, livePub);
+  assert.equal(row.cert_serial, a.made.cert.payload.serial);
+});

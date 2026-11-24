@@ -9,13 +9,15 @@
  *      address. A pending record is kept in memory only (10 min, at most 8). Nothing is signed.
  *   2. completePairing (the owner confirmed and typed the code): the code is normalised (and a
  *      malformed one refused) before any network; crow makes the mgmt key, signs the cert, sends
- *      the MAC (never the code), verifies the done signature, then inserts the `satellites` row.
- *      Any failure shreds the new key and inserts nothing. The pending record is claimed
- *      synchronously, so two concurrent completes can't both proceed. A revoked row for the
- *      same satellite is replaced in place on success (re-pair, spec §4.3).
+ *      the MAC (never the code), verifies the done signature, PINS the ceremony's host outside
+ *      crow.db, then inserts the `satellites` row. A failed pin write fails the pairing; a failed
+ *      row write puts the previous pin back. Any failure shreds the new key and inserts nothing.
+ *      The pending record is claimed synchronously, so two concurrent completes can't both
+ *      proceed. A revoked row for the same satellite is replaced in place on success (re-pair,
+ *      spec §4.3).
  *   3. unpairSatellite: signed POST /satellite/v1/unpair (best-effort), then crow's side alone:
- *      row revoked, signed revocation stored; the mgmt key is shredded and tool pins deleted
- *      whatever fails first.
+ *      row revoked, signed revocation stored, the address pin dropped; the mgmt key is shredded
+ *      and tool pins deleted whatever fails first.
  *
  * Network calls are injectable (`fetchImpl`, `whoisImpl`); errors are PairingError {code, status}.
  */
@@ -27,6 +29,9 @@ import {
   AGENT_PROTOCOL, satelliteIdFromPub, isSatelliteId, formatFingerprint, verifyBytes,
   helloSigningString, doneSigningString, normalizePairCode, pairMac, certSha256,
 } from "../../shared/satellite-protocol.js";
+import {
+  getSatellitePin, isTailnetIPv4, normalizeSatelliteHost, pinSatelliteHost, unpinSatellite,
+} from "../../shared/satellite-pins.js";
 import { loadIdentityIfPresent } from "../../sharing/identity.js";
 import { getOrCreateLocalInstanceId, selfPairingAddress } from "../instance-registry.js";
 import { getBootSha } from "../convergence.js";
@@ -36,7 +41,7 @@ import {
 } from "./store.js";
 import { createMgmtKey, shredMgmtKey } from "./mgmt-keys.js";
 import { issueCert, revokeSatelliteRecord } from "./certs.js";
-import { satelliteFetch, satelliteBaseUrl, readCapped, assertJsonResponse, sendOnce } from "./client.js";
+import { satelliteFetch, pairingBaseUrl, readCapped, assertJsonResponse, sendOnce } from "./client.js";
 
 export const PENDING_TTL_MS = 10 * 60000;
 export const MAX_PENDING = 8;
@@ -53,28 +58,11 @@ export class PairingError extends Error {
 }
 const fail = (code, status, detail) => new PairingError(code, status, detail);
 
-const LABEL = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
-const HOST_RE = new RegExp(`^${LABEL}(?:\\.${LABEL})*$`);
-/** True for an IPv4 literal inside the tailnet range 100.64.0.0/10. */
-export function isTailnetIPv4(h) {
-  if (isIP(h) !== 4) return false;
-  const [a, b] = h.split(".").map(Number);
-  return a === 100 && b >= 64 && b <= 127;
-}
-
-/**
- * A MagicDNS name (valid labels, ending in ".ts.net", at least one label before it) or a
- * 100.64.0.0/10 IPv4 literal; case-insensitive. Anything else (localhost, loopback,
- * link-local, a public name or address, a scheme, port, path or user info) is refused
- * before any network.
- */
-export function normalizeHost(input) {
-  if (typeof input !== "string") return null;
-  const h = input.trim().toLowerCase().replace(/\.$/, "");
-  if (!h || h.length > 253) return null;
-  if (isIP(h)) return isTailnetIPv4(h) ? h : null;
-  return HOST_RE.test(h) && h.endsWith(".ts.net") && h.split(".").length >= 3 ? h : null;
-}
+// The pairing host form lives in servers/shared/satellite-pins.js now (the pin module is shared with
+// the CLI and the tests, and the pin compare must use exactly the same rules the ceremony used).
+// Re-exported here so every existing importer of pairing.js keeps working.
+export const normalizeHost = normalizeSatelliteHost;
+export { isTailnetIPv4 };
 
 const NAME_MAX = 64;
 function normalizeName(input, host) {
@@ -131,7 +119,7 @@ export function createPairingService({
 
   /** POST a JSON body to an unpaired satellite; returns {status, json}. */
   async function postPair(host, path, obj) {
-    const res = await sendOnce(fetchImpl, satelliteBaseUrl(host) + path, {
+    const res = await sendOnce(fetchImpl, pairingBaseUrl(host) + path, {
       method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json" },
       body: JSON.stringify(obj), timeoutMs,
     });
@@ -223,6 +211,10 @@ export function createPairingService({
     try {
       const norm = normalizePairCode(code);
       if (!norm) throw refuse("bad_code", 400);
+      // The pin is only ever written from the ceremony's OWN vetted host. If a pending record ever
+      // carried none, refuse rather than fall back to a row value (a contained bot can write the
+      // row, so a host taken from it would undo the pin).
+      if (!normalizeHost(p.host)) throw refuse("bad_host", 400);
       const label = normalizeName(name, p.host);
       if (!label) throw refuse("bad_name", 400);
       if (p.whois?.unknown && confirm_without_whois !== true) throw refuse("whois_required", 409);
@@ -237,6 +229,9 @@ export function createPairingService({
       const repair = !!existing; // a revoked row is replaced in place on success (spec §4.3)
 
       const key = freshMgmtKey(p.satellite_id);
+      // The pin write is tracked so the catch below can put back exactly what was there before.
+      let pinned = false;
+      let previousPin = null;
       try {
         const t = now();
         const cert = issueCert({
@@ -261,6 +256,13 @@ export function createPairingService({
         const doneStr = Buffer.from(doneSigningString({ nonceC: p.nonce_c, certSha256: certHash }), "utf8");
         if (typeof doneSig !== "string" || !verifyBytes(p.satellite_pubkey, doneStr, doneSig)) throw fail("bad_done_sig", 502);
 
+        // PIN before the row exists: every send dials the host recorded OUTSIDE crow.db
+        // (servers/shared/satellite-pins.js), so no row may come into being without one. The
+        // owner just re-authenticated this host in the ceremony, so a re-pair overwrites it.
+        previousPin = getSatellitePin(p.satellite_id, { env });
+        if (!pinSatelliteHost(p.satellite_id, p.host, { env })) throw fail("pin_failed", 500);
+        pinned = true;
+
         const at = new Date(t).toISOString();
         const row = {
           id: p.satellite_id, name: label, tailnet_host: p.host, satellite_pubkey: p.satellite_pubkey,
@@ -275,6 +277,13 @@ export function createPairingService({
         }
         return { satellite_id: p.satellite_id, name: label, fingerprint: formatFingerprint(p.satellite_id), cert_expires_at: cert.payload.expires_at, repaired: repair };
       } catch (err) {
+        // A row write that failed for ANY reason (a losing re-pair, a duplicate key, a DB error)
+        // must not leave the satellite pointed at the fresh ceremony host: put the previous state
+        // back, so a failed ceremony can never re-point an ACTIVE satellite. Ids only, never a host.
+        if (pinned) {
+          if (previousPin) pinSatelliteHost(p.satellite_id, previousPin, { env });
+          else unpinSatellite(p.satellite_id, { env });
+        }
         try { shredMgmtKey(p.satellite_id, { env }); } catch { /* best effort */ }
         if (err?.code === "not_migrated" && !(err instanceof PairingError)) throw fail("not_migrated", 503);
         throw err;
@@ -311,6 +320,14 @@ export function createPairingService({
       } catch { reached = false; } // unreachable is fine: crow does its side alone (§3.3)
       await markRevoked(db, id, at);
       await recordRevocation(db, revokeSatelliteRecord({ identity, serial: row.cert_serial, satellite_id: id, reason: why, now: t }));
+      // Only AFTER crow's side succeeded: if either write above threw, the row is not revoked and
+      // the satellite keeps its address (so a retry can still reach it).
+      // The ONLY caller of unpairSatellite is the owner-only route POST /api/satellites/:id/unpair
+      // in servers/gateway/routes/satellites.js (session gate + local password session + CSRF; it
+      // refuses peer and instance-authenticated requests). No MCP tool, bot door, tools-mount.js or
+      // tool-entry.js calls it, and none may be added: dropping the pin is a step of the owner's
+      // revocation, not something a contained bot can trigger.
+      unpinSatellite(id, { env });
     } finally {
       // Whatever failed above, crow stops being able to manage this satellite.
       shredQuietly(id);
