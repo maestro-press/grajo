@@ -3269,7 +3269,7 @@
     {
       "id": "kiosk",
       "name": "Kiosk display",
-      "version": "0.7.2",
+      "version": "0.7.3",
       "type": "mcp-server",
       "author": "Crow",
       "category": "hardware",

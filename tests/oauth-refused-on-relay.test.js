@@ -51,6 +51,7 @@ import {
 } from "../servers/gateway/dashboard/auth.js";
 import { RELAY_SOURCE_V4 } from "../servers/shared/bot-doors.js";
 import { createDbClient } from "../servers/db.js";
+import { writeSetting } from "../servers/gateway/dashboard/settings/registry.js";
 
 const RELAY = RELAY_SOURCE_V4;          // the mark a relayed socket carries
 const LOOPBACK = "127.0.0.1";
@@ -102,12 +103,14 @@ before(async () => {
     INSERT INTO oauth_tokens (token, token_type, client_id, scopes, expires_at)
       VALUES ('${hashToken(SESSION_TOKEN)}', 'access', '${DASHBOARD_CLIENT_ID}', 'dashboard',
               datetime('now', '+3600 seconds'));
-    -- The path-scoped board token a relayed bot legitimately holds.
-    INSERT INTO dashboard_settings (key, value) VALUES ('mcp_board_token_hash', '${hashToken(BOARD_TOKEN)}');
   `);
   raw.close();
 
   db = createDbClient(dbPath);
+  // The path-scoped board token a relayed bot legitimately holds. Seeded the way the PRODUCT
+  // writes it — a local-scope override (design OQ-8: a per-instance token key is never read from
+  // the global `dashboard_settings` row, so a global fixture would now seed nothing).
+  await writeSetting(db, "mcp_board_token_hash", hashToken(BOARD_TOKEN), { scope: "local" });
   provider = createOAuthProvider(dbPath);
 
   const authMiddleware = createBearerAuthMiddleware({

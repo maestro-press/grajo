@@ -453,6 +453,32 @@ try {
   console.error("[token-hmac] boot conversion failed:", err.message);
 }
 
+// Keyed token verifiers, §1a half (§8 PR 3a of the same design): the SETTINGS-BACKED families
+// (`mcp_local_token_hash`, board, phone, artifacts, models, peer relay, kiosk announce, the
+// cloud door and the path-scoped loopback families). Same rail and the same reason: it runs
+// here, after the settings tables exist and long before listen, so `localTokenAuthMiddleware`,
+// the model doors, the peer relay and the kiosk announce route only ever see stored values the
+// converter has visited — the old-style window is zero. A lost or invalid key never stops the
+// boot either; every one of those validators then refuses.
+try {
+  const { runSettingsTokenHmacBoot } = await import("./boot/token-hmac-settings.js");
+  const _settingsDb = createDbClient();
+  try {
+    const _settingsHmac = await runSettingsTokenHmacBoot({ db: _settingsDb });
+    if (_settingsHmac.key !== "ok") {
+      console.error(`[token-hmac] boot is running WITHOUT a usable key (${_settingsHmac.key}): ${_settingsHmac.keyPath}`);
+    } else if (_settingsHmac.alarms || _settingsHmac.refused) {
+      console.warn(`[token-hmac] settings tokens: ${_settingsHmac.alarms} old-style and ${_settingsHmac.refused} unprovable stored value(s) reported at boot`);
+    }
+  } finally {
+    _settingsDb.close();
+  }
+} catch (err) {
+  // Never take the gateway down for it: an unconverted family keeps validating its legacy value
+  // until the next boot converts it.
+  console.error("[token-hmac] settings-token boot conversion failed:", err.message);
+}
+
 // Stamp the moment the new/classic shell first existed on this instance, before
 // listen, so a device whose session predates it opens classic (shell/mode.js).
 try {

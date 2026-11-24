@@ -18,6 +18,7 @@ import {
   validatePhoneToken, validateArtifactsToken, validateKioskAnnounceToken,
 } from "../servers/gateway/local-token.js";
 import { readSetting } from "../servers/gateway/dashboard/settings/registry.js";
+import { macToken } from "../servers/shared/token-mac.js";
 import { rotateCloudDoorTokenAtBoot } from "../servers/gateway/boot/mcp-mounts.js";
 
 const home = mkdtempSync(join(tmpdir(), "llm-cloud-token-"));
@@ -111,12 +112,16 @@ test("no other token kind validates at the cloud door, the models token included
   }
 });
 
-test("only sha256(token) is stored in the setting, never the raw token", async () => {
+test("only the keyed verifier is stored in the setting, never the raw token", async () => {
   const t = await rotateLlmCloudToken(db);
   const stored = await readSetting(db, LLM_CLOUD_TOKEN_KEYS.HASH);
   assert.notEqual(stored, t);
   assert.ok(!String(stored).includes(t), "the raw token does not appear in the setting");
-  assert.equal(stored, createHash("sha256").update(t).digest("hex"));
+  // §1a/§2.2: the stored form is the family's keyed MAC, not a bare sha256 (a bot with crow.db
+  // write access could compute that one).
+  assert.match(String(stored), /^h1\.[0-9a-f]{16}\.[0-9a-f]{64}$/);
+  assert.equal(stored, macToken("mcp_llm_cloud_token_hash", t));
+  assert.notEqual(stored, createHash("sha256").update(t).digest("hex"));
 });
 
 test("a failed file write leaves the old token and the old hash matching", async (t) => {

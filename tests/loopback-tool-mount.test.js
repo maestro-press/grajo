@@ -40,7 +40,7 @@ const SHORT4 = "Zq7w";
 const SHORT3 = "Qx3";
 const TIMEOUT_MS = 400;
 
-let dir, dbPath, srv, base, sessions, TOKEN, savedDbPath;
+let dir, dbPath, srv, base, sessions, TOKEN, savedDbPath, savedHome;
 const SESS = {};
 const tokens = {};
 const audit = [];
@@ -228,22 +228,22 @@ before(async () => {
   _resetActorKeyForTest();
   initGatewayActorKey();
   const db = createDbClient(dbPath);
+  // One instance is one home AND one database: the family tokens' stored verifiers are keyed
+  // under `<CROW_HOME>/secrets/token-hmac.key` (§1a) and the raw token files live under the same
+  // home, so this test's whole run — minting AND every validation the mount does — belongs to
+  // this test's home. (Hashing used to be home-independent; it is not any more, so a token
+  // minted under one home would read as a foreign keyId under another and be refused.)
+  savedHome = process.env.CROW_HOME;
+  process.env.CROW_HOME = dir;
   TOKEN = await EXAMPLE_TOKEN().rotate(db);
   tokens.local = await generateLocalToken(db);
   tokens.board = await generateBoardToken(db);
   tokens.relay = await generatePeerRelayToken(db);
   tokens.otherFamily = await SATELLITE_TOOLS_TOKEN.rotate(db);
-  // The file-backed doors write their raw token under the crow home: keep them in this test's dir.
-  const savedHome = process.env.CROW_HOME;
-  process.env.CROW_HOME = dir;
-  try {
-    tokens.phone = await generatePhoneToken(db);
-    tokens.models = await generateModelsToken(db);
-    tokens.artifacts = await generateArtifactsToken(db);
-    tokens.cloudDoor = await rotateLlmCloudToken(db);
-  } finally {
-    if (savedHome === undefined) delete process.env.CROW_HOME; else process.env.CROW_HOME = savedHome;
-  }
+  tokens.phone = await generatePhoneToken(db);
+  tokens.models = await generateModelsToken(db);
+  tokens.artifacts = await generateArtifactsToken(db);
+  tokens.cloudDoor = await rotateLlmCloudToken(db);
   db.close();
 
   sessions = new SessionManager();
@@ -266,6 +266,7 @@ after(async () => {
   await new Promise((r) => (srv ? srv.close(r) : r()));
   srv?.closeAllConnections?.();
   _resetActorKeyForTest();
+  if (savedHome === undefined) delete process.env.CROW_HOME; else process.env.CROW_HOME = savedHome;
   if (savedDbPath === undefined) delete process.env.CROW_DB_PATH; else process.env.CROW_DB_PATH = savedDbPath;
   rmSync(dir, { recursive: true, force: true });
 });

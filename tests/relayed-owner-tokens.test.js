@@ -41,6 +41,7 @@ import { loopbackActorGate } from "../servers/gateway/loopback-gate.js";
 import { allowFirstRun } from "../servers/gateway/dashboard/setup-token.js";
 import { requireLocalhost } from "../servers/gateway/routes/admin-backup.js";
 import { validateLocalToken, validateModelsToken } from "../servers/gateway/local-token.js";
+import { writeSetting } from "../servers/gateway/dashboard/settings/registry.js";
 import { RELAY_SOURCE_V4 } from "../servers/shared/bot-doors.js";
 import { classifyPeer } from "../servers/shared/peer-class.js";
 import { createDbClient } from "../servers/db.js";
@@ -103,9 +104,11 @@ before(async () => {
   // needs its own row).
   execFileSync(process.execPath, [join(ROOT, "scripts", "init-db.js")], { env: process.env, stdio: "ignore", timeout: 120_000 });
   db = createDbClient();
-  // The rows a contained bot could write for itself: real hashes, real tokens.
-  await db.execute({ sql: "INSERT OR REPLACE INTO dashboard_settings (key, value) VALUES (?, ?)", args: ["mcp_local_token_hash", sha(LOCAL_TOKEN)] });
-  await db.execute({ sql: "INSERT OR REPLACE INTO dashboard_settings (key, value) VALUES (?, ?)", args: ["mcp_models_token_hash", sha(MODELS_TOKEN)] });
+  // The rows a contained bot could write for itself: real hashes, real tokens. Seeded the way the
+  // PRODUCT writes them — a local-scope override (design OQ-8: a per-instance token key is never
+  // read from the global `dashboard_settings` row, so a global fixture would now seed nothing).
+  await writeSetting(db, "mcp_local_token_hash", sha(LOCAL_TOKEN), { scope: "local" });
+  await writeSetting(db, "mcp_models_token_hash", sha(MODELS_TOKEN), { scope: "local" });
   await db.execute({
     sql: "INSERT OR REPLACE INTO crow_instances (id, name, crow_id, auth_token_hash, trusted, status) VALUES (?, ?, ?, ?, 1, 'active')",
     args: ["peer-a", "A paired peer", "peer-crow-id", sha(PEER_TOKEN)],

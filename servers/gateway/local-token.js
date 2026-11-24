@@ -1,14 +1,21 @@
 /**
  * Local MCP token — a single, per-instance, full-tool-access static bearer
  * token for headless / no-browser MCP clients (the remote-HTTP path that does
- * not run the OAuth dance). Only sha256(token) is stored, in a local-scoped
- * dashboard setting that never syncs to paired instances; the raw value is
- * shown exactly once at generation. See
- * the private engineering notes
+ * not run the OAuth dance). Only the KEYED verifier of the token is stored (an `h1.` HMAC under
+ * <CROW_HOME>/secrets/token-hmac.key, `mintSettingsToken` below), in a local-scoped dashboard
+ * setting that never syncs to paired instances; the raw value is shown exactly once at
+ * generation. See the private engineering notes.
+ *
+ * EVERY family in this file (this one, board, phone, artifacts, models, peer relay, kiosk
+ * announce, llm cloud and the path-scoped loopback families) stores its verifier the same way
+ * and verifies it through `verifySettingsToken`, which is `verifyStored` under the family's own
+ * MAC domain: the setting key IS the domain, so a value copied from one family's setting never
+ * verifies in another, and a bare sha256 in a converted family is refused and alarmed instead
+ * of accepted (design §1a/§2.2/§3.3). No validator here compares hashes itself.
  */
-import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { resolveCrowHome } from "../shared/crow-home.js";
-import { writeFileSync, existsSync, chmodSync, mkdirSync, renameSync, unlinkSync, readFileSync, lstatSync, openSync, writeSync, closeSync, fchmodSync, fstatSync, ftruncateSync, constants } from "node:fs";
+import { writeFileSync, existsSync, chmodSync, mkdirSync, renameSync, unlinkSync, lstatSync, openSync, writeSync, closeSync, fchmodSync, fstatSync, ftruncateSync, constants } from "node:fs";
 import { join, dirname } from "node:path";
 import { ensureSecretsDir, migrateLegacySecretFile } from "../shared/peer-credentials.js";
 import { isRelayedSocket } from "../shared/bot-doors.js";
@@ -16,6 +23,10 @@ import { verifyTurnToken } from "./mail/drafts/turn-token.js";
 import {
   readSetting, writeSetting, deleteLocalSetting,
 } from "./dashboard/settings/registry.js";
+import {
+  mintSettingsToken, settingsTokenRawFile, verifySettingsToken, readStoredSettingsToken,
+} from "./token-settings.js";
+import { readHardenedTokenFile } from "./token-file-read.js";
 
 const HASH_KEY = "mcp_local_token_hash";
 const CREATED_KEY = "mcp_local_token_created";
@@ -41,7 +52,7 @@ const PHONE_HASH_KEY = "mcp_phone_token_hash";
 const PHONE_CREATED_KEY = "mcp_phone_token_created";
 const PHONE_PATH_RE = /^\/phone\/(?:mcp|sse|messages)$/;
 function phoneTokenPath() {
-  return join(crowHome(), "phone-token");
+  return settingsTokenRawFile(PHONE_HASH_KEY, crowHome());
 }
 
 // Artifacts token (Crow Artifacts, spec §7.1): same shape, PATH-SCOPED to
@@ -51,7 +62,7 @@ const ARTIFACTS_HASH_KEY = "mcp_artifacts_token_hash";
 const ARTIFACTS_CREATED_KEY = "mcp_artifacts_token_created";
 const ARTIFACTS_PATH_RE = /^\/artifacts\/(?:mcp|sse|messages)$/;
 function artifactsTokenPath() {
-  return join(crowHome(), "artifacts-token");
+  return settingsTokenRawFile(ARTIFACTS_HASH_KEY, crowHome());
 }
 
 // Not importing resolveCrowHome from ./proxy.js — proxy.js pulls in the
@@ -62,18 +73,14 @@ function crowHome() {
 }
 
 function boardTokenPath() {
-  return join(crowHome(), "board-token");
-}
-
-function sha256Hex(s) {
-  return createHash("sha256").update(s).digest("hex");
+  return settingsTokenRawFile(BOARD_HASH_KEY, crowHome());
 }
 
 /** Generate a new token, overwriting any existing one (this is also "rotate").
- *  Stores only the hash; returns the raw token for one-time display. */
+ *  Stores only the keyed verifier; returns the raw token for one-time display. */
 export async function generateLocalToken(db) {
   const token = randomBytes(32).toString("hex");
-  await writeSetting(db, HASH_KEY, sha256Hex(token), { scope: "local" });
+  await writeSetting(db, HASH_KEY, await mintSettingsToken(db, HASH_KEY, token), { scope: "local" });
   await writeSetting(db, CREATED_KEY, new Date().toISOString(), { scope: "local" });
   return token;
 }
@@ -85,20 +92,14 @@ export async function revokeLocalToken(db) {
 
 /** Non-sensitive status for the UI. Never returns the raw token or the hash. */
 export async function getLocalTokenMeta(db) {
-  const hash = await readSetting(db, HASH_KEY);
+  const hash = await readStoredSettingsToken(db, HASH_KEY);
   if (!hash) return { present: false, createdAt: null };
   const createdAt = await readSetting(db, CREATED_KEY);
   return { present: true, createdAt: createdAt || null };
 }
 
 export async function validateLocalToken(db, token) {
-  if (!token) return false;
-  const stored = await readSetting(db, HASH_KEY);
-  if (!stored) return false;
-  const a = Buffer.from(sha256Hex(token), "hex");
-  const b = Buffer.from(stored, "hex");
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
+  return verifySettingsToken(db, HASH_KEY, token);
 }
 
 /** Synthesized req.auth for a validated local-operator token request. Full
@@ -229,7 +230,7 @@ function openSameInode(path, st, ours) {
  *  the raw token. */
 export async function generateBoardToken(db) {
   const token = randomBytes(32).toString("hex");
-  await writeSetting(db, BOARD_HASH_KEY, sha256Hex(token), { scope: "local" });
+  await writeSetting(db, BOARD_HASH_KEY, await mintSettingsToken(db, BOARD_HASH_KEY, token), { scope: "local" });
   await writeSetting(db, BOARD_CREATED_KEY, new Date().toISOString(), { scope: "local" });
   const path = boardTokenPath();
   mkdirSync(dirname(path), { recursive: true });
@@ -238,39 +239,99 @@ export async function generateBoardToken(db) {
 }
 
 export async function validateBoardToken(db, token) {
-  if (!token) return false;
-  const stored = await readSetting(db, BOARD_HASH_KEY);
-  if (!stored) return false;
-  const a = Buffer.from(sha256Hex(token), "hex");
-  const b = Buffer.from(stored, "hex");
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
+  return verifySettingsToken(db, BOARD_HASH_KEY, token);
 }
 
 /** Non-sensitive status. Never returns the raw token or the hash. */
 export async function getBoardTokenMeta(db) {
-  const hash = await readSetting(db, BOARD_HASH_KEY);
+  const hash = await readStoredSettingsToken(db, BOARD_HASH_KEY);
   if (!hash) return { present: false, createdAt: null };
   const createdAt = await readSetting(db, BOARD_CREATED_KEY);
   return { present: true, createdAt: createdAt || null };
 }
 
-/** Idempotent boot mint (called from boot/mcp-mounts.js): a hash setting AND
- *  a readable raw file both present → no-op (the common case on every boot
- *  after the first). Hash present but the file is missing (deleted disk,
- *  fresh restore) → re-mint both, since the raw file is the ONLY place a bot
- *  config could have read the token from — nothing currently holds a valid
- *  copy if it's gone. No hash at all → mint fresh. Returns {minted:boolean}. */
-export async function ensureBoardToken(db) {
-  const hash = await readSetting(db, BOARD_HASH_KEY);
-  if (hash && existsSync(boardTokenPath())) return { minted: false };
-  await generateBoardToken(db);
+/**
+ * Does the raw token file at `path` still hold the token `family`'s stored verifier stands for?
+ * Verified through `verifySettingsToken` (never a hash compare of its own), so a legacy file on an
+ * unconverted family and an `h1.` file under the current key both match — and `false` only ever
+ * means the two really disagree (or there is no file, or it cannot be read).
+ *
+ * The file is read through the same hardened helper the boot converter uses
+ * (`servers/gateway/token-file-read.js`: `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, regular file only,
+ * capped at 4 KiB, read from the fd that was judged). A plain `readFileSync` here followed a
+ * symlink, blocked forever on a FIFO planted at a token path, and slurped a file of any size. A
+ * refusal now answers `false` — a DEFINITE mismatch, so the family is re-minted (and
+ * `writeTokenFile` unlinks and recreates the path with `O_EXCL | O_NOFOLLOW`, so the planted
+ * entry is replaced, never written through).
+ *
+ * `null` is a third answer, "could not tell": the VERIFIER threw rather than answering (a
+ * transient SQLITE_BUSY from a write lock another process holds at boot, a settings store that
+ * will not open). That is not a mismatch, and a caller must never re-mint on it — a rotation is
+ * irreversible for every consumer of the file.
+ *
+ * @returns {Promise<true|false|null>}
+ */
+async function fileTokenVerifies(db, family, path) {
+  const read = readHardenedTokenFile(path);
+  if (!read.ok || !read.token) return false;
+  try { return await verifySettingsToken(db, family, read.token); } catch { return null; }
+}
+
+/**
+ * The ensure shared by every FILE-BACKED family (spec §3.4): the stored verifier and the raw token
+ * file must AGREE, not merely both exist.
+ *
+ *  - no stored verifier → mint (a fresh instance, or a family the operator reset cleared);
+ *  - a stored verifier and a file whose token verifies against it → no-op (the common case on
+ *    every boot after the first);
+ *  - a stored verifier and a file that does NOT verify against it — junk, a legacy value, another
+ *    family's token, a value minted under a key this box no longer holds, a file somebody else
+ *    wrote, or an entry that is not a readable regular file at all (a symlink, a FIFO, a file
+ *    past the token-size cap) — → RE-MINT: a new token, a new file and a new keyed stored value,
+ *    so the family's door works again off the file its consumers read, and the value a writer
+ *    planted is gone.
+ *  - a stored verifier and a verifier that could not ANSWER (a transient SQLITE_BUSY while another
+ *    process held the store at boot, an unopenable settings store) → LEAVE IT ALONE
+ *    (`{minted:false}`): "we could not tell" is never "they disagree", and a re-mint here would
+ *    rotate the family's token over a lock that clears in milliseconds. One fixed line says so
+ *    (never the value, never a hash), so the next boot can check again.
+ *
+ * One fixed line reports a replaced file (never the value, never a hash). `mint` throws whatever
+ * its key/mint path throws — a lost key cannot mint, and the caller's own failure handling says
+ * so; it must never be reported as "nothing to do".
+ *
+ * @returns {Promise<{minted: boolean}>}
+ */
+async function ensureFileBackedToken(db, { family, path, mint }) {
+  const stored = await readStoredSettingsToken(db, family);
+  if (stored) {
+    const verdict = await fileTokenVerifies(db, family, path);
+    if (verdict === true) return { minted: false };
+    if (verdict === null) {
+      console.warn(`[gateway] left ${path} alone: its token could not be checked against this instance's stored verifier`);
+      return { minted: false };
+    }
+  }
+  await mint();
+  if (stored) console.warn(`[gateway] re-minted ${path}: the file did not match this instance's stored verifier`);
   return { minted: true };
+}
+
+/** Idempotent boot mint (called from boot/mcp-mounts.js): the hash setting and the raw file must
+ *  AGREE (see `ensureFileBackedToken`). Hash present but the file is missing (deleted disk, fresh
+ *  restore) → re-mint both, since the raw file is the ONLY place a bot config could have read the
+ *  token from. Hash present but the file holds something that does not verify against it →
+ *  re-mint both, so the stored verifier and the file its consumers read never disagree. No hash
+ *  at all → mint fresh. Returns {minted:boolean}. */
+export async function ensureBoardToken(db) {
+  return ensureFileBackedToken(db, {
+    family: BOARD_HASH_KEY, path: boardTokenPath(), mint: () => generateBoardToken(db),
+  });
 }
 
 export async function generatePhoneToken(db) {
   const token = randomBytes(32).toString("hex");
-  await writeSetting(db, PHONE_HASH_KEY, sha256Hex(token), { scope: "local" });
+  await writeSetting(db, PHONE_HASH_KEY, await mintSettingsToken(db, PHONE_HASH_KEY, token), { scope: "local" });
   await writeSetting(db, PHONE_CREATED_KEY, new Date().toISOString(), { scope: "local" });
   const path = phoneTokenPath();
   mkdirSync(dirname(path), { recursive: true });
@@ -279,27 +340,20 @@ export async function generatePhoneToken(db) {
 }
 
 export async function validatePhoneToken(db, token) {
-  if (!token) return false;
-  const stored = await readSetting(db, PHONE_HASH_KEY);
-  if (!stored) return false;
-  const a = Buffer.from(sha256Hex(token), "hex");
-  const b = Buffer.from(stored, "hex");
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
+  return verifySettingsToken(db, PHONE_HASH_KEY, token);
 }
 
 export async function ensurePhoneToken(db) {
-  const hash = await readSetting(db, PHONE_HASH_KEY);
-  if (hash && existsSync(phoneTokenPath())) return { minted: false };
-  await generatePhoneToken(db);
-  return { minted: true };
+  return ensureFileBackedToken(db, {
+    family: PHONE_HASH_KEY, path: phoneTokenPath(), mint: () => generatePhoneToken(db),
+  });
 }
 
 export const PHONE_TOKEN_KEYS = { PHONE_HASH_KEY, PHONE_CREATED_KEY };
 
 export async function generateArtifactsToken(db) {
   const token = randomBytes(32).toString("hex");
-  await writeSetting(db, ARTIFACTS_HASH_KEY, sha256Hex(token), { scope: "local" });
+  await writeSetting(db, ARTIFACTS_HASH_KEY, await mintSettingsToken(db, ARTIFACTS_HASH_KEY, token), { scope: "local" });
   await writeSetting(db, ARTIFACTS_CREATED_KEY, new Date().toISOString(), { scope: "local" });
   const path = artifactsTokenPath();
   mkdirSync(dirname(path), { recursive: true });
@@ -308,20 +362,13 @@ export async function generateArtifactsToken(db) {
 }
 
 export async function validateArtifactsToken(db, token) {
-  if (!token) return false;
-  const stored = await readSetting(db, ARTIFACTS_HASH_KEY);
-  if (!stored) return false;
-  const a = Buffer.from(sha256Hex(token), "hex");
-  const b = Buffer.from(stored, "hex");
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
+  return verifySettingsToken(db, ARTIFACTS_HASH_KEY, token);
 }
 
 export async function ensureArtifactsToken(db) {
-  const hash = await readSetting(db, ARTIFACTS_HASH_KEY);
-  if (hash && existsSync(artifactsTokenPath())) return { minted: false };
-  await generateArtifactsToken(db);
-  return { minted: true };
+  return ensureFileBackedToken(db, {
+    family: ARTIFACTS_HASH_KEY, path: artifactsTokenPath(), mint: () => generateArtifactsToken(db),
+  });
 }
 
 // Peer-relay token (item 46 PR-B): same shape as the artifacts token (hash in
@@ -337,7 +384,7 @@ export async function ensureArtifactsToken(db) {
 const PEER_RELAY_HASH_KEY = "mcp_peer_relay_token_hash";
 const PEER_RELAY_CREATED_KEY = "mcp_peer_relay_token_created";
 export function peerRelayTokenPath() {
-  return join(crowHome(), "secrets", "peer-relay-token");
+  return settingsTokenRawFile(PEER_RELAY_HASH_KEY, crowHome());
 }
 function legacyPeerRelayTokenPath() {
   return join(crowHome(), "peer-relay-token");
@@ -345,7 +392,7 @@ function legacyPeerRelayTokenPath() {
 
 export async function generatePeerRelayToken(db) {
   const token = randomBytes(32).toString("hex");
-  await writeSetting(db, PEER_RELAY_HASH_KEY, sha256Hex(token), { scope: "local" });
+  await writeSetting(db, PEER_RELAY_HASH_KEY, await mintSettingsToken(db, PEER_RELAY_HASH_KEY, token), { scope: "local" });
   await writeSetting(db, PEER_RELAY_CREATED_KEY, new Date().toISOString(), { scope: "local" });
   const path = peerRelayTokenPath();
   ensureSecretsDir(dirname(path));
@@ -355,32 +402,34 @@ export async function generatePeerRelayToken(db) {
 
 export async function validatePeerRelayToken(db, token) {
   if (!token || typeof token !== "string") return false;
-  const stored = await readSetting(db, PEER_RELAY_HASH_KEY);
-  if (!stored) return false;
-  const a = Buffer.from(sha256Hex(token), "hex");
-  const b = Buffer.from(stored, "hex");
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
+  return verifySettingsToken(db, PEER_RELAY_HASH_KEY, token);
 }
 
 export async function ensurePeerRelayToken(db) {
-  const hash = await readSetting(db, PEER_RELAY_HASH_KEY);
+  const hash = await readStoredSettingsToken(db, PEER_RELAY_HASH_KEY);
   // An older version's token at <crowHome>/peer-relay-token moves into
-  // secrets/ only when it is the minted one (its hash matches): a bot shell
-  // can write the old path, so anything else there is discarded.
+  // secrets/ only when it is the minted one (it verifies against this family's stored verifier,
+  // keyed or legacy, while the family is unconverted): a bot shell can write the old path, so
+  // anything else there is discarded.
   const legacy = legacyPeerRelayTokenPath();
   try {
     if (existsSync(legacy)) {
-      const tok = readFileSync(legacy, "utf8").trim();
-      if (hash && tok && sha256Hex(tok) === hash) migrateLegacySecretFile(legacy, peerRelayTokenPath());
+      // Hardened read too: this path is even easier to plant (it sits in CROW_HOME itself), and a
+      // FIFO here would block this pre-listen boot just as surely.
+      const read = readHardenedTokenFile(legacy);
+      const tok = read.ok ? read.token : "";
+      if (hash && tok && await verifySettingsToken(db, PEER_RELAY_HASH_KEY, tok)) migrateLegacySecretFile(legacy, peerRelayTokenPath());
       else { unlinkSync(legacy); console.warn(`[gateway] discarded ${legacy}: not this instance's minted relay token`); }
     }
   } catch (err) {
     console.warn(`[gateway] could not move the peer-relay token into secrets/: ${err.message}`);
   }
-  if (hash && existsSync(peerRelayTokenPath())) return { minted: false };
-  await generatePeerRelayToken(db);
-  return { minted: true };
+  // The stored verifier and the file must AGREE, not merely both exist (see
+  // `ensureFileBackedToken`): a file left by another key, or one that holds something else
+  // entirely, is re-minted rather than trusted.
+  return ensureFileBackedToken(db, {
+    family: PEER_RELAY_HASH_KEY, path: peerRelayTokenPath(), mint: () => generatePeerRelayToken(db),
+  });
 }
 
 // Kiosk announce token (kiosk spec §4.1): lets the kiosk bundle's stdio MCP
@@ -391,12 +440,12 @@ export async function ensurePeerRelayToken(db) {
 const KIOSK_ANNOUNCE_HASH_KEY = "kiosk_announce_token_hash";
 const KIOSK_ANNOUNCE_CREATED_KEY = "kiosk_announce_token_created";
 function kioskAnnounceTokenPath() {
-  return join(crowHome(), "kiosk-announce-token");
+  return settingsTokenRawFile(KIOSK_ANNOUNCE_HASH_KEY, crowHome());
 }
 
 export async function generateKioskAnnounceToken(db) {
   const token = randomBytes(32).toString("hex");
-  await writeSetting(db, KIOSK_ANNOUNCE_HASH_KEY, sha256Hex(token), { scope: "local" });
+  await writeSetting(db, KIOSK_ANNOUNCE_HASH_KEY, await mintSettingsToken(db, KIOSK_ANNOUNCE_HASH_KEY, token), { scope: "local" });
   await writeSetting(db, KIOSK_ANNOUNCE_CREATED_KEY, new Date().toISOString(), { scope: "local" });
   const path = kioskAnnounceTokenPath();
   mkdirSync(dirname(path), { recursive: true });
@@ -405,20 +454,13 @@ export async function generateKioskAnnounceToken(db) {
 }
 
 export async function validateKioskAnnounceToken(db, token) {
-  if (!token) return false;
-  const stored = await readSetting(db, KIOSK_ANNOUNCE_HASH_KEY);
-  if (!stored) return false;
-  const a = Buffer.from(sha256Hex(token), "hex");
-  const b = Buffer.from(stored, "hex");
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
+  return verifySettingsToken(db, KIOSK_ANNOUNCE_HASH_KEY, token);
 }
 
 export async function ensureKioskAnnounceToken(db) {
-  const hash = await readSetting(db, KIOSK_ANNOUNCE_HASH_KEY);
-  if (hash && existsSync(kioskAnnounceTokenPath())) return { minted: false };
-  await generateKioskAnnounceToken(db);
-  return { minted: true };
+  return ensureFileBackedToken(db, {
+    family: KIOSK_ANNOUNCE_HASH_KEY, path: kioskAnnounceTokenPath(), mint: () => generateKioskAnnounceToken(db),
+  });
 }
 
 export const KIOSK_ANNOUNCE_TOKEN_KEYS = { HASH: KIOSK_ANNOUNCE_HASH_KEY, CREATED: KIOSK_ANNOUNCE_CREATED_KEY };
@@ -429,12 +471,12 @@ export const KIOSK_ANNOUNCE_TOKEN_KEYS = { HASH: KIOSK_ANNOUNCE_HASH_KEY, CREATE
 const MODELS_HASH_KEY = "mcp_models_token_hash";
 const MODELS_CREATED_KEY = "mcp_models_token_created";
 export function modelsTokenPath() {
-  return join(crowHome(), "models-token");
+  return settingsTokenRawFile(MODELS_HASH_KEY, crowHome());
 }
 
 export async function generateModelsToken(db) {
   const token = randomBytes(32).toString("hex");
-  await writeSetting(db, MODELS_HASH_KEY, sha256Hex(token), { scope: "local" });
+  await writeSetting(db, MODELS_HASH_KEY, await mintSettingsToken(db, MODELS_HASH_KEY, token), { scope: "local" });
   await writeSetting(db, MODELS_CREATED_KEY, new Date().toISOString(), { scope: "local" });
   const path = modelsTokenPath();
   mkdirSync(dirname(path), { recursive: true });
@@ -443,20 +485,13 @@ export async function generateModelsToken(db) {
 }
 
 export async function validateModelsToken(db, token) {
-  if (!token) return false;
-  const stored = await readSetting(db, MODELS_HASH_KEY);
-  if (!stored) return false;
-  const a = Buffer.from(sha256Hex(token), "hex");
-  const b = Buffer.from(stored, "hex");
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
+  return verifySettingsToken(db, MODELS_HASH_KEY, token);
 }
 
 export async function ensureModelsToken(db) {
-  const hash = await readSetting(db, MODELS_HASH_KEY);
-  if (hash && existsSync(modelsTokenPath())) return { minted: false };
-  await generateModelsToken(db);
-  return { minted: true };
+  return ensureFileBackedToken(db, {
+    family: MODELS_HASH_KEY, path: modelsTokenPath(), mint: () => generateModelsToken(db),
+  });
 }
 
 export const MODELS_TOKEN_KEYS = { MODELS_HASH_KEY, MODELS_CREATED_KEY };
@@ -513,6 +548,9 @@ export async function rotateLlmCloudToken(db) {
  */
 async function rotateTokenFile(db, { path, hashKey, createdKey, label, ensureDir, onFailure }) {
   const token = randomBytes(32).toString("hex");
+  // The keyed verifier is computed BEFORE anything is written, so a lost or invalid key changes
+  // nothing at all (no temp file, no stored value) and the caller's failure path stays as it was.
+  const stored = await mintSettingsToken(db, hashKey, token);
   const failClosed = async (err) => {
     try { await deleteLocalSetting(db, hashKey); } catch (e) {
       console.warn(`[${label}] could not delete the stored hash after a failed rotation: ${e.message}`);
@@ -532,8 +570,8 @@ async function rotateTokenFile(db, { path, hashKey, createdKey, label, ensureDir
   }
   let oldHash;
   try {
-    oldHash = await readSetting(db, hashKey);
-    await writeSetting(db, hashKey, sha256Hex(token), { scope: "local" });
+    oldHash = await readStoredSettingsToken(db, hashKey);
+    await writeSetting(db, hashKey, stored, { scope: "local" });
   } catch (err) {
     dropTmp();
     return bail(err);
@@ -544,6 +582,8 @@ async function rotateTokenFile(db, { path, hashKey, createdKey, label, ensureDir
     dropTmp();
     if (onFailure === "fail-closed") return failClosed(err);
     try {
+      // The old stored value goes back EXACTLY as it was read: an `h1.` value on a converted
+      // family, so the previous boot's token keeps validating (§3.2).
       if (oldHash) await writeSetting(db, hashKey, oldHash, { scope: "local" });
       else await deleteLocalSetting(db, hashKey);
     } catch (restoreErr) {
@@ -559,15 +599,10 @@ async function rotateTokenFile(db, { path, hashKey, createdKey, label, ensureDir
   return token;
 }
 
-/** Timing-safe check against the cloud-door hash ONLY. */
+/** Timing-safe check against the cloud-door family ONLY (a keyed `verifyStored` compare). */
 export async function validateLlmCloudToken(db, token) {
   if (!token || typeof token !== "string") return false;
-  const stored = await readSetting(db, LLM_CLOUD_HASH_KEY);
-  if (!stored) return false;
-  const a = Buffer.from(sha256Hex(token), "hex");
-  const b = Buffer.from(stored, "hex");
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
+  return verifySettingsToken(db, LLM_CLOUD_HASH_KEY, token);
 }
 
 export const LLM_CLOUD_TOKEN_KEYS = { HASH: LLM_CLOUD_HASH_KEY, CREATED: LLM_CLOUD_CREATED_KEY };
@@ -594,16 +629,11 @@ export function pathScopedToken({ name, hashKey, createdKey, home }) {
      *  0700 by the shared ensureSecretsDir. */
     async rotate(db) {
       return rotateTokenFile(db, { path: path(), hashKey, createdKey, label: `${name}-token`, ensureDir: ensureSecretsDir, onFailure: "fail-closed" });
-    },
-    /** Timing-safe check against this family's hash ONLY. */
+    },    /** Timing-safe check against this family's stored verifier ONLY. */
     async validate(db, token) {
       try {
         if (!token || typeof token !== "string") return false;
-        const stored = await readSetting(db, hashKey);
-        if (!stored) return false;
-        const a = Buffer.from(sha256Hex(token), "hex");
-        const b = Buffer.from(stored, "hex");
-        return a.length === b.length && timingSafeEqual(a, b);
+        return await verifySettingsToken(db, hashKey, token);
       } catch { return false; }
     },
   };
@@ -697,10 +727,13 @@ export function localTokenAuthMiddleware(db) {
       }
       // A socket that came through the egress relay is never the operator. A
       // contained bot has crow.db bound read-write (Phase 1), so it can write
-      // mcp_local_token_hash and then present its own value as the operator's
-      // full local token — on /board/mcp, which is a door. Only the
-      // path-scoped board, phone and artifacts tokens may authenticate a
-      // relayed request.
+      // mcp_local_token_hash — and on /board/mcp, which is a door, that used to
+      // be the operator's full local token. The setting is a keyed MAC now
+      // (verifySettingsToken), so a value the bot can compute no longer
+      // verifies; the rule stays anyway, because "a relayed caller is never the
+      // owner" must not depend on which stored form a build happened to read.
+      // Only the path-scoped board, phone and artifacts tokens may authenticate
+      // a relayed request.
       const relayed = isRelayedSocket(req.socket);
       if (!relayed && await validateLocalToken(db, token)) {
         req.localTokenAuth = { token: "local-mcp" };

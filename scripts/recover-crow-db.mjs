@@ -43,7 +43,6 @@
 
 import Database from "better-sqlite3";
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import {
   existsSync, copyFileSync, renameSync, rmSync, readFileSync, mkdtempSync,
 } from "node:fs";
@@ -305,10 +304,14 @@ let tokenStatus = "no CROW_LOCAL_MCP_TOKEN found (skipped)";
 if (token) {
   const { createDbClient } = await import("../servers/db.js");
   const { writeSetting } = await import("../servers/gateway/dashboard/settings/registry.js");
-  const { validateLocalToken } = await import("../servers/gateway/local-token.js");
+  const { LOCAL_TOKEN_KEYS, validateLocalToken } = await import("../servers/gateway/local-token.js");
+  const { mintSettingsToken } = await import("../servers/gateway/token-settings.js");
   const tdb = createDbClient(TEMP);
-  await writeSetting(tdb, "mcp_local_token_hash", createHash("sha256").update(token).digest("hex"), { scope: "local" });
-  await writeSetting(tdb, "mcp_local_token_created", new Date().toISOString(), { scope: "local" });
+  // The stored verifier is the family's KEYED MAC (`mintSettingsToken`), never a bare sha256:
+  // an already-converted install refuses a legacy value, and on a box whose key was never
+  // created this mints it exactly as the boot would.
+  await writeSetting(tdb, LOCAL_TOKEN_KEYS.HASH_KEY, await mintSettingsToken(tdb, LOCAL_TOKEN_KEYS.HASH_KEY, token), { scope: "local" });
+  await writeSetting(tdb, LOCAL_TOKEN_KEYS.CREATED_KEY, new Date().toISOString(), { scope: "local" });
   const ok = await validateLocalToken(tdb, token);
   tdb.close();
   if (!ok) bail("Re-injected MCP token failed validation — refusing to swap.");

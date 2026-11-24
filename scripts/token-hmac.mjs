@@ -13,16 +13,34 @@
  *   2. Deletes EVERY `oauth_tokens` row: every OAuth grant (access and refresh) and every
  *      dashboard session is revoked. The dashboard password is NOT touched, so the owner
  *      signs in again with the password (or the first-run / 2FA flow) and gets a new session.
+ *   2b. Deletes the stored verifiers of the SETTINGS-BACKED static tokens (§1a: local MCP,
+ *      board, phone, artifacts, models, peer relay, cloud door, the path-scoped loopback
+ *      families and kiosk announce) from BOTH settings stores. They are keyed under the key
+ *      this run retires, so leaving them would strand every one of those doors on a FOREIGN
+ *      keyId. Deleting the verifier lets each family's own mint write a fresh one — the next
+ *      boot re-ensures or rotates all of them except the local MCP token, which the owner
+ *      generates again in Settings → Connect. Those rows are keyed by `(key, instance_id)`, so
+ *      the delete targets THIS instance's id from `<data dir>/instance-id` — the file the
+ *      gateway itself uses — and the run REFUSES before changing anything (exit 1) when this
+ *      home has no such file: an id this process invented would match no row, and the reset
+ *      would delete nothing while reporting success.
  *   3. Creates a new key and reports its id.
- *   4. Re-marks the three families CONVERTED (no rows behind them) — in the state file AND the
- *      `token_hmac_era:*` mirror. NO step of this tool clears or deletes a family marker: they
- *      stay CONVERTED throughout, because a converted family means "a bare sha256 is not a
- *      credential here", so a legacy row written between this reset and the next gateway boot
- *      is refused and alarmed instead of being laundered into a valid `h1.` row by that boot.
- *      Every sibling family's era and `password_set_at` stay in the state file, which is never
- *      moved aside.
+ *   4. Re-marks EVERY family CONVERTED (no rows behind them) — the three `oauth_tokens`
+ *      families AND the thirteen settings-backed ones — in the state file AND the
+ *      `token_hmac_era:*` mirror. The settings families are marked even on a box whose key was
+ *      lost BEFORE their conversion ever ran, and that is the point: with no marker of its own,
+ *      a bare sha256 a bot plants in `mcp_local_token_hash` while the gateway is stopped (its
+ *      units keep running) would be laundered into a valid `h1.` credential by the next boot —
+ *      owner authority from a row something without the key wrote. Marked converted, that value
+ *      is refused and alarmed instead, and each family's own mint writes its fresh verifier.
+ *      NO step of this tool clears or deletes a family marker: they stay CONVERTED throughout,
+ *      because a converted family means "a bare sha256 is not a credential here", so a legacy
+ *      row written between this reset and the next gateway boot is refused and alarmed instead
+ *      of being laundered by that boot. Every sibling family's era and `password_set_at` stay in
+ *      the state file, which is never moved aside.
  *
- * Net effect: a new key, an empty table, and the three families converted.
+ * Net effect: a new key, an empty `oauth_tokens`, no static-token verifiers, and every family
+ * converted.
  *
  * Run it with the gateway STOPPED (it opens crow.db directly and replaces the key underneath
  * it). The tool probes `/health` first, on the gateway's OWN two expressions —
@@ -151,9 +169,11 @@ import {
 } from "../servers/shared/token-mac.js";
 import { gatewayListenHost } from "../servers/gateway/listen-host.js";
 import { gatewayListenPort } from "../servers/gateway/listen-port.js";
+import { readLocalInstanceIdOrNull } from "../servers/shared/crow-home.js";
 import { writeSetting } from "../servers/gateway/dashboard/settings/registry.js";
 import { getOrCreateLocalInstanceId } from "../servers/gateway/instance-registry.js";
 import { FAMILY_PREDICATE, TOKEN_STORE_FAMILIES, tokenFamilyConverted } from "../servers/gateway/token-store.js";
+import { SETTINGS_TOKEN_FAMILIES } from "../servers/gateway/token-settings.js";
 import { ROLLBACK_PREFIX } from "../servers/gateway/boot/token-hmac.js";
 
 /** The health probe's budget: a live gateway answers long before this. */
@@ -177,6 +197,23 @@ const LEGACY_STORED = /^[0-9a-f]{64}$/;
 
 /** The three families a rollback may restore — exactly the ones the boot converter visits. */
 const RESTORABLE = new Set(TOKEN_STORE_FAMILIES);
+
+/**
+ * Every family `--reset` marks CONVERTED (step 4): the three `oauth_tokens` families, whose rows
+ * this run just deleted, and the thirteen settings-backed ones, whose stored verifiers it just
+ * deleted. Marking a settings family that had no era yet is deliberate — see the header's step 4:
+ * without the marker, the next boot would CONVERT a bare sha256 a bot planted while the gateway
+ * was stopped.
+ */
+const CONVERTED_FAMILIES = Object.freeze([...TOKEN_STORE_FAMILIES, ...SETTINGS_TOKEN_FAMILIES]);
+
+/**
+ * `--reset`'s refusal when this home carries no `<data dir>/instance-id` (step 2b). Fixed text:
+ * the reset cannot name the instance whose settings rows it must delete, so it changes nothing.
+ */
+const NO_INSTANCE_ID_REFUSAL =
+  "No instance id at <data dir>/instance-id, so this home's stored token verifiers cannot be "
+  + "targeted. Nothing was changed. Start the gateway once (it writes that file), then run this again.";
 
 /** Loopback or the unspecified address, in any spelling a bind may carry. */
 function isLoopbackOrWildcard(host) {
@@ -244,6 +281,55 @@ function confirm(question) {
   });
 }
 
+/**
+ * Delete the SETTINGS-BACKED static tokens' stored verifiers (`--reset` step 2b).
+ *
+ * The rows are keyed by `(key, instance_id)`, so the delete means something only with THIS
+ * instance's own id — the one `readLocalInstanceIdOrNull()` reads from `<data dir>/instance-id`,
+ * the same file the gateway uses. Never `getOrCreateLocalInstanceId()` here: on a home that
+ * carries no such file it mints a random per-process id, which matches no row, so the reset would
+ * delete nothing and still report success. `reset()` refuses (exit 1, nothing changed) before
+ * this is called when the file is missing.
+ *
+ * A settings store this DB does not have is skipped on its own, exactly as
+ * `deleteEraMirrorRows` does for the era mirror, so a unit-test database loses only what it has.
+ *
+ * @param {object} db the gateway's crow.db client
+ * @param {string} localId this instance's id (overrides are keyed by it)
+ * @returns {Promise<number>} rows deleted
+ */
+async function dropSettingTokens(db, localId) {
+  const hasTable = async (table) => {
+    try {
+      const { rows } = await db.execute({
+        sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", args: [table],
+      });
+      return (rows?.length ?? 0) > 0;
+    } catch { return false; }
+  };
+  const overrides = await hasTable("dashboard_settings_overrides");
+  const globals = await hasTable("dashboard_settings");
+  let deleted = 0;
+  for (const family of SETTINGS_TOKEN_FAMILIES) {
+    if (overrides) {
+      try {
+        const res = await db.execute({
+          sql: "DELETE FROM dashboard_settings_overrides WHERE key = ? AND instance_id = ?",
+          args: [family, localId],
+        });
+        deleted += Number(res?.rowsAffected ?? 0) || 0;
+      } catch { /* this store could not be written: nothing was deleted from it */ }
+    }
+    if (globals) {
+      try {
+        const res = await db.execute({ sql: "DELETE FROM dashboard_settings WHERE key = ?", args: [family] });
+        deleted += Number(res?.rowsAffected ?? 0) || 0;
+      } catch { /* same */ }
+    }
+  }
+  return deleted;
+}
+
 async function reset({ yes, force }) {
   const keyPath = tokenMacKeyPath();
 
@@ -260,6 +346,16 @@ async function reset({ yes, force }) {
     }
   }
 
+  // 2b needs this home's OWN instance id: the settings verifiers live in
+  // `dashboard_settings_overrides`, keyed by `(key, instance_id)`. It is read from the file the
+  // gateway itself uses, and a home without one is refused here — before anything moves — because
+  // an id this process invented would target no row and delete nothing.
+  const localId = readLocalInstanceIdOrNull();
+  if (!localId) {
+    console.error(NO_INSTANCE_ID_REFUSAL);
+    return 1;
+  }
+
   if (!yes) {
     console.log("This will:");
     console.log("  - revoke EVERY OAuth grant and dashboard session (all oauth_tokens rows)");
@@ -273,12 +369,13 @@ async function reset({ yes, force }) {
   }
 
   // 1. The key goes aside first: nothing may mint under it after this line. The era state is NOT
-  //    touched here — the three families stay CONVERTED throughout (step 4 re-marks them), so
-  //    the reset has no window in which a family is unconverted.
+  //    touched here — every family stays CONVERTED throughout (step 4 re-marks them, including
+  //    the settings-backed ones), so the reset has no window in which a family is unconverted.
   const movedKey = moveAside(keyPath, "lost");
 
   const db = createDbClient();
   let revoked = 0;
+  let droppedStatic = 0;
   let key;
   let mirrored = 0;
   try {
@@ -286,18 +383,31 @@ async function reset({ yes, force }) {
     const res = await db.execute({ sql: "DELETE FROM oauth_tokens", args: [] });
     revoked = Number(res?.rowsAffected ?? 0) || 0;
 
+    // 2b. The SETTINGS-BACKED static tokens (§1a: local MCP, board, phone, artifacts, models,
+    //     peer relay, cloud door, the path-scoped loopback families, kiosk announce) are keyed
+    //     under the key this run is retiring, so after it every stored one reads as a FOREIGN
+    //     keyId and refuses. Their verifiers are deleted here so each family's own mint writes a
+    //     fresh one: the boot re-ensures board/phone/artifacts/models/peer relay/kiosk, rotates
+    //     the cloud door and the path-scoped families, and the owner re-generates the local MCP
+    //     token in the Connect panel. This deletes VERIFIERS, not eras — every family is marked
+    //     converted in step 4 (which is what makes a bare sha256 written in the meantime refused
+    //     and alarmed rather than laundered by the next boot).
+    droppedStatic = await dropSettingTokens(db, localId);
+
     // 3. A fresh key, so the box is immediately coherent (no login has to mint it). This is
     //    the one place a key may be created over an existing state file: the operator retired
     //    the old key on purpose, and every other field of the state stays as it is.
     key = adoptOperatorKey({ at: new Date().toISOString() });
 
-    // 4. Re-mark the three families CONVERTED, never cleared: from here on a legacy sha256 row in
-    //    one of them is refused and alarmed by every validator AND by the next boot's scan,
-    //    instead of being converted into a valid `h1.` row. A family that was already converted
-    //    keeps its first `converted_at` (markConverted is add-only); the DB mirror is written by
+    // 4. Re-mark EVERY family CONVERTED, never cleared: the three `oauth_tokens` families and all
+    //    thirteen settings-backed ones. From here on a legacy sha256 value in one of them — a row
+    //    in oauth_tokens, a settings verifier a bot plants while the gateway is stopped — is
+    //    refused and alarmed by every validator AND by the next boot's scan, instead of being
+    //    converted into a valid `h1.` credential. A family that was already converted keeps its
+    //    first `converted_at` (markConverted is add-only); the DB mirror is written by
     //    markConverted itself (`token_hmac_era:<family>`, local scope).
-    for (const family of TOKEN_STORE_FAMILIES) {
-      // eslint-disable-next-line no-await-in-loop -- three families, one operator run
+    for (const family of CONVERTED_FAMILIES) {
+      // eslint-disable-next-line no-await-in-loop -- sixteen families, one operator run
       const mark = await markConverted(family, {
         count: 0,
         rollbackFile: null,
@@ -314,8 +424,13 @@ async function reset({ yes, force }) {
   console.log("Token key reset.");
   console.log(`  key file:      ${movedKey ? `moved aside → ${movedKey}` : "none (already absent)"}`);
   console.log(`  new key id:    ${key.id} (${keyPath})`);
-  console.log(`  era state:     re-marked converted, never cleared: ${TOKEN_STORE_FAMILIES.join(", ")}`);
+  console.log(`  era state:     re-marked converted, never cleared: the ${TOKEN_STORE_FAMILIES.length} oauth_tokens`);
+  console.log(`                 families and the ${SETTINGS_TOKEN_FAMILIES.length} settings-backed ones (no rows behind them)`);
   console.log(`  oauth_tokens:  ${revoked} row(s) deleted — every OAuth grant and dashboard session is revoked`);
+  console.log(`  static tokens: ${droppedStatic} stored verifier(s) deleted — board, phone, artifacts, models,`);
+  console.log("                 peer relay, cloud door, services, satellite tools, secrets, sharing bot, reports");
+  console.log("                 and kiosk announce are re-minted at the next start; the local MCP token has to");
+  console.log("                 be generated again in Settings → Connect (its raw value is not kept anywhere)");
   console.log(`  era mirror:    ${mirrored} family marker(s) written to the DB as converted (no rows behind them)`);
   console.log("");
   console.log("Start the gateway again. Existing MCP clients must re-authorize, and every browser");

@@ -141,6 +141,9 @@ function scratch(seed = null) {
   process.env.CROW_DATA_DIR = join(root, "data");
   process.env.CROW_DB_PATH = join(root, "data", "crow.db");
   mkdirSync(process.env.CROW_DATA_DIR, { recursive: true });
+  // The gateway writes `<data dir>/instance-id` on its first boot, and `--reset` reads THAT file
+  // to target the per-instance settings rows (it refuses, exit 1, on a home without one).
+  writeFileSync(join(process.env.CROW_DATA_DIR, "instance-id"), "0123456789abcdef0123456789abcdef", { mode: 0o600 });
   forgetTokenMacKey();
   forgetTokenMacAlarms();
   forgetTokenStoreEvidence();
@@ -191,8 +194,8 @@ async function rowCount(db) {
   return Number(rows[0]?.n ?? 0);
 }
 
-async function settingsCount(db, sql) {
-  const { rows } = await db.execute({ sql, args: [] });
+async function settingsCount(db, sql, args = []) {
+  const { rows } = await db.execute({ sql, args });
   return Number(rows[0]?.n ?? 0);
 }
 
@@ -996,8 +999,14 @@ const SEEDED = [
   [SESSION_RAW, DASHBOARD_SESSION_FAMILY],
 ];
 
+const OAUTH_ERA_FAMILIES = [OAUTH_ACCESS_FAMILY, OAUTH_REFRESH_FAMILY, DASHBOARD_SESSION_FAMILY];
+// The `oauth_tokens` era's own mirror rows. Scoped to those three on purpose: a `--reset` also
+// marks the thirteen SETTINGS-backend families converted in the same table, and their era is a
+// separate rail a rollback of this era never touches.
 const eraMirrorRows = (db) => settingsCount(db,
-  "SELECT COUNT(*) AS n FROM dashboard_settings_overrides WHERE key LIKE 'token_hmac_era:%'");
+  `SELECT COUNT(*) AS n FROM dashboard_settings_overrides WHERE key LIKE 'token_hmac_era:%'`
+  + ` AND key IN (${OAUTH_ERA_FAMILIES.map(() => "?").join(", ")})`,
+  OAUTH_ERA_FAMILIES.map((family) => `token_hmac_era:${family}`));
 
 const movedAside = (s, prefix) => {
   try {

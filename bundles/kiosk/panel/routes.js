@@ -88,6 +88,11 @@ const runtime = createKioskRuntime({
   themeCss: () => kioskThemeCss(PERCH_TOKENS),
   files: { publicDir: join(BUNDLE_DIR, "public"), birdSvgPath: join(APP_ROOT, "bundles", "ramble", "server", "bird-svg.cjs") },
   announceToken: { validate: validateKioskAnnounceToken },
+  // The announce token's stored verifier is a KEYED MAC since the keyed-token-hashes design
+  // (§1a): `validateKioskAnnounceToken` is `verifyStored` under the `kiosk_announce_token_hash`
+  // domain, so a bare sha256 planted in crow.db — the forgery a contained bot can mount — is
+  // refused and alarmed instead of accepted. The validator's SIGNATURE is unchanged, so this
+  // panel passes it exactly as before.
   addonDoor: { isAddonRelayed: (req) => isAddonRelayAddr(req.socket?.remoteAddress), validate: validateAddonDoorToken },
   // A contained bot's egress relay is loopback too, but it is never this machine's own tool
   // server: the kiosk's announce token and a display's device token are owner/device authority
