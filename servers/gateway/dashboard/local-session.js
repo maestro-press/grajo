@@ -11,23 +11,21 @@
  * a login from this machine (scopes 'dashboard onhost', dashboard/auth.js), wherever it is
  * replayed from. Both still browse the dashboard as signed in; only the owner's turn is refused.
  */
-import { createHash } from "node:crypto";
 import { createDbClient } from "../../db.js";
 import { isSelfOrigin } from "../../shared/self-origin.js";
-
-// The same hash dashboard/auth.js stores session tokens under.
-const hashToken = (t) => createHash("sha256").update(String(t)).digest("hex");
+import { DASHBOARD_SESSION_FAMILY, findTokenRow } from "../token-store.js";
 
 /** The same check on a crow.db client the caller already holds (one client per request). */
 export async function isLocalPasswordSessionOn(db, req) {
   if (!req?.dashboardSession || req?.crossHostAuth) return false;
   if (isSelfOrigin(req)) return false;
   try {
-    const r = await db.execute({
-      sql: "SELECT scopes FROM oauth_tokens WHERE token = ? AND client_id = 'dashboard' AND julianday(expires_at) > julianday('now')",
-      args: [hashToken(req.dashboardSession)],
+    // The `dashboard:session` family: the keyed form, or (only while the family is not
+    // converted) the old sha256 — never a private copy of the hash (design §8 PR 2).
+    const row = await findTokenRow(db, DASHBOARD_SESSION_FAMILY, req.dashboardSession, {
+      extraWhere: " AND julianday(expires_at) > julianday('now')",
     });
-    return r.rows[0]?.scopes === "dashboard";
+    return row?.scopes === "dashboard";
   } catch {
     return false;
   }

@@ -10,11 +10,15 @@ import { readRunnerSecret } from "../bundles/phone/server/secrets.js";
 import { fromLaptop } from "./helpers/off-box.js";
 
 const sha = (s) => createHash("sha256").update(s).digest("hex");
+/** The real table's shape for the columns the family predicates read (scripts/init-db.js):
+ *  a dashboard session is `token_type='access'` with `client_id='dashboard'`, and the store's
+ *  reader selects by that pair, so the fake must carry `token_type` too. */
+const DASHBOARD_SESSION_COLUMNS = "token TEXT PRIMARY KEY, token_type TEXT, client_id TEXT, scopes TEXT, expires_at TEXT";
 
 test("local session yes, SSO session no, expired no", async () => {
   const db = createDbClient(join(mkdtempSync(join(tmpdir(), "phone-auth-")), "crow.db"));
-  await db.execute({ sql: "CREATE TABLE oauth_tokens (token TEXT PRIMARY KEY, client_id TEXT, scopes TEXT, expires_at TEXT)", args: [] });
-  const ins = (raw, scopes, exp) => db.execute({ sql: "INSERT INTO oauth_tokens VALUES (?,?,?,datetime('now', ?))", args: [sha(raw), "dashboard", scopes, exp] });
+  await db.execute({ sql: `CREATE TABLE oauth_tokens (${DASHBOARD_SESSION_COLUMNS})`, args: [] });
+  const ins = (raw, scopes, exp) => db.execute({ sql: "INSERT INTO oauth_tokens (token, token_type, client_id, scopes, expires_at) VALUES (?, 'access', 'dashboard', ?, datetime('now', ?))", args: [sha(raw), scopes, exp] });
   await ins("local", "dashboard", "+1 day");
   await ins("sso", "dashboard sso", "+1 day");
   await ins("old", "dashboard", "-1 day");
@@ -26,11 +30,12 @@ test("local session yes, SSO session no, expired no", async () => {
 
 test("local session with ISO string expires_at: expired rejected, future accepted", async () => {
   const db = createDbClient(join(mkdtempSync(join(tmpdir(), "phone-auth-")), "crow.db"));
-  await db.execute({ sql: "CREATE TABLE oauth_tokens (token TEXT PRIMARY KEY, client_id TEXT, scopes TEXT, expires_at TEXT)", args: [] });
+  await db.execute({ sql: `CREATE TABLE oauth_tokens (${DASHBOARD_SESSION_COLUMNS})`, args: [] });
   const expiredIso = new Date(Date.now() - 60_000).toISOString();
   const futureIso = new Date(Date.now() + 86_400_000).toISOString();
-  await db.execute({ sql: "INSERT INTO oauth_tokens VALUES (?,?,?,?)", args: [sha("expired"), "dashboard", "dashboard", expiredIso] });
-  await db.execute({ sql: "INSERT INTO oauth_tokens VALUES (?,?,?,?)", args: [sha("future"), "dashboard", "dashboard", futureIso] });
+  const ins = (stored, exp) => db.execute({ sql: "INSERT INTO oauth_tokens (token, token_type, client_id, scopes, expires_at) VALUES (?, 'access', 'dashboard', 'dashboard', ?)", args: [stored, exp] });
+  await ins(sha("expired"), expiredIso);
+  await ins(sha("future"), futureIso);
   assert.equal(await isLocalDashboardSession(db, fromLaptop({ dashboardSession: "expired" })), false);
   assert.equal(await isLocalDashboardSession(db, fromLaptop({ dashboardSession: "future" })), true);
 });

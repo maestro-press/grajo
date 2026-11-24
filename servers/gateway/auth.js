@@ -10,8 +10,9 @@ import { randomUUID, createHash } from "node:crypto";
 import { InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { createDbClient, auditLog } from "../db.js";
 import { createPendingAuthorization } from "./oauth-consent.js";
-
-function hashToken(t) { return createHash('sha256').update(t).digest('hex'); }
+import {
+  deleteTokenRow, findTokenRow, mintStoreToken, OAUTH_ACCESS_FAMILY, OAUTH_REFRESH_FAMILY,
+} from "./token-store.js";
 
 /**
  * client_id of the dashboard's own session rows. Dashboard sessions are stored
@@ -149,12 +150,14 @@ export class CrowOAuthProvider {
     const refreshToken = randomUUID();
     const expiresIn = 86400; // 24 hours
 
-    // Store hashed tokens in DB
+    // Store the keyed verifiers in DB. `mintStoreToken` is `macToken` for the family,
+    // after the one-time key ensure; `oauth:access` and `oauth:refresh` are separate
+    // domains, so neither stored value can stand in for the other (design §2.3).
     await this.db.execute({
       sql: `INSERT INTO oauth_tokens (token, token_type, client_id, scopes, expires_at, resource)
             VALUES (?, 'access', ?, ?, datetime('now', '+' || ? || ' seconds'), ?)`,
       args: [
-        hashToken(accessToken),
+        await mintStoreToken(this.db, OAUTH_ACCESS_FAMILY, accessToken),
         client.client_id,
         (codeData.params.scopes || []).join(" "),
         expiresIn,
@@ -166,7 +169,7 @@ export class CrowOAuthProvider {
       sql: `INSERT INTO oauth_tokens (token, token_type, client_id, scopes, expires_at, resource)
             VALUES (?, 'refresh', ?, ?, datetime('now', '+30 days'), ?)`,
       args: [
-        hashToken(refreshToken),
+        await mintStoreToken(this.db, OAUTH_REFRESH_FAMILY, refreshToken),
         client.client_id,
         (codeData.params.scopes || []).join(" "),
         codeData.params.resource?.toString() || null,
@@ -185,16 +188,16 @@ export class CrowOAuthProvider {
   }
 
   async exchangeRefreshToken(client, refreshToken, scopes, resource) {
-    const hashedRefresh = hashToken(refreshToken);
-    const { rows } = await this.db.execute({
-      sql: "SELECT * FROM oauth_tokens WHERE token = ? AND token_type = 'refresh' AND client_id = ?",
-      args: [hashedRefresh, client.client_id],
+    // The refresh family is its own MAC domain, and the client id still has to match.
+    // A legacy row is found (and then refused + alarmed) only inside the refresh family.
+    const row = await findTokenRow(this.db, OAUTH_REFRESH_FAMILY, refreshToken, {
+      extraWhere: " AND client_id = ?",
+      extraArgs: [client.client_id],
     });
 
-    if (rows.length === 0) throw new Error("Invalid refresh token");
-    const row = rows[0];
+    if (!row) throw new Error("Invalid refresh token");
     if (!(dbTimeMs(row.expires_at) > Date.now())) {
-      await this.db.execute({ sql: "DELETE FROM oauth_tokens WHERE token = ?", args: [hashedRefresh] });
+      await deleteTokenRow(this.db, OAUTH_REFRESH_FAMILY, refreshToken);
       throw new Error("Refresh token expired");
     }
 
@@ -203,7 +206,7 @@ export class CrowOAuthProvider {
       const createdAt = new Date(dbTimeMs(row.created_at));
       const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
       if (Date.now() - createdAt.getTime() > thirtyDaysMs) {
-        await this.db.execute({ sql: "DELETE FROM oauth_tokens WHERE token = ?", args: [hashedRefresh] });
+        await deleteTokenRow(this.db, OAUTH_REFRESH_FAMILY, refreshToken);
         throw new Error("Session expired — please re-authenticate");
       }
     }
@@ -216,7 +219,7 @@ export class CrowOAuthProvider {
       sql: `INSERT INTO oauth_tokens (token, token_type, client_id, scopes, expires_at, resource)
             VALUES (?, 'access', ?, ?, datetime('now', '+' || ? || ' seconds'), ?)`,
       args: [
-        hashToken(newAccessToken),
+        await mintStoreToken(this.db, OAUTH_ACCESS_FAMILY, newAccessToken),
         client.client_id,
         row.scopes,
         expiresIn,
@@ -236,16 +239,13 @@ export class CrowOAuthProvider {
   }
 
   async verifyAccessToken(token) {
-    const hashedToken = hashToken(token);
-    const { rows } = await this.db.execute({
-      sql: "SELECT * FROM oauth_tokens WHERE token = ? AND token_type = 'access' AND client_id != ?",
-      args: [hashedToken, DASHBOARD_CLIENT_ID],
-    });
+    // `oauth:access` excludes the dashboard-session client on BOTH sides (S4): a session
+    // cookie's keyed value was minted under `dashboard:session` and cannot verify here.
+    const row = await findTokenRow(this.db, OAUTH_ACCESS_FAMILY, token);
 
-    if (rows.length === 0) throw new InvalidTokenError("Invalid token");
-    const row = rows[0];
+    if (!row) throw new InvalidTokenError("Invalid token");
     if (!(dbTimeMs(row.expires_at) > Date.now())) {
-      await this.db.execute({ sql: "DELETE FROM oauth_tokens WHERE token = ?", args: [hashedToken] });
+      await deleteTokenRow(this.db, OAUTH_ACCESS_FAMILY, token);
       throw new InvalidTokenError("Token expired");
     }
 

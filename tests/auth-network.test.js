@@ -1285,6 +1285,10 @@ test("auth-network: the Services Private switch refuses SSO, onhost and this-mac
   let wrote = 0;
   const fakeDb = () => ({
     execute: async ({ sql }) => {
+      // The session verifier reads the era mirror (a local setting) and probes for an `h1.`
+      // row before it looks the session up: both are READS, not the connection lookup.
+      if (/token LIKE 'h1\.%'/.test(sql)) return { rows: [] };
+      if (/FROM dashboard_settings/.test(sql)) return { rows: [] };
       if (/FROM oauth_tokens/.test(sql)) return { rows: [{ scopes }] };
       wrote++;
       return { rows: [] };
@@ -1386,10 +1390,14 @@ test("Crow Mail's OAuth callback refuses Funnel and a peer-SSO session before ta
     take() { spent.take += 1; return null; },
     size() { return 0; },
   };
-  const SCOPES = new Map([
-    [hash("owner-session"), "dashboard"],
-    [hash("peer-sso-session"), "dashboard sso src:peer-1"],
-  ]);
+  // The session reader looks a row up BY its stored value, so the fixture maps BOTH forms
+  // the store can hold: the old sha256 and (when this process has a key) the keyed `h1.` value.
+  const { DASHBOARD_SESSION_FAMILY, storedCandidates } = await import("../servers/gateway/token-store.js");
+  const SCOPES = new Map();
+  for (const [raw, scope] of [["owner-session", "dashboard"], ["peer-sso-session", "dashboard sso src:peer-1"]]) {
+    for (const stored of storedCandidates(DASHBOARD_SESSION_FAMILY, raw)) SCOPES.set(stored, scope);
+  }
+  void hash;
   const fakeDb = {
     async execute(query) {
       const args = query && typeof query === "object" ? (query.args ?? []) : [];

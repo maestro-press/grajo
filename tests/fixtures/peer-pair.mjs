@@ -29,6 +29,7 @@ import { createHash, randomBytes } from "node:crypto";
 import Database from "better-sqlite3";
 import { generateEnrollOtc } from "../../servers/shared/enroll-guard.js";
 import { ensureSyncTables } from "../../servers/shared/sync-stamp.js";
+import { macToken } from "../../servers/shared/token-mac.js";
 
 export const REPO = new URL("../..", import.meta.url).pathname;
 const UID = String(typeof process.getuid === "function" ? process.getuid() : 0);
@@ -560,8 +561,16 @@ export class Instance {
   /** A dashboard session on this instance (the operator, for Settings POSTs). */
   operatorSession() {
     const token = randomBytes(32).toString("hex");
+    // Once this instance's gateway has booted, its dashboard:session family is converted to keyed
+    // hashes and a bare sha256 row is refused as a forgery; mint the row the way the gateway does.
+    let converted = false;
+    try {
+      const st = JSON.parse(readFileSync(join(this.dir, "secrets", "token-hmac-state.json"), "utf8"));
+      converted = Boolean(st?.families?.["dashboard:session"]?.converted_at);
+    } catch { /* no state yet: the family is still legacy */ }
+    const stored = converted ? macToken("dashboard:session", token, { crowHome: this.dir }) : sha(token);
     this.sql("INSERT INTO oauth_tokens (token, token_type, client_id, scopes, expires_at) VALUES (?, 'access', 'dashboard', 'dashboard', ?)",
-      [sha(token), new Date(Date.now() + 3_600_000).toISOString()]);
+      [stored, new Date(Date.now() + 3_600_000).toISOString()]);
     return token;
   }
 }

@@ -9,11 +9,15 @@
  *
  * The bot-run extensions need CREDENTIALS, never the instance seed: storage needs the opened
  * Shared Storage settings (piped over the fd by scripts/pi-bots/mcp_writer.mjs), and Ramble
- * needs public persona authors. So no code that a Crow bot can execute may import the two
- * modules that hold the seed:
+ * needs public persona authors. So no code that a Crow bot can execute may import the modules
+ * that hold the seed — or the key the stored-verifier MACs are minted under:
  *
  *   servers/sharing/identity.js    — the master seed, every derived key, loadOrCreateIdentity
  *   servers/sharing/secret-box.js  — the HKDF "crow-secret-box-v1" seal key over that seed
+ *   servers/shared/token-mac.js    — <CROW_HOME>/secrets/token-hmac.key: the HMAC key a
+ *                                    stored credential's verifier is computed with. A bot that
+ *                                    read it could forge the very rows the keyed hashes exist
+ *                                    to protect, so it is host-only like the two above.
  *
  * "Bot-reachable" is DERIVED, not hard-coded:
  *   - every stdio server the bot catalog can emit (CORE_SERVERS + CONDITIONAL_SERVERS): the
@@ -66,10 +70,11 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { CORE_SERVERS, CONDITIONAL_SERVERS, ROOT } from "../scripts/server-registry.js";
 import { crowServerCatalog } from "../scripts/pi-bots/crow-server-catalog.mjs";
 
-/** The two modules a bot-reachable file may never import. */
-const SEED_MODULES = [
+/** The host-only modules a bot-reachable file may never import (see the header). */
+const GUARDED_MODULES = [
   "servers/sharing/identity.js",
   "servers/sharing/secret-box.js",
+  "servers/shared/token-mac.js",
 ].map((p) => resolve(ROOT, p));
 
 /** Where those modules live: not a ROOT of the walk, see the header. */
@@ -104,6 +109,20 @@ export const ALLOWED_HOST_SIDE = Object.freeze({
     "Crow Messages' HOST-SIDE adapter (the pibot-gateways process, never a bot child): it reads " +
     "the instance identity to address this instance on its own relay, which is the same " +
     "authority the gateway has.",
+  "servers/gateway/token-store.js":
+    "the gateway's oauth_tokens store layer: the ONE place a session, OAuth access or OAuth " +
+    "refresh verifier is minted and checked (design §8 PR 2), so it imports the token-mac key " +
+    "module. NO bot child loads it today: the walk reaches it through exactly TWO chains, and " +
+    "both are imported only from that bundle's panel/ code, which runs in the GATEWAY. " +
+    "Chain 1: bundles/maker-lab/server/device-binding.js -> servers/gateway/dashboard/auth.js " +
+    "(for sessionFromRequest), imported only from bundles/maker-lab/panel/routes.js and " +
+    "panel/maker-lab.js. Chain 2: bundles/phone/server/authority.js -> " +
+    "servers/gateway/dashboard/local-session.js, imported only from " +
+    "bundles/phone/panel/routes.js. In the nnp/none sandbox tiers the key file is readable by " +
+    "the gateway's own user anyway, so neither chain adds a capability a bot lacks there; in " +
+    "the bwrap tiers <CROW_HOME>/secrets is masked and every mint/verify fails closed with " +
+    "key-missing. This entry stays until a follow-up moves those two server/ files out of a " +
+    "bot-reachable tree.",
   "servers/sharing/instance-sync.js":
     "instance sync's signing (identity.js's sign/verify) is reached only from emitChange and " +
     "the feed paths, which run in the GATEWAY process that owns the feeds; a bot's server " +
@@ -223,9 +242,9 @@ export function importSpecifiers(src) {
   return out;
 }
 
-/** Does this specifier name one of the seed modules, from a file at `file`? */
+/** Does this specifier name one of the guarded host-only modules, from a file at `file`? */
 export function namesSeedModule(spec, file, { root = ROOT } = {}) {
-  const guarded = SEED_MODULES.map((p) => (root === ROOT ? p : resolve(root, relative(ROOT, p))));
+  const guarded = GUARDED_MODULES.map((p) => (root === ROOT ? p : resolve(root, relative(ROOT, p))));
   const clean = String(spec).split("?")[0];
   if (!clean) return false;
   let abs = null;
@@ -402,14 +421,14 @@ export function seedImportViolations(files, { root = ROOT, allow = ALLOWED_HOST_
 
 // ─── the guard itself ───────────────────────────────────────────────────────
 
-test("no bot-reachable file — transitively — imports the seed or the seal helpers", () => {
+test("no bot-reachable file — transitively — imports the seed, the seal helpers or the token-mac key", () => {
   const files = botReachableFiles();
   assert.ok(files.length > 100, "the derived set is the real tree, not a handful of files: " + files.length);
   const { violations } = walkSeedImports(files);
   assert.deepEqual(
     violations,
     [],
-    "bot-reachable code must not reach the identity or the seal helpers. Move the work host-side " +
+    "bot-reachable code must not reach the identity, the seal helpers or the token-mac key. Move the work host-side " +
     "(scripts/pi-bots/mcp_writer.mjs opens a value and pipes the OPENED config), lazy-import it " +
     "behind the host-only condition, or add the file to ALLOWED_HOST_SIDE with the host-side reason. " +
     "Chains: " + violations.map((v) => `${v.file}:${v.line} -> ${v.spec} (${v.chain.join(" -> ")})`).join(" | "),
@@ -425,6 +444,21 @@ test("no bot-reachable file uses a non-literal import specifier (a reviewed list
     "Use a literal specifier, or add the file to ALLOWED_DYNAMIC_IMPORT with the reason its target " +
     "can only be a known set. Offenders: " + offenders.join(", "),
   );
+});
+
+test("the token-mac key module is guarded like the seed, and no bot entry reaches it", () => {
+  const tokenMac = resolve(ROOT, "servers", "shared", "token-mac.js");
+  assert.ok(GUARDED_MODULES.includes(tokenMac),
+    "servers/shared/token-mac.js belongs in the guarded set: it holds the HMAC key every stored verifier is minted under");
+  // Both specifier shapes a bot-reachable file could use.
+  assert.equal(namesSeedModule("../../../servers/shared/token-mac.js", resolve(ROOT, "bundles/x/server/y.js"), { root: ROOT }), true);
+  assert.equal(namesSeedModule("servers/shared/token-mac.js", resolve(ROOT, "scripts/pi-bots/x.mjs"), { root: ROOT }), true);
+  const files = botReachableFiles().map((f) => relative(ROOT, f).split(sep).join("/"));
+  assert.equal(files.includes("servers/shared/token-mac.js"), false,
+    "the key module is host-only and can never be a bot entry");
+  const { violations } = walkSeedImports(botReachableFiles());
+  assert.equal(violations.some((v) => v.spec.includes("token-mac")), false,
+    "no bot-reachable chain imports the token-mac key module");
 });
 
 test("the derived set covers the places that matter (it cannot shrink silently)", () => {

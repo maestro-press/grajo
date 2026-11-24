@@ -34,8 +34,8 @@
  * Nothing here writes: the buttons go to the owner API (routes/reports-api.js), which is where every
  * decision and every seal lives. This panel only reads.
  */
-import { createHash } from "node:crypto";
 import { isLocalPasswordSessionOn } from "../local-session.js";
+import { DASHBOARD_SESSION_FAMILY, findTokenRow } from "../../token-store.js";
 import { t } from "../shared/i18n.js";
 import { projectHomeCss } from "./project-home/css.js";
 import { projectMissingHtml } from "./project-home/html.js";
@@ -48,9 +48,6 @@ import { projectReportPageHtml, projectReportsListHtml } from "./project-reports
 function segment(value) {
   return typeof value === "string" ? value : "";
 }
-
-// The same hash dashboard/auth.js stores a session token under (see local-session.js).
-const hashToken = (token) => createHash("sha256").update(String(token)).digest("hex");
 
 /**
  * Who is reading this request: "owner", "member" or "peer" (refused). One classification per request.
@@ -77,12 +74,11 @@ export async function viewerOf(db, req, { ownerCheck = isLocalPasswordSessionOn 
   if (!req.dashboardSession) return "peer";
   let scopes = "";
   try {
-    const { rows } = await db.execute({
-      sql: "SELECT scopes FROM oauth_tokens WHERE token = ? AND client_id = 'dashboard' AND julianday(expires_at) > julianday('now')",
-      args: [hashToken(req.dashboardSession)],
+    const row = await findTokenRow(db, DASHBOARD_SESSION_FAMILY, req.dashboardSession, {
+      extraWhere: " AND julianday(expires_at) > julianday('now')",
     });
-    if (!rows.length) return "peer";
-    scopes = rows[0].scopes == null ? "" : String(rows[0].scopes);
+    if (!row) return "peer";
+    scopes = row.scopes == null ? "" : String(row.scopes);
   } catch {
     return "peer";
   }

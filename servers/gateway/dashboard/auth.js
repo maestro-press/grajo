@@ -48,7 +48,20 @@ import { hasPasswordSetMarker, writePasswordSetMarker } from "./password-set-mar
 // this gateway). A relayed socket is never the owner — the same rule bearer-auth.js
 // applies to OAuth, applied here to the session cookie.
 import { isRelayedSocket } from "../../shared/bot-doors.js";
+// The session rows are the `dashboard:session` MAC family (design §8 PR 2): every write
+// stores `macToken(family, raw)`, every read verifies through `findTokenRow`, and every
+// revoke removes both stored forms.
+import {
+  DASHBOARD_SESSION_FAMILY, deleteDashboardSessionsExcept, deleteTokenRow, findTokenRow,
+  mintStoreToken,
+} from "../token-store.js";
 
+/**
+ * The PRE-CONVERSION session hash, kept ONLY for tests and tools that seed a session row
+ * the way the old code wrote it. Gateway code must never call it: writers mint
+ * `mintStoreToken`/`macToken` and readers go through `findTokenRow`, so a bare sha256 row
+ * is refused (and alarmed) once the family is converted (design §3.3).
+ */
 export function hashToken(t) { return createHash('sha256').update(t).digest('hex'); }
 
 const isHosted = !!process.env.CROW_HOSTED;
@@ -356,10 +369,7 @@ export async function setPassword(password, { keepSession = null } = {}) {
     writePasswordSetMarker();
     let revoked = 0;
     try {
-      const res = keepSession
-        ? await db.execute({ sql: "DELETE FROM oauth_tokens WHERE client_id = 'dashboard' AND token <> ?", args: [hashToken(keepSession)] })
-        : await db.execute({ sql: "DELETE FROM oauth_tokens WHERE client_id = 'dashboard'", args: [] });
-      revoked = Number(res?.rowsAffected ?? 0) || 0;
+      revoked = await deleteDashboardSessionsExcept(db, DASHBOARD_SESSION_FAMILY, keepSession);
     } catch (err) {
       console.warn("[auth] could not revoke the other sessions after the password change:", err.message);
     }
@@ -583,7 +593,7 @@ export async function attemptLogin(password, ip, deviceTrustToken = null, userAg
     const expiresAt = new Date(Date.now() + SESSION_MAX_AGE).toISOString();
     await db.execute({
       sql: "INSERT INTO oauth_tokens (token, token_type, client_id, scopes, expires_at) VALUES (?, 'access', 'dashboard', ?, ?)",
-      args: [hashToken(token), passwordSessionScopes(onHost), expiresAt],
+      args: [await mintStoreToken(db, DASHBOARD_SESSION_FAMILY, token), passwordSessionScopes(onHost), expiresAt],
     });
     if (onHost) {
       try { await auditLog(db, 'auth_login_onhost', { ip, details: { scopes: passwordSessionScopes(true) } }); } catch { /* audit is best effort */ }
@@ -615,7 +625,7 @@ export async function complete2faLogin(ip, opts = {}) {
     const expiresAt = new Date(Date.now() + SESSION_MAX_AGE).toISOString();
     await db.execute({
       sql: "INSERT INTO oauth_tokens (token, token_type, client_id, scopes, expires_at) VALUES (?, 'access', 'dashboard', ?, ?)",
-      args: [hashToken(token), passwordSessionScopes(onHost), expiresAt],
+      args: [await mintStoreToken(db, DASHBOARD_SESSION_FAMILY, token), passwordSessionScopes(onHost), expiresAt],
     });
     return { token };
   } finally {
@@ -657,7 +667,7 @@ export async function mintSsoSession(srcInstanceId) {
       // sessions it minted. local-session.js compares scopes to "dashboard"
       // exactly and the session verifier ignores scopes, so the tag is inert.
       sql: "INSERT INTO oauth_tokens (token, token_type, client_id, scopes, expires_at) VALUES (?, 'access', 'dashboard', ?, ?)",
-      args: [hashToken(token), srcInstanceId ? `dashboard sso src:${srcInstanceId}` : "dashboard sso", expiresAt],
+      args: [await mintStoreToken(db, DASHBOARD_SESSION_FAMILY, token), srcInstanceId ? `dashboard sso src:${srcInstanceId}` : "dashboard sso", expiresAt],
     });
     await auditLog(db, 'auth_sso_login', { src: srcInstanceId || null });
     return { token };
@@ -673,11 +683,9 @@ export async function verifySession(token) {
   if (!token) return false;
   const db = createDbClient();
   try {
-    const result = await db.execute({
-      sql: "SELECT token FROM oauth_tokens WHERE token = ? AND client_id = 'dashboard' AND julianday(expires_at) > julianday('now')",
-      args: [hashToken(token)],
-    });
-    return result.rows.length > 0;
+    return Boolean(await findTokenRow(db, DASHBOARD_SESSION_FAMILY, token, {
+      extraWhere: " AND julianday(expires_at) > julianday('now')",
+    }));
   } finally {
     db.close();
   }
@@ -690,7 +698,7 @@ export async function destroySession(token) {
   if (!token) return;
   const db = createDbClient();
   try {
-    await db.execute({ sql: "DELETE FROM oauth_tokens WHERE token = ?", args: [hashToken(token)] });
+    await deleteTokenRow(db, DASHBOARD_SESSION_FAMILY, token);
     await auditLog(db, 'session_destroyed', {});
   } finally {
     db.close();
@@ -937,11 +945,9 @@ export async function sessionAuth(token) {
  * The live session row for a token, `null` when there is none.
  */
 async function readSessionRow(db, token) {
-  const result = await db.execute({
-    sql: "SELECT scopes, expires_at, created_at FROM oauth_tokens WHERE token = ? AND client_id = 'dashboard' AND julianday(expires_at) > julianday('now')",
-    args: [hashToken(token)],
+  return findTokenRow(db, DASHBOARD_SESSION_FAMILY, token, {
+    extraWhere: " AND julianday(expires_at) > julianday('now')",
   });
-  return result.rows[0] || null;
 }
 
 /**

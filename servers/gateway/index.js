@@ -342,6 +342,32 @@ try {
 // Initialize OAuth tables
 await initOAuthTables();
 
+// Keyed token verifiers (§8 PR 2 of the keyed-token-hashes design): create or load the
+// HMAC key, convert every existing oauth_tokens row of the three families
+// (oauth:access / oauth:refresh / dashboard:session) to its `h1.` form, and alarm on any
+// old-style row. It runs HERE — after the schema exists and long before listen — so no
+// route, OAuth fallback or session reader can validate a row the converter has not seen.
+// A lost or invalid key never stops the boot: it logs one loud line and every validator
+// then refuses, exactly as the design's §2.6 requires.
+try {
+  const { runTokenHmacBoot } = await import("./boot/token-hmac.js");
+  const _hmacDb = createDbClient();
+  try {
+    const _hmac = await runTokenHmacBoot({ db: _hmacDb });
+    if (_hmac.key !== "ok") {
+      console.error(`[token-hmac] boot is running WITHOUT a usable key (${_hmac.key}): ${_hmac.keyPath}`);
+    } else if (_hmac.alarms) {
+      console.warn(`[token-hmac] ${_hmac.alarms} old-style credential row(s) reported at boot`);
+    }
+  } finally {
+    _hmacDb.close();
+  }
+} catch (err) {
+  // The conversion must never take the gateway down; a failed boot leaves the rows in
+  // their current form, which validators handle (legacy only while unconverted).
+  console.error("[token-hmac] boot conversion failed:", err.message);
+}
+
 // Stamp the moment the new/classic shell first existed on this instance, before
 // listen, so a device whose session predates it opens classic (shell/mode.js).
 try {

@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { actAsServe, serveHeaders } from "./fixtures/serve-peer.mjs";
+import { DASHBOARD_SESSION_FAMILY, findTokenRow } from "../servers/gateway/token-store.js";
 
 const tmpDir = mkdtempSync(join(tmpdir(), "crow-self-origin-"));
 execFileSync(process.execPath, ["scripts/init-db.js"], { env: { ...process.env, CROW_DATA_DIR: tmpDir }, stdio: "pipe" });
@@ -64,6 +65,9 @@ after(() => { setInterfaceTableForTests(null); try { db.close(); } catch {} rmSy
 
 const hash = (t) => createHash("sha256").update(t).digest("hex");
 const until = new Date(Date.now() + 3_600_000).toISOString();
+/** The scope of the live session row for a raw token — through the store's own reader, so it
+ *  finds the keyed (`h1.`) form the writer now mints as well as a seeded legacy row. */
+const scopesOf = async (tok) => (await findTokenRow(db, DASHBOARD_SESSION_FAMILY, tok))?.scopes;
 /** The three fixed session tokens this file asks about, freshly seeded.
  *
  *  Seeded, not seeded-once: `setPassword` revokes every dashboard session by design (the first-run
@@ -200,7 +204,6 @@ test("passwordSessionScopes fails closed: only an explicit off-box login is a pl
 test("attemptLogin / complete2faLogin store 'dashboard onhost' unless told the login was off the box", async () => {
   const { setPassword } = await import("../servers/gateway/dashboard/auth.js");
   await setPassword("correct horse battery staple");
-  const scopesOf = async (tok) => (await db.execute({ sql: "SELECT scopes FROM oauth_tokens WHERE token = ?", args: [hash(tok)] })).rows[0]?.scopes;
   const a = await attemptLogin("correct horse battery staple", "10.0.0.5", null, null, { onHost: true });
   assert.equal(await scopesOf(a.token), "dashboard onhost");
   const b = await attemptLogin("correct horse battery staple", "10.0.0.5");
@@ -230,7 +233,6 @@ test("the real login route: a login from the box is 'dashboard onhost', still si
     const m = set.map((c) => /^crow_session=([^;]+)/.exec(c)).find(Boolean);
     return m ? m[1] : null;
   };
-  const scopesOf = async (tok) => (await db.execute({ sql: "SELECT scopes FROM oauth_tokens WHERE token = ?", args: [hash(tok)] })).rows[0]?.scopes;
   await withServer(app, async (port) => {
     const login = (headers, body) => request(port, { method: "POST", path: "/dashboard/login", headers: { ...headers, "content-type": "application/x-www-form-urlencoded" }, body: form(body) });
     // First-time setup, from the box through Serve (the shared browser carries the owner's login).
@@ -341,7 +343,6 @@ test("the real 2FA routes: a password step from the box mints 'dashboard onhost'
   app.use(dashboardRouter((req, res, next) => next()));
   const form = (o) => new URLSearchParams(o).toString();
   const cookieOf = (r, name) => [].concat(r.headers["set-cookie"] || []).map((c) => new RegExp(`^${name}=([^;]+)`).exec(c)).find(Boolean)?.[1] || null;
-  const scopesOf = async (tok) => (await db.execute({ sql: "SELECT scopes FROM oauth_tokens WHERE token = ?", args: [hash(tok)] })).rows[0]?.scopes;
   const fromBox = serveHeaders("owner@example.invalid", "100.64.20.1");
   const fromLap = serveHeaders("owner@example.invalid", "100.64.20.9");
   const clock = mock.method(Date, "now", clockNow);

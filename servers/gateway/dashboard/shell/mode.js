@@ -5,7 +5,8 @@
  */
 import { createHash } from "node:crypto";
 import { readLocalInstanceIdOrNull, resolveInstanceDataDir } from "../../../shared/crow-home.js";
-import { hashToken, cookieSecureSuffix } from "../auth.js";
+import { cookieSecureSuffix } from "../auth.js";
+import { DASHBOARD_SESSION_FAMILY, findTokenRow } from "../../token-store.js";
 import { readSetting, writeSetting } from "../settings/registry.js";
 // The base names live in the one Crow cookie list (../../cookie-names.js),
 // because the extension proxy strips every one of them before forwarding a
@@ -87,9 +88,7 @@ export async function ensureShellSince(db) {
 
 export async function sessionCreatedAt(db, token) {
   if (!token) return null;
-  const r = await db.execute({
-    sql: "SELECT created_at FROM oauth_tokens WHERE token = ? AND client_id = 'dashboard'",
-    args: [hashToken(token)],
-  });
-  return r.rows[0]?.created_at ?? null;
+  // The `dashboard:session` family (no expiry filter: this asks when the row was minted).
+  const row = await findTokenRow(db, DASHBOARD_SESSION_FAMILY, token);
+  return row?.created_at ?? null;
 }
