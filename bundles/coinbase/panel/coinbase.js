@@ -7,7 +7,9 @@
  * 8 seconds and draws in plain words: whether Crow is connected, what a bot is
  * worth beside simply holding the starting mix, which AI proposals are waiting
  * for a yes, what is left of each limit today, which orders are resting on each
- * book, and whether trading is stopped. The products the new-bot form offers
+ * book, whether trading is stopped, and whether practice stock orders can be
+ * priced (the Tiingo token the page pastes into the Stock prices card). The
+ * products the new-bot form offers
  * come from the same answer (the engine's own list), never from this file.
  *
  * The one thing the page must never get wrong is the kill switch: it sits at the
@@ -65,6 +67,16 @@ function esc(value) {
 
 /** The sentence the panel shows when two-factor sign-in is still off. */
 const TWO_FACTOR_MESSAGE = "Turn on two-factor sign-in first (Settings \u2192 Security)";
+
+/**
+ * The Stock prices card's steps, in plain words. This key only reads public prices: it can spend
+ * nothing and move nothing, so it is a free personal key pasted here and nowhere else.
+ */
+const TIINGO_STEPS =
+  "Stock prices come from Tiingo, which has a free plan for personal use. " +
+  "1. Make a free account at https://www.tiingo.com/ . " +
+  "2. Find your API token in your Tiingo account (the menu name may differ: look for API or Account). " +
+  "3. Paste it here and press Test.";
 
 /**
  * The words the page uses. One object, serialised into the script once, with
@@ -271,6 +283,25 @@ function renderContent({ steps, focus, lang }) {
     <p id="cb-key-line" class="cb-hint"></p>
     <label class="cb-field">2FA code <input id="cb-disconnect-code" inputmode="numeric" maxlength="6" autocomplete="off"></label>
     <div class="cb-bar"><button type="button" id="cb-disconnect">Disconnect</button></div>
+  </div>
+
+  <h2>Stock prices (Tiingo)</h2>
+  <div id="cb-tiingo" class="cb-card">
+    <p id="cb-tiingo-msg"></p>
+    <div id="cb-tiingo-entry">
+      <p class="cb-steps">${esc(TIINGO_STEPS)}</p>
+      <p class="cb-hint">The free plan is for personal use.
+        <a href="https://www.tiingo.com/" target="_blank" rel="noreferrer noopener">tiingo.com</a></p>
+      <label class="cb-field">Tiingo token
+        <input id="cb-tiingo-token" type="password" autocomplete="off" spellcheck="false"></label>
+      <div class="cb-bar">
+        <button type="button" id="cb-tiingo-test">Test</button>
+        <button type="button" id="cb-tiingo-save">Save</button>
+      </div>
+    </div>
+    <div class="cb-bar" id="cb-tiingo-done" hidden>
+      <button type="button" id="cb-tiingo-disconnect">Disconnect</button>
+    </div>
   </div>
 
   <h2>Pending approvals</h2>
@@ -565,6 +596,66 @@ function renderScript() {
       keyLine.textContent = bits.join("  \\u00b7  ");
     }
   }
+
+  // ---- Stock prices (Tiingo) ----------------------------------------------------------------
+
+  // The token is typed into a password field and read once per press: the page keeps no copy of its
+  // own. The field itself is left alone until a Save has worked or the token is disconnected.
+  function tiingoToken() {
+    var field = document.getElementById("cb-tiingo-token");
+    return field ? String(field.value || "").trim() : "";
+  }
+
+  function clearTiingoToken() {
+    var field = document.getElementById("cb-tiingo-token");
+    if (field) field.value = "";
+  }
+
+  // The card says the panel's own sentence for its state, and shows only what that state needs:
+  // the steps and the field while a token is wanted; Disconnect once the prices are connected, or
+  // while Tiingo is only pausing (the token is fine then and there is nothing to paste again).
+  // With stock trading off in the engine the whole card goes: there is nothing here to set up.
+  function renderPrices(state) {
+    var card = document.getElementById("cb-tiingo");
+    if (card) card.hidden = state.equity_enabled === false;
+    var prices = state.prices || {};
+    var message = document.getElementById("cb-tiingo-msg");
+    if (message) message.textContent = String(prices.message || "");
+    var settled = prices.state === "connected" || prices.state === "paused";
+    var entry = document.getElementById("cb-tiingo-entry");
+    if (entry) entry.hidden = settled || prices.state === "coinbase_off";
+    var done = document.getElementById("cb-tiingo-done");
+    if (done) done.hidden = !settled;
+  }
+
+  // The pasted token stays in the field until it has done its job: a Test (whether it passed or
+  // not) and a Save that did not work leave it there, so a typo is corrected in place. Only a Save
+  // that worked and a Disconnect empty the field.
+  document.getElementById("cb-tiingo-test").addEventListener("click", function () {
+    api("POST", "/tiingo/test", { token: tiingoToken() }).then(function (answer) {
+      say((answer && answer.message) || S.done, false);
+    }).catch(fail);
+  });
+
+  document.getElementById("cb-tiingo-save").addEventListener("click", function () {
+    api("POST", "/tiingo", { token: tiingoToken() }).then(function (answer) {
+      if (answer && answer.ok === true) {
+        clearTiingoToken();
+        say(answer.message || S.done, false);
+        load();
+        return;
+      }
+      say((answer && answer.message) || S.done, true);
+    }).catch(fail);
+  });
+
+  document.getElementById("cb-tiingo-disconnect").addEventListener("click", function () {
+    clearTiingoToken();
+    api("POST", "/tiingo/disconnect", {}).then(function (answer) {
+      say((answer && answer.message) || S.done, false);
+      load();
+    }).catch(fail);
+  });
 
   // ---- pending approvals --------------------------------------------------------------------
 
@@ -1020,6 +1111,7 @@ function renderScript() {
   function render(state) {
     renderBanner(state);
     renderConnect(state);
+    renderPrices(state);
     renderPreviews(state);
     renderRecent(state);
     renderBots(state);

@@ -13,6 +13,8 @@ simulator stays in the gateway's own `seed_dry`.  Its live side is either nothin
 an `ExchangeRouter`, or a zero-argument factory that is asked again on every
 access (so credentials that appear later are picked up), and a factory that raises
 is "there is no live exchange right now", never an error the caller has to handle.
+`dry_exchange_for` is the one place the dry book is built, so the engine and the
+watchdog get the same simulator with the same product hooks.
 
 `Switches` is the two kv flags an owner sets, plus the one ceiling that is not a
 switch at all: `CROW_COINBASE_LIVE` in the environment.  The ceiling defaults to
@@ -148,6 +150,32 @@ class BookRouter:
 def no_live_exchange() -> None:
     """The default live factory: no live exchange exists yet, so there is none."""
     return None
+
+
+def dry_exchange_for(store, limits, market_for, fee_rate):
+    """The simulator serving the dry book, over *store*, from *limits*.
+
+    One simulated account serves both product kinds, so the dry book needs no
+    second adapter: it is given the same product hooks the router has — the
+    configured equity list, the configured crypto list, and the store's own query
+    for an EQUITY row of a product — so a delisted symbol whose rows are EQUITY
+    rows is still simulated as an equity.  Both the engine and the watchdog build
+    the dry book this way, from the same environment and over the same store, and
+    neither reaches for the live side at all.
+
+    `DryRunExchange` is imported here rather than at the top of the module, so
+    importing `books` still loads no simulator (and no store) of its own.
+    """
+    from .exchange import DryRunExchange
+
+    return DryRunExchange(
+        store.conn,
+        market_for,
+        fee_rate,
+        is_equity=limits.is_equity,
+        is_crypto=lambda product: product in limits.products,
+        equity_rows=store.has_equity_rows,
+    )
 
 
 def ceiling_from_env(env: Mapping[str, str]) -> bool:

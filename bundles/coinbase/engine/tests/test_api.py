@@ -41,9 +41,10 @@ import crow_coinbase.api as api_module
 import crow_coinbase.__main__ as main_module
 from crow_coinbase import records
 from crow_coinbase.__main__ import _run_runner, build_app, main
-from crow_coinbase.books import APPROVAL_INVALID
+from crow_coinbase.books import APPROVAL_INVALID, BookRouter
 from crow_coinbase.gateway import HALTED, NOT_BOT_OWNERS, PORTFOLIO_OWNER
 from crow_coinbase.money import ProductSpec
+from crow_coinbase.router import ExchangeRouter
 from crow_coinbase.runner import StartupRefused
 from crow_coinbase.store import (
     ACTIVE,
@@ -590,6 +591,7 @@ def test_bot_id_reuse_refused(engine, client):
         D("10"),
         status=OPEN,
         book="dry",
+        product_type="SPOT",
     )
     assert client.post("/bots", json=dict(CREATE_BODY, id="ghost3")).status_code == 409
 
@@ -1865,6 +1867,7 @@ STATUS_KEYS = {
     "live_switches",
     "drawdown",
     "products",
+    "equity",
 }
 
 # The three keys a book's own drawdown carries.
@@ -1987,11 +1990,14 @@ def test_status_products_listed(engine, client):
 
 
 def test_status_existing_keys_unchanged(engine, client):
-    """The three new keys arrived beside every key the body already carried."""
+    """The equity block arrived beside every key the body already carried."""
     assert client.post("/bots", json=CREATE_BODY).status_code == 201
 
     status = client.get("/status").json()
-    assert set(status) == STATUS_KEYS
+    # Every key the body has always carried is still there, and the equity block
+    # is the only one beside them (`test_status_equity_block` pins the whole set).
+    assert STATUS_KEYS <= set(status)
+    assert set(status) - STATUS_KEYS <= {"equity"}
 
     assert status["halted"] is False
     assert status["halted_books"] == {"dry": False, "live": False}
@@ -2007,6 +2013,213 @@ def test_status_existing_keys_unchanged(engine, client):
         "init_done",
     }
     assert status["recent_alerts"] == []
+
+
+# ---------------------------------------------------------------- status: equity
+
+# The keys the equity block carries, and nothing else.
+EQUITY_BLOCK_KEYS = {
+    "enabled",
+    "value",
+    "hwm",
+    "drawdown_alert",
+    "session_open",
+    "live",
+    "available",
+    "reason",
+    "live_reason",
+    "prices",
+    "prices_message",
+}
+
+# The reason a live equity book is not a live reading until the order preview is
+# on record, as the equity status spells it.
+EQUITY_LIVE_UNCONFIRMED = "EQUITY_LIVE_UNCONFIRMED"
+
+# The kv key the owner's confirmed preview is recorded under, and the confirmation
+# a live equity route needs on record.
+PREVIEW_KEY = "equity_preview_confirmed"
+VALID_CONFIRMATION = {
+    "displayed_order_config": "LIMIT_GFD",
+    "equity_trading_session": "EQUITY_TRADING_SESSION_NORMAL",
+}
+
+# An engine with one equity product and a capital behind it.
+EQUITY_ENV = {
+    "CROW_COINBASE_EQUITY_PRODUCTS": "NVDA-USD",
+    "CROW_COINBASE_EQUITY_AI_CAPITAL_USD": "500",
+}
+
+# The owner the equity mark is kept for, and the kv key the alert's episode lives
+# under, on the book the AI routes to (the dry one here).
+EQUITY_HWM_OWNER = "_equity"
+EQUITY_ALERT_KEY = "equity_alert:dry"
+
+
+class LiveStub:
+    """A live account the route can reach; the status block reads no book of its own."""
+
+    dry_run = False
+    # A live route is a live equity reading only when the live account has an
+    # equity side of its own, which the key pair a real install pushed has.
+    equity = SimpleNamespace(dry_run=False)
+
+
+# The runner's own clock, fixed so the session answer is deterministic.
+CLOCK = 1_800_000_000.0
+
+
+def clocked_session(runner, *, is_open):
+    """Pin a runner's clock and session, and answer every moment it was asked.
+
+    The report is `runner.session_open(runner.now())`, so the test has to own
+    both: the clock answers one value, and every ask is recorded.
+    """
+    seen = []
+    runner.now = lambda: CLOCK
+    runner.session_open = lambda ts: bool(seen.append(ts)) or is_open
+    return seen
+
+
+def test_status_equity_block(tmp_path):
+    """The equity block reports the equity mark, and calls nothing when it is off."""
+    # Enabled: the value and the mark are strings, and the alert flag is the
+    # episode marker as it stands.
+    engine = make_engine(tmp_path / "equity", env=dict(ENV, **EQUITY_ENV)).engine
+    engine.store.update_hwm(EQUITY_HWM_OWNER, D("480"), "dry")
+    engine.store.put(EQUITY_ALERT_KEY, True)
+    seen = clocked_session(engine.runner, is_open=True)
+
+    with api(engine) as client:
+        status = client.get("/status").json()
+    block = status["equity"]
+
+    assert set(block) == EQUITY_BLOCK_KEYS
+    assert block["enabled"] is True
+    assert isinstance(block["value"], str)
+    assert D(block["value"]) == D("500")
+    assert isinstance(block["hwm"], str)
+    assert D(block["hwm"]) == D("480")
+    assert block["drawdown_alert"] is True
+    assert block["session_open"] is True
+    # The stock products are usable (nothing has said otherwise), and no live
+    # reason stands: practice stock trading is on.
+    assert block["available"] is True
+    assert block["reason"] is None
+    assert block["live_reason"] is None
+    # The session was judged at the runner's own clock.
+    assert seen and all(ts == CLOCK for ts in seen)
+    # The ai trades the dry book here, so the equity is not a live reading.
+    assert block["live"] is False
+    # No stock price token was handed to this engine, so the block says so.
+    assert block["prices"] == "missing"
+    assert block["prices_message"] == "Stock prices are not connected."
+    # The equity block is the only key the body gained.
+    assert set(status) == STATUS_KEYS | {"equity"}
+
+    # Disabled: exactly the contract's block, and not one equity call.
+    plain = make_engine(tmp_path / "plain").engine
+    reads = []
+    real_value = plain.gateway.equity_value
+
+    def counting_value(book=None):
+        reads.append(book)
+        return real_value(book)
+
+    plain.gateway.equity_value = counting_value
+    closed_seen = clocked_session(plain.runner, is_open=False)
+    with api(plain) as client:
+        disabled = client.get("/status").json()["equity"]
+
+    assert disabled == {
+        "enabled": False,
+        "value": None,
+        "hwm": None,
+        "drawdown_alert": False,
+        "session_open": False,
+        "live": False,
+        "available": False,
+        "reason": None,
+        "live_reason": None,
+        "prices": "missing",
+        "prices_message": None,
+    }
+    # The session is still reported for an install with no equities, and the
+    # mark is never read.
+    assert closed_seen and all(ts == CLOCK for ts in closed_seen)
+    assert reads == []
+
+    # Live needs all three: equity_live, the ai's own switch, and a live account.
+    # It also needs the recorded preview: until it is on record the book is not a
+    # live reading, and the block says why.
+    live = make_engine(
+        tmp_path / "live",
+        env=dict(ENV, **EQUITY_ENV, CROW_COINBASE_EQUITY_LIVE="true"),
+    ).engine
+    live.gateway.books = BookRouter(live.exchange, LiveStub())
+    live.gateway.switches.set("ai_live_enabled", True)
+    with api(live) as client:
+        unconfirmed = client.get("/status").json()["equity"]
+
+    assert unconfirmed["available"] is True
+    assert unconfirmed["reason"] is None
+    assert unconfirmed["live_reason"] == EQUITY_LIVE_UNCONFIRMED
+    assert unconfirmed["live"] is False
+
+    live.store.put(PREVIEW_KEY, dict(VALID_CONFIRMATION))
+    with api(live) as client:
+        reported = client.get("/status").json()["equity"]
+
+    assert reported["live"] is True
+    assert reported["live_reason"] is None
+    assert reported["reason"] is None
+    assert D(reported["value"]) == D("500")
+    assert reported["hwm"] is None  # no live mark has been written
+
+    # The switch and the account alone are not enough while equity_live is off.
+    dry_live = make_engine(tmp_path / "dry-live", env=dict(ENV, **EQUITY_ENV)).engine
+    dry_live.gateway.books = BookRouter(dry_live.exchange, LiveStub())
+    dry_live.gateway.switches.set("ai_live_enabled", True)
+    with api(dry_live) as client:
+        assert client.get("/status").json()["equity"]["live"] is False
+
+
+def test_status_equity_live_needs_an_equity_adapter(tmp_path):
+    """A live reading needs the live account's own equity side, not just a route."""
+    engine = make_engine(
+        tmp_path / "equity-live-adapter",
+        env=dict(ENV, **EQUITY_ENV, CROW_COINBASE_EQUITY_LIVE="true"),
+    ).engine
+    engine.gateway.switches.set("ai_live_enabled", True)
+    # The preview a live equity route needs on record, so the only question left
+    # for the block below is whether the account has an equity side.
+    engine.store.put(PREVIEW_KEY, dict(VALID_CONFIRMATION))
+
+    # A live router with a crypto account alone: the route is live and reachable,
+    # but there is no equity account for the AI's equity book to live on, so the
+    # block does not report a live reading.
+    engine.gateway.books = BookRouter(
+        engine.exchange, ExchangeRouter(LiveStub(), usd_one_pool=True)
+    )
+    with api(engine) as client:
+        block = client.get("/status").json()["equity"]
+    assert block["enabled"] is True
+    assert block["live"] is False
+
+    # The same route with an equity side on the live account is a live reading.
+    engine.gateway.books = BookRouter(
+        engine.exchange,
+        ExchangeRouter(
+            LiveStub(),
+            LiveStub(),
+            is_equity=lambda product: product == "NVDA-USD",
+            usd_one_pool=False,
+        ),
+    )
+    with api(engine) as client:
+        block = client.get("/status").json()["equity"]
+    assert block["enabled"] is True
+    assert block["live"] is True
 
 
 # ---------------------------------------------------------------- GET /orders
@@ -2036,6 +2249,7 @@ def place_order(
     side="BUY",
     size="10",
     price="0.9852",
+    product_type="SPOT",
 ):
     """One order row through the store's own writer, stamped by the test."""
     store.insert_order(
@@ -2049,6 +2263,7 @@ def place_order(
         D(size),
         status=status,
         book=book,
+        product_type=product_type,
     )
     store.update_order(cid, created_at=created_at)
 

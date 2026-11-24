@@ -329,7 +329,7 @@ def seed_order(
     cid = cid or f"cb-{owner}-B0-{cid_suffix:012x}"
     store.insert_order(
         cid, owner, source, product, side, level, price, size, status=status,
-        book="dry",
+        book="dry", product_type="SPOT",
     )
     if order_id is not None:
         store.update_order(cid, order_id=order_id)

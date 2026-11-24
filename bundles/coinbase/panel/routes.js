@@ -118,6 +118,18 @@ const MESSAGE_ENGINE_DOWN_NOTE = "Trading engine is not responding.";
 const MESSAGE_DISCONNECT_UNFINISHED = "Disconnect didn't finish \u2014 press Disconnect again";
 const MESSAGE_NEEDS_RECONNECT = "Crow lost its link to the trading engine. Press Connect again.";
 const MESSAGE_CONNECTED_PREFIX = "Connected \u2014 Crow portfolio \u2026";
+// The Stock prices card's own five sentences, one per state the panel can be in. They are fixed
+// here rather than taken from the engine's answer, so the engine's own words never reach the page.
+// "paused" is Tiingo limiting Crow, not a refused token: the token is fine and the prices wait on
+// their own, so the sentence says that and the card keeps Disconnect.
+const MESSAGE_PRICES_CONNECTED = "Stock prices are connected (Tiingo).";
+const MESSAGE_PRICES_MISSING =
+  "Stock prices are not connected, so practice stock orders will not fill. " +
+  "Paste your free Tiingo token below.";
+const MESSAGE_PRICES_REJECTED = "Tiingo did not accept the token. Paste it again.";
+const MESSAGE_PRICES_PAUSED =
+  "Stock prices are paused for now (Tiingo is limiting requests); they will resume on their own.";
+const MESSAGE_PRICES_COINBASE_OFF = "Connect Coinbase first, then add stock prices.";
 const MESSAGE_NO_BOT = "That bot is gone. Open the Trading page again.";
 const MESSAGE_NO_PRODUCT = "Pick what to trade first.";
 const MESSAGE_GRID_FIELDS =
@@ -393,6 +405,43 @@ function switchesOf(status) {
     ai_live_enabled: live ? live.ai_live_enabled === true : false,
     ceiling: live && typeof live.ceiling === "boolean" ? live.ceiling : null,
   };
+}
+
+/**
+ * What the Stock prices card says: whether Coinbase is connected at all, then the engine's own
+ * `equity.prices` when it answered.
+ *
+ * The engine's own `prices_message` is never read, let alone repeated: each state reads this
+ * file's fixed sentence, so nothing the engine carried can reach the page through this field. An
+ * engine that did not answer is the same state as one that reported no token: prices missing.
+ * A "paused" engine keeps its own state here (the token is fine; Tiingo is limiting Crow), so the
+ * card says the prices wait on their own instead of asking for the token again.
+ */
+function pricesOf(connected, reachable, status) {
+  if (!connected) return { state: "coinbase_off", message: MESSAGE_PRICES_COINBASE_OFF };
+  const equity = status && isPlainObject(status.equity) ? status.equity : null;
+  const reported = equity && typeof equity.prices === "string" ? equity.prices : null;
+  if (reachable && reported === "connected") {
+    return { state: "connected", message: MESSAGE_PRICES_CONNECTED };
+  }
+  if (reachable && reported === "rejected") {
+    return { state: "rejected", message: MESSAGE_PRICES_REJECTED };
+  }
+  if (reachable && reported === "paused") {
+    return { state: "paused", message: MESSAGE_PRICES_PAUSED };
+  }
+  return { state: "missing", message: MESSAGE_PRICES_MISSING };
+}
+
+/**
+ * Whether stock trading is configured at all, which is what decides if the Stock prices card is on
+ * the page: the engine's own `equity.enabled`, and false when it did not answer (an engine that is
+ * not there enables no stock trading).
+ */
+function equityEnabledOf(reachable, status) {
+  if (!reachable) return false;
+  const equity = status && isPlainObject(status.equity) ? status.equity : null;
+  return Boolean(equity && equity.enabled === true);
 }
 
 /** Each book's fall from its own high-water mark, exactly as the engine reports it (null = none). */
@@ -946,7 +995,9 @@ export function createPanelRoutes(options = {}) {
    * The whole page in one read.
    *
    * Nothing here is stored: the switches, each book's drawdown and the products are the engine's
-   * own last answer, and the open orders are its own list per book. An engine that is down is a
+   * own last answer, and the open orders are its own list per book. The Stock prices card's state
+   * is the engine's equity block reduced to one of five states and this file's own sentence, and
+   * `equity_enabled` says whether stock trading is configured at all. An engine that is down is a
    * state the page shows, never a failed page, and this read writes nothing to the database.
    */
   async function handlePanel(req, res) {
@@ -1084,9 +1135,11 @@ export function createPanelRoutes(options = {}) {
     if (!reachable) note = MESSAGE_ENGINE_DOWN_NOTE;
     else if (health.credentials === "not_ready") note = MESSAGE_KILL_NOT_READY;
 
+    const connection = await connectionInfo();
+
     return res.json({
       ok: true,
-      connection: await connectionInfo(),
+      connection,
       two_factor: twoFactor,
       engine: {
         reachable,
@@ -1106,6 +1159,8 @@ export function createPanelRoutes(options = {}) {
         .map((alert) => ({ ts: alert.ts ?? null, message: String(alert.message ?? "") })),
       limits,
       products: productsOf(status),
+      prices: pricesOf(connection.connected === true, reachable, status),
+      equity_enabled: equityEnabledOf(reachable, status),
       switches: switchesOf(status),
       drawdown,
       open_orders: {

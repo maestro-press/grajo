@@ -452,7 +452,8 @@ def test_dry_and_live_books_separate(engines):
     # A dry fill on the dry bot: it moves the dry book's holdings.
     cid = "cb-b1-B-9-000000000001"
     store.insert_order(
-        cid, "b1", "bot", PRODUCT, "BUY", 9, D("0.95"), D("10"), book="dry"
+        cid, "b1", "bot", PRODUCT, "BUY", 9, D("0.95"), D("10"), book="dry",
+        product_type="SPOT",
     )
     store.update_order(
         cid,
@@ -521,7 +522,8 @@ def test_dry_orders_dont_use_live_caps(engines):
     for index in range(3):
         cid = f"cb-b1-B+{index + 2}-{index:012x}"
         store.insert_order(
-            cid, "b1", "bot", PRODUCT, "BUY", index + 2, D("100"), D("10"), book="dry"
+            cid, "b1", "bot", PRODUCT, "BUY", index + 2, D("100"), D("10"), book="dry",
+            product_type="SPOT",
         )
 
     caps = engine.gateway.caps
@@ -540,7 +542,8 @@ def test_dry_orders_dont_use_live_caps(engines):
 
     live_cid = "cb-b1-B+9-00ab00ab"
     store.insert_order(
-        live_cid, "b1", "bot", PRODUCT, "BUY", 9, D("30"), D("1"), book="live"
+        live_cid, "b1", "bot", PRODUCT, "BUY", 9, D("30"), D("1"), book="live",
+        product_type="SPOT",
     )
     assert caps.daily_notional(None, book="dry") == D("3000")
     assert caps.orders_last_hour(None, book="dry") == 3
@@ -577,6 +580,7 @@ def test_reconcile_live_only_against_exchange(engines):
         status=OPEN,
         order_id="dry-ex-1",
         book="dry",
+        product_type="SPOT",
     )
     store.insert_order(
         live_cid,
@@ -590,6 +594,7 @@ def test_reconcile_live_only_against_exchange(engines):
         status=OPEN,
         order_id="live-ex-1",
         book="live",
+        product_type="SPOT",
     )
     store.insert_order(
         pending_cid,
@@ -602,6 +607,7 @@ def test_reconcile_live_only_against_exchange(engines):
         D("1"),
         status=PENDING_SUBMIT,
         book="live",
+        product_type="SPOT",
     )
     store.conn().execute(
         "UPDATE orders SET created_at=? WHERE client_order_id=?",
@@ -792,7 +798,8 @@ def test_live_to_dry_rebase(engines):
     # Live filled history: a buy of 10 at 0.9, fee 0.045.
     history = "cb-b1-B-3-0000000000f1"
     store.insert_order(
-        history, BOT, "bot", PRODUCT, "BUY", 3, D("0.9"), D("10"), book="live"
+        history, BOT, "bot", PRODUCT, "BUY", 3, D("0.9"), D("10"), book="live",
+        product_type="SPOT",
     )
     store.update_order(
         history,
@@ -805,7 +812,8 @@ def test_live_to_dry_rebase(engines):
     # An old dry row the new dry epoch must stop counting.
     old_dry = "cb-b1-B-4-0000000000a1"
     store.insert_order(
-        old_dry, BOT, "bot", PRODUCT, "BUY", 4, D("10"), D("100"), book="dry"
+        old_dry, BOT, "bot", PRODUCT, "BUY", 4, D("10"), D("100"), book="dry",
+        product_type="SPOT",
     )
     store.update_order(
         old_dry,
@@ -944,7 +952,8 @@ def test_route_matrix(engines):
     for book, suffix in ((DRY, "0000000da1"), (LIVE, "0000000ea1")):
         cid = f"cb-ai-S-1-{suffix}"
         store.insert_order(
-            cid, "ai", "ai", PRODUCT, "SELL", 1, D("12"), D("1"), book=book
+            cid, "ai", "ai", PRODUCT, "SELL", 1, D("12"), D("1"), book=book,
+            product_type="SPOT",
         )
         store.update_order(
             cid, status=FILLED, filled_size=D("1"), filled_value=D("12"), fees=D("0")
@@ -1260,19 +1269,22 @@ def test_book_required_keyword(tmp_path):
 
         with pytest.raises(TypeError):
             store.insert_order(
-                cid, "b1", "bot", PRODUCT, "BUY", 1, D("0.9"), D("1")
+                cid, "b1", "bot", PRODUCT, "BUY", 1, D("0.9"), D("1"),
+                product_type="SPOT",
             )
         with pytest.raises(TypeError):
             store.record_fill(fill, cid)
 
         with pytest.raises(ValueError):
             store.insert_order(
-                cid, "b1", "bot", PRODUCT, "BUY", 1, D("0.9"), D("1"), book="paper"
+                cid, "b1", "bot", PRODUCT, "BUY", 1, D("0.9"), D("1"), book="paper",
+                product_type="SPOT",
             )
         assert store.order(cid) is None
 
         store.insert_order(
-            cid, "b1", "bot", PRODUCT, "BUY", 1, D("0.9"), D("1"), book="dry"
+            cid, "b1", "bot", PRODUCT, "BUY", 1, D("0.9"), D("1"), book="dry",
+            product_type="SPOT",
         )
         assert store.order(cid)["book"] == "dry"
 
@@ -1342,7 +1354,8 @@ def test_pnl_and_fills_use_book(engines):
     # Dry history: a fill with a large commission and a realized gain.
     dry_cid = "cb-b1-S-1-000000000001"
     store.insert_order(
-        dry_cid, BOT, "bot", PRODUCT, "SELL", 1, D("1"), D("10"), book="dry"
+        dry_cid, BOT, "bot", PRODUCT, "SELL", 1, D("1"), D("10"), book="dry",
+        product_type="SPOT",
     )
     store.update_order(
         dry_cid,
@@ -1372,7 +1385,8 @@ def test_pnl_and_fills_use_book(engines):
     # Live history: one fill, commission 1, a realized 0.95.
     live_cid = "cb-b1-S-2-000000000002"
     store.insert_order(
-        live_cid, BOT, "bot", PRODUCT, "SELL", 2, D("1"), D("10"), book="live"
+        live_cid, BOT, "bot", PRODUCT, "SELL", 2, D("1"), D("10"), book="live",
+        product_type="SPOT",
     )
     store.update_order(
         live_cid,
@@ -1991,7 +2005,8 @@ def test_pnl_excludes_first_dry_period(engines):
     old_stamp = time.time() - 1000
     old = "cb-b1-S-1-0000000000a1"
     store.insert_order(
-        old, BOT, "bot", PRODUCT, "SELL", 1, D("1"), D("10"), book=DRY
+        old, BOT, "bot", PRODUCT, "SELL", 1, D("1"), D("10"), book=DRY,
+        product_type="SPOT",
     )
     store.update_order(
         old,
@@ -2028,7 +2043,8 @@ def test_pnl_excludes_first_dry_period(engines):
 
     new = "cb-b1-S-2-0000000000a2"
     store.insert_order(
-        new, BOT, "bot", PRODUCT, "SELL", 2, D("1"), D("10"), book=DRY
+        new, BOT, "bot", PRODUCT, "SELL", 2, D("1"), D("10"), book=DRY,
+        product_type="SPOT",
     )
     store.update_order(
         new,

@@ -65,13 +65,46 @@ repin moves the portfolio and never the secret.  The rail's in-memory secret is
 set only after the transaction commits, and it is set only for a secret whose
 own hash is the pin the transaction left behind.
 
+`equity` is the engine's `EquityWiring`, and it is optional: with none — or with
+no equity products configured — the slot is the crypto-only one it has always
+been.  With it, and equities configured, one accepted key drives both sides of
+the router (the same adapter on both, because one key is one account), and a
+request may carry a SECOND key pair for the equity account: `equity_key_name`
+and `equity_private_key`, both or neither.  The second key is judged AFTER the
+first — a first key that is refused keeps its own `KEY_*` code and the second is
+never built — and it is kept in memory only exactly like the first: built,
+asked for its permissions, and dropped unless the whole request is accepted.
+Its permissions are its own (`can_transfer` denied in so many words, scoped to
+the configured equity portfolio, able to trade and to view), its USD pool
+relationship with the first key is derived from the two answers rather than
+assumed, and nothing about it is ever written, logged or echoed back.
+
+Two refusal codes belong to that second key alone.  `EQUITY_KEY_REFUSED` is
+every way the pair or the key is unusable: one field without the other, either
+field while no equity product is configured, the first key's name given again, a
+private key whose shape is not one, an adapter that cannot be built or asked, a
+permissions answer the equity account may not be traded with, and two adapters
+that cannot become one router.  `EQUITY_USD_POOLS` is the money: two keys whose
+dollars would be two separate pools while a configured crypto product is quoted
+in USD — the same dollars would be counted twice — or a pair whose pool
+relationship cannot be known at all.  Every message is fixed text;
+none of them carries a key, a key name, a private key, a portfolio id or an
+exchange's own error text.
+
 Refusal codes are strings equal to their names, so a code travels in JSON
 unchanged: `KEY_INVALID`, `KEY_CAN_TRANSFER`, `KEY_NOT_PORTFOLIO_SCOPED`,
 `KEY_DEFAULT_PORTFOLIO`, `KEY_WRONG_PORTFOLIO`, `KEY_CANNOT_TRADE`,
-`LIVE_ORDERS_OPEN` — and `SECRET_MISMATCH` for the pin refusal, which the
-approval rail raises on this route and which the transaction below answers with
-the same code (defined there, where it is answered, and re-exported here with
-the rest).
+`LIVE_ORDERS_OPEN`, `EQUITY_KEY_REFUSED`, `EQUITY_USD_POOLS` — and
+`SECRET_MISMATCH` for the pin refusal, which the approval rail raises on this
+route and which the transaction below answers with the same code (defined there,
+where it is answered, and re-exported here with the rest).
+
+A key push is also the first moment the AUTHENTICATED product reads are possible,
+so it is when the equity lists are judged: with a `status` on the wiring, an
+accepted key verifies `(router.crypto, router.equity)` there.  That verification
+never raises and never refuses the key — a disagreement turns stock trading off
+(the runner's own alert) instead — and a `clear` resets the status with the
+router it drops.  A `check` installs nothing and therefore verifies nothing.
 """
 
 from __future__ import annotations
@@ -92,7 +125,8 @@ from .auth import (
     pin_exists,
 )
 from .books import LIVE, LIVE_LOCKED
-from .router import ExchangeRouter
+from .equity_wiring import EquityWiring, equity_key_refusal
+from .router import ExchangeRouter, usd_one_pool_from_keys
 from .store import LIVE_STATUSES, Store
 
 # ---------------------------------------------------------------- refusal codes
@@ -103,6 +137,12 @@ KEY_DEFAULT_PORTFOLIO = "KEY_DEFAULT_PORTFOLIO"  # the owner's main portfolio
 KEY_WRONG_PORTFOLIO = "KEY_WRONG_PORTFOLIO"  # another portfolio than the pinned one
 KEY_CANNOT_TRADE = "KEY_CANNOT_TRADE"  # the key has no trade permission
 LIVE_ORDERS_OPEN = "LIVE_ORDERS_OPEN"  # live orders are resting: not now
+# The second key pair for the equity account: unusable as sent, or unusable as
+# the account's key (see `_equity_route`).
+EQUITY_KEY_REFUSED = "EQUITY_KEY_REFUSED"
+# The two keys would keep their dollars in two pools while a configured crypto
+# product spends USD, or their pool relationship cannot be known.
+EQUITY_USD_POOLS = "EQUITY_USD_POOLS"
 # `SECRET_MISMATCH` is imported above: the rail raises it, this module reports it.
 
 # ---------------------------------------------------------------- portfolio types
@@ -168,6 +208,21 @@ MESSAGE_WRONG_PORTFOLIO = (
 MESSAGE_CANNOT_TRADE = "This key cannot trade; give it Trade permission."
 MESSAGE_CANNOT_VIEW = "This key cannot see the account; give it View permission."
 MESSAGE_SECRET_MISMATCH = "That approval secret is not the one this engine pinned."
+# The two refusals of the equity key pair.  Each covers every cause of its code
+# and says what an acceptable pair looks like, so one fixed sentence can answer
+# a malformed pair, a key that may move money out and a key on another portfolio
+# alike — no key, no id and no exception text in it.
+MESSAGE_EQUITY_KEY = (
+    "The equity key was not accepted. It has to be a second key with a name of "
+    "its own, sent together with its private key on an engine that has equity "
+    "products configured, scoped to the equity portfolio this engine is set to, "
+    "with permission to trade and view, and no permission to move money out."
+)
+MESSAGE_EQUITY_POOLS = (
+    "The two keys would keep their dollars in two separate pools while a crypto "
+    "product is quoted in USD, so the same dollars would be counted twice. Use "
+    "one key for both accounts, or two keys on one portfolio."
+)
 MESSAGE_REMOVED = "credentials removed"
 # The record of an owner's forget, which unpins the engine rather than disconnecting
 # it: no key, no secret and no portfolio in the sentence.
@@ -350,11 +405,16 @@ class CredentialSlot:
     to, and `build_live(creds)` builds the adapter one key pair names — the real
     `LiveExchange` in production, where `__main__.build_app` supplies it, and a
     fake in a test.  `now` is the engine's clock, the one a stamp would be taken
-    from, so nothing here reads the wall clock of its own.
+    from, so nothing here reads the wall clock of its own.  `equity` is the
+    engine's `EquityWiring`, or None for a slot with no equity half at all: it is
+    what says whether equity products are configured and what the equity key's own
+    path needs (the configured portfolio, the two product lists).
 
     What the slot keeps between calls is ONE thing: the `ExchangeRouter` over the
     adapter an accepted key built.  It keeps no key, no key name and no secret of
     its own — the secret is the rail's (`set_secret`), and the pin is the store's.
+    An accepted second key pair for the equity account is built and judged the
+    same way, and it too is kept only as the router's other side.
     """
 
     def __init__(
@@ -364,11 +424,13 @@ class CredentialSlot:
         build_live: Callable[[dict], Any],
         *,
         now: Callable[[], float],
+        equity: Optional[EquityWiring] = None,
     ) -> None:
         self._store = store
         self._auth = auth
         self._build_live = build_live
         self._now = now
+        self._equity = equity
         self._exchange: Optional[ExchangeRouter] = None
 
     # ------------------------------------------------ state
@@ -412,7 +474,13 @@ class CredentialSlot:
 
     # ------------------------------------------------ checking
     def check(
-        self, key_name: str, private_key: str, *, repin: bool = False
+        self,
+        key_name: str,
+        private_key: str,
+        *,
+        repin: bool = False,
+        equity_key_name: Optional[str] = None,
+        equity_private_key: Optional[str] = None,
     ) -> KeyCheck:
         """Judge one key pair and keep nothing, whatever it answers.
 
@@ -422,19 +490,40 @@ class CredentialSlot:
         names another portfolio is allowed to move the pin.  An exchange or a
         network that fails answers the same fixed refusal `KEY_INVALID`, never
         the exception's own text.
+
+        `equity_key_name` and `equity_private_key` are the OPTIONAL second pair
+        for the equity account: both or neither, judged after the first key has
+        passed, and kept nowhere here exactly as `set` keeps them nowhere on a
+        refusal.
         """
         result, _router, _portfolio = self._evaluate(
-            key_name, private_key, repin=repin
+            key_name,
+            private_key,
+            repin=repin,
+            equity_key_name=equity_key_name,
+            equity_private_key=equity_private_key,
         )
         return result
 
     def _evaluate(
-        self, key_name: Any, private_key: Any, *, repin: bool
+        self,
+        key_name: Any,
+        private_key: Any,
+        *,
+        repin: bool,
+        equity_key_name: Optional[str] = None,
+        equity_private_key: Optional[str] = None,
     ) -> tuple[KeyCheck, Optional[ExchangeRouter], Optional[str]]:
         """The one check `check` and `set` share: the answer, its router, its portfolio.
 
         The router is answered only for a key that passed, so a refusal never
         leaves one behind; `set` is the only caller that keeps it.
+
+        The FIRST key is judged exactly as it has always been — its shape, its
+        adapter, its permissions and the pin — and only once it is accepted does
+        the optional second pair reach `_equity_route`: the second key is never
+        built for a first key that is refused, and it is dropped with the router
+        when it is refused itself.
         """
         last4 = _last4(key_name)
         if not valid_key_shape(key_name, private_key):
@@ -446,8 +535,7 @@ class CredentialSlot:
         key = normalised_key(private_key)
         try:
             live = self._build_live({"api_key": key_name, "api_secret": key})
-            router = ExchangeRouter(live, usd_one_pool=True)
-            perms = router.key_permissions()
+            perms = live.key_permissions()
         except Exception:  # noqa: BLE001 - any failure is one refusal, in plain words
             return (
                 KeyCheck(
@@ -464,11 +552,98 @@ class CredentialSlot:
         result = evaluate_permissions(perms, pinned)
         if result.state != "ok":
             return replace(result, key_last4=last4), None, None
+        refused, router = self._equity_route(
+            live, perms, key_name, equity_key_name, equity_private_key
+        )
+        if refused is not None:
+            return refused, None, None
         return (
             replace(result, key_last4=last4),
             router,
             _portfolio_of(perms),
         )
+
+    def _equity_route(
+        self,
+        crypto: Any,
+        crypto_perms: Any,
+        key_name: Any,
+        equity_key_name: Optional[str],
+        equity_private_key: Optional[str],
+    ) -> tuple[Optional[KeyCheck], Optional[ExchangeRouter]]:
+        """The router an accepted first key routes with, or the refusal it earns.
+
+        With no equity field in the request the answer is the plain router of a
+        crypto-only install, or — on an engine with equity products configured —
+        the one-adapter router that puts the same account on both sides: one key
+        is one account, so it is one USD pool.
+
+        A request carrying an equity field is judged next, and never before the
+        first key: both fields or neither, only while equity products are
+        configured, a name that is not the first key's, the same shape, its own
+        adapter and its own permissions.  `equity_key_refusal` then holds that
+        key to the configured equity portfolio and to a literal denial of the
+        transfer permission, which is the same policy the first key is held to
+        and is expressed in the same fixed words.  The two keys' USD pools are
+        derived from their two permission answers rather than assumed, and two
+        pools are refused (`EQUITY_USD_POOLS`) while a configured crypto product
+        is quoted in USD: that product spends the dollars one of the two pools
+        would be.
+
+        Every refusal is one of the two fixed codes with its fixed message, and
+        none of them is, or carries, a value out of either pair: no key, no key
+        name, no private key, no portfolio id and no exchange error text.  The
+        `key_last4` of every one of them is the FIRST key's, because the equity
+        key is only ever the second question.
+        """
+        equity = self._equity
+        key_refused = _refused(EQUITY_KEY_REFUSED, MESSAGE_EQUITY_KEY, key_name)
+        pools_refused = _refused(EQUITY_USD_POOLS, MESSAGE_EQUITY_POOLS, key_name)
+        given_name = equity_key_name is not None
+        given_key = equity_private_key is not None
+        if not given_name and not given_key:
+            if equity is None or not equity.enabled:
+                return None, ExchangeRouter(crypto, usd_one_pool=True)
+            return None, equity.router(crypto, crypto, usd_one_pool=True)
+        if given_name != given_key:
+            # Half a key pair is not a pair: both fields travel together or not
+            # at all, so a single one is refused before anything is built.
+            return key_refused, None
+        if equity is None or not equity.enabled:
+            # An equity key on an install with no equity products has no account
+            # to open, so the fields are refused rather than quietly ignored.
+            return key_refused, None
+        if equity_key_name == key_name:
+            # Two fields naming one key: the second side would be the first's own
+            # account under another label, which is not a second key at all.
+            return key_refused, None
+        if not valid_key_shape(equity_key_name, equity_private_key):
+            return key_refused, None
+        try:
+            second = self._build_live(
+                {
+                    "api_key": equity_key_name,
+                    "api_secret": normalised_key(equity_private_key),
+                }
+            )
+            second_perms = second.key_permissions()
+        except Exception:  # noqa: BLE001 - an unreadable key is one fixed refusal
+            return key_refused, None
+        if equity_key_refusal(second_perms, equity.portfolio_id) is not None:
+            return key_refused, None
+        try:
+            one_pool = usd_one_pool_from_keys(crypto_perms, second_perms)
+        except ValueError:
+            # A relationship nobody knows is refused rather than read as one
+            # pool: whether the two keys' dollars are one sum or two is money,
+            # not a preference, so it is never guessed at.
+            return pools_refused, None
+        if not one_pool and equity.usd_crypto_products():
+            return pools_refused, None
+        try:
+            return None, equity.router(crypto, second, usd_one_pool=one_pool)
+        except Exception:  # noqa: BLE001 - two accounts that cannot be one router
+            return key_refused, None
 
     def _stored_portfolio(self) -> Optional[str]:
         """The portfolio this engine pinned, or None when nothing is pinned yet."""
@@ -484,6 +659,8 @@ class CredentialSlot:
         *,
         repin: bool = False,
         key_kind: str = KEY_KIND_PINNED_SECRET,
+        equity_key_name: Optional[str] = None,
+        equity_private_key: Optional[str] = None,
     ) -> KeyCheck:
         """Check the key, and only on an acceptable one pin it and keep it.
 
@@ -497,14 +674,26 @@ class CredentialSlot:
         defaults to the owner's secret, so a caller that does not say which kind
         of key it had is held to the pin and can never make the first one.
 
+        `equity_key_name` and `equity_private_key` are the OPTIONAL second key
+        pair for the equity account, and they are judged in `_evaluate` with the
+        first pair, before this transaction: both or neither, and only on an
+        install with equity products configured.  The first key's permissions
+        are judged first, so a bad first key answers its own code.  The second
+        key is kept the way the first is — as the router's other side, in memory
+        only — and a refusal of it writes nothing at all, exactly like a refusal
+        of the first.
+
         One transaction writes everything a connect persists: the pin (its kv row
         only when there is no pin row at all, because the first connect is what
         pins a secret), the portfolio the key names (replaced only by `repin`),
         and the engine epoch (generated once and kept on every later push).  Then
-        the router is kept in memory and the approval secret is handed to the
-        rail, which is the only holder of anything a later request can be keyed
-        with — and only once the transaction committed, and only for a secret
-        whose own sha256 is the pin it left behind.
+        the router is kept in memory, the equity status — when the wiring carries
+        one and equities are configured — verifies the two product lists off the
+        adapters just installed (it never refuses this key), and the approval
+        secret is handed to the rail, which is the only holder of anything a
+        later request can be keyed with — and only once the transaction
+        committed, and only for a secret whose own sha256 is the pin it left
+        behind.
 
         A refusal writes nothing, keeps nothing and leaves the rail exactly as it
         was: `repin` moves the portfolio and never the secret, so a request
@@ -519,7 +708,11 @@ class CredentialSlot:
         short to be a key never reaches this method.
         """
         result, router, portfolio = self._evaluate(
-            key_name, private_key, repin=repin
+            key_name,
+            private_key,
+            repin=repin,
+            equity_key_name=equity_key_name,
+            equity_private_key=equity_private_key,
         )
         if result.state != "ok" or router is None:
             return result
@@ -573,17 +766,47 @@ class CredentialSlot:
         ):
             return _secret_refusal(result.key_last4, result.portfolio_last4)
         self._exchange = router
+        self._verify_equity(router)
         self._auth.set_secret(approve_secret)
         return result
+
+    def _equity_status(self) -> Any:
+        """The equity status this slot's wiring carries; None when it carries none."""
+        return getattr(self._equity, "status", None) if self._equity else None
+
+    def _verify_equity(self, router: ExchangeRouter) -> None:
+        """Let the equity status judge the two product lists off the installed key.
+
+        A key push is the first moment the authenticated product reads are
+        possible, so it is when the lists can be confirmed: both adapters the
+        router holds are handed over and the status keeps the specs it read.  The
+        call never raises and a disagreement does not refuse the key — stock
+        trading turns itself off instead, and the runner's step 4c says so once
+        per episode — so nothing here can cost an owner the key they pushed.  An
+        install with no equity products, and a wiring with no status, verify
+        nothing at all.
+        """
+        if self._equity is None or not self._equity.enabled:
+            return
+        status = self._equity_status()
+        if status is None:
+            return
+        status.verify(router.crypto, router.equity)
 
     def clear(self) -> None:
         """Drop the live route and the in-memory secret; the pin stays where it is.
 
         Clearing is not unpinning: the pin is what makes the install token no key,
         so the next connect has to present the owner's secret in its body, and the
-        install token never becomes a way back in.
+        install token never becomes a way back in.  The equity status is reset
+        with the router, because the specs it kept came from that key's own
+        authenticated reads: without it the stock products are unverified again
+        until a later push confirms them.
         """
         self._exchange = None
+        status = self._equity_status()
+        if status is not None:
+            status.reset()
         self._auth.clear_secret()
 
 

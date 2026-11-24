@@ -12,6 +12,11 @@ here instead of touching a live account.
 explicit `created_at` through `store.update_order`.  Prices and sizes are
 synthetic XRP-USDC values around 1.0; `trades.csv` sits next to the database
 file and is read back row by row.
+
+The equity section at the end adds one equity product (NVDA-USD) and an exchange
+that says what an equity is: the rows it drives are the ones `reconcile` ADOPTS,
+so the row's `product_type` is the engine's own answer about the account it came
+from, which is what the AI's equity pool, its fills and its kill path all read.
 """
 
 from __future__ import annotations
@@ -26,7 +31,9 @@ import pytest
 
 from crow_coinbase import records
 from crow_coinbase.exchange import PermanentError, TransientError
+from crow_coinbase.ledger import Ledger
 from crow_coinbase.reconcile import reconcile
+from crow_coinbase.router import ExchangeRouter
 from crow_coinbase.store import (
     CANCELLED,
     FAILED,
@@ -38,6 +45,11 @@ from crow_coinbase.store import (
 )
 
 PRODUCT = "XRP-USDC"
+
+# The equity product these tests adopt and settle, and the capital behind the AI's
+# one equity pool.  The pool is USD, which is what an equity is quoted in.
+EQUITY = "NVDA-USD"
+EQUITY_CAPITAL = D("100")
 
 # `trade_type` sentinel: OMIT leaves the key out of the fill dict, None puts the
 # key there with a null value.  Both mean FILL.
@@ -213,6 +225,7 @@ def seed(
     order_id=None,
     product=PRODUCT,
     source="bot",
+    product_type="SPOT",
 ):
     """Insert one order row and return its cid."""
     store.insert_order(
@@ -227,6 +240,7 @@ def seed(
         status=status,
         order_id=order_id,
         book="dry",
+        product_type=product_type,
     )
     return cid
 
@@ -1326,3 +1340,179 @@ def test_updated_counts_rows_once(store, trades_csv):
     settled = sync(store, exchange, trades_csv)
     assert settled.updated == 1
     assert store.order(cid)["status"] == FILLED
+
+
+# ---------------------------------------------------------------- equities
+#
+# One equity product, one pool of USD behind it, and exchanges that do or do not
+# say what an equity is.  The rows these tests use are the ones `reconcile`
+# ADOPTS: an equity order adopted as a spot one is counted in no equity pool and
+# marked by no equity read, so the row's kind is what every later step runs on.
+
+
+class FakeEquityExchange(FakeExchange):
+    """A FakeExchange that also says which products are equities (an equity account)."""
+
+    dry_run = True
+
+    def __init__(self, *args, equity_products=(EQUITY,), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_equity = lambda product: product in equity_products
+
+
+class RouterAdapter(FakeExchange):
+    """A FakeExchange a router can hold: one dry-run account, and no is_equity."""
+
+    dry_run = True
+
+
+def equity_ledger(store, capital=EQUITY_CAPITAL):
+    """The ledger the AI's equity pool is read through."""
+    return Ledger(
+        store,
+        fee_rate=D("0.005"),
+        equity_ai_capital=lambda: D(capital),
+        is_equity=lambda product: product == EQUITY,
+    )
+
+
+def product_of_row(store):
+    """An order id's product, read from the store's own rows."""
+
+    def product_of(order_id):
+        row = (
+            store.conn()
+            .execute(
+                "SELECT product FROM orders WHERE order_id=?", (str(order_id),)
+            )
+            .fetchone()
+        )
+        return row["product"] if row else None
+
+    return product_of
+
+
+def test_equity_day_order_expires_partial(store, trades_csv):
+    """A day order that expires partly filled settles once, and frees its hold."""
+    order_id = "ex-eq-1"
+    cid = cid_for("ai", 1)
+    exchange = FakeEquityExchange()
+    # The order rests on the equity account with no row of ours: reconcile adopts
+    # it, so the row this test settles is the engine's own.
+    exchange.orders[order_id] = snap(
+        order_id,
+        cid,
+        product=EQUITY,
+        price="100",
+        size="0.66",
+        status="OPEN",
+    )
+
+    sync(store, exchange, trades_csv)
+
+    adopted = store.order(cid)
+    assert adopted is not None
+    assert adopted["owner"] == "ai"
+    assert adopted["product_type"] == "EQUITY"
+    assert adopted["size"] == D("0.66")
+
+    ledger = equity_ledger(store)
+    # A resting buy holds its whole submitted size in the pool.
+    assert ledger.equity_pool_used("dry") == D("66")
+    held = ledger.holding("ai", EQUITY, book="dry")
+    assert held.reserved_quote == D("66")
+    assert held.available_quote == D("34")
+
+    # The exchange expires it with 0.4 of the 0.66 filled.
+    exchange.orders[order_id] = snap(
+        order_id,
+        cid,
+        product=EQUITY,
+        price="100",
+        size="0.66",
+        status="EXPIRED",
+        filled_size="0.4",
+        filled_value="40",
+        total_fees="0.2",
+    )
+    exchange.fills_by_order[order_id] = [
+        trade_fill(
+            "t-eq-1", order_id, product=EQUITY, size="0.4", price="100", commission="0.2"
+        )
+    ]
+
+    sync(store, exchange, trades_csv)
+
+    settled = store.order(cid)
+    assert settled["status"] == CANCELLED
+    assert settled["filled_size"] == D("0.4")
+    assert settled["filled_value"] == D("40")
+    assert len(fill_rows(store)) == 1
+
+    # The pool counts what was actually paid, and the hold on the rest is gone.
+    assert ledger.equity_pool_used("dry") == D("40.2")
+    freed = ledger.holding("ai", EQUITY, book="dry")
+    assert freed.reserved_quote == D("0")
+    assert freed.available_quote == D("59.8")
+
+    # A second cycle over the same book books that fill exactly once.
+    sync(store, exchange, trades_csv)
+
+    assert len(fill_rows(store)) == 1
+    assert len(csv_rows_for(trades_csv, "t-eq-1")) == 1
+    assert ledger.equity_pool_used("dry") == D("40.2")
+    assert store.order(cid)["status"] == CANCELLED
+
+
+def test_reconcile_adopts_equity_order_as_equity(store, trades_csv, tmp_path):
+    """An adopted order's kind is the exchange's own answer about the product."""
+    # 1. An equity account: NVDA-USD is an equity, so its row is one too.
+    equity_cid = cid_for("ai", 1)
+    equity_exchange = FakeEquityExchange(
+        [snap("ex-eq", equity_cid, product=EQUITY, price="100", size="1")]
+    )
+    sync(store, equity_exchange, trades_csv)
+
+    adopted = store.order(equity_cid)
+    assert adopted is not None
+    assert adopted["product_type"] == "EQUITY"
+    assert adopted["owner"] == "ai"
+
+    # 2. An exchange that says nothing about kinds: spot, which is every row
+    # written before equities existed.
+    plain_cid = cid_for("ai", 2)
+    plain_store = Store(tmp_path / "plain.db")
+    try:
+        plain = FakeExchange(
+            [snap("ex-plain", plain_cid, product=EQUITY, price="100", size="1")]
+        )
+        assert not hasattr(plain, "is_equity")
+        sync(plain_store, plain, tmp_path / "plain.csv")
+
+        as_spot = plain_store.order(plain_cid)
+        assert as_spot is not None
+        assert as_spot["product_type"] == "SPOT"
+    finally:
+        plain_store.close()
+
+    # 3. A crypto order on a router: the router's own is_equity says it is not an
+    # equity, so the row is spot.
+    router_cid = cid_for("ai", 3)
+    router_store = Store(tmp_path / "router.db")
+    try:
+        router = ExchangeRouter(
+            RouterAdapter([snap("ex-crypto", router_cid, product=PRODUCT)]),
+            RouterAdapter(),
+            is_equity=lambda product: product == EQUITY,
+            product_of=product_of_row(router_store),
+            usd_one_pool=False,
+            equity_bases=("NVDA",),
+        )
+        sync(router_store, router, tmp_path / "router.csv")
+
+        crypto_row = router_store.order(router_cid)
+        assert crypto_row is not None
+        assert crypto_row["product"] == PRODUCT
+        assert crypto_row["product_type"] == "SPOT"
+    finally:
+        router_store.close()

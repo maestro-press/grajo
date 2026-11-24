@@ -269,6 +269,7 @@ def seed_order(
         size,
         status=status,
         book="dry",
+        product_type="SPOT",
     )
     return cid
 

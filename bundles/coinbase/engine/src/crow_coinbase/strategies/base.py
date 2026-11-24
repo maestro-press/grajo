@@ -2,7 +2,8 @@
 
 Only frozen dataclasses and one Protocol live here, so the loop, the gateway and
 every strategy share the same shapes without importing one another.  Money and
-size are `Decimal`; `ts` and `now` are the only floats (epoch seconds).
+size are `Decimal`; `ts`, `print_ts` and `now` are the only floats (epoch
+seconds).
 """
 
 from __future__ import annotations
@@ -17,7 +18,16 @@ from ..money import ProductSpec
 
 @dataclass(frozen=True)
 class MarketSnapshot:
-    """One product's top of book and the low/high of the poll window that read it."""
+    """One product's top of book and the low/high of the poll window that read it.
+
+    `ts` is when the read happened.  `print_ts` is when the PRICE was made, for a
+    market that knows the difference: an equity print carries its own time, and a
+    reader has to be able to tell a fresh read of an old price from a fresh price
+    (a stock order's age bound is about the print, not about the read).  It is the
+    last field, defaulting to None, so every snapshot that has no print of its own
+    — a crypto book, or one built before this existed — is unchanged and is judged
+    by `ts` alone.
+    """
 
     product: str
     bid: Decimal
@@ -25,6 +35,7 @@ class MarketSnapshot:
     low: Decimal
     high: Decimal
     ts: float
+    print_ts: Optional[float] = None
 
 
 @dataclass(frozen=True)

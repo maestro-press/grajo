@@ -36,6 +36,7 @@ from crow_coinbase.router import (
 XRP = "XRP-USDC"
 BTC = "BTC-USDC"
 NVDA = "NVDA-USD"
+VOO = "VOO-USD"
 
 
 class Fake:
@@ -305,6 +306,533 @@ def test_router_cancel_unknown_id_both_ored():
     equity.cancel_result = {"y": False}
     assert router.cancel(["y"]) == {"y": False}
     assert sorted(name for name, _, _ in log) == ["crypto", "equity"]
+
+
+def test_router_delisted_product_with_equity_rows_routes_to_equity():
+    """A product off the equity list, but with EQUITY rows, stays the equity side's."""
+    router, _crypto, _equity, log = make_router(
+        crypto_kwargs={"open_orders": [{"order_id": "o3"}]},
+        equity_kwargs={
+            "open_orders": [{"order_id": "o2"}],
+            "fills_result": [
+                {"trade_id": "t-eq", "order_id": "o2", "product": NVDA}
+            ],
+        },
+        is_equity=lambda product: product == VOO,
+        equity_rows=lambda product: product == NVDA,
+        product_of={"o2": NVDA, "o3": XRP}.get,
+    )
+
+    # NVDA is not on the equity list any more, but its rows are equity rows.
+    assert router.get_order("o2")["order_id"] == "o2"
+    assert calls(log) == [("equity", "get_order")]
+
+    log.clear()
+    assert [fill["trade_id"] for fill in router.fills("o2")] == ["t-eq"]
+    assert calls(log) == [("equity", "fills")]
+
+    log.clear()
+    assert [order["order_id"] for order in router.list_open_orders(NVDA)] == ["o2"]
+    assert calls(log) == [("equity", "list_open_orders")]
+
+    log.clear()
+    found = router.find_by_client_id("cb-ai-x", 0, NVDA)
+    assert found["order_id"] == "equity-cb-ai-x"
+    assert calls(log) == [("equity", "find_by_client_id")]
+
+    # A crypto product with no equity rows is still the crypto account's.
+    log.clear()
+    assert router.get_order("o3")["order_id"] == "o3"
+    assert calls(log) == [("crypto", "get_order")]
+
+    # A cancel splits the ids by the account that holds each one.
+    log.clear()
+    merged = router.cancel(["o2", "o3"])
+    sent: dict[str, list[str]] = {}
+    for name, method, args in log:
+        assert method == "cancel"
+        sent[name] = list(args[0])
+    assert sent == {"crypto": ["o3"], "equity": ["o2"]}
+    assert merged == {"o3": True, "o2": True}
+
+    # The delisted product may not go out on the crypto path at all.
+    log.clear()
+    refused = router.place_limit("cb-ai-B+0-1", NVDA, "BUY", D("1"), D("100"))
+    assert refused == {
+        "ok": False,
+        "order_id": None,
+        "reason": EQUITY_USE_EQUITY_PATH,
+    }
+    assert log == []
+
+    # Every resting order of the merged book comes off its own account.
+    log.clear()
+    resting = router.list_open_orders()
+    every = router.cancel([order["order_id"] for order in resting])
+    assert every == {"o3": True, "o2": True}
+    sent = {}
+    for name, method, args in log:
+        if method != "cancel":
+            continue
+        sent[name] = list(args[0])
+    assert sent == {"crypto": ["o3"], "equity": ["o2"]}
+
+    # Without the row rule the router behaves as it always did: a product that
+    # is not on the equity list is the crypto account's.
+    plain_log: list = []
+    plain = ExchangeRouter(
+        Fake("crypto", plain_log),
+        Fake("equity", plain_log),
+        is_equity=lambda product: product == VOO,
+        product_of={"o2": NVDA}.get,
+        usd_one_pool=False,
+    )
+    assert plain.get_order("o2")["order_id"] == "o2"
+    assert calls(plain_log) == [("crypto", "get_order")]
+
+
+def test_router_crypto_product_with_a_stray_equity_row_stays_crypto():
+    """The crypto list wins over a stray EQUITY row: no call is re-routed."""
+    log = []
+    router = ExchangeRouter(
+        Fake("crypto", log),
+        Fake("equity", log),
+        is_equity=lambda product: product == NVDA,
+        is_crypto=lambda product: product == XRP,
+        product_of=lambda order_id: XRP,
+        equity_rows=lambda product: product == XRP,
+        usd_one_pool=True,
+    )
+
+    placed = router.place_limit("cb-grid-B+0-1", XRP, "BUY", D("1"), D("1"))
+    assert placed["ok"] is True
+    assert placed["reason"] is None
+    assert placed["order_id"] == "crypto-cb-grid-B+0-1"
+    assert calls(log) == [("crypto", "place_limit")]
+
+    log.clear()
+    assert router.cancel(["o1"]) == {"o1": True}
+    assert calls(log) == [("crypto", "cancel")]
+
+    log.clear()
+    assert router.get_order("o1")["order_id"] == "o1"
+    assert calls(log) == [("crypto", "get_order")]
+
+    log.clear()
+    assert router.fills("o1") == []
+    assert calls(log) == [("crypto", "fills")]
+
+
+def test_router_place_equity_limit_follows_the_list_not_history():
+    """A stray EQUITY row does not make a product a new equity order's instrument."""
+    router, _crypto, _equity, log = make_router(
+        is_equity=lambda product: product == NVDA,
+        equity_rows=lambda product: product == VOO,
+    )
+
+    refused = router.place_equity_limit("cb-ai-B+0-1", VOO, "BUY", D("1"), D("50"))
+
+    assert refused == {
+        "ok": False,
+        "order_id": None,
+        "reason": NOT_EQUITY_PRODUCT,
+    }
+    assert log == []
+
+
+def test_router_delisted_symbol_keeps_its_reads_on_the_equity_account():
+    """Reads about a delisted symbol follow its rows; a new order follows the list."""
+    router, _crypto, _equity, log = make_router(
+        crypto_kwargs={"open_orders": [{"order_id": "o3"}]},
+        equity_kwargs={
+            "open_orders": [{"order_id": "o2"}],
+            "fills_result": [
+                {"trade_id": "t-eq", "order_id": "o2", "product": VOO}
+            ],
+        },
+        is_equity=lambda product: product == NVDA,
+        is_crypto=lambda product: product == XRP,
+        equity_rows=lambda product: product == VOO,
+        product_of={"o2": VOO, "o3": XRP}.get,
+    )
+
+    # VOO is off the equity list and off the crypto one, and its rows are EQUITY
+    # rows: every read about one of them is answered on the equity account.
+    assert router.get_order("o2")["order_id"] == "o2"
+    assert calls(log) == [("equity", "get_order")]
+
+    log.clear()
+    assert [fill["trade_id"] for fill in router.fills("o2")] == ["t-eq"]
+    assert calls(log) == [("equity", "fills")]
+
+    log.clear()
+    assert router.cancel(["o2"]) == {"o2": True}
+    assert calls(log) == [("equity", "cancel")]
+
+    # A NEW order is a different question: it follows the configured list, so a
+    # symbol that is no longer an equity takes neither path.
+    log.clear()
+    assert router.place_limit("cb-ai-B+0-1", VOO, "BUY", D("1"), D("50")) == {
+        "ok": False,
+        "order_id": None,
+        "reason": EQUITY_USE_EQUITY_PATH,
+    }
+    assert router.place_equity_limit(
+        "cb-ai-B+0-2", VOO, "BUY", D("1"), D("50")
+    ) == {"ok": False, "order_id": None, "reason": NOT_EQUITY_PRODUCT}
+    assert log == []
+
+
+class InPlaceList(Fake):
+    """An adapter whose `list_open_orders` hands back its own dicts, not copies."""
+
+    def list_open_orders(self, product=None):
+        self._record("list_open_orders", product)
+        return list(self._open)
+
+
+def test_router_list_all_tags_each_snapshot_with_its_account():
+    """Every snapshot of the merged book says which account it came from."""
+    log = []
+    crypto_listed = {"order_id": "c1", "client_order_id": "cb-b1-B+0-1"}
+    equity_listed = {
+        "order_id": "e1",
+        "client_order_id": "cb-ai-B+0-2",
+        "product": NVDA,
+    }
+    router = ExchangeRouter(
+        Fake("crypto", log, open_orders=[crypto_listed]),
+        InPlaceList("equity", log, open_orders=[equity_listed]),
+        is_equity=lambda product: product == NVDA,
+        usd_one_pool=True,
+    )
+
+    everything = router.list_open_orders(None)
+
+    # Crypto first, then equity, and the tag is the only key added.
+    assert everything == [
+        {"order_id": "c1", "client_order_id": "cb-b1-B+0-1", "account": "crypto"},
+        {
+            "order_id": "e1",
+            "client_order_id": "cb-ai-B+0-2",
+            "product": NVDA,
+            "account": "equity",
+        },
+    ]
+    # The snapshot the equity adapter handed back is untouched: the tag went on
+    # a copy, so the adapter's own record still reads what the account said.
+    assert equity_listed == {
+        "order_id": "e1",
+        "client_order_id": "cb-ai-B+0-2",
+        "product": NVDA,
+    }
+
+    # A one-key router is a pure pass-through: no account is invented for it.
+    solo_log = []
+    solo_expected = {"order_id": "c9", "client_order_id": "cb-b1-B+0-9"}
+    solo_listed = dict(solo_expected)
+    solo = ExchangeRouter(
+        InPlaceList("crypto", solo_log, open_orders=[solo_listed]), usd_one_pool=True
+    )
+    assert solo.list_open_orders(None) == [solo_expected]
+    assert "account" not in solo_listed
+
+
+def test_router_shared_adapter_lists_each_order_once_tagged_by_ownership():
+    """One adapter on both sides is one book: each order once, tagged per product."""
+    log = []
+    same = Fake(
+        "crypto",
+        log,
+        open_orders=[
+            {"order_id": "e1", "client_order_id": "cb-ai-B+0-1", "product": NVDA},
+            {"order_id": "c1", "client_order_id": "cb-b1-B+0-2", "product": XRP},
+            {"order_id": "d1", "client_order_id": "cb-ai-B+0-3", "product": VOO},
+        ],
+    )
+    router = ExchangeRouter(
+        same,
+        same,
+        is_equity=lambda product: product == NVDA,
+        is_crypto=lambda product: product == XRP,
+        equity_rows=lambda product: product == VOO,
+        usd_one_pool=True,
+    )
+
+    everything = router.list_open_orders(None)
+
+    # One entry per order the one account reported, each tagged with what
+    # `owns_equity` says about its product — the same answer the reads route by.
+    assert len(everything) == 3
+    assert sorted(
+        (order["client_order_id"], order["account"]) for order in everything
+    ) == [
+        ("cb-ai-B+0-1", "equity"),  # a listed equity
+        ("cb-ai-B+0-3", "equity"),  # off the list, but its rows are EQUITY rows
+        ("cb-b1-B+0-2", "crypto"),  # the crypto list wins over any row
+    ]
+    assert router.owns_equity(VOO) is True
+    assert router.owns_equity(XRP) is False
+
+
+def test_router_shared_adapter_without_hooks_lists_once_untagged():
+    """Nothing to steer by: the one adapter's own list, once, with no tag added."""
+    log = []
+    listed = [
+        {"order_id": "c1", "client_order_id": "cb-b1-B+0-9", "product": XRP}
+    ]
+    same = Fake("crypto", log, open_orders=[dict(listed[0])])
+    router = ExchangeRouter(same, same, usd_one_pool=True)
+
+    assert router.list_open_orders(None) == listed
+    assert calls(log) == [("crypto", "list_open_orders")]
+
+    # A two-adapter router is unchanged: the crypto book first, then the equity
+    # one, each snapshot carrying the account that listed it.
+    two_log = []
+    two = ExchangeRouter(
+        Fake("crypto", two_log, open_orders=[{"order_id": "c1", "product": XRP}]),
+        Fake("equity", two_log, open_orders=[{"order_id": "e1", "product": NVDA}]),
+        is_equity=lambda product: product == NVDA,
+        is_crypto=lambda product: product == XRP,
+        usd_one_pool=False,
+    )
+    assert [
+        (order["order_id"], order["account"])
+        for order in two.list_open_orders(None)
+    ] == [("c1", "crypto"), ("e1", "equity")]
+    assert calls(two_log) == [
+        ("crypto", "list_open_orders"),
+        ("equity", "list_open_orders"),
+    ]
+
+
+class TypedFake(Fake):
+    """A shared adapter that also answers a product's own kind, as a live one does.
+
+    `kinds` is the per-product answer off a product spec and `kinds_error` makes
+    every lookup raise, so a test can tell a lookup that answered from one that
+    could not (and so has no kind to tag by).
+    """
+
+    def __init__(self, name, log, *, kinds=None, kinds_error=None, **kwargs):
+        super().__init__(name, log, **kwargs)
+        self.kinds = dict(kinds or {})
+        self.kinds_error = kinds_error
+
+    def product_type(self, product):
+        self._record("product_type", product)
+        if self.kinds_error is not None:
+            raise self.kinds_error
+        return self.kinds.get(product, "")
+
+
+class InPlaceTyped(TypedFake):
+    """A typed adapter whose `list_open_orders` hands back its own dicts."""
+
+    def list_open_orders(self, product=None):
+        self._record("list_open_orders", product)
+        return list(self._open)
+
+
+def test_shared_adapter_tags_by_product_type():
+    """One adapter on both sides tags each order by its OWN product kind.
+
+    An order on a symbol the store has no EQUITY rows for, and that no list names,
+    is still the equity account's when the adapter's own spec says EQUITY: a lost
+    store would otherwise adopt the orphan SPOT and leave the pool.
+    """
+    log = []
+    listed = [
+        {"order_id": "d1", "client_order_id": "cb-ai-B+0-1", "product": NVDA},
+        {"order_id": "x1", "client_order_id": "cb-b1-B+0-2", "product": XRP},
+        {"order_id": "b1", "client_order_id": "cb-b1-B+0-3", "product": BTC},
+        {"order_id": "v1", "client_order_id": "cb-ai-B+0-4", "product": VOO},
+    ]
+    same = InPlaceTyped(
+        "same",
+        log,
+        open_orders=listed,
+        kinds={NVDA: "equity", XRP: "EQUITY", BTC: "SPOT", VOO: ""},
+    )
+    router = ExchangeRouter(
+        same,
+        same,
+        is_equity=lambda product: False,
+        is_crypto=lambda product: product == XRP,
+        equity_rows=lambda product: product == VOO,
+        usd_one_pool=True,
+    )
+
+    everything = router.list_open_orders(None)
+
+    # The delisted symbol is nobody's by the router's own rule (no list, no rows),
+    # and the adapter's own kind is what tags it an equity.
+    assert router.owns_equity(NVDA) is False
+    assert router.owns_equity(BTC) is False
+    assert [(order["client_order_id"], order["account"]) for order in everything] == [
+        ("cb-ai-B+0-1", "equity"),  # the adapter's kind, over owns_equity's answer
+        ("cb-b1-B+0-2", "crypto"),  # the crypto list wins over the adapter's kind
+        ("cb-b1-B+0-3", "crypto"),  # a SPOT kind
+        ("cb-ai-B+0-4", "equity"),  # an empty kind, on a product not listed crypto
+    ]
+    # Each of the one account's orders is listed once, and the tag went on a copy.
+    assert len(everything) == len(listed)
+    assert len({order["order_id"] for order in everything}) == len(listed)
+    assert all("account" not in order for order in listed)
+
+    # An empty kind on a product no list names is still equity: a product that is
+    # not crypto-listed is never adopted SPOT, whatever `owns_equity` says.
+    empty_log = []
+    empty = InPlaceTyped(
+        "empty",
+        empty_log,
+        open_orders=[
+            {"order_id": "b1", "client_order_id": "cb-b1-B+0-8", "product": BTC}
+        ],
+        kinds={},
+    )
+    unowned = ExchangeRouter(
+        empty,
+        empty,
+        is_equity=lambda product: False,
+        equity_rows=lambda product: False,
+        usd_one_pool=True,
+    )
+    assert unowned.owns_equity(BTC) is False
+    assert unowned.list_open_orders(None)[0]["account"] == "equity"
+
+    # A lookup that cannot answer is no better a reason to adopt SPOT: the two
+    # products below are not crypto-listed, so both are tagged equity.
+    failing_log = []
+    failing = TypedFake(
+        "failing",
+        failing_log,
+        open_orders=[
+            {"order_id": "v1", "client_order_id": "cb-ai-B+0-6", "product": VOO},
+            {"order_id": "b1", "client_order_id": "cb-b1-B+0-7", "product": BTC},
+        ],
+        kinds_error=TransientError("product spec unavailable"),
+    )
+    falling_back = ExchangeRouter(
+        failing,
+        failing,
+        is_equity=lambda product: False,
+        equity_rows=lambda product: product == VOO,
+        usd_one_pool=True,
+    )
+
+    assert falling_back.owns_equity(VOO) is True
+    assert falling_back.owns_equity(BTC) is False
+    assert [
+        (order["order_id"], order["account"])
+        for order in falling_back.list_open_orders(None)
+    ] == [("v1", "equity"), ("b1", "equity")]
+
+    # A crypto-listed product keeps its own account even when the lookup fails.
+    crypto_log = []
+    crypto = TypedFake(
+        "crypto",
+        crypto_log,
+        open_orders=[
+            {"order_id": "b1", "client_order_id": "cb-b1-B+0-9", "product": BTC}
+        ],
+        kinds_error=TransientError("product spec unavailable"),
+    )
+    listed_crypto = ExchangeRouter(
+        crypto,
+        crypto,
+        is_equity=lambda product: False,
+        is_crypto=lambda product: product == BTC,
+        usd_one_pool=True,
+    )
+    assert listed_crypto.list_open_orders(None)[0]["account"] == "crypto"
+
+
+def test_shared_adapter_without_hooks_but_with_product_type_is_tagged():
+    """An adapter that knows its products' kinds tags its one book with no hooks."""
+    log = []
+    same = InPlaceTyped(
+        "same",
+        log,
+        open_orders=[
+            {"order_id": "e1", "client_order_id": "cb-ai-B+0-1", "product": NVDA},
+            {"order_id": "c1", "client_order_id": "cb-b1-B+0-2", "product": XRP},
+        ],
+        kinds={NVDA: "EQUITY", XRP: "SPOT"},
+    )
+    router = ExchangeRouter(same, same, usd_one_pool=True)
+
+    tagged = router.list_open_orders(None)
+
+    assert [(order["order_id"], order["account"]) for order in tagged] == [
+        ("e1", "equity"),
+        ("c1", "crypto"),
+    ]
+    assert calls(log)[0] == ("same", "list_open_orders")
+    assert [method for _, method, _ in log].count("list_open_orders") == 1
+    assert len(tagged) == len(same._open)
+    assert all("account" not in order for order in same._open)
+    assert tagged[0] is not same._open[0]
+
+
+def test_shared_adapter_without_product_type_unchanged():
+    """An adapter with no kind to give is tagged (or left untagged) exactly as before."""
+    log = []
+    listed = [
+        {"order_id": "e1", "client_order_id": "cb-ai-B+0-1", "product": NVDA},
+        {"order_id": "c1", "client_order_id": "cb-b1-B+0-2", "product": XRP},
+    ]
+    same = InPlaceList("crypto", log, open_orders=listed)
+    router = ExchangeRouter(
+        same,
+        same,
+        is_equity=lambda product: product == NVDA,
+        is_crypto=lambda product: product == XRP,
+        equity_rows=lambda product: False,
+        usd_one_pool=True,
+    )
+
+    tagged = router.list_open_orders(None)
+
+    # `owns_equity` is the tag, one entry per order, and the adapter's own dicts
+    # are untouched.
+    assert [(order["order_id"], order["account"]) for order in tagged] == [
+        ("e1", "equity"),
+        ("c1", "crypto"),
+    ]
+    assert len(tagged) == len(listed)
+    assert all("account" not in order for order in listed)
+
+    # With no hooks and no kind either: one list, untagged, as the adapter answered.
+    solo_log = []
+    solo_listed = [
+        {"order_id": "c9", "client_order_id": "cb-b1-B+0-9", "product": XRP}
+    ]
+    solo = ExchangeRouter(
+        InPlaceList("crypto", solo_log, open_orders=solo_listed), usd_one_pool=True
+    )
+    assert solo.list_open_orders(None) == solo_listed
+    assert calls(solo_log) == [("crypto", "list_open_orders")]
+    assert all("account" not in order for order in solo_listed)
+
+
+def test_router_owns_equity_answers_the_lists_before_the_rows():
+    """A listed equity and a delisted row are the equity side's; a crypto is not."""
+    router = ExchangeRouter(
+        Fake("crypto", []),
+        Fake("equity", []),
+        is_equity=lambda product: product == NVDA,
+        is_crypto=lambda product: product == XRP,
+        equity_rows=lambda product: product in (VOO, XRP),
+        usd_one_pool=True,
+    )
+
+    # A listed equity, and a symbol off every list that still has EQUITY rows.
+    assert router.owns_equity(NVDA) is True
+    assert router.owns_equity(VOO) is True
+    # The crypto list wins: a stray EQUITY row does not move a coin to equity.
+    assert router.owns_equity(XRP) is False
 
 
 def test_router_get_order_routes_by_product():

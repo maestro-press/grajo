@@ -1352,5 +1352,5 @@ test("test_descriptions_honest", async () => {
 
 test("manifest_version_bumped", () => {
   const manifest = JSON.parse(readFileSync(join(BUNDLE_DIR, "manifest.json"), "utf8"));
-  assert.equal(manifest.version, "0.4.11", `the bundle version is bumped (found ${manifest.version})`);
+  assert.equal(manifest.version, "0.4.14", `the bundle version is bumped (found ${manifest.version})`);
 });

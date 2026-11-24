@@ -103,6 +103,27 @@
       "CROW_COINBASE_ENGINE_URL": [
         "http://127.0.0.1:3062"
       ],
+      "CROW_COINBASE_EQUITY_AI_CAPITAL_USD": [
+        "0"
+      ],
+      "CROW_COINBASE_EQUITY_DAILY_NOTIONAL_USD": [
+        "200"
+      ],
+      "CROW_COINBASE_EQUITY_DRAWDOWN_ALERT_PCT": [
+        "20"
+      ],
+      "CROW_COINBASE_EQUITY_LIVE": [
+        "false"
+      ],
+      "CROW_COINBASE_EQUITY_MAX_ORDER_USD": [
+        "100"
+      ],
+      "CROW_COINBASE_EQUITY_PORTFOLIO_ID": [
+        ""
+      ],
+      "CROW_COINBASE_EQUITY_PRODUCTS": [
+        ""
+      ],
       "CROW_COINBASE_LIVE": [
         "true"
       ],

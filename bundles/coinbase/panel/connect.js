@@ -13,6 +13,32 @@
  *   POST /api/coinbase/disconnect      has the engine forget the pin, then drops the connection
  *   GET  /api/coinbase/connect/state   what the panel shows, read only
  *
+ * Four routes hold the Stock prices token (Tiingo) on that same connection. They are
+ * LOCAL-SESSION-ONLY: a local password session on this Crow, no 2FA switch check and no code, because
+ * the token only reads public prices and can neither spend nor move money. Every route that can trade
+ * or reveal still wants both. They refuse a peer session and want the CSRF header like the rest.
+ *
+ *   POST /api/coinbase/tiingo/test         asks the engine about a pasted token, seals nothing
+ *   POST /api/coinbase/tiingo              tests it, seals it on the connection, then pushes it
+ *   POST /api/coinbase/tiingo/disconnect   drops the sealed token, then has the engine forget it
+ *   GET  /api/coinbase/tiingo/state        what the Stock prices card shows, read only
+ *
+ * The token is one keychain row (`TIINGO_TOKEN`) on the standing Coinbase connection, so it needs
+ * Coinbase connected first and a Coinbase Disconnect takes it with the rest. No route, audit payload
+ * or answer ever carries it, and no answer carries even its last four characters.
+ *
+ * A Connect that replaces the standing connection carries that sealed token onto the new row: the
+ * token is read from the connection being let go while it still stands, sealed on the connection
+ * that replaces it, and then handed to the engine with the new client — best effort, never part of
+ * the answer, and a copy that cannot be made leaves the connection itself untouched. Only a row of
+ * the new connection's own project is read for that copy: every other active row of the service is
+ * still let go, but a token sealed in another project stays with the row it was pasted on.
+ *
+ * The state route reads the engine's own view of the prices: `connected`, `missing`, `rejected`, or
+ * `paused` while Tiingo is limiting Crow. A pause is not a refusal — the token is fine and the
+ * prices resume on their own — so it answers `connected: true` with the pause sentence, keeping the
+ * five keys every reader of that route depends on.
+ *
  * Every POST sits behind a local password session on this Crow and 2FA switched on; the two that
  * write anything (Connect and Disconnect) also want a fresh code, checked by the one step-up gate
  * this process has, so a code already used is never used again. That code is proof of who is here
@@ -55,10 +81,17 @@ const APPROVE_SECRET_BYTES = 32;
 const SECRET_KEY_NAME = "COINBASE_KEY_NAME";
 const SECRET_PRIVATE_KEY = "COINBASE_PRIVATE_KEY";
 const SECRET_APPROVE = "COINBASE_APPROVE_SECRET";
+// The Stock prices token: one more sealed row on the same connection, deliberately NOT a declared
+// panel secret (a declared one is required of every existing connection, which would break them).
+const SECRET_TIINGO_TOKEN = "TIINGO_TOKEN";
+const TIINGO_LABEL = "Coinbase \u2014 Stock prices \u2014 TIINGO_TOKEN";
 
 const ACTION_CONNECT = "coinbase.connect";
 const ACTION_TEST = "coinbase.connect_test";
 const ACTION_DISCONNECT = "coinbase.disconnect";
+const ACTION_TIINGO_TEST = "coinbase.tiingo_test";
+const ACTION_TIINGO_CONNECT = "coinbase.tiingo_connect";
+const ACTION_TIINGO_DISCONNECT = "coinbase.tiingo_disconnect";
 
 const CODE_OK = "ok";
 const CODE_BAD_REQUEST = "bad_request";
@@ -106,6 +139,26 @@ const MESSAGE_ENGINE_PINNED =
 
 const ACCEPTED_PREFIX = "Key accepted \u2014 Crow portfolio \u2026";
 const CONNECTED_PREFIX = "Connected \u2014 Crow portfolio \u2026";
+
+// The Stock prices card's own words. The engine's fixed sentences are for a token it refused; the
+// four sentences below are what the card says about the state it read, so the engine's own words
+// never reach the page through this field.
+const MESSAGE_PASTE_TIINGO = "Paste the Tiingo token.";
+const MESSAGE_TIINGO_ACCEPTED = "Tiingo accepted the token.";
+const MESSAGE_TIINGO_SAVED = "Stock prices connected.";
+const MESSAGE_TIINGO_PENDING =
+  "Saved. Crow will send it to the trading engine as soon as it answers.";
+const MESSAGE_TIINGO_DISCONNECTED = "Stock prices disconnected.";
+const MESSAGE_CONNECT_COINBASE_FIRST = "Connect Coinbase first.";
+const MESSAGE_PRICES_CONNECTED = "Stock prices are connected (Tiingo).";
+const MESSAGE_PRICES_MISSING =
+  "Stock prices are not connected, so practice stock orders will not fill. " +
+  "Paste your free Tiingo token below.";
+const MESSAGE_PRICES_REJECTED = "Tiingo did not accept the token. Paste it again.";
+// A paused allowance: Tiingo is limiting Crow's requests, so the prices wait. The token is fine,
+// which is why the state route answers this as connected.
+const MESSAGE_PRICES_PAUSED =
+  "Stock prices are paused for now (Tiingo is limiting requests); they will resume on their own.";
 
 /** The setup steps the panel shows above the two fields. */
 export const COPY_STEPS =
@@ -261,6 +314,24 @@ function cleanPastedValue(value) {
 }
 
 /**
+ * A pasted Stock prices token, cleaned the same way a pasted key is: CRLF line ends become LF, the
+ * text is trimmed and it must be one line with no spaces or control characters. null when the value
+ * cannot be used, so nothing is sent to the engine. The shape rules a token must satisfy (printable
+ * ASCII only, at most 256 characters) stay the engine's own: it answers TOKEN_SHAPE, in its own
+ * words, for anything this cleaner let through.
+ */
+function cleanTiingoToken(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.replace(/\r\n/g, "\n");
+  if (CONTROL_RE.test(normalized)) return null;
+  const text = normalized.trim();
+  if (text === "") return null;
+  if (text.length > FIELD_MAX_CHARS) return null;
+  if (/\s/.test(text)) return null;
+  return text;
+}
+
+/**
  * A promise-chain mutex: each task starts after the one before it settled, and a task that throws
  * does not break the chain for the next one. Not reentrant — a task that already holds it must
  * call the unlocked form of whatever it needs.
@@ -274,6 +345,55 @@ function createMutex() {
       () => undefined,
     );
     return answer;
+  };
+}
+
+/**
+ * The sealed Stock prices token on one connection, or null. `row` is the connection row (or its
+ * uuid). Exported for tests that read the keychain the way the panel does; its answer is never
+ * handed to a response, an audit row or a log line.
+ */
+export async function sealedTiingoToken(db, loadKey, row) {
+  const uuid = row && typeof row === "object" ? row.uuid : row;
+  if (typeof uuid !== "string" || uuid === "") return null;
+  const { serviceSecretsFor } = await keychainStore();
+  const key = typeof loadKey === "function" ? await loadKey() : null;
+  const secrets = await serviceSecretsFor(db, key, String(uuid), {
+    allowedKeys: [SECRET_TIINGO_TOKEN],
+  });
+  const value = secrets ? secrets[SECRET_TIINGO_TOKEN] : null;
+  return typeof value === "string" && value ? value : null;
+}
+
+/**
+ * The keychain seam the Tiingo work goes through: `save(uuid, token)`, `read(uuid)` and
+ * `remove(uuid)` over the real sealing functions, on the same connection and under the same key as
+ * its key name and private key. A read that cannot open the keychain answers null (nothing to
+ * push) rather than guessing at a token.
+ */
+function createTiingoStore(db, loadKey) {
+  return {
+    async save(uuid, token) {
+      const { saveServiceSecret } = await keychainStore();
+      return saveServiceSecret(db, await loadKey(), {
+        connectionUuid: String(uuid),
+        bundleId: SERVICE_ID,
+        envKey: SECRET_TIINGO_TOKEN,
+        label: TIINGO_LABEL,
+        secret: String(token),
+      });
+    },
+    async read(uuid) {
+      try {
+        return await sealedTiingoToken(db, loadKey, { uuid });
+      } catch {
+        return null;
+      }
+    },
+    async remove(uuid) {
+      const { deleteServiceSecret } = await keychainStore();
+      return deleteServiceSecret(db, String(uuid), SECRET_TIINGO_TOKEN, { bundleId: SERVICE_ID });
+    },
   };
 }
 
@@ -321,6 +441,13 @@ export function createConnectionStore(options = {}) {
   const engineClient = config.engineClient;
   const loadKey = typeof config.loadKey === "function" ? config.loadKey : null;
   const lock = typeof config.lock === "function" ? config.lock : createMutex();
+  const keyLoader = loadKey || (async () => {
+    const { ensureWriteKey } = await keychainStore();
+    return ensureWriteKey(db, { crowHome });
+  });
+  // The same keychain seam the Connect routes use, so a re-push sends the sealed token whether the
+  // routes handed one in or the defaults sealed it.
+  const tiingoStore = isPlainObject(config.tiingoStore) ? config.tiingoStore : createTiingoStore(db, keyLoader);
 
   const notConnected = () => ({
     ok: false,
@@ -380,6 +507,30 @@ export function createConnectionStore(options = {}) {
     }
   }
 
+  /**
+   * Hand the sealed Stock prices token back to the engine, if one is sealed.
+   *
+   * The same restart that lost the key lost the token, so a successful credentials push is also the
+   * moment to send it. Never throws and never changes the caller's result: a token the engine never
+   * answered for stays sealed here, so the next re-push sends it again, and its value is never in a
+   * result.
+   */
+  async function pushSealedTiingo(uuid) {
+    if (!engineClient || typeof engineClient.setTiingo !== "function") return;
+    let token = null;
+    try {
+      token = await tiingoStore.read(uuid);
+    } catch {
+      return;
+    }
+    if (typeof token !== "string" || token === "") return;
+    try {
+      await engineClient.setTiingo({ token });
+    } catch {
+      // A token the engine never answered for is still sealed here.
+    }
+  }
+
   async function repushUnlocked() {
     let row;
     let secrets;
@@ -422,6 +573,7 @@ export function createConnectionStore(options = {}) {
       } catch {
         // A config write that fails changes nothing about the push the engine accepted.
       }
+      await pushSealedTiingo(row.uuid);
     }
     return result;
   }
@@ -451,6 +603,12 @@ export function createConnectionStore(options = {}) {
  * `secretProvider(kind)` (the sealed owner secret, or the install token), `gates(req, res, action,
  * { needsCode, needs2fa })`, `writeAudit(projectId, action, target, payload)`, `buildClient()` and
  * `boundProjectId()`. None of them ever answers with a secret.
+ *
+ * `tiingoStore` is the keychain seam the four Stock prices routes seal, read and drop the token
+ * through: `{save(uuid, token), read(uuid), remove(uuid)}`, all async. The defaults wrap
+ * `saveServiceSecret` / `serviceSecretsFor` (allowed key `TIINGO_TOKEN`) / `deleteServiceSecret`
+ * with the key from `loadKey`; the connection store takes the same seam for its re-push, so a row is
+ * read back the way it was written whichever way the routes reached it.
  */
 export function createConnectRoutes(options = {}) {
   const config = options || {};
@@ -543,7 +701,21 @@ export function createConnectRoutes(options = {}) {
       }
       return client.pushCredentials(body, pushOptions);
     },
+    /** The Stock prices token rides along on a credentials push, one fresh client per call. */
+    async setTiingo(body) {
+      const client = await buildClient();
+      if (!client || typeof client.setTiingo !== "function") {
+        return { ok: false, status: 0, code: "ENGINE_UNREACHABLE", message: "" };
+      }
+      return client.setTiingo(body);
+    },
   };
+
+  // The keychain seam the four Stock prices routes seal, read and drop the token through. A caller
+  // may hand one in (the tests do), so the rows are the same rows either way.
+  const tiingoStore = isPlainObject(config.tiingoStore)
+    ? config.tiingoStore
+    : createTiingoStore(db, loadKey);
 
   const connection = createConnectionStore({
     db,
@@ -552,6 +724,7 @@ export function createConnectRoutes(options = {}) {
     engineClient: storeClient,
     loadKey,
     lock,
+    tiingoStore,
   });
 
   // ---- audit ----------------------------------------------------------------------------------
@@ -802,6 +975,96 @@ export function createConnectRoutes(options = {}) {
   }
 
   /**
+   * The other active connections of this service, oldest first: every row that stands beside
+   * `rowUuid` and has to go, and the one a Connect that replaces a connection reads first.
+   *
+   * `projectId` narrows the read to the rows of one project, and only the carry ever names one: a
+   * sealed token belongs to the connection it was pasted on, so a Connect that replaces a
+   * connection in one project reads the token of that project's row and never a token sealed in
+   * another. A caller that names no project — `disconnectOtherActiveRows` — still gets every other
+   * active row of the service, whatever project it stands in.
+   */
+  async function otherActiveRows(rowUuid, projectId) {
+    const project = positiveProjectId(projectId);
+    try {
+      const result = project === null
+        ? await db.execute({
+          sql: `SELECT uuid FROM service_connections
+                WHERE service_id = ? AND status = 'active' AND uuid <> ?
+                ORDER BY id`,
+          args: [serviceId, String(rowUuid)],
+        })
+        : await db.execute({
+          sql: `SELECT uuid FROM service_connections
+                WHERE service_id = ? AND status = 'active' AND uuid <> ? AND project_id = ?
+                ORDER BY id`,
+          args: [serviceId, String(rowUuid), project],
+        });
+      return result && Array.isArray(result.rows) ? result.rows : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * The sealed Stock prices token of the connection that is being let go, copied onto the row that
+   * replaces it, and only then returned so the engine can be handed it after the swap.
+   *
+   * The copy happens while the old connection still stands, because that is the only moment its
+   * sealed row can be read. Only a row of `projectId` — the new connection's own project — is read:
+   * a token sealed on a connection of another project stays where it was pasted, and every other
+   * active row of the service is let go below without its token being carried.
+   *
+   * A read that cannot open the keychain, and a copy that cannot be sealed, both answer null: the
+   * token is then simply pasted again, and the connection itself is unaffected. The value never
+   * leaves this function towards an answer, an audit payload or a log line.
+   *
+   * `projectId` is the carry's whole scope, so a value that is not a positive integer (a string,
+   * null, undefined, 0, a negative, NaN) carries nothing and reads nothing at all: without a
+   * project there is no row this copy is allowed to come from.
+   */
+  async function carrySealedTiingo(rowUuid, projectId) {
+    if (!Number.isInteger(projectId) || projectId <= 0) return null;
+    let rows = [];
+    try {
+      rows = await otherActiveRows(rowUuid, projectId);
+    } catch {
+      return null;
+    }
+    for (const row of rows) {
+      let token = null;
+      try {
+        token = await tiingoStore.read(row.uuid);
+      } catch {
+        token = null;
+      }
+      if (typeof token !== "string" || token === "") continue;
+      try {
+        await tiingoStore.save(rowUuid, token);
+      } catch {
+        return null;
+      }
+      return token;
+    }
+    return null;
+  }
+
+  /**
+   * Hand a carried token to the engine with the new connection's own client. Best effort: a token
+   * the engine never answered for stays sealed on the row, so the next successful re-push sends it
+   * again, and nothing about the Connect answer depends on this call.
+   */
+  async function pushCarriedTiingo(token) {
+    if (typeof token !== "string" || token === "") return;
+    try {
+      const client = await buildClient();
+      if (client && typeof client.setTiingo === "function") await client.setTiingo({ token });
+    } catch {
+      // The sealed copy is what the next re-push sends; this attempt is not the answer.
+    }
+  }
+
+  /**
    * Every other active connection of this service goes, whatever made it.
    *
    * One active connection per service is the rule, and a row this request never heard of — left
@@ -810,18 +1073,7 @@ export function createConnectRoutes(options = {}) {
    * for the next pass rather than failing the connect.
    */
   async function disconnectOtherActiveRows(rowUuid) {
-    let rows = [];
-    try {
-      const result = await db.execute({
-        sql: `SELECT uuid FROM service_connections
-              WHERE service_id = ? AND status = 'active' AND uuid <> ?
-              ORDER BY id`,
-        args: [serviceId, String(rowUuid)],
-      });
-      rows = result && Array.isArray(result.rows) ? result.rows : [];
-    } catch {
-      return;
-    }
+    const rows = await otherActiveRows(rowUuid);
     if (rows.length === 0) return;
     let disconnectConnection;
     try {
@@ -839,9 +1091,10 @@ export function createConnectRoutes(options = {}) {
   }
 
   /**
-   * The connection stands: keep the epoch and the two fingerprints on the row, let go of every
-   * other active row of this service (the one this Connect replaces, and any stale one), tell the
-   * panel, and file the one audit row that says it worked. Also the end of a settled
+   * The connection stands: keep the epoch and the two fingerprints on the row, carry a sealed Stock
+   * prices token over from the connection this one replaces, let go of every other active row of
+   * this service (the one this Connect replaces, and any stale one), hand the engine the carried
+   * token, tell the panel, and file the one audit row that says it worked. Also the end of a settled
    * `pending_pin`: the config is rewritten whole, so the flag is gone.
    */
   async function finishConnect(res, { projectId, rowUuid, data, probeData, previous }) {
@@ -866,7 +1119,14 @@ export function createConnectRoutes(options = {}) {
       // The connection stands; the panel reads what it can.
     }
 
+    // The token lived on the connection that is about to go, so it is read and copied while that
+    // row still stands, before anything is disconnected.
+    const carriedToken = await carrySealedTiingo(rowUuid, projectId);
+
     await disconnectOtherActiveRows(rowUuid);
+
+    // The new connection stands: the engine gets the carried token with the new client's own MAC.
+    await pushCarriedTiingo(carriedToken);
 
     try {
       await onConnected({ projectId, connectionUuid: rowUuid });
@@ -1101,6 +1361,15 @@ export function createConnectRoutes(options = {}) {
 
   /** Drop the row and its sealed secrets: the engine holds nothing worth forgetting. */
   async function dropConnection(res, projectId, uuid) {
+    // The Stock prices token lived on this connection, so the engine's copy goes first: once the
+    // sealed secrets are dropped there is no owner secret left to sign the forget with. Best effort
+    // only — a token the engine keeps reads public prices and can do nothing else.
+    try {
+      const client = await buildClient();
+      if (client && typeof client.clearTiingo === "function") await client.clearTiingo();
+    } catch {
+      // The Disconnect stands whatever the engine answered for its stock prices token.
+    }
     try {
       const { disconnectConnection } = await services();
       await disconnectConnection(db, uuid, { actor: "local" });
@@ -1177,6 +1446,184 @@ export function createConnectRoutes(options = {}) {
     return dropConnection(res, projectId, existing.uuid);
   }
 
+  // ---- the Stock prices (Tiingo) routes -----------------------------------------------------------
+
+  /** The standing Coinbase connection, or null: the sealed token lives on it and nowhere else. */
+  async function tiingoConnection() {
+    try {
+      return await readActiveRow(db, serviceId);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The pasted token, asked of the engine once.
+   *
+   * The engine's own refusal keeps its own code and its own fixed sentence; a shape it refuses is
+   * `TOKEN_SHAPE`, a token it will not take is `TOKEN_REJECTED`, and so on. Everything else — no
+   * client, an engine that did not answer, a client that cannot sign — is the engine unreachable.
+   * The token is in the request body only, and the client redacts it out of whatever came back.
+   */
+  async function checkTiingoToken(token) {
+    const client = await buildClient();
+    if (!client || typeof client.checkTiingo !== "function") {
+      return { ok: false, status: 503, code: CODE_ENGINE_UNREACHABLE, message: MESSAGE_ENGINE_UNREACHABLE };
+    }
+    const result = await client.checkTiingo({ token });
+    if (!result || !result.ok) {
+      return { ok: false, status: 503, code: CODE_ENGINE_UNREACHABLE, message: MESSAGE_ENGINE_UNREACHABLE };
+    }
+    const data = isPlainObject(result.data) ? result.data : {};
+    if (data.state === CODE_OK) return { ok: true };
+    const code = typeof data.code === "string" && data.code ? data.code : CODE_ENGINE_UNREACHABLE;
+    const message = typeof data.message === "string" && data.message ? data.message : MESSAGE_GENERIC;
+    return { ok: false, status: 422, code, message };
+  }
+
+  /** What the engine says about the token it holds, or "missing" when it cannot be asked. */
+  async function pricesState() {
+    try {
+      const client = await buildClient();
+      if (!client || typeof client.status !== "function") return "missing";
+      const result = await client.status();
+      const data = result && result.ok ? result.data : null;
+      const equity = isPlainObject(data) ? data.equity : null;
+      const reported = isPlainObject(equity) ? equity.prices : null;
+      if (
+        reported === "connected" ||
+        reported === "rejected" ||
+        reported === "paused" ||
+        reported === "missing"
+      ) {
+        return reported;
+      }
+      return "missing";
+    } catch {
+      return "missing";
+    }
+  }
+
+  async function handleTiingoTest(req, res) {
+    const token = cleanTiingoToken(isPlainObject(req.body) ? req.body.token : null);
+    if (!token) {
+      return refuse(res, ACTION_TIINGO_TEST, await boundProjectId(), 400, CODE_BAD_REQUEST, MESSAGE_PASTE_TIINGO);
+    }
+    const row = await tiingoConnection();
+    if (!row) {
+      return refuse(res, ACTION_TIINGO_TEST, null, 409, CODE_NOT_CONNECTED, MESSAGE_CONNECT_COINBASE_FIRST);
+    }
+    const checked = await checkTiingoToken(token);
+    if (!checked.ok) {
+      await writeAudit(Number(row.project_id), ACTION_TIINGO_TEST, row.uuid, { ok: false, code: checked.code });
+      return answerRefusal(res, checked.status, checked.code, checked.message);
+    }
+    return res.json({ ok: true, message: MESSAGE_TIINGO_ACCEPTED });
+  }
+
+  async function handleTiingoSave(req, res) {
+    const token = cleanTiingoToken(isPlainObject(req.body) ? req.body.token : null);
+    if (!token) {
+      return refuse(res, ACTION_TIINGO_CONNECT, await boundProjectId(), 400, CODE_BAD_REQUEST, MESSAGE_PASTE_TIINGO);
+    }
+    const row = await tiingoConnection();
+    if (!row) {
+      return refuse(res, ACTION_TIINGO_CONNECT, null, 409, CODE_NOT_CONNECTED, MESSAGE_CONNECT_COINBASE_FIRST);
+    }
+    const projectId = Number(row.project_id);
+
+    // Nothing is sealed behind a token the engine has not just accepted.
+    const checked = await checkTiingoToken(token);
+    if (!checked.ok) {
+      await writeAudit(projectId, ACTION_TIINGO_CONNECT, row.uuid, { ok: false, code: checked.code });
+      return answerRefusal(res, checked.status, checked.code, checked.message);
+    }
+
+    try {
+      await tiingoStore.save(row.uuid, token);
+    } catch {
+      return refuse(res, ACTION_TIINGO_CONNECT, projectId, 500, CODE_FAILED, MESSAGE_GENERIC, row.uuid);
+    }
+
+    // From here the token is sealed. An engine that is not answering keeps it: the next successful
+    // credentials re-push sends it again, so the owner is told it is saved, not lost.
+    let pushed = null;
+    try {
+      const client = await buildClient();
+      if (client && typeof client.setTiingo === "function") pushed = await client.setTiingo({ token });
+    } catch {
+      pushed = null;
+    }
+    if (pushed && pushed.ok) {
+      await writeAudit(projectId, ACTION_TIINGO_CONNECT, row.uuid, { ok: true });
+      return res.json({ ok: true, message: MESSAGE_TIINGO_SAVED });
+    }
+    const reason = pushed && typeof pushed.code === "string" && pushed.code ? pushed.code : CODE_ENGINE_UNREACHABLE;
+    await writeAudit(projectId, ACTION_TIINGO_CONNECT, row.uuid, { ok: true, code: reason });
+    return res.json({ ok: true, pending: true, message: MESSAGE_TIINGO_PENDING });
+  }
+
+  async function handleTiingoDisconnect(req, res) {
+    const row = await tiingoConnection();
+    if (!row) {
+      return refuse(res, ACTION_TIINGO_DISCONNECT, null, 409, CODE_NOT_CONNECTED, MESSAGE_CONNECT_COINBASE_FIRST);
+    }
+    const projectId = Number(row.project_id);
+    try {
+      await tiingoStore.remove(row.uuid);
+    } catch {
+      return refuse(res, ACTION_TIINGO_DISCONNECT, projectId, 500, CODE_FAILED, MESSAGE_GENERIC, row.uuid);
+    }
+    // The sealed row is gone, so the engine's copy goes too. Best effort: an engine that is not
+    // answering still loses the token on its next restart, and the owner is told it is disconnected.
+    try {
+      const client = await buildClient();
+      if (client && typeof client.clearTiingo === "function") await client.clearTiingo();
+    } catch {
+      // The sealed token is gone either way.
+    }
+    await writeAudit(projectId, ACTION_TIINGO_DISCONNECT, row.uuid, { ok: true });
+    return res.json({ ok: true, message: MESSAGE_TIINGO_DISCONNECTED });
+  }
+
+  async function handleTiingoState(req, res) {
+    let local = false;
+    try {
+      local = (await isLocalSession(db, req)) === true;
+    } catch {
+      local = false;
+    }
+    if (!local) return answerRefusal(res, 403, CODE_LOCAL_LOGIN, MESSAGE_LOCAL_LOGIN);
+
+    const row = await tiingoConnection();
+    if (!row) {
+      return res.json({ ok: true, connected: false, sealed: false, rejected: false, message: null });
+    }
+
+    // Whether the token is sealed here is the keychain's answer; whether the engine took it is the
+    // engine's. Neither is repeated: the answer carries four flags and one fixed sentence.
+    let sealed = false;
+    try {
+      sealed = (await tiingoStore.read(row.uuid)) !== null;
+    } catch {
+      sealed = false;
+    }
+    const prices = await pricesState();
+    const rejected = prices === "rejected";
+    // A pause is the token working while the allowance is used up, so it reads as connected: the
+    // five keys stay exactly as they are and only the sentence says the prices are waiting.
+    const paused = prices === "paused";
+    const connected = prices === "connected" || paused;
+    const message = rejected
+      ? MESSAGE_PRICES_REJECTED
+      : paused
+        ? MESSAGE_PRICES_PAUSED
+        : connected
+          ? MESSAGE_PRICES_CONNECTED
+          : MESSAGE_PRICES_MISSING;
+    return res.json({ ok: true, connected, sealed, rejected, message });
+  }
+
   // ---- GET /api/coinbase/connect/state ------------------------------------------------------------
 
   async function handleState(req, res) {
@@ -1235,6 +1682,30 @@ export function createConnectRoutes(options = {}) {
   router.post(`${PREFIX}/connect/test`, wrap(ACTION_TEST, handleTest, { needsCode: false }));
   router.post(`${PREFIX}/connect`, wrap(ACTION_CONNECT, handleConnect));
   router.post(`${PREFIX}/disconnect`, wrap(ACTION_DISCONNECT, handleDisconnect));
+  // The Stock prices routes: a local password session only, no 2FA switch check and no code (the
+  // token reads public prices and can neither spend nor move money). The two writes still pass the
+  // CSRF middleware above and still refuse a peer session.
+  router.post(
+    `${PREFIX}/tiingo/test`,
+    wrap(ACTION_TIINGO_TEST, handleTiingoTest, { needsCode: false, needs2fa: false }),
+  );
+  router.post(
+    `${PREFIX}/tiingo`,
+    wrap(ACTION_TIINGO_CONNECT, handleTiingoSave, { needsCode: false, needs2fa: false }),
+  );
+  router.post(
+    `${PREFIX}/tiingo/disconnect`,
+    wrap(ACTION_TIINGO_DISCONNECT, handleTiingoDisconnect, { needsCode: false, needs2fa: false }),
+  );
+  router.get(`${PREFIX}/tiingo/state`, (req, res) => {
+    handleTiingoState(req, res).catch(() => {
+      try {
+        answerRefusal(res, 500, CODE_FAILED, MESSAGE_GENERIC);
+      } catch {
+        // The answer is already gone.
+      }
+    });
+  });
   router.get(`${PREFIX}/connect/state`, (req, res) => {
     handleState(req, res).catch(() => {
       try {

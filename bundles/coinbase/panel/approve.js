@@ -48,12 +48,22 @@ const LIMIT_LABELS = {
   ai_daily_notional_usd: "AI orders a day",
   ai_orders_per_hour: "AI orders an hour",
   ai_capital_usd: "money set aside for AI trades",
+  // The three stock limits are separate from the coin ones, so each says so.
+  equity_max_order_usd: "most for one stock order",
+  equity_daily_notional_usd: "stock orders a day",
+  equity_ai_capital_usd: "money set aside for AI stock trades",
   daily_notional_usd: "how much can be traded a day",
   orders_per_hour: "orders an hour",
   portfolio_drawdown_pct: "how far the portfolio may fall before Crow stops trading",
   bot_max_order_usd: "most for one bot order",
   max_bot_capital_usd: "most one bot may hold",
 };
+
+// The two sentences a stock proposal earns about the market, and the line about the money
+// set aside for stock trades.
+const MARKET_OPEN_LINE = "The stock market is open right now.";
+const MARKET_CLOSED_LINE =
+  "The stock market is closed right now, so a stock order cannot be placed until it opens.";
 
 // ---- small helpers ----------------------------------------------------------------------------
 
@@ -174,6 +184,28 @@ function timeLine(secondsLeft) {
   return `${hours} hour${hours === 1 ? "" : "s"} left to approve it.`;
 }
 
+/**
+ * The two lines a stock proposal adds before the time line: whether the stock market is open
+ * right now, and the money left for stock trades. An amount the engine did not write as a
+ * string is no amount at all, so a line never prints an empty figure: both amounts read as one
+ * line, one amount reads as its own, and neither leaves the market line alone. A proposal with
+ * no stock block at all adds nothing, so a coin proposal reads exactly as it always has.
+ */
+function equityLines(equity) {
+  if (!isPlainObject(equity)) return [];
+  const lines = [equity.session_open === true ? MARKET_OPEN_LINE : MARKET_CLOSED_LINE];
+  const left = plainDecimal(equity.pool_left);
+  const leftAfter = plainDecimal(equity.pool_left_after);
+  if (left && leftAfter) {
+    lines.push(`Money left for stock trades: ${left} (${leftAfter} after this order).`);
+  } else if (left) {
+    lines.push(`Money left for stock trades: ${left}.`);
+  } else if (leftAfter) {
+    lines.push(`Money left for stock trades after this order: ${leftAfter}.`);
+  }
+  return lines;
+}
+
 /** The plain sentence: what would be placed, at what price, for about how much. */
 function summaryOf(row) {
   const product = text(row.product);
@@ -218,6 +250,7 @@ export function describePreview(preview, options = {}) {
     live ? LIVE_LINE : PRACTICE_LINE,
     RESTING_LINE,
     ...limits.map((entry) => limitLine(entry)),
+    ...equityLines(row.equity),
     timeLine(seconds),
   ];
 

@@ -547,6 +547,7 @@ def spend(
         D(size),
         status=status,
         book=book,
+        product_type="SPOT",
     )
     return cid
 
@@ -565,7 +566,8 @@ def fill(
     """One settled order row: a buy's cost (and fee) leaves the quote currency."""
     cid = f"cb-{owner}-B0-{secrets.token_hex(6)}"
     h.store.insert_order(
-        cid, owner, owner, product, side, 0, D(price), D(size), status=OPEN, book=book
+        cid, owner, owner, product, side, 0, D(price), D(size), status=OPEN, book=book,
+        product_type="SPOT",
     )
     h.store.update_order(
         cid,

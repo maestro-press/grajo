@@ -14,6 +14,7 @@ Normalized fill dict:  trade_id, order_id, product, side, size, price, commissio
 from __future__ import annotations
 
 import contextlib
+import inspect
 import logging
 import math
 import re
@@ -22,11 +23,12 @@ import time
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import requests
 
 from . import market_hours
+from .books import DRY, LIVE
 from .money import BUY, SELL, ProductSpec, fee_rate_for_type
 
 log = logging.getLogger("crow_coinbase.exchange")
@@ -40,14 +42,50 @@ EQUITY_TRADING_SESSION = "EQUITY_TRADING_SESSION_NORMAL"
 EQUITY_DISPLAYED_ORDER_CONFIG = "LIMIT_GFD"
 # The refusal when the recorded preview confirmation is missing or mismatched.
 EQUITY_PREVIEW_UNCONFIRMED = "EQUITY_PREVIEW_UNCONFIRMED"
+# The refusal when the product's own spec could not be read, so its kind is
+# unknown: neither write path sends an order whose kind it cannot name.
+PRODUCT_TYPE_UNKNOWN = "PRODUCT_TYPE_UNKNOWN"
 # The kv key the confirmed preview is stored under before the live switch may
 # be turned on.
 EQUITY_PREVIEW_CONFIRMED_KEY = "equity_preview_confirmed"
 
-# How old an equity print may be before the quote is refused (seconds), and how
-# far ahead of our own clock a print may be stamped before it is refused.
+# How old an equity print may be before a quote of it is refused, PER BOOK
+# (seconds).  A practice (dry) stock order accepts a print up to five minutes
+# old; a live stock order keeps the strict two minutes.  Live stock trading is
+# off, so the wide bound prices the simulator alone — and the strict one is what
+# a live order would be held to, so the table can only be read, never widened by
+# a caller.
+EQUITY_MAX_AGE_BY_BOOK = {DRY: 300.0, LIVE: 120.0}
+
+# The strict bound, restated as the answer for a book nobody named: the live
+# entry of the table is the same number, and this name is what the rest of the
+# engine reads when it asks for a bound without a book.
 DEFAULT_EQUITY_QUOTE_MAX_AGE_S = 120.0
+
+# How far ahead of our own clock a print may be stamped before it is refused.
 MAX_EQUITY_QUOTE_FUTURE_S = 5.0
+
+# The loosest print any book accepts.  This is the age a price fetched from a
+# stock-price feed may be SERVED at: a practice order is the only reader that
+# takes one this old, so a feed that hands over anything older is handing over a
+# print no order could use.
+EQUITY_FRESHNESS_CEILING_S = max(EQUITY_MAX_AGE_BY_BOOK.values())
+
+
+def equity_max_age_for(book: Any) -> float:
+    """The oldest print an order on *book* may be priced from, in seconds.
+
+    The bound is a fact of the book and of nothing else: the practice book answers
+    its own wide bound, and everything else — the live book, no book at all, an
+    unknown word, a wrongly typed value — answers the strict one, so a misread
+    book is never the LOOSER rule.  The table is only ever read here: an unknown
+    book is answered, never recorded, and a caller is handed the number rather
+    than the table it came from.
+    """
+    try:
+        return EQUITY_MAX_AGE_BY_BOOK.get(book, DEFAULT_EQUITY_QUOTE_MAX_AGE_S)
+    except TypeError:  # noqa: BLE001 - a book that cannot be a key is no book
+        return DEFAULT_EQUITY_QUOTE_MAX_AGE_S
 
 
 class TransientError(Exception):
@@ -60,6 +98,17 @@ class PermanentError(Exception):
 
 class ProductUnavailable(Exception):
     pass
+
+
+class EquityQuotePaused(ProductUnavailable):
+    """No stock price right now, and nothing is wrong: prices are paused.
+
+    A stock-price feed that is being rate-limited, or whose own allowance is used
+    up, has no price to hand over — but the engine, the owner and the product are
+    all fine.  The refusal is its own class so a reader (the runner's poll) can
+    say so once and stop calling it a fault; the message is the plain sentence a
+    person reads, and it carries no token, URL or feed text.
+    """
 
 
 def classify(exc: Exception) -> Exception:
@@ -140,6 +189,45 @@ def _equity_stamp(pid: str, raw: object) -> float:
             f"{pid}: equity quote timestamp {raw!r} is not a finite number"
         )
     return stamp
+
+
+def _takes_book(reader: Any) -> bool:
+    """Whether a market's equity read accepts a `book` argument.
+
+    The engine's own `MarketData` does, and so does a market built over it; a
+    caller's own stand-in — or one written before the bound became the book's —
+    answers its quote without a book, and is then asked without one.  A callable
+    whose signature cannot be read is asked without a book: an `equity_print`
+    takes none, and the alternative is guessing at a keyword it may not have.
+    """
+    try:
+        parameters = inspect.signature(reader).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return True
+    return "book" in parameters
+
+
+def equity_print_for(market: Any, book: str = LIVE) -> tuple[Decimal, Optional[float]]:
+    """One market's equity print under *book*, and when it was printed.
+
+    A market that answers `equity_print` gives the price and the print's own time,
+    which is what a reader keeps apart from the time it read it.  A market with
+    only `equity_quote` (a caller's own stand-in) gives the same read with the
+    print's time unknown, so the answer's second item is None and nothing is
+    claimed about when the price was made.  A market that takes no `book` is asked
+    without one: the bound it applies is then its own, and the book named here is
+    only what a book-aware source would have used.
+    """
+    printer = getattr(market, "equity_print", None)
+    if callable(printer):
+        return printer(book=book) if _takes_book(printer) else printer()
+    reader = getattr(market, "equity_quote", None)
+    if not callable(reader):
+        raise ProductUnavailable("no equity quote source is available")
+    price, _ = reader(book=book) if _takes_book(reader) else reader()
+    return price, None
 
 
 def _norm_order(o: dict) -> dict:
@@ -265,7 +353,9 @@ class MarketData:
     product has no such book: its quote comes from `equity_last`, a callable
     given the base symbol ("NVDA" for "NVDA-USD") that answers the last traded
     price and the epoch seconds it was printed at, and both sides of the quote
-    are that one price.
+    are that one price.  How old that print may be is the BOOK's question —
+    `equity_max_age_for` — and a bound given to the constructor can only tighten
+    it.
     """
 
     def __init__(
@@ -274,7 +364,7 @@ class MarketData:
         client=None,
         sleep=time.sleep,
         equity_last: Optional[Callable[[str], object]] = None,
-        equity_max_age_s: float = DEFAULT_EQUITY_QUOTE_MAX_AGE_S,
+        equity_max_age_s: Optional[float] = None,
         now: Optional[Callable[[], float]] = None,
     ):
         from coinbase.rest import RESTClient
@@ -283,7 +373,9 @@ class MarketData:
         self.pub = client or RESTClient(api_key=None, api_secret=None)
         self.sleep = sleep
         self.equity_last = equity_last
-        self.equity_max_age_s = float(equity_max_age_s)
+        self.equity_max_age_s = (
+            None if equity_max_age_s is None else float(equity_max_age_s)
+        )
         self.now = now
         self.base_symbol = product_id.split("-", 1)[0]
 
@@ -318,18 +410,28 @@ class MarketData:
         )["pricebook"]
         return D(b["bids"][0]["price"]), D(b["asks"][0]["price"])
 
-    def equity_quote(self) -> tuple[Decimal, Decimal]:
-        """An equity product's last price as `(bid, ask)`; one price, both sides.
+    def equity_print(self, book: str = LIVE) -> tuple[Decimal, float]:
+        """An equity product's print for *book*: the price and when it was made.
 
         `equity_last` answers `(price, timestamp)`, the timestamp in epoch
-        seconds.  The quote has to be a print this engine may price an order
-        from, so it is refused with `ProductUnavailable` when: there is no source
-        to ask; the source answers anything but a two-item tuple; the price is
-        not a positive finite number; the timestamp is not a finite number; the
-        print is older than `equity_max_age_s`; it is stamped more than five
-        seconds ahead of the clock; or it was not printed inside the regular
-        session.  The last one is what refuses a previous close's print, however
-        fresh it is by age: a price nobody is trading at is not a quote.
+        seconds.  The print has to be one this engine may price an order on
+        *book* from, so it is refused with `ProductUnavailable` when: there is no
+        source to ask; the source raises (the refusal names the exception's class
+        and never its message, which can carry a URL or a token); the source
+        answers anything but a two-item tuple; the price is not a positive finite
+        number; the timestamp is not a finite number; the print is older than the
+        bound *book* allows; it is stamped more than five seconds ahead of the
+        clock; or it was not printed inside the regular session.  The last one is
+        what refuses a previous close's print, however fresh it is by age: a
+        price nobody is trading at is not a quote.
+
+        The age bound is the book's own (`equity_max_age_for`), and a bound given
+        to the constructor can only TIGHTEN it: what is applied is the smaller of
+        the two, and the refusal names that applied bound, so a caller can never
+        let an older print price an order than the book it is for takes.  A
+        source's own `ProductUnavailable` — an `EquityQuotePaused` included — is
+        re-raised unchanged: it is already the engine's own words, and a pause
+        has to stay a pause for the reader that tells the two apart.
         """
         if self.equity_last is None:
             raise ProductUnavailable(
@@ -340,7 +442,11 @@ class MarketData:
         except ProductUnavailable:
             raise
         except Exception as e:  # noqa: BLE001 - any source failure is no quote
-            raise ProductUnavailable(f"{self.pid}: equity quote failed ({e})") from e
+            # Only the class is reported: a source's own message can carry a URL
+            # or a token, and this text reaches an event and a log line.
+            raise ProductUnavailable(
+                f"{self.pid}: equity quote failed ({type(e).__name__})"
+            ) from e
         if raw is None:
             raise ProductUnavailable(f"{self.pid}: no equity quote available")
         if not isinstance(raw, tuple) or len(raw) != 2:
@@ -356,15 +462,29 @@ class MarketData:
                 f"{self.pid}: equity quote is stamped {stamp - now:.0f}s ahead of "
                 f"the clock"
             )
-        if now - stamp > self.equity_max_age_s:
+        bound = equity_max_age_for(book)
+        if self.equity_max_age_s is not None:
+            bound = min(bound, self.equity_max_age_s)
+        if now - stamp > bound:
             raise ProductUnavailable(
                 f"{self.pid}: equity quote is {now - stamp:.0f}s old, past the "
-                f"{self.equity_max_age_s:.0f}s bound"
+                f"{bound:.0f}s bound"
             )
         if not market_hours.is_regular_session(stamp):
             raise ProductUnavailable(
                 f"{self.pid}: equity quote was not printed in the regular session"
             )
+        return last, stamp
+
+    def equity_quote(self, book: str = LIVE) -> tuple[Decimal, Decimal]:
+        """An equity product's last price as `(bid, ask)`; one price, both sides.
+
+        One print, read under *book*'s own age bound (see `equity_print`, which is
+        the whole of the check), answered as the same price on both sides: a
+        print is not a book, and a crossed one would refuse every order off a
+        market that is working exactly as it should.
+        """
+        last, _ = self.equity_print(book=book)
         return last, last
 
     def candles(self, start: float, end: float) -> list[dict]:
@@ -419,14 +539,56 @@ class LiveExchange:
         self.equity_preview_confirmation = equity_preview_confirmation
 
     # -- product kinds
-    def product_type(self, product: str) -> str:
-        """The product's own kind, upper-cased and stripped, off its live spec.
+    def product_spec(self, product: str) -> ProductSpec:
+        """The product's own listing, off the AUTHENTICATED product read.
 
-        A lookup that cannot answer propagates: a write path that guessed the
-        kind would put an order on the wrong path, so it fails closed instead.
+        Only the authenticated read answers a stock at all — the public product
+        endpoint answers 404 for an equity — so this is the one spec read an
+        equity may be built from.  It is never cached: tick sizes, minimums and
+        the listing's own flags can change, and a caller that wants the listing as
+        it stands asks again.  There is no tradability gate, because a halted or
+        delisted product still answers the kind of product it is; a read that
+        answers some other product's listing is refused with
+        `ProductUnavailable` rather than taken as this one's spec.
         """
-        spec, _raw = self.market_for(product).product()
-        return str(getattr(spec, "product_type", "") or "").strip().upper()
+        raw = with_retry(
+            lambda: self.client.get_product(product).to_dict(),
+            "get_product",
+            sleep=self.sleep,
+        )
+        if raw.get("product_id") != product:
+            raise ProductUnavailable(f"{product} not returned by API")
+        return ProductSpec.from_api(raw)
+
+    def product_type(self, product: str) -> str:
+        """The product's own kind, upper-cased and stripped, off the same read.
+
+        The kind comes from the authenticated product read `product_spec` builds
+        its spec from, never from the public market data, which answers nothing at
+        all for a stock.  A successful lookup is remembered per product, so a
+        write path that reads the kind once (and a caller that asks again) asks
+        the exchange once: the cache is this instance's own attribute, made on
+        first use, because a `LiveExchange` may be built without its constructor.
+        A lookup that cannot answer propagates and is NOT cached: a failure says
+        nothing about the product, so the next read asks again rather than
+        remembering a kind it never learned.
+        """
+        try:
+            cache = self._product_types
+        except AttributeError:
+            cache = {}
+            self._product_types = cache
+        kind = cache.get(product)
+        if kind is not None:
+            return kind
+        raw = with_retry(
+            lambda: self.client.get_product(product).to_dict(),
+            "get_product",
+            sleep=self.sleep,
+        )
+        kind = str(raw.get("product_type") or "").strip().upper()
+        cache[product] = kind
+        return kind
 
     # -- read
     def key_permissions(self) -> dict:
@@ -562,11 +724,25 @@ class LiveExchange:
 
         A crypto product only: an equity product goes through
         `place_equity_limit`, whose request is a different shape.  The kind is
-        read off the product's own spec, so an equity is refused whatever the
-        caller meant to do with it, and a spec lookup that cannot answer
-        propagates rather than sending an equity order down the crypto path.
+        read off the product's own spec — lazily, and remembered once it has been
+        read — so an equity is refused whatever the caller meant to do with it.  A
+        spec lookup that cannot answer refuses the order with
+        `PRODUCT_TYPE_UNKNOWN`: nothing is sent, nothing is raised, and the failed
+        lookup is not remembered.
         """
-        if self.product_type(product) == "EQUITY":
+        kind = None
+        try:
+            kind = self.product_type(product)
+        except Exception as error:  # noqa: BLE001 - no spec means no known kind
+            log.warning(
+                "place %s: %s is of an unknown kind (%s); not sending",
+                cid,
+                product,
+                type(error).__name__,
+            )
+        if kind is None:
+            return _refused(PRODUCT_TYPE_UNKNOWN)
+        if kind == "EQUITY":
             return _refused("EQUITY_USE_EQUITY_PATH")
         try:
             r = self.client.limit_order_gtc(
@@ -591,14 +767,28 @@ class LiveExchange:
         product's own spec has to say EQUITY (a crypto product is refused here,
         never re-routed), and the preview confirmation on record has to be the
         one `equity_preview_refusal` accepts, so an unconfirmed configuration or
-        session never reaches the wire.
+        session never reaches the wire.  A spec lookup that cannot answer refuses
+        the order with `PRODUCT_TYPE_UNKNOWN` — nothing sent, nothing raised, and
+        the failed lookup not remembered, so the next attempt asks again.
 
         The request carries the GTC limit configuration and the regular-session
         metadata an equity order needs, named from the module's constants; it
         carries no post-only flag, because post-only on an equity product is not
         a rule this adapter can stand behind.
         """
-        if self.product_type(product) != "EQUITY":
+        kind = None
+        try:
+            kind = self.product_type(product)
+        except Exception as error:  # noqa: BLE001 - no spec means no known kind
+            log.warning(
+                "place %s: %s is of an unknown kind (%s); not sending",
+                cid,
+                product,
+                type(error).__name__,
+            )
+        if kind is None:
+            return _refused(PRODUCT_TYPE_UNKNOWN)
+        if kind != "EQUITY":
             return _refused("NOT_EQUITY_PRODUCT")
         if equity_preview_refusal(self.equity_preview_confirmation) is not None:
             return _refused(EQUITY_PREVIEW_UNCONFIRMED)
@@ -667,12 +857,19 @@ class DryRunExchange:
     before the order was placed are ignored.
 
     An equity product is simulated from the clock and one quote instead of candles.
-    `is_equity` names the products that take that path (with none, nothing does, and
-    every product is treated as crypto).  An equity order fills when the equity quote
-    stands strictly through its limit, and it expires once the session of the day it
-    was placed in has closed (or on a day with no session at all).  It pays no
-    commission: `fee_rate` is the crypto maker fee and equity products pay none of
-    it, neither in the hold a buy reserves nor in the fee a fill books.
+    `owns_equity` names the products that take that path: `is_equity` is the
+    configured equity list, and `equity_rows` a predicate over the store's own
+    EQUITY order rows, so a symbol taken off the list still has its resting orders
+    simulated as the equity instruments they were.  `is_crypto` names the
+    configured crypto products and always wins: a coin is never moved to the
+    equity path by a stray store row.  With no hook at all nothing is an equity,
+    and every product is simulated as crypto.  An equity order fills when the
+    equity quote stands strictly through its limit, and it expires once the
+    session of the day it was placed in has closed (or on a day with no session at
+    all).  It pays no commission: `fee_rate` is the crypto maker fee and equity
+    products pay none of it, neither in the hold a buy reserves nor in the fee a
+    fill books.  A NEW order follows the configured lists alone: `place_limit`
+    refuses an equity and `place_equity_limit` takes only what `is_equity` names.
     """
 
     dry_run = True
@@ -683,11 +880,15 @@ class DryRunExchange:
         market_for: Callable[[str], MarketData],
         fee_rate: Decimal,
         is_equity: Optional[Callable[[str], bool]] = None,
+        is_crypto: Optional[Callable[[str], bool]] = None,
+        equity_rows: Optional[Callable[[str], bool]] = None,
     ):
         self.conn_factory = conn_factory
         self.market_for = market_for
         self.fee_rate = fee_rate
         self.is_equity = is_equity or (lambda product: False)
+        self.is_crypto = is_crypto or (lambda product: False)
+        self.equity_rows = equity_rows or (lambda product: False)
         db = conn_factory()
         db.row_factory = sqlite3.Row
         db.executescript(SIM_SCHEMA)
@@ -731,13 +932,28 @@ class DryRunExchange:
             raise
         db.execute("COMMIT")
 
+    def owns_equity(self, product: Optional[str]) -> bool:
+        """True when *product*'s resting orders are simulated as an equity.
+
+        The rule is the router's own: the configured equity list names it, or the
+        caller's `equity_rows` says the store holds EQUITY rows for it — a symbol
+        taken off the list still has orders on the book.  A crypto-listed product
+        is never one, whatever rows the store carries for it: a stray EQUITY row
+        on a coin is history, not a place its orders live.  This steers the fee,
+        the hold and the step a resting order takes; a NEW order follows the
+        configured lists alone.
+        """
+        if self.is_equity(product):
+            return True
+        return bool(self.equity_rows(product)) and not self.is_crypto(product)
+
     def _fee_rate(self, product: str) -> Decimal:
         """The maker fee this product pays: none for an equity, else the configured rate.
 
         The rule itself lives in `money.fee_rate_for_type`, so the kind this
         simulator reads here and the fee the ledger reserves are one answer.
         """
-        kind = "EQUITY" if self.is_equity(product) else "SPOT"
+        kind = "EQUITY" if self.owns_equity(product) else "SPOT"
         return fee_rate_for_type(kind, self.fee_rate)
 
     # -- balances (total minus holds of open orders = available)
@@ -888,8 +1104,14 @@ class DryRunExchange:
     def place_limit(
         self, cid: str, product: str, side: str, size: Decimal, price: Decimal
     ) -> dict:
-        """A crypto limit order; an equity product is refused, not simulated here."""
-        if self.is_equity(product):
+        """A crypto limit order; an equity product is refused, not simulated here.
+
+        A product `owns_equity` names — one on the configured list, or a delisted
+        one the store still holds EQUITY rows for — answers
+        `EQUITY_USE_EQUITY_PATH`, while a crypto-listed product is never refused
+        here, whatever rows the store carries for it.
+        """
+        if not self.is_crypto(product) and self.owns_equity(product):
             return _refused("EQUITY_USE_EQUITY_PATH")
         return self._place(cid, product, side, size, price, post_only=True)
 
@@ -897,6 +1119,10 @@ class DryRunExchange:
         self, cid: str, product: str, side: str, size: Decimal, price: Decimal
     ) -> dict:
         """An equity limit order; a crypto product is refused, not simulated here.
+
+        Only the CONFIGURED equity list (`is_equity`) admits an order: the store's
+        EQUITY rows steer reads, cancels and the simulation of resting orders, but
+        they never make a new order an equity one.
 
         No post-only check applies: post-only is a crypto rule this simulator does
         not claim to know for an equity product, so a limit at or through the
@@ -984,7 +1210,7 @@ class DryRunExchange:
             by_product.setdefault(r["product"], []).append(r)
         filled = []
         for product, rows in by_product.items():
-            if self.is_equity(product):
+            if self.owns_equity(product):
                 filled += self._advance_equity(product, rows, now)
             else:
                 filled += self._advance_crypto(product, rows, now)
@@ -1053,6 +1279,10 @@ class DryRunExchange:
         A resting order fills at its own limit price, for its whole size, with no
         commission, once the quote stands strictly through it: below a buy, above
         a sell.
+
+        The quote is the PRACTICE book's print (`equity_print_for(..., DRY)`), so
+        the age this fill accepts is the one a dry order's book allows and not the
+        strict live bound: the orders here are the simulator's.
         """
         fee_rate = self._fee_rate(product)
         resting: list[dict] = []
@@ -1065,7 +1295,7 @@ class DryRunExchange:
         if not resting:
             return []
         try:
-            last, _ = self.market_for(product).equity_quote()
+            last, _ = equity_print_for(self.market_for(product), DRY)
         except Exception as e:  # noqa: BLE001
             log.warning("equity quote failed for %s: %s", product, e)
             return []

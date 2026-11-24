@@ -433,7 +433,8 @@ def fund_ai(h: Harness, quote="10000") -> str:
     amount = D(quote)
     cid = f"cb-ai-S0-{secrets.token_hex(6)}"
     h.store.insert_order(
-        cid, "ai", "ai", PRODUCT, "SELL", 0, D("1.00"), amount, status=OPEN, book="dry"
+        cid, "ai", "ai", PRODUCT, "SELL", 0, D("1.00"), amount, status=OPEN, book="dry",
+        product_type="SPOT",
     )
     h.store.update_order(
         cid,
@@ -635,7 +636,7 @@ def booked_fill(h: Harness, owner: str = BOT, book: str = "dry") -> str:
     cid = f"cb-{owner}-B0-{secrets.token_hex(6)}"
     h.store.insert_order(
         cid, owner, "bot", PRODUCT, "BUY", 0, D("0.98"), D("5"),
-        status=FILLED, book=book,
+        status=FILLED, book=book, product_type="SPOT",
     )
     booked = h.store.record_fill(
         {
@@ -673,7 +674,7 @@ def follow_ups(h: Harness, bot_id: str, count: int, note_text: str) -> str:
     parent = f"cb-{bot_id}-B9-{secrets.token_hex(6)}"
     h.store.insert_order(
         parent, bot_id, "bot", PRODUCT, "BUY", 0, D("0.98"), D("5"),
-        status=FILLED, book="dry",
+        status=FILLED, book="dry", product_type="SPOT",
     )
     h.store.update_order(
         parent,
@@ -686,7 +687,7 @@ def follow_ups(h: Harness, bot_id: str, count: int, note_text: str) -> str:
         child = f"cb-{bot_id}-S{index + 1}-{secrets.token_hex(6)}"
         h.store.insert_order(
             child, bot_id, "bot", PRODUCT, "SELL", index + 1, D("1.00"), D("1"),
-            status=REJECTED, book="dry",
+            status=REJECTED, book="dry", product_type="SPOT",
         )
         h.store.update_order(child, consumes_fill=parent, note=note_text)
     return parent
@@ -782,6 +783,7 @@ def test_events_paging_after_id(tmp_path):
             D("5"),
             status=FILLED,
             book="dry",
+            product_type="SPOT",
         )
         trade_id = "t-" + secrets.token_hex(6)
         assert h.store.record_fill(
@@ -973,7 +975,7 @@ def test_event_kinds_emitted(tmp_path):
     cid = f"cb-{BOT}-B0-{secrets.token_hex(6)}"
     h.store.insert_order(
         cid, BOT, "bot", PRODUCT, "BUY", 0, D("0.98"), D("5"),
-        status=FILLED, book="dry",
+        status=FILLED, book="dry", product_type="SPOT",
     )
     trade_id = "t-" + secrets.token_hex(6)
     fill = {
@@ -1896,7 +1898,7 @@ def test_events_never_contain_secrets(tmp_path):
     real.place_limit(cancel_cid, PRODUCT, "BUY", D("1"), D("0.98"))
     h.store.insert_order(
         cancel_cid, BOT, "bot", PRODUCT, "BUY", 0, D("0.98"), D("1"),
-        status=OPEN, book="dry",
+        status=OPEN, book="dry", product_type="SPOT",
     )
     faulty.failures["cancel"] = failure
     h.gateway.halt("a sweep that cannot be made", "dry")

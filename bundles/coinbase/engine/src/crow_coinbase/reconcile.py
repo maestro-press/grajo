@@ -54,11 +54,13 @@ from .books import BOOKS, DRY
 from .exchange import PermanentError, TransientError
 from .store import (
     CANCELLED,
+    EQUITY,
     FAILED,
     FILLED,
     LIVE_STATUSES,
     OPEN,
     PENDING_SUBMIT,
+    SPOT,
     STOPPED,
     Store,
 )
@@ -154,7 +156,7 @@ def reconcile(
     # is counted once rather than once per write.
     touched: set[str] = set()
     _settle_live(store, exchange, open_list, now, new_fills, touched, book)
-    _adopt_unknown(store, open_list, new_fills, touched, book)
+    _adopt_unknown(store, exchange, open_list, new_fills, touched, book)
     _book_fills(store, exchange, csv_path, book)
     if gateway is not None:
         _kill_gap(store, gateway, open_list, book)
@@ -350,6 +352,7 @@ def _dec(value: Any) -> Decimal:
 
 def _adopt_unknown(
     store: Store,
+    exchange: Any,
     open_list: dict[str, dict],
     new_fills: dict,
     touched: set[str],
@@ -361,8 +364,12 @@ def _adopt_unknown(
     is an orphan (the bot is gone), which the halt branch alone may sweep.  The
     row is written OPEN with the exchange's own order id and then settled from the
     same snapshot in one further step, so a stranger that is already partly
-    filled keeps its filled part.  Each adopted id is added to *touched* once,
-    however many writes its row took.
+    filled keeps its filled part.  Its kind is decided by `_product_type_of`: a
+    product the exchange's `is_crypto` names is a SPOT row whatever the snapshot
+    says, and otherwise a snapshot from a router's merged book carries
+    `"account"`, so an order adopted off the equity account is an EQUITY row and
+    one off the crypto account a SPOT row; an untagged one asks the exchange.
+    Each adopted id is added to *touched* once, however many writes its row took.
     """
     for cid, snap in open_list.items():
         if store.order(cid) is not None:
@@ -376,11 +383,12 @@ def _adopt_unknown(
             source = "bot"
         side, level = _shape_of(cid, snap)
         orphan = owner == "orphan"
+        product = snap.get("product")
         store.insert_order(
             cid,
             owner,
             source,
-            snap.get("product"),
+            product,
             side,
             level,
             _dec(snap.get("price")),
@@ -389,6 +397,7 @@ def _adopt_unknown(
             order_id=snap.get("order_id"),
             note="adopted orphan" if orphan else "adopted",
             book=book,
+            product_type=_product_type_of(exchange, product, snap),
         )
         touched.add(cid)
         row = store.order(cid)
@@ -399,6 +408,49 @@ def _adopt_unknown(
             touched.add(cid)
         if new_fill:
             new_fills.setdefault(owner, []).append(fresh)
+
+
+def _product_type_of(
+    exchange: Any, product: Any, snap: Optional[dict] = None
+) -> str:
+    """The kind an adopted row is written with: the crypto list, then the account.
+
+    A product the exchange's own `is_crypto` names is a crypto product, whatever
+    anything else says about it, so that answer is checked FIRST: a router's
+    merged book could hand back a stray `"account": "equity"` tag for a coin —
+    from a store row, from a hand-written stand-in, from an account that should
+    not have listed it — and an EQUITY row on a coin would draw it against the
+    equity pool forever after.  The list wins over the tag, never the reverse.
+
+    Otherwise a snapshot from a router's merged book says which account listed it
+    (`"account"`), and that is the answer: an order the EQUITY account reported
+    is an EQUITY row whatever the configured list says about its product, and an
+    order the CRYPTO account reported is a SPOT row even when the store carries a
+    stray EQUITY row for that symbol.  Account before list: the account that
+    holds the order is the fact, the list is only a rule about new orders.
+
+    An untagged snapshot — a raw adapter's, a simulator's, a hand-written
+    stand-in's — falls back to the exchange's own answer about the product: the
+    router's public `owns_equity` when it has one, because that is what routes a
+    delisted symbol's orders to the equity account, and otherwise an `is_equity`
+    predicate.  An exchange with neither says nothing about kinds, so the row is
+    SPOT, which is what every row written before equities existed is.
+    """
+    is_crypto = getattr(exchange, "is_crypto", None)
+    if callable(is_crypto) and is_crypto(product):
+        return SPOT
+    account = (snap or {}).get("account")
+    if account == "equity":
+        return EQUITY
+    if account == "crypto":
+        return SPOT
+    owns_equity = getattr(exchange, "owns_equity", None)
+    if callable(owns_equity):
+        return EQUITY if owns_equity(product) else SPOT
+    is_equity = getattr(exchange, "is_equity", None)
+    if callable(is_equity) and is_equity(product):
+        return EQUITY
+    return SPOT
 
 
 def _shape_of(cid: str, snap: dict) -> tuple[str, int]:

@@ -54,7 +54,9 @@ first a thing the owner has to be told about.
 
 `main` is the process entry point: it answers the refusal code for a live
 ceiling it cannot read, builds the store and the dry-run exchange over the data
-directory, and reads the heartbeat once per poll interval.  A pass that raises is
+directory — the engine's own simulated book, with the same product hooks, since
+the sweep has to reach the orders the engine wrote — and reads the heartbeat once
+per poll interval.  A pass that raises is
 logged and the loop carries on, but `FAILURE_STREAK_LIMIT` raising passes in a row
 mean the loop itself is broken rather than one unlucky cycle: one error event for
 the streak, and the failure code, so the supervisor restarts the process.
@@ -72,8 +74,8 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Optional
 
-from .books import Switches
-from .exchange import DryRunExchange, MarketData
+from .books import Switches, dry_exchange_for
+from .exchange import MarketData
 from .limits import WATCHDOG_POLICIES, Limits
 from .runner import ENV_LIVE, LIVE_OFF, LIVE_ON
 from .store import Store
@@ -410,6 +412,12 @@ class Watchdog:
 def _dry_run_factory(store: Store, limits: Limits) -> Callable[[], Any]:
     """A factory building the dry-run exchange over the engine's own database.
 
+    The exchange is the engine's own dry book, built by `books.dry_exchange_for`
+    from the same store and the same limits, so this process and the engine
+    simulate one account with one set of product hooks: a symbol the store holds
+    EQUITY rows for is swept as the equity it was, exactly as it is when the
+    engine sweeps it.
+
     The public market clients are built on demand and kept per product, and
     nothing here reads a book: this is only called when a cancel is about to run,
     and that call lists orders and cancels them, so no market client is ever
@@ -425,7 +433,9 @@ def _dry_run_factory(store: Store, limits: Limits) -> Callable[[], Any]:
         return market
 
     def build() -> Any:
-        return DryRunExchange(store.conn, market_for, limits.maker_fee_pct / 100)
+        return dry_exchange_for(
+            store, limits, market_for, limits.maker_fee_pct / 100
+        )
 
     return build
 

@@ -51,7 +51,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
-from .store import FAILED, REJECTED, Store
+from .store import FAILED, PRODUCT_TYPES, REJECTED, Store
 
 D = Decimal
 ZERO = D(0)
@@ -754,6 +754,7 @@ class CapWindow:
         *,
         products: Optional[Iterable[str]] = None,
         exclude_products: Optional[Iterable[str]] = None,
+        product_type: Optional[str] = None,
         book: str = "dry",
     ) -> Decimal:
         """Notional placed since this UTC day's midnight, on one book.
@@ -768,7 +769,18 @@ class CapWindow:
         are filters, so an empty collection given for `products` matches nothing
         (an empty `exclude_products` excludes nothing).  That is how an equity
         budget is read apart from the crypto one: the caps are separate pools.
+
+        `product_type` is that same separation by kind, exactly `SPOT` or
+        `EQUITY`, and it binds as one parameter beside the product filters: the
+        crypto budget reads SPOT rows and the equity budget EQUITY ones.  Any
+        other value is refused with `ValueError` rather than matching nothing,
+        so a misspelt kind can never quietly read an empty budget.
         """
+        if product_type is not None and product_type not in PRODUCT_TYPES:
+            raise ValueError(
+                f"unknown product type: {product_type!r}; a budget is read as "
+                f"one of {', '.join(PRODUCT_TYPES)}"
+            )
         start = self._utc_day_start()
         rows = self._fetch(
             "price, size",
@@ -777,6 +789,7 @@ class CapWindow:
             source,
             products=products,
             exclude_products=exclude_products,
+            product_type=product_type,
             book=book,
         )
         priced = (D(row["price"] or "0") * D(row["size"] or "0") for row in rows)
@@ -818,6 +831,7 @@ class CapWindow:
         *,
         products: Optional[Iterable[str]] = None,
         exclude_products: Optional[Iterable[str]] = None,
+        product_type: Optional[str] = None,
         book: str = "dry",
     ) -> sqlite3.Cursor:
         """Run one read over the counted rows; every value is a bound parameter.
@@ -830,6 +844,10 @@ class CapWindow:
         text that varies is the number of placeholders, never a value.  An empty
         `products` collection adds `AND 1 = 0`, because a filter given nothing to
         match must match nothing rather than turn itself off.
+
+        A `product_type` adds `AND product_type = ?` with the kind bound as one
+        parameter, so a crypto budget and an equity budget are read apart from
+        the one table.
         """
         marks = ",".join("?" * len(EXCLUDED_STATUSES))
         sql = (
@@ -853,4 +871,7 @@ class CapWindow:
             if unwanted:
                 sql += f" AND product NOT IN ({','.join('?' * len(unwanted))})"
                 params.extend(unwanted)
+        if product_type is not None:
+            sql += " AND product_type = ?"
+            params.append(product_type)
         return self.store.conn().execute(sql, params)

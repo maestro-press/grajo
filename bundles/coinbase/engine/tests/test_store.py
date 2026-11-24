@@ -9,6 +9,7 @@ import pytest
 
 from crow_coinbase.store import (
     CANCELLED,
+    FILLED,
     OPEN,
     PENDING_SUBMIT,
     Store,
@@ -16,6 +17,8 @@ from crow_coinbase.store import (
 
 XRP = "XRP-USDC"
 BTC = "BTC-USDC"
+NVDA = "NVDA-USD"
+VOO = "VOO-USD"
 
 # Every column the interface contract promises. PRAGMA table_info is checked
 # against these so a schema edit cannot silently drop one.
@@ -42,6 +45,7 @@ ORDER_COLUMNS = {
     "fills_ok",
     "note",
     "book",
+    "product_type",
 }
 
 BOT_COLUMNS = {
@@ -391,7 +395,8 @@ def test_record_fill_exactly_once(store):
     store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
     cid = ocid("b1", 1)
     store.insert_order(
-        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry"
+        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry",
+        product_type="SPOT",
     )
     f = fill("t1", "BUY", "4", "1", "0.02")
 
@@ -433,7 +438,8 @@ def test_record_fill_stores_fill_product_and_trade_type(store):
     store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
     cid = ocid("b1", 1)
     store.insert_order(
-        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry"
+        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry",
+        product_type="SPOT",
     )
 
     # The fill's product must match the order's: a fill belongs to its order.
@@ -451,7 +457,8 @@ def test_record_fill_rejects_product_mismatch(store):
     store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
     cid = ocid("b1", 1)
     store.insert_order(
-        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry"
+        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry",
+        product_type="SPOT",
     )
 
     with pytest.raises(ValueError):
@@ -468,7 +475,8 @@ def test_record_fill_never_touches_order_totals(store):
     store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
     cid = ocid("b1", 1)
     store.insert_order(
-        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry"
+        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry",
+        product_type="SPOT",
     )
     store.update_order(cid, filled_size=D("4"), filled_value=D("4"), fees=D("0.02"))
 
@@ -498,7 +506,8 @@ def test_record_fill_keeps_owner_after_bot_row_deleted(store):
     store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
     cid = ocid("b1", 1)
     store.insert_order(
-        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry"
+        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry",
+        product_type="SPOT",
     )
     store.conn().execute("DELETE FROM bots WHERE id=?", ("b1",))
 
@@ -519,7 +528,8 @@ def test_update_order_sets_absolute_fill_totals(store):
     store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
     cid = ocid("b1", 1)
     store.insert_order(
-        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry"
+        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry",
+        product_type="SPOT",
     )
 
     store.update_order(cid, filled_size=D("3"), filled_value=D("3"), fees=D("0.01"))
@@ -536,7 +546,8 @@ def test_update_order_rejects_unknown_column(store):
     store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
     cid = ocid("b1", 1)
     store.insert_order(
-        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry"
+        cid, "b1", "grid", XRP, "BUY", -1, D("1"), D("10"), status=OPEN, book="dry",
+        product_type="SPOT",
     )
 
     with pytest.raises(ValueError):
@@ -561,6 +572,7 @@ def test_insert_order_requires_cb_owner_prefix(store):
             store.insert_order(
                 bad, "b1", "grid", XRP, "BUY", -1, D("1"), D("1"), status=OPEN,
                 book="dry",
+                product_type="SPOT",
             )
 
     # Orphan orders are exempt from the owner part of the id, not from `cb-`.
@@ -568,6 +580,7 @@ def test_insert_order_requires_cb_owner_prefix(store):
         store.insert_order(
             "0xdeadbeef", "orphan", "reconcile", XRP, "BUY", -1, D("1"), D("1"),
             book="dry",
+            product_type="SPOT",
         )
 
     assert store.orders() == []  # a rejected id leaves no row behind
@@ -576,12 +589,14 @@ def test_insert_order_requires_cb_owner_prefix(store):
     store.insert_order(
         orphan_cid, "orphan", "reconcile", XRP, "BUY", -1, D("1"), D("1"),
         book="dry",
+        product_type="SPOT",
     )
     assert store.order(orphan_cid)["owner"] == "orphan"
 
     store.insert_order(
         ocid("b1", 1), "b1", "grid", XRP, "BUY", -1, D("1"), D("1"), status=OPEN,
         book="dry",
+        product_type="SPOT",
     )
     assert store.order(ocid("b1", 1))["owner"] == "b1"
 
@@ -589,7 +604,8 @@ def test_insert_order_requires_cb_owner_prefix(store):
 def test_orphan_order_accepts_any_cb_cid(store):
     cid = "cb-gone1-S-2-000000000002"  # no bot "gone1" any more; id is still ours
     store.insert_order(
-        cid, "orphan", "reconcile", XRP, "SELL", 2, D("2"), D("3"), book="dry"
+        cid, "orphan", "reconcile", XRP, "SELL", 2, D("2"), D("3"), book="dry",
+        product_type="SPOT",
     )
 
     o = store.order(cid)
@@ -639,10 +655,11 @@ def test_order_round_trip_columns(store):
         basis_per_base=D("0.99"),
         note="post-only",
         book="dry",
+        product_type="SPOT",
     )
     store.insert_order(
         cid3, "b1", "grid", XRP, "BUY", -2, D("0.95"), D("5"),
-        status=PENDING_SUBMIT, book="dry",
+        status=PENDING_SUBMIT, book="dry", product_type="SPOT",
     )
 
     o = store.order(cid2)
@@ -780,3 +797,138 @@ def test_kv_json_and_events(store):
     store.event("WARN", "something happened")
     rows = store.conn().execute("SELECT level, message FROM events").fetchall()
     assert [(r[0], r[1]) for r in rows] == [("WARN", "something happened")]
+
+
+# ---------------------------------------------------------------- product type
+
+
+def insert_one(store, cid, book="dry", **kwargs):
+    """One order row on *book* (the dry book by default), as the test wants it."""
+    fields = dict(
+        owner="b1",
+        source="grid",
+        product=XRP,
+        side="BUY",
+        level=-1,
+        price=D("1"),
+        size=D("10"),
+        product_type="SPOT",
+    )
+    fields.update(kwargs)
+    store.insert_order(cid, book=book, **fields)
+    return cid
+
+
+def test_insert_order_product_type_is_required(store):
+    """A row's kind is the caller's decision: there is no default to fall back on."""
+    store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
+
+    with pytest.raises(TypeError):
+        store.insert_order(
+            ocid("b1", 1),
+            "b1",
+            "grid",
+            XRP,
+            "BUY",
+            -1,
+            D("1"),
+            D("10"),
+            book="dry",
+        )
+
+    # Nothing was written for the row that named no kind.
+    assert store.orders() == []
+
+
+def test_insert_order_accepts_spot_and_equity_product_types(store):
+    store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
+
+    insert_one(store, ocid("b1", 1), product_type="SPOT")
+    insert_one(
+        store,
+        ocid("ai", 1),
+        owner="ai",
+        source="ai",
+        product="NVDA-USD",
+        product_type="EQUITY",
+    )
+
+    # A row that names SPOT reads back as a SPOT row.
+    assert store.order(ocid("b1", 1))["product_type"] == "SPOT"
+
+    equity = store.order(ocid("ai", 1))
+    assert equity["product_type"] == "EQUITY"
+    assert equity["product"] == "NVDA-USD"
+    assert equity["book"] == "dry"
+
+    kinds = {x["client_order_id"]: x["product_type"] for x in store.orders()}
+    assert kinds == {ocid("b1", 1): "SPOT", ocid("ai", 1): "EQUITY"}
+
+
+# ---------------------------------------------------------------- product history
+
+
+def test_has_equity_rows(store):
+    """ANY EQUITY row of a product counts, whatever its status, book or owner.
+
+    The question is history, not a decision about trading: a filled or cancelled
+    EQUITY row still has fills, shares and an adoption record on the equity
+    account, so a read or a cancel for it has to reach that account.
+    """
+    insert_one(store, ocid("b1", 1), product=NVDA, product_type="SPOT")
+
+    # A SPOT-only product, and one with no rows at all, are not equities.
+    assert store.has_equity_rows(NVDA) is False
+    assert store.has_equity_rows(VOO) is False
+
+    # One EQUITY row of any status, on either book, under any owner is enough.
+    for cid, owner, status, book in (
+        (ocid("ai", 1), "ai", OPEN, "dry"),
+        (ocid("orphan", 2), "orphan", CANCELLED, "live"),
+        (ocid("b2", 3), "b2", FILLED, "live"),
+    ):
+        insert_one(
+            store,
+            cid,
+            book,
+            owner=owner,
+            product=NVDA,
+            status=status,
+            product_type="EQUITY",
+        )
+        assert store.has_equity_rows(NVDA) is True
+
+    # It is a question about one product: the others stay as they were.
+    assert store.has_equity_rows(VOO) is False
+    assert store.has_equity_rows(BTC) is False
+
+
+def test_product_of_order(store):
+    """An exchange order id answers its row's product, and nothing else does."""
+    insert_one(
+        store,
+        ocid("b1", 1),
+        product=NVDA,
+        order_id="ex-nvda-1",
+        product_type="EQUITY",
+    )
+    # An order still waiting for the exchange to name it carries no id at all.
+    insert_one(store, ocid("b1", 2), product=BTC, order_id=None)
+
+    assert store.product_of_order("ex-nvda-1") == NVDA
+    assert store.product_of_order("ex-nobody") is None
+    assert store.order(ocid("b1", 2))["order_id"] is None
+    assert store.product_of_order(None) is None
+
+
+@pytest.mark.parametrize("bad", ["equity", "X", "Equity", "SPOT ", "spot"])
+def test_insert_order_refuses_an_unknown_product_type(store, bad):
+    store.create_bot("b1", XRP, "grid", {}, D("100"), D("50"))
+
+    with pytest.raises(ValueError):
+        insert_one(store, ocid("b1", 1), product_type=bad)
+
+    # Nothing was written, for the refused row or for anything else.
+    assert store.orders() == []
+    count = store.conn().execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+    assert count == 0

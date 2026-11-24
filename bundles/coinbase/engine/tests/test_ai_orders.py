@@ -518,7 +518,8 @@ def fund_ai(h: Harness, quote="10000") -> str:
     amount = D(quote)
     cid = f"cb-ai-S0-{secrets.token_hex(6)}"
     h.store.insert_order(
-        cid, "ai", "ai", PRODUCT, "SELL", 0, D("1.00"), amount, status=OPEN, book="dry"
+        cid, "ai", "ai", PRODUCT, "SELL", 0, D("1.00"), amount, status=OPEN, book="dry",
+        product_type="SPOT",
     )
     h.store.update_order(
         cid,
@@ -580,7 +581,7 @@ def spend(
     cid = f"cb-{owner}-B0-{secrets.token_hex(6)}"
     h.store.insert_order(
         cid, owner, source, PRODUCT, "BUY", 0, D(price), D(size),
-        status=status, book=book,
+        status=status, book=book, product_type="SPOT",
     )
     return cid
 
@@ -1024,6 +1025,56 @@ def test_preview_off_increment_refused(tmp_path):
         assert stored is not None
         assert D(stored["size"]) == on_tick_size, stored
         assert D(stored["limit_price"]) == on_tick_price, stored
+    close(h)
+
+
+def test_preview_off_tick_equity_price_refused_before_approval(tmp_path):
+    """An equity's own price tick is checked before an approval or any row exists."""
+    product = "NVDA-USD"
+    h = build_engine(
+        tmp_path / "equity-increment",
+        env={"CROW_COINBASE_EQUITY_PRODUCTS": product},
+    )
+    plain_spec = spec_for
+
+    def gateway_spec(name):
+        """The equity's own tick: cents on the price, and no rounding onto it."""
+        if name != product:
+            return plain_spec(name)
+        return ProductSpec(
+            name,
+            price_increment=D("0.01"),
+            base_increment=D("0.01"),
+            quote_increment=D("0.01"),
+            base_min_size=D("0.01"),
+            quote_min_size=D("1"),
+            product_type="EQUITY",
+            fractionable=True,
+        )
+
+    h.engine.gateway.spec_for = gateway_spec
+
+    with h.client() as client:
+        before = preview_count(h.store)
+
+        off_tick = post_preview(
+            client, product=product, size="1", limit_price="100.005"
+        )
+        assert off_tick.status_code == 422, off_tick.text
+        assert off_tick.json().get("code") == INVALID, off_tick.text
+        message = str(off_tick.json().get("message") or "")
+        assert "price" in message.lower(), off_tick.text
+        # Nothing was written: no preview row, and no order row for an order the
+        # equity's own tick cannot spell.
+        assert preview_count(h.store) == before
+        assert order_count(h.store) == 0
+
+        # On the product's own tick the increment check says nothing, so the
+        # answer is the chain's, whatever that is, and never INVALID.
+        on_tick = post_preview(
+            client, product=product, size="1", limit_price="100.00"
+        )
+        assert on_tick.json().get("code") != INVALID, on_tick.text
     close(h)
 
 
@@ -2005,6 +2056,7 @@ def test_sweep_retires_failed_and_stalled(tmp_path):
             D("5"),
             status=status,
             book="dry",
+            product_type="SPOT",
         )
         return identifier
 
@@ -2138,6 +2190,7 @@ def test_stall_rule_only_in_locked_sweep(tmp_path):
         D("5"),
         status=FAILED,
         book="dry",
+        product_type="SPOT",
     )
 
     # None of the unlocked callers retires either row: a preview, a listing, a
@@ -2205,6 +2258,7 @@ def test_order_failed_sweep_keeps_post_only_refusal(tmp_path):
             D("5"),
             status=FAILED,
             book="dry",
+            product_type="SPOT",
         )
         return identifier
 
@@ -2294,6 +2348,7 @@ def test_sweep_maps_cancelled_order_to_cancelled_preview(tmp_path):
             D("5"),
             status=status,
             book="dry",
+            product_type="SPOT",
         )
         return identifier
 

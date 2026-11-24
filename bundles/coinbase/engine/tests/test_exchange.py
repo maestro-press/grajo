@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from decimal import Decimal as D
 
 import crow_coinbase.exchange as exchange_mod
+import crow_coinbase.reconcile as reconcile_mod
 import pytest
 import requests
 
@@ -22,11 +23,13 @@ from crow_coinbase.exchange import (
     parse_client_order_id,
     with_retry,
 )
+from crow_coinbase.store import EQUITY, SPOT
 
 FEE = D("0.005")
 XRP = "XRP-USDC"
 BTC = "BTC-USDC"
 NVDA = "NVDA-USD"
+VOO = "VOO-USD"
 # A fixed instant inside the regular session -- Wed 2026-07-15 14:00:00 UTC,
 # 10:00 in New York -- whose New York close is 20:00:00 UTC the same day.  The
 # Saturday instant below shares no session at all.
@@ -437,6 +440,9 @@ ALLOWED_SDK_METHODS = {
     "get_public_product",
     "get_public_product_book",
     "get_public_candles",
+    # The authenticated product read: the only read that answers a stock at all,
+    # which is what `product_spec` and `product_type` are built on.
+    "get_product",
     "limit_order_gtc",
     "create_order",
     "cancel_orders",
@@ -691,31 +697,43 @@ class FakeOrders:
         return Resp(self.pages[len(self.calls) - 1])
 
 
-class SpecStub:
-    """A product spec stub: the one field the write paths read is the kind."""
+def raw_product(product, product_type="SPOT", **overrides):
+    """A raw authenticated product, as `client.get_product()` answers it.
 
-    def __init__(self, product_type):
-        self.product_type = product_type
-
-
-class TypeMarket:
-    """A market whose `product()` answers a spec of the kind its id names.
-
-    Only the product lookup is used here: the write paths decide which kind of
-    order a product takes, and nothing in these tests reads a book or a candle.
+    `product_id` and `product_type` are the two fields the engine reads off it;
+    the tick sizes and the minimums are what `ProductSpec.from_api` needs in order
+    to build a spec at all.
     """
+    raw = {
+        "product_id": product,
+        "price_increment": "0.0001",
+        "base_increment": "0.1",
+        "quote_increment": "0.01",
+        "base_min_size": "1",
+        "quote_min_size": "1",
+        "product_type": product_type,
+    }
+    raw.update(overrides)
+    return raw
 
-    def __init__(self, product_type):
-        self.product_type = product_type
-        self.product_calls = 0
 
-    def product(self):
-        self.product_calls += 1
-        return SpecStub(self.product_type), {"product_id": "stub"}
+def equity_raw(product=NVDA, **overrides):
+    """An EQUITY listing: cents on the price, fractional shares, USD quoted."""
+    fields = dict(
+        price_increment="0.01",
+        base_increment="0.0001",
+        quote_increment="0.01",
+        base_min_size="0.0001",
+        quote_min_size="1",
+        fractionable=True,
+        fractional_notional_min_size="1",
+    )
+    fields.update(overrides)
+    return raw_product(product, "EQUITY", **fields)
 
 
-# The kind each product id names, as the product lookup would answer it.
-PRODUCT_TYPES = {XRP: "SPOT", BTC: "SPOT", NVDA: "EQUITY"}
+# The raw product each id names, as the authenticated read answers it.
+PRODUCTS = {XRP: raw_product(XRP), BTC: raw_product(BTC), NVDA: equity_raw(NVDA)}
 
 # The preview a live equity route needs on record before it may send anything.
 VALID_CONFIRMATION = {
@@ -724,20 +742,69 @@ VALID_CONFIRMATION = {
 }
 
 
-def live(client, *, confirmation=VALID_CONFIRMATION, product_types=None):
+class AuthedProducts:
+    """The authenticated product read, and how often each product was read.
+
+    This is what a fake SDK client answers for `get_product(product)`; every
+    other call is the wrapped client's own, so a test still asserts on the fake it
+    built.  `failures` makes the first reads of each product raise, which is a
+    lookup that cannot answer; `products` is the whole raw table when a test is
+    about a listing the defaults do not describe.
+    """
+
+    def __init__(self, inner=None, *, products=None, failures=0):
+        self.inner = inner
+        table = PRODUCTS if products is None else products
+        self.products = {product: dict(raw) for product, raw in table.items()}
+        self.failures = failures
+        self.reads = {}
+        self.total = 0
+
+    def get_product(self, product_id):
+        self.reads[product_id] = self.reads.get(product_id, 0) + 1
+        self.total += 1
+        if self.reads[product_id] <= self.failures:
+            raise ProductUnavailable("no spec for this product")
+        raw = self.products.get(product_id)
+        if raw is None:
+            raise ProductUnavailable(f"{product_id}: no such product")
+        return Resp(dict(raw))
+
+    def __getattr__(self, name):
+        inner = self.__dict__.get("inner")
+        if inner is None:
+            raise AttributeError(name)
+        return getattr(inner, name)
+
+
+def live(
+    client,
+    *,
+    confirmation=VALID_CONFIRMATION,
+    product_types=None,
+    products=None,
+    failures=0,
+):
     """A LiveExchange built around *client* without its constructor.
 
-    `market_for` answers the spec kind each product id names, so a test can see
-    which path a product takes; `equity_preview_confirmation` is the recorded
-    preview unless a test asks for a missing or mismatched one.
+    The client is the SDK one, so it answers the authenticated product read the
+    write paths and `product_spec` use: *products* replaces the raw listings,
+    *product_types* overrides one product's kind, and *failures* makes the first
+    reads of each product fail.  How often a product was read is on
+    `ex.client.reads`, so a test can tell a cached kind from a second lookup.
+    `equity_preview_confirmation` is the recorded preview unless a test asks for a
+    missing or mismatched one.
     """
     ex = LiveExchange.__new__(LiveExchange)
     ex.sleep = lambda s: None
-    ex.client = client
     ex.equity_preview_confirmation = confirmation
-    kinds = dict(PRODUCT_TYPES)
-    kinds.update(product_types or {})
-    ex.market_for = lambda product: TypeMarket(kinds[product])
+    table = dict(PRODUCTS if products is None else products)
+    table = {product: dict(raw) for product, raw in table.items()}
+    for product, kind in (product_types or {}).items():
+        raw = dict(table.get(product) or raw_product(product))
+        raw["product_type"] = kind
+        table[product] = raw
+    ex.client = AuthedProducts(client, products=table, failures=failures)
     return ex
 
 
@@ -1023,18 +1090,165 @@ def test_live_place_limit_refuses_an_equity_product():
     assert sent.calls[0]["client_order_id"] == "grid-B-1-x"
 
 
-def test_live_place_limit_fails_closed_when_the_kind_is_unknown():
-    class NoSpec(TypeMarket):
-        def product(self):
-            raise ProductUnavailable("no spec for this product")
+class FakeBothPaths:
+    """An SDK client that records whichever write path it is asked for."""
 
-    fake = FakeCreateOrder()
-    ex = live(fake)
-    ex.market_for = lambda product: NoSpec("SPOT")
+    def __init__(self, payload=None):
+        self.payload = (
+            {"success": True, "success_response": {"order_id": "o1"}}
+            if payload is None
+            else payload
+        )
+        self.limit_calls = []
+        self.create_calls = []
+
+    def limit_order_gtc(self, **kwargs):
+        self.limit_calls.append(kwargs)
+        return Resp(self.payload)
+
+    def create_order(self, **kwargs):
+        self.create_calls.append(kwargs)
+        return Resp(self.payload)
+
+
+def test_live_place_limit_answers_product_type_unknown():
+    """A product read that cannot answer refuses the order instead of sending it."""
+    client = FakeBothPaths()
+    ex = live(client, failures=1)
+
+    refused = ex.place_limit("cb-ai-B+0-ffffffffffff", XRP, "BUY", D("10"), D("0.9"))
+
+    assert refused == {
+        "ok": False,
+        "order_id": None,
+        "reason": exchange_mod.PRODUCT_TYPE_UNKNOWN,
+    }
+    assert exchange_mod.PRODUCT_TYPE_UNKNOWN == "PRODUCT_TYPE_UNKNOWN"
+    assert client.limit_calls == []
+    assert ex.client.reads[XRP] == 1
+
+
+def test_live_place_equity_limit_answers_product_type_unknown():
+    client = FakeBothPaths()
+    ex = live(client, failures=1)
+
+    refused = ex.place_equity_limit(
+        "cb-ai-B+0-ffffffffffff", NVDA, "BUY", D("0.001"), D("1.00")
+    )
+
+    assert refused == {
+        "ok": False,
+        "order_id": None,
+        "reason": exchange_mod.PRODUCT_TYPE_UNKNOWN,
+    }
+    assert client.create_calls == []
+    assert client.limit_calls == []
+    assert ex.client.reads[NVDA] == 1
+
+
+def test_product_type_caches_a_successful_lookup():
+    """One product is read once, and the write paths read the cached kind."""
+    client = FakeBothPaths()
+    ex = live(client)
+
+    assert ex.product_type(NVDA) == "EQUITY"
+    assert ex.product_type(NVDA) == "EQUITY"
+    assert ex.client.reads[NVDA] == 1
+
+    placed = ex.place_equity_limit(
+        "cb-ai-B+0-aaaaaaaaaaaa", NVDA, "BUY", D("0.5"), D("120.25")
+    )
+    assert placed["ok"] is True
+    assert ex.client.reads[NVDA] == 1
+    assert len(client.create_calls) == 1
+
+    # Each product is cached on its own.
+    assert ex.product_type(XRP) == "SPOT"
+    assert ex.product_type(XRP) == "SPOT"
+    assert ex.client.reads[XRP] == 1
+
+
+def test_product_type_does_not_cache_a_failure():
+    """A read that could not answer is asked again next time."""
+    client = FakeBothPaths()
+    ex = live(client, failures=1)
+    cid = "cb-ai-B+0-bbbbbbbbbbbb"
+    args = (cid, NVDA, "BUY", D("0.5"), D("120.25"))
+
+    assert ex.place_equity_limit(*args)["reason"] == exchange_mod.PRODUCT_TYPE_UNKNOWN
+    assert client.create_calls == []
+
+    placed = ex.place_equity_limit(*args)
+    assert placed["ok"] is True
+    assert len(client.create_calls) == 1
+    assert ex.client.reads[NVDA] == 2
+
+
+def test_product_spec_reads_the_authenticated_raw_product():
+    """An equity's spec is the authenticated listing, fractionable shares and all."""
+    client = FakeBothPaths()
+    ex = live(client)
+
+    spec = ex.product_spec(NVDA)
+
+    assert spec.product_id == NVDA
+    assert spec.product_type == "EQUITY"
+    assert spec.fractionable is True
+    assert spec.price_increment == D("0.01")
+    assert spec.base_increment == D("0.0001")
+    assert spec.quote_increment == D("0.01")
+    assert spec.base_min_size == D("0.0001")
+    assert spec.quote_min_size == D("1")
+    assert spec.fractional_notional_min_size == D("1")
+    assert ex.client.reads[NVDA] == 1
+
+    # A listing can change, so a spec is read again rather than kept: the two
+    # reads answer the same spec here, and both happened.
+    assert ex.product_spec(NVDA) == spec
+    assert ex.client.reads[NVDA] == 2
+
+    # A crypto listing comes off the same read, with its own tick sizes.
+    spot = ex.product_spec(XRP)
+    assert spot.product_id == XRP
+    assert spot.product_type == "SPOT"
+    assert spot.base_increment == D("0.1")
+    assert ex.client.reads[XRP] == 1
+
+
+def test_product_spec_refuses_a_different_product():
+    """A read that answers another product is not this product's spec."""
+    ex = live(FakeBothPaths(), products={NVDA: equity_raw(VOO)})
 
     with pytest.raises(ProductUnavailable):
-        ex.place_limit("cb-ai-B+0-ffffffffffff", XRP, "BUY", D("10"), D("0.9"))
-    assert fake.calls == []
+        ex.product_spec(NVDA)
+
+
+def test_product_spec_answers_a_halted_or_delisted_product():
+    """There is no tradability gate: a halted or delisted listing still answers."""
+    halted = equity_raw(
+        NVDA, status="delisted", trading_disabled=True, trading_halted=True
+    )
+    ex = live(FakeBothPaths(), products={NVDA: halted})
+
+    spec = ex.product_spec(NVDA)
+
+    assert spec.product_id == NVDA
+    assert spec.product_type == "EQUITY"
+    # The flags are carried, not judged: a halted stock is still a stock, and its
+    # kind is what tells the engine which path its orders take.
+    assert spec.trading_halted is True
+
+
+def test_product_type_answers_a_halted_or_delisted_product():
+    """The kind comes off the same read, and is not gated on tradability either."""
+    halted = equity_raw(
+        NVDA, status="delisted", trading_disabled=True, trading_halted=True
+    )
+    ex = live(FakeBothPaths(), products={NVDA: halted})
+
+    assert ex.product_type(NVDA) == "EQUITY"
+    assert ex.product_type(NVDA) == "EQUITY"
+    assert ex.client.reads[NVDA] == 1
 
 
 def test_live_place_equity_limit_refuses_a_crypto_product():
@@ -1295,6 +1509,183 @@ def test_dry_wrong_path_refused(monkeypatch):
     assert equity_placed["ok"] is True
 
 
+def dry_sim(*, markets, is_equity=None, is_crypto=None, equity_rows=None):
+    """A seeded dry-run exchange over *markets*, with whichever product hooks given."""
+    db = new_db()
+    ex = DryRunExchange(
+        lambda: db,
+        lambda product: markets[product],
+        FEE,
+        is_equity=is_equity,
+        is_crypto=is_crypto,
+        equity_rows=equity_rows,
+    )
+    ex.deposit("USD", D("1000"), "seed")
+    ex.deposit("USDC", D("1000"), "seed")
+    return ex, db
+
+
+class EquityOnlyMkt:
+    """A delisted symbol's market: one quote, and candles that may never be read."""
+
+    def __init__(self, last="100"):
+        self.last = D(last)
+        self.quotes = 0
+        self.candles_calls = 0
+
+    def equity_quote(self):
+        self.quotes += 1
+        return self.last, self.last
+
+    def candles(self, start, end):
+        self.candles_calls += 1
+        raise RuntimeError("candles must not be read for an equity")
+
+    def best_bid_ask(self):
+        raise RuntimeError("an equity's book is its one print")
+
+
+def insert_sim_order(db, cid, product, side, price, size, created_at):
+    """A resting order written straight onto the simulator's book (no place path)."""
+    order_id = f"sim-{cid}"
+    db.execute(
+        "INSERT INTO sim_orders(order_id,client_order_id,product,side,price,size,"
+        "status,created_at,fee) VALUES(?,?,?,?,?,?,'OPEN',?,'0')",
+        (order_id, cid, product, side, str(price), str(size), created_at),
+    )
+    return order_id
+
+
+def test_dry_owns_equity_rule():
+    """The simulator's own rule: the configured list, then the rows, minus crypto."""
+    markets = {NVDA: EqMkt("100"), VOO: EqMkt("50"), XRP: Mkt(), BTC: Mkt()}
+
+    configured, _ = dry_sim(markets=markets, is_equity=lambda product: product == NVDA)
+    assert configured.owns_equity(NVDA) is True
+    assert configured.owns_equity(VOO) is False
+    assert configured.owns_equity(XRP) is False
+
+    # A delisted symbol the store still holds EQUITY rows for is still an equity.
+    rows, _ = dry_sim(markets=markets, equity_rows=lambda product: product == VOO)
+    assert rows.owns_equity(VOO) is True
+    assert rows.owns_equity(NVDA) is False
+
+    # The configured list wins over the rows, and a crypto-listed product is never
+    # moved to the equity side whatever rows the store carries for it.
+    both, _ = dry_sim(
+        markets=markets,
+        is_equity=lambda product: product == NVDA,
+        is_crypto=lambda product: product == XRP,
+        equity_rows=lambda product: product in (NVDA, VOO, XRP),
+    )
+    assert both.owns_equity(NVDA) is True
+    assert both.owns_equity(VOO) is True
+    assert both.owns_equity(XRP) is False
+
+    # The defaults own nothing and name nothing: a plain simulator is a crypto one.
+    plain, _ = dry_sim(markets=markets)
+    assert callable(plain.is_crypto)
+    assert callable(plain.equity_rows)
+    for product in (NVDA, VOO, XRP, BTC):
+        assert plain.is_crypto(product) is False
+        assert plain.equity_rows(product) is False
+        assert plain.owns_equity(product) is False
+
+
+def test_dry_delisted_symbol_simulated_as_equity(monkeypatch):
+    """A delisted symbol with EQUITY rows is stepped as an equity: no candles, no fee."""
+    monkeypatch.setattr(exchange_mod.time, "time", lambda: T)
+    markets = {NVDA: EquityOnlyMkt("100"), XRP: Mkt()}
+    ex, db = dry_sim(
+        markets=markets,
+        is_equity=lambda product: product == VOO,  # NVDA is off the configured list
+        equity_rows=lambda product: product == NVDA,  # ...but its rows are EQUITY rows
+    )
+
+    # A resting BUY written straight onto the sim book, inside the day's session.
+    bought = insert_sim_order(db, "cb-ai-B+0-delmkt", NVDA, "BUY", "100", "2", T)
+    markets[NVDA].last = D("99.99")  # strictly below the limit: it fills
+    assert ex.advance(T + 60) == ["cb-ai-B+0-delmkt"]
+
+    filled = ex.get_order(bought)
+    assert filled["status"] == "FILLED"
+    assert filled["total_fees"] == D("0")
+    assert ex.fills(bought)[0]["commission"] == D("0")
+    assert ex.totals()["NVDA"] == D("2")
+    assert ex.totals()["USD"] == D("800")
+    # It filled off the quote, never off a candle series the symbol has none of.
+    assert markets[NVDA].quotes == 1
+    assert markets[NVDA].candles_calls == 0
+
+    # A second one expires once its session day is over, still without candles.
+    resting = insert_sim_order(db, "cb-ai-B+1-delmkt", NVDA, "BUY", "50", "1", T)
+    # The hold is size * price, with no commission, exactly as a listed equity's.
+    assert ex.balances()["USD"] == D("800") - D("50")
+    markets[NVDA].last = D("40")  # would cross it, if the session were still open
+    assert ex.advance(CLOSE) == []
+
+    expired = ex.get_order(resting)
+    assert expired["status"] == "EXPIRED"
+    assert expired["filled_size"] == D("0")
+    assert ex.balances()["USD"] == D("800")
+    # Nothing was left to fill, so the quote was not read a second time.
+    assert markets[NVDA].quotes == 1
+    assert markets[NVDA].candles_calls == 0
+
+
+def test_dry_place_limit_refuses_owned_equity():
+    """A new order follows the configured lists; the rows only steer reads."""
+    markets = {NVDA: EqMkt("100"), XRP: Mkt()}
+    ex, _ = dry_sim(
+        markets=markets,
+        is_equity=lambda product: product == VOO,
+        is_crypto=lambda product: product == XRP,
+        equity_rows=lambda product: product in (NVDA, XRP),
+    )
+
+    refused = ex.place_limit("cb-ai-B+0-rows", NVDA, "BUY", D("1"), D("90"))
+    assert refused == {
+        "ok": False,
+        "order_id": None,
+        "reason": "EQUITY_USE_EQUITY_PATH",
+    }
+
+    # The crypto list wins: a coin with a stray EQUITY row is still a coin.
+    placed = ex.place_limit("grid-B-1-rows", XRP, "BUY", D("10"), D("0.9"))
+    assert placed["ok"] is True
+    assert placed["reason"] is None
+
+    # A new equity order follows the configured list, never the store's rows.
+    delisted = ex.place_equity_limit("cb-ai-B+0-rows2", NVDA, "BUY", D("1"), D("90"))
+    assert delisted == {
+        "ok": False,
+        "order_id": None,
+        "reason": "NOT_EQUITY_PRODUCT",
+    }
+    assert ex.list_open_orders(NVDA) == []
+
+
+def test_dry_orphan_typing_via_owns_equity():
+    """An untagged orphan on the dry book is typed by the simulator's own rule."""
+    markets = {NVDA: EqMkt("100"), XRP: Mkt()}
+
+    # A delisted symbol whose rows are EQUITY rows: its orphan is an EQUITY row.
+    rows, _ = dry_sim(markets=markets, equity_rows=lambda product: product == NVDA)
+    assert reconcile_mod._product_type_of(rows, NVDA, {}) == EQUITY
+
+    # The same simulator with no rows hook, and the symbol off the list: SPOT.
+    plain, _ = dry_sim(markets=markets, is_equity=lambda product: product == VOO)
+    assert reconcile_mod._product_type_of(plain, NVDA, {}) == SPOT
+
+    # A crypto-listed product is a coin whatever rows the store holds for it.
+    crypto, _ = dry_sim(
+        markets=markets,
+        is_crypto=lambda product: product == NVDA,
+        equity_rows=lambda product: product == NVDA,
+    )
+    assert reconcile_mod._product_type_of(crypto, NVDA, {}) == SPOT
+
+
 def market_data(source, *, now=None, max_age=None):
     """A MarketData over a fake public client, with a fixed clock when given."""
     options = {}
@@ -1429,6 +1820,29 @@ def test_equity_quote_refuses_a_source_that_raises():
 
     with pytest.raises(ProductUnavailable):
         market_data(unavailable, now=T).equity_quote()
+
+
+def test_equity_quote_source_error_text_hidden():
+    """A source's own message can carry a token or a URL: only its class is reported."""
+    canary = "secret-canary-token"
+
+    def down(base):
+        raise RuntimeError(f"quote backend said {canary}")
+
+    with pytest.raises(ProductUnavailable) as failed:
+        market_data(down, now=T).equity_quote()
+
+    text = str(failed.value)
+    assert "RuntimeError" in text
+    assert canary not in text
+
+    # A refusal the source itself raises is already the engine's own words.
+    def unavailable(base):
+        raise ProductUnavailable(f"{NVDA}: no print is available")
+
+    with pytest.raises(ProductUnavailable) as raised:
+        market_data(unavailable, now=T).equity_quote()
+    assert str(raised.value) == f"{NVDA}: no print is available"
 
 
 def test_merge_totals_one_pool_usd_once():

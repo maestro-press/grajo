@@ -509,6 +509,7 @@ def insert_order_row(
         order_id=order_id,
         basis_per_base=None if basis is None else D(basis),
         book="dry",
+        product_type="SPOT",
     )
     fields = {"opposite": opposite}
     if filled_size is not None:
@@ -1681,7 +1682,7 @@ def test_pending_submit_resolved_after_restart(envs):
     assert landed["ok"] is True
     env.store.insert_order(
         cid, BOT, "bot", PRODUCT, "BUY", -1, D("0.98"), D("10"),
-        status=PENDING_SUBMIT, book="dry",
+        status=PENDING_SUBMIT, book="dry", product_type="SPOT",
     )
     env.store.set_init_done(BOT)
 

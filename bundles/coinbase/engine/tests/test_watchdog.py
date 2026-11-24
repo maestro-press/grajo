@@ -954,6 +954,7 @@ def test_main_cancel_sweep_with_real_dry_exchange_and_reconcile(tmp_path, monkey
             status=OPEN,
             order_id=placed["order_id"],
             book="dry",
+            product_type="SPOT",
         )
 
     # Somebody else's order on the same simulated account, written straight in:

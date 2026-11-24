@@ -2070,6 +2070,7 @@ def test_disconnect_refused_with_live_orders(tmp_path):
             D("10"),
             status=PENDING_SUBMIT,
             book="live",
+            product_type="SPOT",
         )
         pending = h.signer.delete(client, "/credentials", key=secret)
         assert pending.status_code == 409, pending.text
@@ -2091,6 +2092,7 @@ def test_disconnect_refused_with_live_orders(tmp_path):
             D("10"),
             status=OPEN,
             book="live",
+            product_type="SPOT",
         )
 
         resting = h.signer.delete(client, "/credentials", key=secret)
@@ -2281,6 +2283,7 @@ def test_forget_refused_live_orders(tmp_path):
             D("10"),
             status=PENDING_SUBMIT,
             book="live",
+            product_type="SPOT",
         )
         refused_with_live_orders("a submit in flight")
         h.store.conn().execute(
@@ -2299,6 +2302,7 @@ def test_forget_refused_live_orders(tmp_path):
             D("10"),
             status=OPEN,
             book="live",
+            product_type="SPOT",
         )
         refused_with_live_orders("a resting order")
         h.store.conn().execute(

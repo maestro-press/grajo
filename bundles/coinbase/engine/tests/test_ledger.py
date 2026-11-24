@@ -34,10 +34,10 @@ def make_bot(store, bot_id="b1", product=XRP, quote="100", base="0"):
     store.create_bot(bot_id, product, "grid", {}, D(quote), D(base))
 
 
-def place(store, cid, owner, side, price, size, product=XRP, level=0, status=OPEN):
+def place(store, cid, owner, side, price, size, product=XRP, level=0, status=OPEN, book="dry"):
     store.insert_order(
         cid, owner, "grid", product, side, level, D(price), D(size), status=status,
-        book="dry",
+        book=book, product_type="SPOT",
     )
 
 
@@ -301,3 +301,299 @@ def test_unallocated_counts_orphan_owner(store):
     # size, the same shift a bot owner's fill makes.
     assert after["USDC"] == before["USDC"] + D("10.05")
     assert after["XRP"] == before["XRP"] - D("10")
+
+
+# ---------------------------------------------------------------- the equity pool
+
+NVDA = "NVDA-USD"
+VOO = "VOO-USD"
+EQUITIES = (NVDA, VOO)
+
+
+class Capital:
+    """A mutable AI equity capital, read on every call like the engine's own."""
+
+    def __init__(self, amount="150"):
+        self.amount = D(amount)
+
+    def __call__(self):
+        return self.amount
+
+
+def equity_ledger(store, *, capital="150", fee=FEE, ai_capital=None):
+    """A ledger whose equities are NVDA-USD and VOO-USD, and whose capital is *capital*."""
+    return Ledger(
+        store,
+        fee_rate=fee,
+        ai_capital=ai_capital,
+        equity_ai_capital=capital if callable(capital) else Capital(capital),
+        is_equity=lambda product: product in EQUITIES,
+    )
+
+
+def place_equity(
+    store,
+    cid,
+    owner,
+    side,
+    price,
+    size,
+    product=NVDA,
+    level=0,
+    status=OPEN,
+    product_type="EQUITY",
+    book="dry",
+):
+    """One equity order row: the product type is what makes it a pool member."""
+    store.insert_order(
+        cid,
+        owner,
+        "ai",
+        product,
+        side,
+        level,
+        D(price),
+        D(size),
+        status=status,
+        book=book,
+        product_type=product_type,
+    )
+
+
+def test_equity_pool_is_one_usd_pool_across_symbols(store):
+    """The AI's equities share ONE quote pool per book, whatever the symbol."""
+    led = equity_ledger(store, capital="150")
+    place_equity(store, ocid("ai", 1), "ai", "BUY", "100", "1", product=NVDA, level=-1)
+
+    nvda = led.holding("ai", NVDA, book="dry")
+    voo = led.holding("ai", VOO, book="dry")
+
+    assert nvda.quote == D("150")
+    assert nvda.reserved_quote == D("100")
+    assert nvda.available_quote == D("50")
+
+    # The other symbol reads the same pool and the same reservation: 100 spent on
+    # NVDA leaves 50 for VOO, and the reservation is not counted twice.
+    assert voo.quote == D("150")
+    assert voo.reserved_quote == D("100")
+    assert voo.available_quote == D("50")
+
+    # Each product keeps its own base side.
+    assert nvda.base == D("0")
+    assert voo.base == D("0")
+
+
+def test_equity_buy_reservation_pays_no_fee_but_crypto_does(store):
+    make_bot(store, "b1", XRP, "100", "0")
+    led = equity_ledger(store, capital="150")
+    place_equity(store, ocid("ai", 1), "ai", "BUY", "100", "2", level=-1)
+    place(store, ocid("b1", 1), "b1", "BUY", "2", "10", level=-1)
+
+    # An equity BUY holds exactly size * price; a crypto one still holds the fee.
+    assert led.holding("ai", NVDA, book="dry").reserved_quote == D("200")
+    assert led.holding("b1").reserved_quote == D("20.10")
+
+
+def test_equity_pool_used_formula(store):
+    """Live buys at their whole size, finished buys at their cost, sells at their net."""
+    led = equity_ledger(store, capital="150")
+
+    place_equity(store, ocid("ai", 1), "ai", "BUY", "100", "1", level=-1)
+
+    finished = ocid("ai", 2)
+    place_equity(store, finished, "ai", "BUY", "20", "2", status=FILLED)
+    snapshot(store, finished, "2", "40", "0.2")
+
+    sold = ocid("ai", 3)
+    place_equity(store, sold, "ai", "SELL", "25", "2", status=FILLED)
+    snapshot(store, sold, "2", "50", "0.25")
+
+    # A SPOT row of the same owner on the same book is not part of the pool.
+    place(store, ocid("ai", 4), "ai", "BUY", "1", "7", product=XRP)
+
+    assert led.equity_pool_used("dry") == D("100") + D("40.2") - D("49.75")
+    assert led.equity_pool_used("dry") == D("90.45")
+    assert led.equity_pool_used("live") == D("0")
+
+
+def test_equity_pool_used_honours_epoch_and_book(store):
+    """A row the book's epoch left behind is not the pool's spend, nor is the other
+    book's."""
+    led = equity_ledger(store, capital="150")
+
+    # A row from the period the AI has already left on the dry book.
+    old = ocid("ai", 1)
+    place_equity(store, old, "ai", "BUY", "100", "1", status=FILLED)
+    snapshot(store, old, "1", "100", "0")
+    store.update_order(old, created_at=1000.0)
+
+    store.set_book_epoch("dry", "ai", 2000.0)
+
+    # One row written after the epoch, and one on the other book.
+    fresh = ocid("ai", 2)
+    place_equity(store, fresh, "ai", "BUY", "50", "2", status=FILLED)
+    snapshot(store, fresh, "2", "100", "0")
+    store.update_order(fresh, created_at=3000.0)
+
+    other = ocid("ai", 3)
+    place_equity(store, other, "ai", "BUY", "20", "3", status=FILLED, book="live")
+    snapshot(store, other, "3", "60", "0")
+    store.update_order(other, created_at=3000.0)
+
+    # Only the row written after the dry book's epoch is that book's spend...
+    assert led.equity_pool_used("dry") == D("100")
+    # ...and the epoch is per book: the live book's row is its own, unhidden.
+    assert led.equity_pool_used("live") == D("60")
+
+    # Without the epoch every row of the dry book counts, the old one included.
+    store.set_book_epoch("dry", "ai", 0.0)
+    assert led.equity_pool_used("dry") == D("200")
+    assert led.equity_pool_used("live") == D("60")
+
+
+def test_equity_pool_used_is_not_clamped(store):
+    """A sell that brought back more than the buys spent reads negative here."""
+    led = equity_ledger(store, capital="150")
+    sold = ocid("ai", 1)
+    place_equity(store, sold, "ai", "SELL", "100", "5", status=FILLED)
+    snapshot(store, sold, "5", "500", "0")
+
+    assert led.equity_pool_used("dry") == D("-500")
+
+
+def test_unallocated_adds_the_equity_pool_once(store):
+    led = equity_ledger(store, capital="150")
+    place_equity(store, ocid("ai", 1), "ai", "BUY", "100", "1", product=NVDA, level=-1)
+    place_equity(store, ocid("ai", 2), "ai", "BUY", "50", "2", product=VOO, level=-1)
+
+    out = led.unallocated({"USD": D("400"), "NVDA": D("0"), "VOO": D("0")}, book="dry")
+
+    # 150 of pool, counted once — not 150 twice, once per equity product.
+    assert out["USD"] == D("250")
+    assert out["NVDA"] == D("0")
+    assert out["VOO"] == D("0")
+
+
+def test_unallocated_counts_the_equity_base_side(store):
+    led = equity_ledger(store, capital="0")
+    bought = ocid("ai", 1)
+    place_equity(store, bought, "ai", "BUY", "100", "2", status=FILLED)
+    snapshot(store, bought, "2", "200", "0")
+
+    out = led.unallocated({"USD": D("0"), "NVDA": D("3")}, book="dry")
+
+    # The base side is still per product...
+    assert out["NVDA"] == D("1")
+    # ... and a pool floored at zero is not a negative holding handed to anyone.
+    assert out["USD"] == D("0")
+
+
+def test_live_usdc_pool_ignores_equity_slots(store):
+    led = equity_ledger(store, capital="150", ai_capital=Capital("50"))
+    place(store, ocid("ai", 1), "ai", "BUY", "1", "10", product=XRP, book="live")
+    place_equity(store, ocid("ai", 2), "ai", "BUY", "100", "1", product=NVDA, book="live")
+    sold = ocid("ai", 3)
+    place_equity(store, sold, "ai", "SELL", "20", "2", product=VOO, status=FILLED, book="live")
+    snapshot(store, sold, "2", "40", "0")
+
+    # The AI's crypto quote side is its own USDC pool: no equity row is in it.
+    usdc = led.holding("ai", XRP, book="live")
+    assert usdc.quote == D("50")
+    assert usdc.reserved_quote == D("10.05")
+
+    equity = led.holding("ai", NVDA, book="live")
+    assert equity.quote == D("190")  # 150 of capital plus the 40 the sell brought in
+    assert equity.reserved_quote == D("100")
+    assert equity.available_quote == D("90")
+
+    # USD is the equity pool, added once: the equity sell's proceeds are not
+    # also reserved as a crypto-side USD pool.
+    out = led.unallocated({"USDC": D("50"), "USD": D("250")}, book="live")
+    assert out["USDC"] == D("0")
+    assert out["USD"] == D("60")
+
+
+def test_equity_pool_floors_at_zero_when_capital_is_lowered(store):
+    capital = Capital("500")
+    led = equity_ledger(store, capital=capital)
+    bought = ocid("ai", 1)
+    place_equity(store, bought, "ai", "BUY", "100", "3", status=FILLED)
+    snapshot(store, bought, "3", "300", "0")
+
+    assert led.holding("ai", NVDA, book="dry").quote == D("200")
+
+    capital.amount = D("100")  # lowered under what was already spent
+    held = led.holding("ai", NVDA, book="dry")
+    assert held.quote == D("0")
+    assert held.available_quote == D("0")
+
+    # Money that is gone cannot be subtracted from the account as a credit.
+    assert led.unallocated({"USD": D("300"), "NVDA": D("3")}, book="dry")["USD"] == (
+        D("300")
+    )
+
+
+def test_equity_pool_is_read_per_book(store):
+    led = equity_ledger(store, capital="150")
+    place_equity(store, ocid("ai", 1), "ai", "BUY", "100", "1", book="dry")
+    place_equity(store, ocid("ai", 2), "ai", "BUY", "50", "1", book="live")
+
+    assert led.equity_pool_used("dry") == D("100")
+    assert led.equity_pool_used("live") == D("50")
+    assert led.holding("ai", NVDA, book="dry").available_quote == D("50")
+    assert led.holding("ai", NVDA, book="live").available_quote == D("100")
+
+
+def test_ledger_without_equity_settings_still_reads_row_types(store):
+    """No callables: the pool still counts an EQUITY row by the row's own kind."""
+    led = Ledger(store, fee_rate=FEE)
+    place_equity(store, ocid("ai", 1), "ai", "BUY", "100", "1", level=-1)
+    # A SPOT row of the same owner on the same book spends none of the pool.
+    place(store, ocid("ai", 2), "ai", "BUY", "1", "7", product=XRP)
+
+    # Nothing tells this ledger what an equity is, so the resting EQUITY buy is
+    # read from the row's own product type and the crypto row is not in it.
+    assert led.equity_pool_used("dry") == D("100")
+    assert led.holding("ai", NVDA, book="dry").quote == D("0")
+
+    # Both new settings are keyword-only.
+    with pytest.raises(TypeError):
+        Ledger(store, FEE, equity_ai_capital=lambda: D("1"))
+
+
+def test_delisted_symbol_stays_in_the_equity_pool(store):
+    """A symbol off the equity list that still has EQUITY rows is still equity."""
+    listed = {NVDA, VOO}
+    led = Ledger(
+        store,
+        fee_rate=FEE,
+        equity_ai_capital=Capital("150"),
+        is_equity=lambda product: product in listed,
+    )
+    bought = ocid("ai", 1)
+    place_equity(store, bought, "ai", "BUY", "100", "1", status=FILLED)
+    snapshot(store, bought, "1", "100", "0")
+
+    # The symbol is delisted: only VOO-USD is on the equity list now.
+    listed.discard(NVDA)
+
+    # The pool's spend is the row's own kind, never the configured list.
+    assert led.equity_pool_used("dry") == D("100")
+
+    # The share the AI still holds is still an equity, so it prices off the pool.
+    held = led.holding("ai", NVDA, book="dry")
+    assert held.base == D("1")
+    assert held.equity is True
+    assert led.holding("ai", VOO, book="dry").available_quote == D("50")
+
+    # 150 of capital less the 100 already spent leaves 50 in the pool, and the
+    # share the AI holds is subtracted from its own currency: 150 - 50 = 100 of
+    # USD, and the one NVDA share with the AI is 0 unallocated.
+    out = led.unallocated({"USD": D("150"), "NVDA": D("1")}, book="dry")
+    assert out["USD"] == D("100")
+    assert out["NVDA"] == D("0")
+    assert all(value >= 0 for value in out.values()), out
+
+    products = led.equity_products("dry")
+    assert NVDA in products
+    assert XRP not in products

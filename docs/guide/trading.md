@@ -97,6 +97,48 @@ When the AI proposes an order, you get a priority alert titled **The AI proposed
 
 To answer it, type your 2FA code and press **Approve** (*"Approved. Placing your order now."*) or press **Not now** (*"Okay, not now."*, no code needed). An approval places exactly what the card showed; nothing is re-priced. If it moved in the meantime the page says *"This proposal changed. Look at it again before approving."*, and if the window closed, *"This proposal expired. Ask again."* A proposal that is gone, or one someone already answered, says so as well, and you can ask again. A proposal alert on your phone opens the Trading page with that proposal highlighted; you still need your password sign-in and a code to approve it.
 
+## Stocks (off by default)
+
+Stocks are off by default. Nothing about them happens until the install lists the ones it may trade, in the add-on settings; while that list is empty, Crow trades no stocks at all and no stock proposal can be made.
+
+Once stocks are listed, the AI proposes a stock order just like a coin order, and you approve it the same way: the same alert, the same card under **Pending approvals**, the same code. A stock order is always a limit order, and it only goes out in the regular market session, so while the stock market is closed a stock order cannot be placed and the card says so. Nothing is ever sent at the market price.
+
+The limits for stocks are separate from the limits for coins: the most for one stock order, the total for a day's stock orders, and the money set aside for AI stock trades. The proposal shows the ones that apply, says whether the stock market is open, and shows the money left for stock trades before and after this order, so you can see what room is left before you approve.
+
+If Crow cannot confirm the stock products, for example before a key is connected, it turns stock trading off by itself, shows an alert, and keeps trading coins as usual.
+
+Live stock trading cannot be turned on yet. It needs a confirmed order preview, which comes in a later step; until then stock orders stay in practice. If your stock holdings fall far below their high point, Crow raises an alert. It alerts only: it never stops trading on that account, and the decision stays with you.
+
+A stock Crow no longer lists cannot be sold through Crow; sell it by hand in the Coinbase app.
+
+## Stock prices
+
+Crow needs a price source for stocks, because Coinbase does not give Crow stock prices. Crow uses [Tiingo](https://www.tiingo.com/), which has a free plan for personal use. Crow has not checked Tiingo's terms for you: read them yourself.
+
+1. Make a free Tiingo account.
+2. Find your API token in your account. The menu names on Tiingo's site were not checked; look for **API** or **Account**.
+3. Open the Trading page and find **Stock prices (Tiingo)**.
+4. Paste the token into the box; it is hidden as you type.
+5. Press **Test**, then **Save**.
+
+It only needs your password sign-in, with no 2FA code, because the token can only read prices and cannot spend or move money. Coinbase must be connected first. The card is only shown once stocks are listed in the add-on settings.
+
+The card says one of these:
+
+- *"Stock prices are connected (Tiingo)."*
+- *"Stock prices are not connected, so practice stock orders will not fill. Paste your free Tiingo token below."*
+- *"Tiingo did not accept the token. Paste it again."*
+- *"Connect Coinbase first, then add stock prices."*
+- *"Stock prices are paused for now (Tiingo is limiting requests); they will resume on their own."*
+
+The card says prices are paused when Tiingo is limiting requests or when Crow has used its allowance. Nothing needs pressing: the pause ends on its own and prices come back.
+
+**Disconnect** on this card forgets the token. It is stored sealed like your key and never shown again, and the trading engine holds it only in memory (never in a file or setting), so after an engine restart Crow sends it again by itself.
+
+Crow asks Tiingo for a price about every 1.5 to 4 minutes, depending on how many stocks are listed: about 90 seconds per stock with one listed, 170 seconds with two and 255 seconds with three. The more stocks are listed, the longer the wait between prices, and it pauses on its own when the allowance is used. Prices are used only for practice stock fills and for display; real orders always go to Coinbase, and once live stock trading exists, live stock orders will also be checked against this price. A practice stock order accepts a price up to 5 minutes old; a live stock order, when live stock trading exists, will need a price no older than 2 minutes. Neither uses a price from outside the regular session.
+
+Disconnecting Coinbase also forgets the stock prices token, and reconnecting Coinbase after the engine reset may need the token pasted again.
+
 ## The kill switch
 
 The big red **KILL SWITCH** button sits at the top of the page and is always there. Press it once and it asks *"Press the kill switch again to confirm."*; press it again. No code and no two-factor: *"Stops every bot and asks Coinbase to cancel Crow's orders right away. No code needed."* It stops both sides and cancels the orders Crow placed, answering *"Stopped. Every Crow order is being cancelled and every bot is stopped. Press Resume trading when you are ready."* If Coinbase cannot be reached yet, it adds *"The kill switch can only cancel orders on Coinbase once the engine reconnects."* If it could not do the job, it says so instead of pretending: *"Nothing was stopped: the trading engine is down. Cancel open orders by hand in the Coinbase app: Crow portfolio → Open orders."*, *"Nothing was stopped: Crow couldn't reach the trading engine. Cancel open orders by hand in the Coinbase app: Crow portfolio → Open orders."*, or *"Trading is halted, but some orders may still be resting on Coinbase."* — trading is stopped then, so check Coinbase for orders waiting at a set price and cancel them by hand.
@@ -151,10 +193,10 @@ To keep the bell readable, each everyday kind sends at most 6 notices an hour; t
 
 Once you are connected, the **Connect** box is replaced by a connected view. It shows *"Connected — Crow portfolio …"* with the last four characters of the portfolio name, then the last four characters of the key, a **2FA code** box and **Disconnect**. Disconnecting is refused while live trading is still open: with live orders waiting it says *"Pause or stop live bots first"*, and with a live bot or the AI live switch still on it says *"Switch live bots back to practice mode first."* Press **Pause**, **Back to practice** or **Stop** on each live bot, and turn off **Let the AI place real orders after I approve**, then Disconnect again.
 
-If it fails halfway, press **Disconnect** again: *"Disconnect didn't finish — press Disconnect again"*. When it works: *"Disconnected."* Disconnect does not delete the key at Coinbase; if you want the key gone, delete it in Coinbase yourself.
+If it fails halfway, press **Disconnect** again: *"Disconnect didn't finish — press Disconnect again"*. When it works: *"Disconnected."* Disconnect does not delete the key at Coinbase; if you want the key gone, delete it in Coinbase yourself. Disconnecting Coinbase also forgets the stock prices token, so the card asks for it again before practice stock orders can fill.
 
 If the trading engine loses its saved connection (after a reinstall or a reset, say), the page says *"Crow lost its link to the trading engine. Press Connect again."* and a notification tells you to reconnect in the Trading panel. Paste your key name and private key again, since Crow does not hand them back. If the trading engine does not answer, the page says *"Trading engine is not responding."*
 
 ## Privacy
 
-The key name, the private key and the approval secret are stored sealed. They are never shown again: the page shows only the last four characters of the key and of the portfolio. The AI's tools cannot read them, and connecting does not open your saved secrets.
+The key name, the private key, the approval secret and the stock prices token are stored sealed. None of them is ever shown again: the page shows only the last four characters of the key and of the portfolio. The AI's tools cannot read them, and connecting does not open your saved secrets.

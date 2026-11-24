@@ -97,7 +97,12 @@ keys the signature with the approval secret the request's body carries once a pi
 exists and with the install token while there is none — `DELETE
 /credentials` drops the live route behind the strict gate, and `POST
 /credentials/forget` drops the pin itself behind that same strict gate, so the
-engine reads as a first install again.  A key refusal is a
+engine reads as a first install again.  Both key-taking routes also accept the
+OPTIONAL second pair for the equity account, `equity_key_name` and
+`equity_private_key`: they ride in the same signed body, are passed straight to
+the slot, and appear in no answer, event or log line — the refusal they can earn
+is a code and a fixed sentence, and the event a refused connect writes carries
+the code alone.  A key refusal is a
 422 carrying the refusal code and its plain message; a body carrying a secret
 that is not the pinned one is `403 SECRET_MISMATCH` — answered before the
 stamp, the nonce and the MAC are looked at, and asked again inside the store's
@@ -115,6 +120,20 @@ while a live bot that could still act trades the live book or the AI's live
 switch is on (a STOPPED bot, which the kill switch or its own stop leaves in live
 mode, is not one: it cannot place, resume or switch books) — because an engine
 unpinned under one of them has no key to settle what it has open.
+
+Stock prices are three routes of their own, mounted only when `create_app` is
+given a `tiingo.TiingoQuotes`: `POST /tiingo/check` judges a pasted token with
+one read and keeps nothing, `POST /tiingo` keeps it in the client's memory and
+`DELETE /tiingo` forgets it.  All three are the strict gate's — the owner's MAC,
+never the install token — because the token they carry is the owner's, and none
+of them ever answers, records or logs the token itself.  Their bodies are the
+same one-token model, read by the same one-parse dependency the credentials push
+uses, so an extra field, a token that is not text and a field named twice are the
+surface's one `422 INVALID` naming fields and no values.  The `equity` block of
+`GET /status` carries `prices` (`connected`, `missing`, `rejected` or `paused`)
+and the plain `prices_message` that goes with it, so a surface can say whether
+practice stock orders can be priced at all — and, while they cannot be asked
+for, that prices resume on their own rather than that the token is wrong.
 
 The lease is the other thing this surface offers the owner's client, and both of
 its routes are privileged in the same way: `POST /lease` takes, renews or
@@ -145,13 +164,19 @@ its book, so the drawdown the stop fired on cannot fire again on the next cycle.
 A book nothing can price has its mark reset instead of blocking the clear, and
 the next priced cycle ratchets a fresh one.
 
-`GET /status` reports three things beside the keys it has always carried: the
+`GET /status` reports four things beside the keys it has always carried: the
 owner's two live switches and the ceiling above them, exactly as `Switches`'
 snapshot answers them; one drawdown entry per book — that book's own portfolio
 equity, the mark it is measured against, and the percentage between the two,
 floored at zero and null wherever either number is unknown (a book no bot trades
-has no equity, and a mark nobody wrote is no mark); and the products this engine
-may trade.  `GET /orders?book=` is the order rows' own read side: the resting
+has no equity, and a mark nobody wrote is no mark); the products this engine
+may trade; and one `equity` block for the AI's equity book — its value, its own
+mark, whether its drawdown alert is standing, whether the session is open,
+whether that book is a live reading, and the stock products' own state
+(`available`, `reason`, `live_reason`, read off the gateway's `equity_status`) —
+which is all null with `enabled` false, and `available` false too, on an install
+that configures no equities.  `GET /orders?book=` is the order rows' own read
+side: the resting
 orders (`PENDING_SUBMIT` and `OPEN`) of both books or of the one the query names,
 oldest first, each named by the client order id the engine minted for it and
 carrying no exchange order id, no note and no fill figures.  A `book` that is
@@ -259,6 +284,8 @@ from .limits import (
 )
 from .money import ProductSpec
 from .runner import (
+    EQUITY_ALERT_PREFIX,
+    EQUITY_HWM_OWNER,
     PAUSED_REASON_PREFIX,
     PauseChanged,
     Runner,
@@ -276,6 +303,16 @@ from .store import (
     Store,
 )
 from .strategies.base import Strategy
+from .tiingo import (
+    SENTENCE_BAD_ANSWER,
+    SENTENCE_RATE_LIMITED,
+    SENTENCE_REJECTED,
+    SENTENCE_TOKEN_SHAPE,
+    SENTENCE_UNREACHABLE,
+    STATE_MISSING,
+    TiingoError,
+    TiingoQuotes,
+)
 
 D = Decimal
 log = logging.getLogger("crow_coinbase.api")
@@ -419,6 +456,25 @@ LIVE_BOTS_MESSAGE = "Switch live bots back to practice mode first."
 # sentences that name nothing else.
 PRICE_UNKNOWN_PRODUCT = "That product is not one this engine trades."
 PRICE_UNAVAILABLE = "No price is available for that product right now."
+# The codes a refused `POST /tiingo/check` answers, one per fixed sentence the
+# client can raise for that one read, so a panel reads a code rather than
+# matching on prose.  The sentence beside each code is the client's own text.
+TOKEN_SHAPE = "TOKEN_SHAPE"
+TOKEN_REJECTED = "TOKEN_REJECTED"
+RATE_LIMITED = "RATE_LIMITED"
+UNREACHABLE = "UNREACHABLE"
+BAD_ANSWER = "BAD_ANSWER"
+TIINGO_CODES = {
+    SENTENCE_TOKEN_SHAPE: TOKEN_SHAPE,
+    SENTENCE_REJECTED: TOKEN_REJECTED,
+    SENTENCE_RATE_LIMITED: RATE_LIMITED,
+    SENTENCE_UNREACHABLE: UNREACHABLE,
+    SENTENCE_BAD_ANSWER: BAD_ANSWER,
+}
+# What a stored token's own event says, and what a forgotten one's says: the
+# names of the two things that happened, and no value of any token.
+MESSAGE_TIINGO_STORED = "stock price token stored"
+MESSAGE_TIINGO_REMOVED = "stock price token removed"
 
 # The `Limits` FIELD the AI's live capital is kept under: the one cap whose raise
 # is measured against the live book before it is written.  It is named by its
@@ -753,12 +809,21 @@ class CredentialCheckBody(BaseModel):
     `extra="forbid"` keeps a field this build does not know from riding along,
     and both parts stay text: nothing here is coerced into a key the caller did
     not send.
+
+    `equity_key_name` and `equity_private_key` are the OPTIONAL second pair for
+    the equity account, and they are optional TOGETHER: a body may carry both or
+    neither, and the slot refuses one without the other (on an engine that has
+    equities configured at all) rather than this model deciding it.  They are
+    judged by the slot with the first pair and appear in no answer: the refusal
+    they can earn names a code and plain words, never either field.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     key_name: str
     private_key: str
+    equity_key_name: Optional[str] = None
+    equity_private_key: Optional[str] = None
 
 
 class CredentialBody(BaseModel):
@@ -770,6 +835,14 @@ class CredentialBody(BaseModel):
     exactly as it arrived rather than coerced: only a JSON `true` moves a pinned
     portfolio, and every other value — absent, false, the string `"true"`, a
     number — is refused as a field this build cannot read.
+
+    `equity_key_name` and `equity_private_key` are the OPTIONAL second pair for
+    the equity account, under the same both-or-neither rule the check body's are
+    under, and they travel inside the body the MAC covers: the same signature,
+    pin, step-up and in-memory-only rule apply to them with no route of their
+    own.  Like the first pair they are never written, logged or echoed: the
+    refusal they can earn carries a code and plain words, and the event a refused
+    connect writes carries the code alone.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -778,6 +851,8 @@ class CredentialBody(BaseModel):
     private_key: str
     approve_secret: str = Field(min_length=MIN_KEY_BYTES)
     repin: bool = False
+    equity_key_name: Optional[str] = None
+    equity_private_key: Optional[str] = None
 
     @field_validator("repin", mode="before")
     @classmethod
@@ -787,11 +862,27 @@ class CredentialBody(BaseModel):
         return value
 
 
+class TiingoTokenBody(BaseModel):
+    """The whole POST /tiingo and POST /tiingo/check body: one token, nothing else.
+
+    `extra="forbid"` keeps a field this build does not know from riding along with
+    the token, so a body carrying one is refused as a body.  The token stays text:
+    nothing here is coerced into a token nobody sent, and its shape is judged by
+    the client rather than by this model, so the refusal names the client's own
+    fixed sentence instead of a validation message this module would have to
+    write twice.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str
+
+
 class DuplicatedBodyFields(Exception):
     """A body that names one field twice, answered as the surface's `422 INVALID`.
 
-    Raised by the `POST /credentials` dependency from the ONE parse of the
-    captured bytes, before that parse's object is read into a model: a model
+    Raised by a signed body's dependency (`_signed_body`) from the ONE parse of
+    the captured bytes, before that parse's object is read into a model: a model
     keeps only the last value a name was given, and an approval made on one of
     two secrets says nothing about the other.  The exception carries field NAMES
     and nothing else, so the answer to it can carry nothing a request sent.
@@ -971,6 +1062,119 @@ def _drawdown_json(
         "equity": _optional_text(equity),
         "hwm": _optional_text(hwm),
         "pct": _optional_text(pct),
+    }
+
+
+def _prices_state(tiingo: Optional[TiingoQuotes]) -> tuple[str, Optional[str]]:
+    """Whether stock prices can be priced at all, and the sentence that says it.
+
+    `connected`, `missing`, `rejected` or `paused` is the client's own answer, and
+    the sentence beside it is the client's too (`None` while it is connected).
+    `paused` is a token that is fine but cannot be asked right now — a Tiingo rate
+    pause, or the client's own hourly or daily allowance used up — so a surface
+    says prices resume on their own instead of asking the owner to paste the token
+    again.  An app built with no client at all — a surface that was never given
+    one — has no token and nothing to say about one, so it answers the missing
+    state with no message rather than a sentence about a client that is not there.
+    """
+    if tiingo is None:
+        return STATE_MISSING, None
+    return tiingo.state(), tiingo.message()
+
+
+def _equity_json(
+    gateway: OrderGateway,
+    store: Store,
+    limits: Limits,
+    runner: Runner,
+    tiingo: Optional[TiingoQuotes],
+) -> dict:
+    """The AI's equity book as `GET /status` reports it, or an all-null block.
+
+    The block is the book the AI routes to right now (`gateway.route_for("ai")`),
+    so a bot-driven switch of the AI's own route is reported without the surface
+    deciding anything: `value` is `gateway.equity_value` there — the shares at
+    their mid plus the pool's cash left — and `hwm` is the mark the runner keeps
+    for that book under `EQUITY_HWM_OWNER`, which is NOT the portfolio mark a
+    drawdown stop reads.  `drawdown_alert` is the runner's own episode marker for
+    that book, so a reader can tell an alert that is standing from one that has
+    cleared.  `session_open` is the runner's session, asked at the runner's own
+    clock exactly as a cycle asks it.  `live` needs all three of the equity
+    switch, the AI's route and a live account that route can reach, and it is
+    read from the route's own answer so a refused live route never reports as
+    one — and the account that route answers has to have an equity side of its
+    own (`router.equity`): the AI's equity book can only be a live reading on an
+    account that holds equities, so a live crypto account alone is not one.  The
+    switch is judged first and short-circuits the rest, so an install with
+    `equity_live` off never asks for the live account at all.
+
+    An install with no equities configured makes no equity call at all: the block
+    is the fixed `enabled: false` shape, every figure null, the session still
+    reported (it is the clock's answer, not the equities').
+
+    `prices` and `prices_message` are the stock-price source's own state, reported
+    rather than decided here (`_prices_state`): whether a token is in the Tiingo
+    client's memory (`connected`), whether none is (`missing`), whether the last
+    read had it refused (`rejected`), whether it is fine but cannot be asked right
+    now (`paused`: a rate pause or a used-up allowance), and the plain sentence for
+    every state but `connected`.  An install with no equities answers `missing`
+    and no message, because no stock order can be priced there whether or not a
+    token is stored.
+
+    `available`, `reason` and `live_reason` are the gateway's own
+    `equity_status`, reported rather than decided here: `reason` is why the stock
+    products cannot be traded at all right now (unverified product kinds, a
+    mismatch, a failed read), `live_reason` is why the live stock route is off on
+    its own (the order preview is not confirmed on record yet), and `available`
+    is the equities being configured with no `reason` standing.  A gateway built
+    without a status reports the equities as available and both reasons null, and
+    an install with no equities reports `available` false.  `live` is false
+    whenever `live_reason` is not null: a live stock route nobody confirmed is
+    not a live reading, whatever else is in place.
+    """
+    session_open = bool(runner.session_open(runner.now()))
+    status = getattr(gateway, "equity_status", None)
+    if not limits.equity_products:
+        return {
+            "enabled": False,
+            "value": None,
+            "hwm": None,
+            "drawdown_alert": False,
+            "session_open": session_open,
+            "live": False,
+            "available": False,
+            "reason": None,
+            "live_reason": None,
+            "prices": STATE_MISSING,
+            "prices_message": None,
+        }
+    reason = status.reason() if status is not None else None
+    live_reason = status.live_reason() if status is not None else None
+    book = gateway.route_for("ai")
+    # The switch is a settings read and the route is the gateway's own answer, so
+    # both are decided before any account is asked for: an install with
+    # `equity_live` off never reaches the live exchange here, whatever its route.
+    live = bool(limits.equity_live) and gateway.route("ai") == (LIVE, None)
+    if live:
+        router = gateway.books.live_exchange()
+        live = router is not None and getattr(router, "equity", None) is not None
+    if live_reason is not None:
+        live = False
+    prices, prices_message = _prices_state(tiingo)
+    return {
+        "enabled": True,
+        "value": _optional_text(gateway.equity_value(book)),
+        "hwm": _optional_text(store.hwm(EQUITY_HWM_OWNER, book)),
+        "drawdown_alert": (
+            store.get(f"{EQUITY_ALERT_PREFIX}{book}") is not None
+        ),
+        "session_open": session_open,
+        "live": live,
+        "available": reason is None,
+        "reason": reason,
+        "live_reason": live_reason,
+        "prices": prices,
+        "prices_message": prices_message,
     }
 
 
@@ -1632,6 +1836,7 @@ def create_app(
     auth: Optional[Authenticator] = None,
     slot: Optional[CredentialSlot] = None,
     ai_orders: Optional[AiOrders] = None,
+    tiingo: Optional[TiingoQuotes] = None,
 ) -> FastAPI:
     """Build the app over already-built pieces: nothing here opens a file or a socket.
 
@@ -1681,6 +1886,20 @@ def create_app(
     own `RequestValidationError` handler: `422 {"code": "INVALID", "fields":
     [...]}`, naming the fields and never a value that was sent; a body that names
     one field twice reaches `DuplicatedBodyFields`, which answers the same shape.
+
+    `tiingo` is the stock-price client (`tiingo.py`), and its three routes exist
+    only when it is given: `POST /tiingo/check` reads one fixed ticker with a
+    pasted token and keeps nothing, `POST /tiingo` keeps a token in the client's
+    memory without asking anything, and `DELETE /tiingo` forgets it.  All three
+    are behind the STRICT gate — the owner's MAC, never the install token — and
+    their bodies are the one-token model read by the same one-parse dependency
+    the credentials push uses, so an unreadable body, a field this build does not
+    know and a field named twice are that route's `422 INVALID` answers.  A
+    refusal of the check is a 200 carrying the client's code and its fixed
+    sentence, because the request succeeded and the token is what was judged; no
+    answer, event or log line carries the token itself.  With no client the three
+    routes are absent and the `/status` equity block still reports its prices as
+    `missing`.
 
     `ai_orders` is the AI's preview and approval surface (`ai_orders.py`), and the
     five AI routes exist only when it is given: `POST /ai/previews` measures a
@@ -1875,8 +2094,9 @@ def create_app(
         The keys beside those are reads and write nothing: `live_switches` is the
         switches' own snapshot (both flags and the environment's ceiling),
         `drawdown` is one entry per book with that book's equity, mark and the
-        percentage between them, and `products` is the allow-list as the plain
-        strings it holds.
+        percentage between them, `products` is the allow-list as the plain
+        strings it holds, and `equity` is the AI's equity book on the book the AI
+        routes to now.
         """
         halted_books = gateway.halted_books()
         bots = store.list_bots()
@@ -1895,6 +2115,7 @@ def create_app(
                 for book in BOOKS
             },
             "products": list(limits.products),
+            "equity": _equity_json(gateway, store, limits, runner, tiingo),
         }
 
     # ------------------------------------------------ the event feed
@@ -2299,10 +2520,18 @@ def create_app(
             returns.  A key that is refused answers 200 with `state: "refused"`,
             its code and its plain message — the request itself succeeded, and the
             key is what was judged.  The install token signs this one while no pin
-            exists; after a pin only the owner's secret does.
+            exists; after a pin only the owner's secret does.  A body may also
+            carry the optional second key pair for the equity account, which the
+            slot judges after the first pair and which the answer does not
+            mention: a refused equity key is a code and a fixed sentence.
             """
             return _key_check_json(
-                slot.check(body.key_name, body.private_key)
+                slot.check(
+                    body.key_name,
+                    body.private_key,
+                    equity_key_name=body.equity_key_name,
+                    equity_private_key=body.equity_private_key,
+                )
             )
 
         @app.post(
@@ -2342,6 +2571,10 @@ def create_app(
             `403 SECRET_MISMATCH` and writes nothing; a refused key answers 422
             with its code and its plain message and leaves everything exactly as
             it was: nothing pinned, nothing kept, the live book still locked.
+            The optional second key pair for the equity account is handed to the
+            slot with the first and is judged there, after it; the event a
+            refusal writes carries the refusal code alone, so nothing of either
+            pair reaches the feed.
             """
             key_kind = _credential_mac(request, body.approve_secret)
             if body.repin and not slot.pinned():
@@ -2353,6 +2586,8 @@ def create_app(
                     body.approve_secret,
                     repin=body.repin,
                     key_kind=key_kind,
+                    equity_key_name=body.equity_key_name,
+                    equity_private_key=body.equity_private_key,
                 )
                 if result.code == SECRET_MISMATCH:
                     # The pin the approval was decided against is not the pin the
@@ -2470,6 +2705,72 @@ def create_app(
                     status_code=200,
                     content={"state": "missing", "pinned": slot.pinned()},
                 )
+
+    # ------------------------------------------------ stock prices (Tiingo)
+    if tiingo is not None:
+
+        @app.post("/tiingo/check", dependencies=privileged)
+        def check_tiingo(
+            body: TiingoTokenBody = Depends(_tiingo_body),
+        ) -> Response:
+            """Judge a pasted token with one read, and store nothing at all.
+
+            A privileged route behind the STRICT gate: the token is the owner's,
+            so the install token is never a key here.  One read of one fixed
+            liquid ticker with the token in the body, and the answer is the
+            outcome: `ok` for a well-formed answer, or `refused` with a code and
+            the client's one fixed sentence.  The request itself succeeded in
+            either case, which is why both are 200s.  The stored token's state,
+            its cache and its request allowance are untouched, and the answer
+            never carries the token.
+            """
+            try:
+                tiingo.check(body.token)
+            except TiingoError as error:
+                return JSONResponse(
+                    status_code=200, content=_tiingo_refusal(error)
+                )
+            return JSONResponse(status_code=200, content={"state": "ok"})
+
+        @app.post("/tiingo", dependencies=privileged)
+        def set_tiingo(
+            body: TiingoTokenBody = Depends(_tiingo_body),
+        ) -> Response:
+            """Keep a token in the client's memory, and ask Tiingo nothing.
+
+            A privileged route behind the strict gate, like the check beside it.
+            Storing is a memory write and no request at all: a token of the wrong
+            shape is refused with the client's own sentence and leaves the token
+            that was working where it was, and a good one clears a rejection and
+            a rate pause along with the cache the old token filled.  One info
+            event records the store, naming nothing of the token.
+            """
+            try:
+                tiingo.set_token(body.token)
+            except TiingoError as error:
+                return JSONResponse(
+                    status_code=200, content=_tiingo_refusal(error)
+                )
+            _record(store, "info", MESSAGE_TIINGO_STORED, kind="credentials")
+            return JSONResponse(
+                status_code=200, content={"state": tiingo.state()}
+            )
+
+        @app.delete("/tiingo", dependencies=privileged)
+        def delete_tiingo() -> Response:
+            """Forget the token and everything measured with it: the Disconnect.
+
+            A privileged route behind the strict gate: making the engine forget
+            how it prices stocks is the owner's decision.  The cache, the rate
+            pause, the rejection mark and the request allowance go with the
+            token, so a token pasted afterwards starts clean.  One info event
+            records the removal, and no value of anything.
+            """
+            tiingo.clear()
+            _record(store, "info", MESSAGE_TIINGO_REMOVED, kind="credentials")
+            return JSONResponse(
+                status_code=200, content={"state": STATE_MISSING}
+            )
 
     @app.post("/bots/{bot_id}/pause", dependencies=guard)
     def pause_bot(bot_id: str) -> Response:
@@ -3028,18 +3329,19 @@ def _unreadable_body() -> RequestValidationError:
     return RequestValidationError([])
 
 
-def _credentials_body(request: Request) -> CredentialBody:
-    """The `POST /credentials` body, from ONE parse of the bytes the MAC covers.
+def _signed_body(request: Request, model: type[BaseModel]) -> Any:
+    """One signed body, from ONE parse of the bytes the MAC covered, read into *model*.
 
     FastAPI would parse the body itself, from the raw bytes, and its parser and
-    this route's own reading of them could disagree: the same bytes can be one
+    the route's own reading of them could disagree: the same bytes can be one
     object to a parser that sniffs an encoding and unreadable to a strict UTF-8
-    decode, and a body that names a field twice has two values only until a
-    model keeps the last of them.  So the bytes `BodyCaptureMiddleware` captured
-    are decoded here — strictly, as UTF-8, with no encoding sniffed — parsed as
-    JSON from the decoded TEXT (a leading BOM is then a parse failure and not an
-    encoding hint), and read into the model from that single result.  The route
-    takes the model from this dependency, so nothing parses the body again.
+    decode, and a body that names a field twice has two values only until a model
+    keeps the last of them.  So the bytes `BodyCaptureMiddleware` captured are
+    decoded here — strictly, as UTF-8, with no encoding sniffed — parsed as JSON
+    from the decoded TEXT (a leading BOM is then a parse failure and not an
+    encoding hint), and read into *model* from that single result.  A route takes
+    its model from this dependency, so nothing parses the body a second time and
+    the object the route acts on is always the one the MAC was computed over.
 
     Bytes this build cannot read — not UTF-8, not JSON, or not a JSON object once
     parsed — are the `422 INVALID` naming no field.  A body that names one field
@@ -3057,7 +3359,7 @@ def _credentials_body(request: Request) -> CredentialBody:
     raw = getattr(request.state, "raw_body", None)
     if not isinstance(raw, (bytes, bytearray)):
         raise HTTPException(status_code=403, detail=APPROVAL_INVALID)
-    known = tuple(CredentialBody.model_fields)
+    known = tuple(model.model_fields)
     repeated: list[str] = []
     seen_twice = False
 
@@ -3083,9 +3385,52 @@ def _credentials_body(request: Request) -> CredentialBody:
     if seen_twice:
         raise DuplicatedBodyFields(repeated)
     try:
-        return CredentialBody.model_validate(parsed)
+        return model.model_validate(parsed)
     except ValidationError as error:
         raise RequestValidationError(error.errors()) from None
+
+
+def _credentials_body(request: Request) -> CredentialBody:
+    """The `POST /credentials` body, from ONE parse of the bytes the MAC covers.
+
+    A `CredentialBody` read by `_signed_body`, which is where the single parse,
+    the duplicated-name rule and the `422` shapes are explained: this route's
+    body carries the key, the private key and the approval secret, so it is the
+    one that must never be parsed twice or answered with a value it sent.
+    """
+    return _signed_body(request, CredentialBody)
+
+
+def _tiingo_body(request: Request) -> TiingoTokenBody:
+    """The one-token body of the two POST Tiingo routes, from that same one parse.
+
+    Read by `_signed_body` for the same reasons the credentials body is: the
+    token these routes carry is the owner's secret, so a body naming `token`
+    twice is refused rather than answered with one of its two values, and a body
+    this build cannot read names no field at all.  The shape of the token itself
+    is the client's to judge, so it is not a field of this model.
+    """
+    return _signed_body(request, TiingoTokenBody)
+
+
+def _tiingo_refusal(error: TiingoError) -> dict:
+    """A refused stock-price read: the client's code and its fixed sentence.
+
+    Every `TiingoError` this surface sees carries one of the client's fixed
+    sentences, which is what maps it to the code a panel acts on.  The message is
+    answered only when it is one of those sentences; anything else is the
+    client's unusable-answer sentence, so a message that was not one of the fixed
+    ones is never quoted back to a caller.
+    """
+    sentence = str(error)
+    code = TIINGO_CODES.get(sentence)
+    if code is None:
+        return {
+            "state": "refused",
+            "code": BAD_ANSWER,
+            "message": SENTENCE_BAD_ANSWER,
+        }
+    return {"state": "refused", "code": code, "message": sentence}
 
 
 def _key_check_json(check: KeyCheck) -> dict:

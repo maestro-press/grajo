@@ -114,11 +114,14 @@ def add(
     source="bot",
     owner="b1",
     product=PRODUCT,
+    product_type="SPOT",
+    book="dry",
 ):
     """Insert one order row and pin its created_at to *created_at*.
 
     insert_order stamps the wall clock, so the timestamp is overwritten
-    afterwards; the connection is autocommit, so the row is durable at once.
+    afterwards; the connection is autocommit, so the row is durable at once.  A
+    row is SPOT unless the test names the other kind it means.
     """
     cid = cid_of(owner, n)
     store.insert_order(
@@ -131,7 +134,8 @@ def add(
         price=price,
         size=size,
         status=status,
-        book="dry",
+        book=book,
+        product_type=product_type,
     )
     store.conn().execute(
         "UPDATE orders SET created_at=? WHERE client_order_id=?", (created_at, cid)
@@ -832,3 +836,93 @@ def test_empty_table_is_zero(store):
 
     assert window.orders_last_hour("ai") == 0
     assert isinstance(window.orders_last_hour("ai"), int)
+
+
+# ---------------------------------------------------------------- product type
+
+
+def test_daily_notional_filters_by_product_type(store):
+    """A SPOT budget and an EQUITY budget are read apart, from one table."""
+    t = utc(2026, 3, 10, 12, 0, 0)
+    add(store, 1, t, price=D("2"), size=D("10"))  # 20, SPOT by default
+    add(
+        store,
+        2,
+        t,
+        price=D("5"),
+        size=D("4"),
+        product="NVDA-USD",
+        product_type="EQUITY",
+        source="ai",
+    )  # 20, EQUITY
+    add(
+        store,
+        3,
+        t,
+        price=D("10"),
+        size=D("1"),
+        product="VOO-USD",
+        product_type="EQUITY",
+        source="ai",
+    )  # 10, EQUITY
+
+    window, _ = window_at(store, t)
+
+    # No filter is still every row, exactly as before.
+    assert window.daily_notional(None) == D("50")
+
+    assert window.daily_notional(None, product_type="SPOT") == D("20")
+    assert window.daily_notional(None, product_type="EQUITY") == D("30")
+    assert isinstance(window.daily_notional(None, product_type="EQUITY"), D)
+
+    # The source filter still applies beside the kind: the SPOT row is the
+    # bot's, the two EQUITY rows are the ai's.
+    assert window.daily_notional("bot", product_type="SPOT") == D("20")
+    assert window.daily_notional("ai", product_type="SPOT") == D("0")
+    assert window.daily_notional("ai", product_type="EQUITY") == D("30")
+    assert window.daily_notional("bot", product_type="EQUITY") == D("0")
+
+    # ... and so do the product filters.
+    assert window.daily_notional(
+        None, product_type="EQUITY", products=("NVDA-USD",)
+    ) == D("20")
+    assert window.daily_notional(
+        None, product_type="SPOT", products=("NVDA-USD",)
+    ) == D("0")
+    assert window.daily_notional(
+        None, product_type="EQUITY", exclude_products=("VOO-USD",)
+    ) == D("20")
+
+
+def test_daily_notional_filters_one_book_with_a_product_type(store):
+    t = utc(2026, 3, 10, 12, 0, 0)
+    add(store, 1, t, price=D("2"), size=D("10"))  # dry SPOT, 20
+    add(store, 2, t, price=D("3"), size=D("5"), book="live")  # live SPOT, 15
+    add(
+        store,
+        3,
+        t,
+        price=D("7"),
+        size=D("1"),
+        product="NVDA-USD",
+        product_type="EQUITY",
+        book="live",
+    )  # live EQUITY, 7
+
+    window, _ = window_at(store, t)
+
+    assert window.daily_notional(None, book="dry", product_type="SPOT") == D("20")
+    assert window.daily_notional(None, book="dry", product_type="EQUITY") == D("0")
+    assert window.daily_notional(None, book="live", product_type="SPOT") == D("15")
+    assert window.daily_notional(None, book="live", product_type="EQUITY") == D("7")
+
+
+@pytest.mark.parametrize("bad", ["equity", "X", "Spot", "spoT", "SPOT "])
+def test_daily_notional_refuses_an_unknown_product_type(store, bad):
+    t = utc(2026, 3, 10, 12, 0, 0)
+    add(store, 1, t, price=D("2"), size=D("10"))
+
+    window, _ = window_at(store, t)
+
+    with pytest.raises(ValueError):
+        window.daily_notional(None, product_type=bad)

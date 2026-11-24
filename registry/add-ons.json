@@ -1171,7 +1171,7 @@
     {
       "id": "coinbase",
       "name": "Coinbase (Beta)",
-      "version": "0.4.11",
+      "version": "0.4.14",
       "description": "Beta Coinbase trading engine for Crow. Practice mode is the default: orders are simulated against public market data, and live trading is switched on separately, in the Trading panel. Every order from a bot or the AI goes through one gateway with caps.",
       "type": "bundle",
       "author": "Crow",
@@ -1347,6 +1347,50 @@
           "description": "Days a bot may do worse than simply holding its starting mix before the engine raises an alert and suggests pausing it.",
           "default": "7",
           "required": false
+        },
+        {
+          "name": "CROW_COINBASE_EQUITY_PRODUCTS",
+          "description": "Stocks are off while this is empty. Set a comma-separated list of stock ids, such as NVDA-USD, to let Crow trade them. Each one is a stock Coinbase trades, and a stock may not share its underlying asset with a crypto product.",
+          "default": "",
+          "required": false
+        },
+        {
+          "name": "CROW_COINBASE_EQUITY_LIVE",
+          "description": "Live stock trading cannot be turned on yet. It needs a confirmed order preview, which comes in a later step; until then stock orders stay in practice.",
+          "default": "false",
+          "required": false,
+          "advanced": true
+        },
+        {
+          "name": "CROW_COINBASE_EQUITY_MAX_ORDER_USD",
+          "description": "The most, in USD, for one stock order the AI may place. Set it here; the Trading panel cannot change it.",
+          "default": "100",
+          "required": false
+        },
+        {
+          "name": "CROW_COINBASE_EQUITY_DAILY_NOTIONAL_USD",
+          "description": "The most total USD value of stock orders the AI may place per UTC day. Set it here; the Trading panel cannot change it.",
+          "default": "200",
+          "required": false
+        },
+        {
+          "name": "CROW_COINBASE_EQUITY_AI_CAPITAL_USD",
+          "description": "The money, in USD, set aside for the AI's stock trades. Zero means the AI may not buy a stock. Set it here; the Trading panel cannot change it.",
+          "default": "0",
+          "required": false
+        },
+        {
+          "name": "CROW_COINBASE_EQUITY_DRAWDOWN_ALERT_PCT",
+          "description": "How far your stock holdings may fall from their high point, in percent, before Crow raises an alert. It alerts only; trading carries on.",
+          "default": "20",
+          "required": false
+        },
+        {
+          "name": "CROW_COINBASE_EQUITY_PORTFOLIO_ID",
+          "description": "Reserved for a later step. Leave it empty.",
+          "default": "",
+          "required": false,
+          "advanced": true
         },
         {
           "name": "CROW_COINBASE_WATCHDOG_POLICY",

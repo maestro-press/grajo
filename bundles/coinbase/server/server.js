@@ -131,6 +131,31 @@ function approvalLink(previewId) {
   return `${APPROVAL_ROUTE}?preview=${encodeURIComponent(String(previewId))}`;
 }
 
+// The five stock facts a proposal may carry, in the engine's own order: whether the
+// stock market is open, then the money set aside for AI stock trades, what of it is
+// used, what is left, and what would be left after this order. Nothing else rides along.
+const EQUITY_FLAG = "session_open";
+const EQUITY_MONEY = ["pool_capital", "pool_used", "pool_left", "pool_left_after"];
+
+/**
+ * The engine's stock block, or null when there is nothing a reader can trust.
+ *
+ * It is passed on only when it is a plain object with a real true/false answer for
+ * whether the stock market is open; the money facts are kept only as the engine's own
+ * strings, so a true/false or a number there is dropped, never repaired. An extra field,
+ * a string "true" or a list is dropped whole.
+ */
+function equityBlock(equity) {
+  if (!equity || typeof equity !== "object" || Array.isArray(equity)) return null;
+  if (typeof equity[EQUITY_FLAG] !== "boolean") return null;
+  const out = { [EQUITY_FLAG]: equity[EQUITY_FLAG] };
+  for (const name of EQUITY_MONEY) {
+    const value = equity[name];
+    if (typeof value === "string") out[name] = value;
+  }
+  return out;
+}
+
 /**
  * The small plain object one proposal is reported as.
  *
@@ -152,6 +177,10 @@ function previewSummary(preview) {
   };
   if (row.refusal !== undefined && row.refusal !== null) out.refusal = row.refusal;
   if (typeof row.message === "string" && row.message) out.message_from_engine = row.message;
+  // A proposal about a stock carries the engine's stock facts; one about a coin carries
+  // no such key at all, so an answer for a coin reads exactly as it did before.
+  const equity = equityBlock(row.equity);
+  if (equity) out.equity = equity;
   return out;
 }
 
@@ -435,9 +464,18 @@ export function createCoinbaseServer({ client, projectId } = {}) {
 
   server.tool(
     "crow_cb_order_preview",
-    `Measures one order against the engine's limits and returns a proposal; nothing is placed. ${APPROVER_SENTENCE}`,
+    "Measures one order against the engine's limits and returns a proposal; nothing is placed. " +
+      "A stock such as NVDA-USD may be proposed when stocks are enabled; a stock order only " +
+      "goes out in the regular market session, and its proposal shows the stock limits and the " +
+      `money left for stocks. ${APPROVER_SENTENCE}`,
     {
-      product: z.string().min(1).describe("The trading pair, for example BTC-USDC"),
+      product: z
+        .string()
+        .min(1)
+        .describe(
+          "The trading pair, for example BTC-USDC, or a stock such as NVDA-USD when stocks are " +
+            "enabled. A stock order only goes out in the regular market session",
+        ),
       side: z.enum(["BUY", "SELL"]).describe("Which way the order goes"),
       size: z.string().min(1).describe("The order size, as the engine takes it"),
       limit_price: z.string().min(1).describe("The limit price for the order"),
@@ -459,7 +497,10 @@ export function createCoinbaseServer({ client, projectId } = {}) {
 
   server.tool(
     "crow_cb_order_place",
-    `Reports one order proposal's current state and its approval link. ${APPROVER_SENTENCE}`,
+    "Reports one order proposal's current state and its approval link. " +
+      "A stock such as NVDA-USD may be proposed when stocks are enabled; a stock order only " +
+      "goes out in the regular market session, and its proposal shows the stock limits and the " +
+      `money left for stocks. ${APPROVER_SENTENCE}`,
     { preview_id: z.string().min(1).describe("The proposal's id, from a preview") },
     guarded(async ({ preview_id }) => {
       const listed = await client.aiPreviews();

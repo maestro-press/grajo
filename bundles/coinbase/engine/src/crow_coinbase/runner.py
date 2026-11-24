@@ -5,11 +5,15 @@ method per step, so the body reads as that order:
 
     0. drop the events past their retention, at most once a day, and let the AI
        order surface sweep its own previews
-    1. poll every product any bot row names (under the gateway's cycle lock)
+    1. poll every product any bot row names (under the gateway's cycle lock),
+       then the configured equity products while the session is open
     2. step the dry-run exchange
     3. reconcile each book against its own exchange
+    3b. take the AI's resting equity off both books once the session has closed
     4. re-check each book's portfolio mark, halting that book alone, and the
        per-bot drawdown stops
+    4b. alert while the AI's equity book is below its own mark, and ratchet it
+    4c. alert while the equity status says the stock products cannot be traded
     5. one decision per ACTIVE bot whose book is not halted, its orders through
        the gateway; then alert a grid whose book is empty and has no fill left
        to answer
@@ -17,6 +21,21 @@ method per step, so the body reads as that order:
     6b. alert a bot that has trailed its own starting mix for long enough
     7. alert while an exchange is short of what its own book's owners hold
     8. write the heartbeat, and return it
+
+The equity half is the AI's own and stays apart from the bots'.  A poll reads
+the equity products inside the regular session alone and leaves the previous
+snapshot standing when a quote fails, step 3b cancels the AI's resting equity on
+the book its row belongs to when the session closes, and step 4b rings once per
+episode while the equity book sits below a mark of its own: it never halts a
+book, never refuses an order and never enters the portfolio mark.  The stock
+products turning themselves off is step 4c's news, not a start refusal: while
+the gateway's `equity_status` reports a reason the equity poll reads nothing and
+one fixed sentence is written per reason, so crypto keeps running untouched.
+That mark is taken against the equity capital in force, which is env-only and so
+can only change between two runs: step 4b re-bases the mark, clears the episode
+and says so once when it finds a different capital than the last run saw.  The
+session is `self.session_open`, always asked at `self.now()`, so a caller can pin
+both.
 
 The heartbeat's payload names the bots that raised in step 5 (`errors`), which is
 empty when every bot got through and also when a halt skipped it, so a reader can
@@ -71,7 +90,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
 
-from . import money
+from . import market_hours, money
 from .benchmark import Benchmark
 from .books import (
     BOOKS,
@@ -82,6 +101,8 @@ from .books import (
     LiveLocked,
     ModeRefused,
 )
+from .equity_wiring import EquityStatus
+from .exchange import EquityQuotePaused, equity_print_for
 from .gateway import (
     CLOCK_SKEW,
     DAILY_CAP,
@@ -100,6 +121,7 @@ from .snapshot import SnapshotCache
 from .store import (
     ACTIVE,
     CANCELLED,
+    EQUITY,
     FAILED,
     FILLED,
     LIVE_STATUSES,
@@ -151,6 +173,66 @@ IDLE_BOOK_PREFIX = "runner:idle_book:"
 IDLE_BOOK_NOTE = (
     "grid has no live orders and no pending fills; recenter or re-init it"
 )
+
+# The environment variable that turns the equity live path on.  A live equity
+# route also needs the crypto live ceiling above it, so a start that asks for one
+# without the other is refused rather than quietly held.
+ENV_EQUITY_LIVE = "CROW_COINBASE_EQUITY_LIVE"
+
+# The high-water mark the AI's equity book is measured against, kept beside the
+# portfolio mark and never in it: the leading underscore puts it outside the bot
+# id grammar, exactly as `_portfolio` is, so it can never name a bot.  The
+# drawdown alert's episode lives under its own kv key per book, so a dry episode
+# never silences a live one.
+EQUITY_HWM_OWNER = "_equity"
+EQUITY_ALERT_PREFIX = "equity_alert:"
+
+# The kv key holding the equity capital in force on a book (`equity_capital:<book>`)
+# and the one event a capital that changed since the last run writes.  The capital
+# is env-only, so it can only change across a restart; the mark it was measured
+# against cannot survive that change, and is re-based when it is noticed.
+EQUITY_CAPITAL_PREFIX = "equity_capital:"
+EQUITY_CAPITAL_CHANGED = (
+    "equity capital changed; the equity high-water mark was reset"
+)
+
+# One alert per episode while the stock products cannot be traded: the kv key
+# holds the reason the episode was reported for, so a repeat of the same reason
+# says nothing and a DIFFERENT reason is news again.  `EQUITY_OFF_TEXT` is the one
+# fixed sentence per reason: no product, no exchange's words and no value.
+EQUITY_OFF_ALERT_KEY = "equity_off_alert"
+EQUITY_OFF_TEXT = {
+    EquityStatus.REASON_UNVERIFIED: (
+        "Stock trading is off until a connected key confirms the stock products."
+    ),
+    EquityStatus.REASON_MISMATCH: (
+        "Stock trading is off: a listed product is not the kind of product its "
+        "list says."
+    ),
+    EquityStatus.REASON_READ_FAILED: (
+        "Stock trading is off: the stock products could not be read."
+    ),
+    EquityStatus.LIVE_UNCONFIRMED: (
+        "Live stock trading is off: it has not been confirmed yet."
+    ),
+}
+# What an episode is reported with when a status names a reason this build has no
+# sentence for: still off, still no value, so the owner is told either way.
+EQUITY_OFF_UNKNOWN = "Stock trading is off."
+
+# One warning per episode and per product while an equity quote cannot be read:
+# the kv key holds the episode's mark, so a source that stays unavailable is
+# news once and the next failure after a successful quote is news again.
+EQUITY_QUOTE_WARN_PREFIX = "equity_quote_warn:"
+
+# One INFO event per episode and per product while stock prices are PAUSED: the
+# feed is limiting us or our allowance is spent, which is news once (it is no
+# fault of the engine, the owner or the product) and heals on its own.
+EQUITY_QUOTE_PAUSED_PREFIX = "equity_quote_paused:"
+
+# The reason a session-close sweep carries, and the note the gateway appends to
+# each row it takes off the book, so a reader can tell it from an owner's cancel.
+SESSION_SWEEP_REASON = "session close sweep"
 
 # The kv key holding, per fill, the refusal code last warned about: a follow-up
 # the exchange keeps refusing is news once per fill and code, not once a cycle.
@@ -374,6 +456,7 @@ class Runner:
         sleep: Callable[[float], None] = time.sleep,
         ai_sweep: Optional[Callable[[], Any]] = None,
         trail_alert_days: Any = None,
+        session_open: Callable[[float], bool] = market_hours.is_regular_session,
     ) -> None:
         self.store = store
         self.gateway = gateway
@@ -398,6 +481,10 @@ class Runner:
         # so.  It is read once, here, and never again: a value that is not a
         # positive whole number of days is the default.
         self.trail_alert_days = _trail_alert_days(trail_alert_days)
+        # Whether the equity session is open at a moment, asked at `self.now()`
+        # every time: the exchange's own clock, injected so a cycle can be driven
+        # through a close without waiting for one.
+        self.session_open = session_open
 
         # This copy is for the values that are not caps — the poll interval and
         # the maker fee.  Every cap is read from `self.gateway.limits`, which is
@@ -419,13 +506,15 @@ class Runner:
     def startup_checks(self) -> list[str]:
         """Every configuration problem that blocks a start; an empty list is fine.
 
-        One check on the live ceiling, then one pass per bot over its strategy —
-        its name, then `validate` against the product's real `ProductSpec`, then
-        the fee guard.  Passing the spec to `validate` is what refuses a step that
-        collapses on the product's price tick before a single order is built, and
-        a STOPPED bot is left alone: it places nothing.
+        One check on the live ceiling, one check on the equity configuration,
+        then one pass per bot over its strategy — its name, then `validate`
+        against the product's real `ProductSpec`, then the fee guard.  Passing the
+        spec to `validate` is what refuses a step that collapses on the product's
+        price tick before a single order is built, and a STOPPED bot is left
+        alone: it places nothing.
         """
         problems = self._live_problems()
+        problems.extend(self._equity_problems())
         for bot in self.store.list_bots():
             if bot["status"] == STOPPED:
                 continue
@@ -444,6 +533,28 @@ class Runner:
         value = str(self.env.get(ENV_LIVE) or "").strip().lower()
         if value not in LIVE_ON and value not in LIVE_OFF:
             return [f"unrecognised {ENV_LIVE} value {value!r}"]
+        return []
+
+    def _equity_problems(self) -> list[str]:
+        """The one equity problem that blocks a start, as a plain string.
+
+        An equity live path needs the crypto live ceiling above it: equity live
+        with `CROW_COINBASE_LIVE` off is a route the ceiling forbids, and it is
+        refused at the start rather than held back later.
+
+        Nothing else about the equities is a start's business any more.  A
+        missing preview confirmation and a listed product whose kind disagrees
+        with its list are what turns stock trading OFF — `EquityStatus` and step
+        4c's one alert — so an install whose stock products cannot be confirmed
+        still starts, and keeps trading coins exactly as it did.  A start
+        therefore reads no product kind at all: no public listing and no
+        authenticated read happens here.
+        """
+        if self.limits.equity_live and not self.gateway.switches.ceiling:
+            return [
+                f"{ENV_EQUITY_LIVE} is on while {ENV_LIVE} is off; the equity "
+                f"live path needs the live ceiling above it"
+            ]
         return []
 
     def _bot_problems(self, bot: dict) -> list[str]:
@@ -494,7 +605,10 @@ class Runner:
                     gateway=self.gateway,
                     book=LIVE,
                 )
+            self._sweep_equity_session()  # 3b
             self._check_drawdowns()  # 4
+            self._check_equity_drawdown()  # 4b
+            self._check_equity_status()  # 4c
             errors: list[str] = []
             if not self.gateway.is_halted():  # 5
                 # A global halt skips the whole step; a book's own halt skips
@@ -540,14 +654,18 @@ class Runner:
 
     # ------------------------------------------------ step 1: the book
     def _poll_markets(self) -> None:
-        """Poll every product a bot row names, then measure the clock skew.
+        """Poll every product a bot row names, then the equities, then the clock.
 
         A product is polled once however many bots share it, and a failing poll
         keeps that product's previous snapshot: an unpriceable product is
-        reported, never filled in with an invented book.
+        reported, never filled in with an invented book.  The equities come after
+        the crypto products and before the skew, and only while the session is
+        open: an equity print outside the session says nothing an order could be
+        checked against.
         """
         for product in self._polled_products():
             self._poll_product(product)
+        self._poll_equity_products()
         self._measure_clock()
 
     def _polled_products(self) -> list[str]:
@@ -579,6 +697,92 @@ class Runner:
         )
         self._last_poll[product] = self.now()
 
+    def _poll_equity_products(self) -> None:
+        """Poll each configured equity product, while the session is open.
+
+        The list is the gateway's runtime limits, so a product an owner added is
+        polled without the process being rebuilt, and an install with no equities
+        makes no equity call at all: no market is asked for and no quote read.
+        Out of session the same is true, which is what keeps a closed market's
+        last print from being refreshed by the engine itself, and so is a status
+        whose `reason()` says the stock products cannot be confirmed: a stock
+        nobody may trade is not priced, and step 4c reports it instead.
+        """
+        products = self.gateway.limits.equity_products
+        if not products:
+            return
+        status = getattr(self.gateway, "equity_status", None)
+        if status is not None and status.reason() is not None:
+            # The stock products cannot be confirmed right now, so there is
+            # nothing to price: step 4c is what says so, once per episode.
+            return
+        if not self.session_open(self.now()):
+            return
+        for product in products:
+            self._poll_equity_product(product)
+
+    def _poll_equity_product(self, product: str) -> None:
+        """Read one equity's print into the snapshot cache, one price for both sides.
+
+        An equity quote is a single print, so the bid and the ask are that same
+        price and the poll window's low and high are it too: a print is not a
+        book, and a crossed one would refuse every order off a market that is
+        working exactly as it should.  The print is read under the PRACTICE
+        book's bound (`equity_print_for(..., DRY)`), and its own time is kept
+        beside the poll's in `MarketSnapshot.print_ts` — the gateway prices a
+        live order from that time, never from when this poll happened.  A failing
+        quote leaves the product's previous snapshot standing, exactly as a
+        failing crypto poll does.
+
+        A real failure is news once per episode and per product: the kv key
+        `equity_quote_warn:<product>` holds the episode's mark, so the event and
+        the log line are written when there is no mark and the mark is set, and a
+        later successful quote clears it — an engine whose source is down says so
+        once, not every cycle.  Both the log line and the event name the
+        exception's CLASS and nothing else: a quote source's own message can
+        carry a URL or a token, and both of these reach a panel.
+
+        A PAUSE is not a failure: a feed that is limiting us, or whose allowance
+        is spent, has no price to hand over while everything else is fine, so it
+        is one `info` event per episode and per product (`equity_quote_paused:`
+        holds that mark), writes no warning at all, and does not touch the
+        failure mark.  A successful quote clears both marks, so the next pause is
+        news again.
+        """
+        warn_key = f"{EQUITY_QUOTE_WARN_PREFIX}{product}"
+        paused_key = f"{EQUITY_QUOTE_PAUSED_PREFIX}{product}"
+        try:
+            price, stamp = equity_print_for(self.market_for(product), DRY)
+        except EquityQuotePaused:
+            if self.store.get(paused_key) is None:
+                log.info("poll %s paused: stock prices are paused", product)
+                self.store.event(
+                    "info", f"poll {product} paused: stock prices are paused"
+                )
+                self.store.put(paused_key, True)
+            return
+        except Exception as error:  # noqa: BLE001 - one product may not stop the rest
+            if self.store.get(warn_key) is None:
+                log.warning(
+                    "poll %s: quote unavailable (%s)",
+                    product,
+                    type(error).__name__,
+                )
+                self.store.event(
+                    "warn",
+                    f"poll {product} failed: quote unavailable "
+                    f"({type(error).__name__})",
+                )
+                self.store.put(warn_key, True)
+            return
+        self.snapshots.put(
+            MarketSnapshot(product, price, price, price, price, self.now(), stamp)
+        )
+        if self.store.get(warn_key) is not None:
+            self.store.put(warn_key, None)
+        if self.store.get(paused_key) is not None:
+            self.store.put(paused_key, None)
+
     def _measure_clock(self) -> None:
         """Store the skew between the exchange's clock and ours."""
         try:
@@ -588,6 +792,57 @@ class Runner:
             self.store.event("warn", f"server time unavailable: {error}")
             return
         self.snapshots.set_clock(server, self.now())
+
+    # ------------------------------------------------ step 3b: the session close
+    def _sweep_equity_session(self) -> None:
+        """Take the AI's resting equity off the book once the session has closed.
+
+        The rows are read from the store, not from the configured product list: a
+        symbol that was taken off the list still has orders resting, and those
+        are exactly the ones a close has to retire.  A row counts while it is
+        still live — PENDING_SUBMIT, because a send whose answer was lost may be
+        on the account already, or OPEN — and only one that carries an order id:
+        a row that never reached the account has nothing to cancel.  Each row is
+        cancelled through the gateway on the product its own row names, which is
+        how the order reaches the account that holds it — an equity row on the
+        live book is taken off the live account and one on the dry book off the
+        simulator — and a row whose cancel is refused, or whose cancel raises, is
+        logged and left for the next pass: one order may not cost the cycle.  A
+        row already carrying the cancel note is offered again, because the gateway
+        appends that note once and the row is not settled until reconcile says it
+        is.  Both warnings name the exception's CLASS and nothing else: a cancel
+        that raises can carry a URL or a token in its own message, and these
+        lines reach a panel.
+        """
+        if self.session_open(self.now()):
+            return
+        for row in self.store.orders(owner="ai", statuses=(PENDING_SUBMIT, OPEN)):
+            if row["product_type"] != EQUITY or not row["order_id"]:
+                continue
+            intent = OrderIntent(
+                action="cancel",
+                side=None,
+                size=None,
+                limit_price=None,
+                level=None,
+                cancel_cid=row["client_order_id"],
+                reason=SESSION_SWEEP_REASON,
+            )
+            try:
+                result = self.gateway.submit("ai", "ai", intent, row["product"])
+            except Exception as error:  # noqa: BLE001 - one order is not the cycle
+                log.warning(
+                    "session sweep %s: the cancel failed (%s)",
+                    row["client_order_id"],
+                    type(error).__name__,
+                )
+                continue
+            if not result.ok:
+                log.warning(
+                    "session sweep %s refused: %s",
+                    row["client_order_id"],
+                    result.refusal,
+                )
 
     # ------------------------------------------------ step 4: drawdown stops
     def _check_drawdowns(self) -> None:
@@ -673,6 +928,124 @@ class Runner:
             )
             log.error(message)
             self.store.event("ALERT", message, kind="bot_paused", owner=bot["id"])
+
+    # ------------------------------------------------ step 4b: the equity mark
+    def _check_equity_drawdown(self) -> None:
+        """Alert while the AI's equity book is below its own mark, and ratchet it.
+
+        The equity book is measured on the book the AI routes to right now, and
+        only an install with equities configured is measured at all: with none
+        there is no book to value and nothing is read.  The capital in force is
+        reconciled with the one that mark was taken against first
+        (`_rebase_equity_capital`), before the value is read, so a capital that
+        changed since the last run re-bases the mark even when the book cannot be
+        valued at all.  An unknown value (a held symbol nobody can price) says
+        nothing, so it neither rings, ratchets nor ends an episode.  Otherwise the
+        value is compared with the mark kept for the equity book
+        (`EQUITY_HWM_OWNER`), which is NOT the portfolio's: this alert never halts
+        a book, never sets a halt, never refuses an order and never moves the mark
+        a bot's drawdown is measured against, and the mark it does write is its
+        own.
+
+        One alert per episode: the kv marker `equity_alert:<book>` is set with the
+        event and cleared once the value is back at the mark, so a week under the
+        mark is one piece of news and the next fall is news again.  The ratchet
+        comes last and only ever upward, exactly as every other mark does.
+        """
+        if not self.gateway.limits.equity_products:
+            return
+        book = self.gateway.route_for("ai")
+        self._rebase_equity_capital(book)
+        value = self.gateway.equity_value(book)
+        if value is None:
+            return
+        key = f"{EQUITY_ALERT_PREFIX}{book}"
+        hwm = self.store.hwm(EQUITY_HWM_OWNER, book)
+        pct = self.gateway.limits.equity_drawdown_alert_pct
+        floor = hwm * (1 - pct / 100) if hwm is not None and hwm > 0 else None
+        if floor is not None and value < floor:
+            if self.store.get(key) is None:
+                message = (
+                    f"equity drawdown: the equity book is worth {value} on the "
+                    f"{book} book, below {floor} ({pct}% of high-water mark "
+                    f"{hwm})"
+                )
+                log.warning(message)
+                self.store.event("warn", message, kind="alert")
+                self.store.put(key, True)
+        elif self.store.get(key) is not None:
+            self.store.put(key, None)
+        self.store.update_hwm(EQUITY_HWM_OWNER, value, book)
+
+    # ------------------------------------------------ step 4c: the equity status
+    def _check_equity_status(self) -> None:
+        """Say once per episode that the stock products cannot be traded.
+
+        The equities never stop the engine: the gateway's `equity_status` holds
+        what a connected key's authenticated reads said about the two product
+        lists, and a reason there (`EQUITY_KINDS_UNVERIFIED` before any key has
+        given specs, a mismatch, a failed read, or an unconfirmed live route)
+        means stock trading is off while coins carry on untouched.  The reason is
+        read with `live_reason()` behind `reason()`, so the live route's own
+        sentence is reported when the products themselves are fine.
+
+        One alert per episode: the kv key `equity_off_alert` holds the reason it
+        was reported for, so the same reason on every cycle says it once and a
+        reason that CHANGED is news again.  The sentence is fixed per reason
+        (`EQUITY_OFF_TEXT`) and carries no product, no value and no exception
+        text.  A cycle with no reason clears the marker, so the next episode
+        rings again.  Installs with no equities, and gateways with no status, do
+        nothing at all.
+        """
+        status = getattr(self.gateway, "equity_status", None)
+        if not self.gateway.limits.equity_products or status is None:
+            return
+        reason = status.reason() or status.live_reason()
+        stored = self.store.get(EQUITY_OFF_ALERT_KEY)
+        if reason is None:
+            if stored is not None:
+                self.store.put(EQUITY_OFF_ALERT_KEY, None)
+            return
+        if stored == reason:
+            return
+        message = EQUITY_OFF_TEXT.get(reason, EQUITY_OFF_UNKNOWN)
+        log.warning(message)
+        self.store.event("warn", message, kind="alert")
+        self.store.put(EQUITY_OFF_ALERT_KEY, reason)
+
+    def _rebase_equity_capital(self, book: str) -> None:
+        """Re-base the equity mark when the capital in force has changed.
+
+        The equity capital is read from the environment, not lowered or raised at
+        run time, so it can only change between two runs of the engine; the mark
+        it funded cannot outlive that change, because a mark taken on the old
+        capital would measure the new book against a size it never had.  The
+        value in force is kept per book under `equity_capital:<book>`.  With
+        nothing stored the capital is recorded and no mark is touched: that is a
+        first run, not a change.  A stored value that differs — including one this
+        store cannot read, which says nothing about the capital either — resets
+        the mark, clears the drawdown episode's marker (an episode that belonged
+        to the old mark is stale) and stores the new value, and ONE info event the
+        owner has to see is written with no amounts in it.  An equal value does
+        nothing at all.
+        """
+        capital = self.gateway.limits.equity_ai_capital_usd
+        key = f"{EQUITY_CAPITAL_PREFIX}{book}"
+        stored = self.store.get(key)
+        if stored is None:
+            self.store.put(key, str(capital))
+            return
+        try:
+            previous = D(str(stored))
+        except (ArithmeticError, ValueError, TypeError):
+            previous = None
+        if previous is not None and previous == D(str(capital)):
+            return
+        self.store.reset_hwm(EQUITY_HWM_OWNER, book)
+        self.store.put(f"{EQUITY_ALERT_PREFIX}{book}", None)
+        self.store.put(key, str(capital))
+        log.info(EQUITY_CAPITAL_CHANGED)
+        self.store.event("info", EQUITY_CAPITAL_CHANGED)
 
     def _mid(self, product: str) -> Optional[D]:
         """The product's mid price, or None when its snapshot cannot price it.
@@ -1382,13 +1755,21 @@ class Runner:
         The live book is checked only while its account can be reached, and a
         totals read that fails there is logged (without its exception text) and
         skipped: a live account the engine cannot read must not stop the cycle
-        the dry book still needs.
+        the dry book still needs.  Its totals are the whole live account's
+        (`books.live_exchange().totals()`, the router's merged view), because that
+        is the cash the AI's equity pool and the live bots' orders both draw on:
+        read from the crypto account alone a pool the equity account funds would
+        look like a shortfall that does not exist.  With no equity adapter the
+        merged view IS the crypto totals, so a crypto-only install is unchanged.
         """
         self._check_book_unallocated(DRY, self.exchange.totals())
         if not self.gateway.books.live_available():
             return
         try:
-            live_totals = self.gateway.books.totals(LIVE)
+            live = self.gateway.books.live_exchange()
+            if live is None:
+                return
+            live_totals = live.totals()
         except Exception:  # noqa: BLE001 - an unreadable account is not a cycle
             log.warning("unallocated check skipped on the live book")
             return

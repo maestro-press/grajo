@@ -17,8 +17,9 @@
  * `INVALID` without a fetch.
  *
  * Redaction is part of the contract: the bearer token, the MAC key of a call,
- * and the key material a credentials body carries are never repeated in a
- * result.  A message that would carry one has it replaced by `[hidden]`.
+ * the key material a credentials body carries and a pasted stock-price token are
+ * never repeated in a result.  A message that would carry one has it replaced by
+ * `[hidden]`.
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -174,6 +175,16 @@ function notConnected() {
 
 function invalidId() {
   return { ok: false, status: 0, code: INVALID_CODE, message: INVALID_ID_MESSAGE };
+}
+
+/**
+ * The token one Tiingo body carries, so every field of the engine's answer is redacted of it.
+ * A body with no token (or one JSON could not carry) contributes nothing.
+ */
+function callSecrets(body) {
+  if (!body || typeof body !== "object") return [];
+  const token = body.token;
+  return typeof token === "string" && token.length > 0 ? [token] : [];
 }
 
 /** Whether a value may be pasted into a path segment of a route. */
@@ -546,6 +557,23 @@ export function createEngineClient(options = {}) {
     },
     forgetCredentials() {
       return privileged("POST", "/credentials/forget", undefined, false);
+    },
+
+    // ---- stock prices (Tiingo): the owner's own requests
+    /**
+     * Ask the engine to try one pasted Tiingo token. Nothing is stored either side; the token is
+     * in the body only, and the engine's answer is taken as it comes.
+     */
+    checkTiingo(body) {
+      return gated("POST", "/tiingo/check", body, "owner", callSecrets(body));
+    },
+    /** Hand the engine the token to keep in memory (never persisted by the engine either). */
+    setTiingo(body) {
+      return gated("POST", "/tiingo", body, "owner", callSecrets(body));
+    },
+    /** Have the engine forget its token: a privileged delete, MAC over the empty body. */
+    clearTiingo() {
+      return privileged("DELETE", "/tiingo", undefined, false);
     },
 
     // ---- the lease gate

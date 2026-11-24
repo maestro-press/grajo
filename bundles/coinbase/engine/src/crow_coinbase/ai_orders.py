@@ -13,6 +13,13 @@ size or a price the product's own increments cannot spell, and nothing is
 written while too many previews are waiting for an answer or too many have been
 asked for inside the hour: both are refusals, not rows.
 
+Equities ride the same preview and approve path: a stock proposal is the same row,
+the same chain and the same yes, but its preview carries the equity caps instead
+of the crypto AI budgets, and beside them an `equity` block — whether the regular
+session is open, the money set aside for AI stock trades, what of it is spent and
+what would be left after this order.  The block is stored for a refused preview
+too, so the owner can see why nothing went out.
+
 An approval is one row's transition, never a message.  `approve()` moves the row
 from `pending` to `approved` with a conditional UPDATE inside one transaction, and
 only the connection that changed that row goes on to place the order, so two
@@ -59,32 +66,42 @@ import uuid
 from decimal import Decimal
 from typing import Any, Callable, Mapping, Optional
 
+from .exchange import EQUITY_PREVIEW_UNCONFIRMED, PRODUCT_TYPE_UNKNOWN
 from .gateway import (
     AI_OWNER,
     APPROVAL_REQUIRED,
     CANCEL_FAILED,
+    CAPITAL_CAP,
     CLOCK_SKEW,
     DAILY_CAP,
     DRAWDOWN_STOP,
+    EQUITY_UNAVAILABLE,
     EXCHANGE_REJECTED,
+    FRACTIONAL_NOT_ALLOWED,
     HALTED,
     INSUFFICIENT_HOLDING,
+    LIQUIDATE_ONLY,
     LIVE_DISABLED,
     LIVE_LOCKED,
+    MARKET_CLOSED,
+    NO_EQUITY_ACCOUNT,
     NOT_CANCELLABLE,
     NOT_OWNER,
     ORDER_TOO_LARGE,
     POST_ONLY_WOULD_CROSS,
+    PRICE_BAND,
     PRODUCT_NOT_ALLOWED,
     RATE_CAP,
     STALE_MARKET,
     TOO_SMALL,
+    TRADING_HALTED,
     UNALLOCATED_NEGATIVE,
     ApprovalGone,
     OrderGateway,
 )
 from .store import (
     CANCELLED as ORDER_CANCELLED_STATUS,
+    EQUITY as PRODUCT_TYPE_EQUITY,
     FAILED as ORDER_FAILED_STATUS,
     REJECTED as ORDER_REJECTED_STATUS,
     Store,
@@ -200,6 +217,25 @@ MESSAGES = {
     NOT_OWNER: "That order is not the AI's.",
     NOT_CANCELLABLE: "That order cannot be cancelled now.",
     CANCEL_FAILED: "The exchange did not take the cancellation.",
+    # What a stock order can answer with, on top of the codes above: the
+    # product's own facts, the equity caps, and the stock side of the account.
+    MARKET_CLOSED: "The stock market is closed right now.",
+    PRICE_BAND: "That price is too far from the current stock price.",
+    FRACTIONAL_NOT_ALLOWED: "That stock only trades in whole shares.",
+    CAPITAL_CAP: (
+        "That order would go over the money set aside for AI stock trades."
+    ),
+    TRADING_HALTED: "Trading in that stock is halted.",
+    LIQUIDATE_ONLY: "That stock can only be sold right now.",
+    NO_EQUITY_ACCOUNT: "The live account has no stock trading side connected.",
+    EQUITY_UNAVAILABLE: (
+        "Stock trading is off right now; Crow could not confirm the stock "
+        "products yet."
+    ),
+    EQUITY_PREVIEW_UNCONFIRMED: "Live stock trading hasn't been confirmed yet.",
+    PRODUCT_TYPE_UNKNOWN: (
+        "The stock broker could not tell what kind of product that is."
+    ),
 }
 GENERIC_MESSAGE = "The order could not be placed."
 
@@ -409,17 +445,18 @@ def _check_increments(
 ) -> None:
     """Refuse a size or a price the product's own tick cannot spell.
 
-    The spec is asked of the gateway, and only then: a product that is not on the
-    allow-list, or one whose spec cannot be had, answers nothing here and is left
-    to the chain's own refusal, which is the answer a caller would get for it
-    anyway.  The remainder of a `Decimal` is exact, so nothing is rounded onto
-    the tick: a size or a price off it is refused `INVALID` before a row is
-    written, and the chain is never asked to measure an order the exchange could
-    not represent.  A spec whose increments cannot be read answers nothing and
-    lets the chain decide.
+    A product on neither of the engine's lists — crypto or equity — is left to
+    the chain's own refusal, and the spec is asked of the gateway only once the
+    product is tradable; a spec that cannot be had answers nothing here either.
+    An equity therefore has its own tick read exactly as a crypto product does.
+    The remainder of a `Decimal` is exact, so nothing is rounded onto the tick: a
+    size or a price off it is refused `INVALID` before a row is written, and the
+    chain is never asked to measure an order the exchange could not represent.  A
+    spec whose increments cannot be read answers nothing and lets the chain
+    decide.
     """
     try:
-        if product not in gateway.limits.products:
+        if not gateway.limits.tradable(product):
             return
         spec = gateway.spec_for(product)
         base = D(str(spec.base_increment))
@@ -711,11 +748,13 @@ class AiOrders:
             "book": book,
             "hash": _preview_digest(product, side, size, limit_price, book),
             "payload_json": json.dumps(
-                {
-                    "notional": _money(notional),
-                    "requested_limit_price": _money(requested),
-                    "limits": self._limits(book, notional),
-                }
+                self._payload_of(
+                    product=product,
+                    side=side,
+                    requested=requested,
+                    book=book,
+                    notional=notional,
+                )
             ),
             "refusal": refusal,
         }
@@ -747,20 +786,125 @@ class AiOrders:
             }
         return self._write(row, note)
 
-    def _limits(self, book: str, notional: D) -> list[dict]:
+    def _payload_of(
+        self,
+        *,
+        product: str,
+        side: str,
+        requested: D,
+        book: str,
+        notional: D,
+    ) -> dict:
+        """The payload a preview row stores: its amounts, its limits, its stock facts.
+
+        The payload is what it always was — `notional`, the caller's own price and
+        the limits — and an `equity` key is added only for a product the gateway
+        names as an equity.  The block is a figure read here and checked against
+        nothing: a read that cannot answer leaves it out and the preview stands.
+        """
+        payload = {
+            "notional": _money(notional),
+            "requested_limit_price": _money(requested),
+            "limits": self._limits(book, notional, product=product, side=side),
+        }
+        equity = self._equity_block(product, side, book, notional)
+        if equity is not None:
+            payload["equity"] = equity
+        return payload
+
+    def _equity_block(
+        self, product: Any, side: Any, book: str, notional: D
+    ) -> Optional[dict]:
+        """The stock facts an equity preview carries, or None for a crypto product.
+
+        The session the preview was taken in, the money set aside for AI stock
+        trades, what of that is spent and what would be left once this order went
+        out (less the notional for a buy, back onto it for a sell).  Every amount
+        is a money text, and the session is a bool.  A read that cannot answer
+        answers nothing: a preview is not failed for a figure nobody needs in
+        order to place the order.
+        """
+        gateway = self._ready()
+        try:
+            if not gateway.limits.is_equity(str(product)):
+                return None
+            capital = D(gateway.limits.equity_ai_capital_usd)
+            used = D(gateway.ledger.equity_pool_used(book))
+            left = capital - used
+            after = left - notional if str(side) != SELL else left + notional
+            return {
+                "session_open": bool(gateway.session_open(gateway.now())),
+                "pool_capital": _money(capital),
+                "pool_used": _money(used),
+                "pool_left": _money(left),
+                "pool_left_after": _money(after),
+            }
+        except Exception:  # noqa: BLE001 - the block is a figure, not a check
+            log.warning("ai preview: the equity facts could not be read")
+            return None
+
+    def _limits(
+        self,
+        book: str,
+        notional: D,
+        product: Optional[Any] = None,
+        side: Optional[Any] = None,
+    ) -> list[dict]:
         """The five limits an owner sees beside a preview, as they stand now.
 
         Each entry names a cap, the value it is set to and what the figure would
-        be once this order went out: the AI's single-order and daily budgets, the
-        book's daily budget, and the two order counts.  They are what the engine
-        thinks at preview time and nothing more — the whole chain is asked again
-        at the approve — so a read that cannot answer leaves the list empty rather
-        than failing a preview that sent nothing.
+        be once this order went out.  For a product the gateway names as an
+        equity the five are the equity ones — the single stock order, a stock
+        day's total, the pool set aside and the two order counts — and not one of
+        the crypto AI budgets: the two budgets are separate pools, so a stock
+        preview never reports a crypto cap.  Every other product still reads the
+        five it always did.  They are what the engine thinks at preview time and
+        nothing more — the whole chain is asked again at the approve — so a read
+        that cannot answer leaves the list empty rather than failing a preview
+        that sent nothing.
         """
         gateway = self._ready()
         try:
             caps = gateway.caps
             limits = gateway.limits
+            if product is not None and limits.is_equity(str(product)):
+                pool = D(gateway.ledger.equity_pool_used(book))
+                pool_after = (
+                    pool - notional if str(side) == SELL else pool + notional
+                )
+                return [
+                    {
+                        "name": "equity_max_order_usd",
+                        "limit": _money(limits.equity_max_order_usd),
+                        "used_after": _money(notional),
+                    },
+                    {
+                        "name": "equity_daily_notional_usd",
+                        "limit": _money(limits.equity_daily_notional_usd),
+                        "used_after": _money(
+                            caps.daily_notional(
+                                None, book=book, product_type=PRODUCT_TYPE_EQUITY
+                            )
+                            + notional
+                        ),
+                    },
+                    {
+                        "name": "equity_ai_capital_usd",
+                        "limit": _money(limits.equity_ai_capital_usd),
+                        "used_after": _money(pool_after),
+                    },
+                    {
+                        "name": "ai_orders_per_hour",
+                        "limit": int(limits.ai_orders_per_hour),
+                        "used_after": int(caps.orders_last_hour(AI_OWNER, book=book))
+                        + 1,
+                    },
+                    {
+                        "name": "orders_per_hour",
+                        "limit": int(limits.orders_per_hour),
+                        "used_after": int(caps.orders_last_hour(None, book=book)) + 1,
+                    },
+                ]
             return [
                 {
                     "name": "ai_max_order_usd",
@@ -798,10 +942,14 @@ class AiOrders:
             return []
 
     def _answer(self, row: Mapping[str, Any], message: Optional[str]) -> dict:
-        """One preview row in the shape every AI order answer has."""
+        """One preview row in the shape every AI order answer has.
+
+        The `equity` block is answered only when the row stored one, so a crypto
+        preview's answer has no such key and every other key is unchanged.
+        """
         payload = _payload(row)
         refusal = row.get("refusal")
-        return {
+        answer = {
             "preview_id": row["id"],
             "hash": row["hash"],
             "state": row["state"],
@@ -822,6 +970,10 @@ class AiOrders:
                 else (message or MESSAGES.get(refusal, GENERIC_MESSAGE))
             ),
         }
+        equity = payload.get("equity")
+        if isinstance(equity, dict):
+            answer["equity"] = equity
+        return answer
 
     # ------------------------------------------------ listing
     def list(self, state: Optional[str] = None) -> list[dict]:

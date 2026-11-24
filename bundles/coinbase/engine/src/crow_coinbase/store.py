@@ -17,10 +17,12 @@ counted once.
 
 Every order row and every fill row belongs to a book (`books.py`: `dry` or
 `live`), and `insert_order()` / `record_fill()` take it as a required keyword:
-an order or a fill that cannot name its book is never written.  A bot row carries
-the book it trades (`mode`) and a capital budget per book, and `book_epoch()`
-stamps when a book (re)started counting for an owner, so the rows of a book the
-owner has left stop counting.
+an order or a fill that cannot name its book is never written.  An order row's
+instrument kind (`product_type`: `SPOT` or `EQUITY`) is a required keyword too,
+because only its caller knows which instrument it is placing or adopting.  A bot
+row carries the book it trades (`mode`) and a capital budget per book, and
+`book_epoch()` stamps when a book (re)started counting for an owner, so the rows
+of a book the owner has left stop counting.
 
 The database runs in WAL mode (readers never block the writer).  Each thread
 gets its own connection through `threading.local`; `Store.conn` is also a valid
@@ -69,6 +71,11 @@ LIVE_STATUSES = (PENDING_SUBMIT, OPEN)
 
 # bot statuses
 ACTIVE, PAUSED, STOPPED = "ACTIVE", "PAUSED", "STOPPED"
+
+# the product kinds an order row may carry: the crypto pair, and an equity
+SPOT = "SPOT"
+EQUITY = "EQUITY"
+PRODUCT_TYPES = (SPOT, EQUITY)
 
 # opposite-order bookkeeping on a filled order
 OPP_TODO, OPP_PLACED, OPP_SKIPPED = 0, 1, 2
@@ -454,6 +461,7 @@ class Store:
         note: Optional[str] = None,
         *,
         book: str,
+        product_type: str,
     ) -> None:
         """Record a local order row before it is (or is not) sent to the exchange.
 
@@ -462,6 +470,13 @@ class Store:
         know, is refused with `ValueError` before anything is written.  Nothing
         infers the book from the owner, so a row can never land on the book the
         caller did not mean.
+
+        `product_type` is the row's instrument kind and is required, exactly
+        `SPOT` or `EQUITY` (upper-case, no padding): the caller that places or
+        adopts the order is the only place that knows which instrument it is, so
+        there is no default to fall back on, and anything else is refused with
+        `ValueError` before anything is written, rather than left to the column's
+        own CHECK.
 
         EVERY order's client order id starts with `cb-`: the engine's own ids all
         carry that prefix, so an id without it is not recognisably ours.
@@ -477,6 +492,11 @@ class Store:
         """
         if book not in BOOKS:
             raise ValueError(f"unknown book: {book!r}")
+        if product_type not in PRODUCT_TYPES:
+            raise ValueError(
+                f"unknown product type: {product_type!r}; a row is written as "
+                f"one of {', '.join(PRODUCT_TYPES)}"
+            )
         cid = str(cid)
         prefix = f"cb-{owner}-"
         if not cid.startswith("cb-"):
@@ -487,7 +507,8 @@ class Store:
         self.conn().execute(
             "INSERT INTO orders(client_order_id,order_id,owner,source,product,side,"
             "level,price,size,status,parent_cid,created_at,updated_at,basis_per_base,"
-            "consumes_fill,note,book) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "consumes_fill,note,book,product_type) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 cid,
                 order_id,
@@ -506,6 +527,7 @@ class Store:
                 consumes_fill,
                 note,
                 book,
+                product_type,
             ),
         )
 
@@ -563,6 +585,34 @@ class Store:
             args.append(book)
         q += " ORDER BY created_at, client_order_id"
         return [_order(r) for r in self.conn().execute(q, args)]
+
+    def product_of_order(self, order_id: str) -> Optional[str]:
+        """The product of the row whose exchange order id is *order_id*.
+
+        An order id is what a routed read or cancel may be given without its
+        product, so this is how a caller learns which account to ask.  An id no
+        row carries — and no id at all — answers None: an unknown id is not a
+        product, and nothing here guesses one.
+        """
+        row = self.conn().execute(
+            "SELECT product FROM orders WHERE order_id=? LIMIT 1", (order_id,)
+        ).fetchone()
+        return row["product"] if row else None
+
+    def has_equity_rows(self, product: str) -> bool:
+        """True when ANY row of *product* is an EQUITY row.
+
+        The question is history, not a decision about trading: a filled or
+        cancelled EQUITY row — on either book, under any owner — still has
+        fills, shares and an adoption record on the equity account, so a read or
+        a cancel about the product has to reach that account.  A product whose
+        rows are all SPOT, and one with no rows at all, answer False.
+        """
+        row = self.conn().execute(
+            "SELECT 1 FROM orders WHERE product=? AND product_type=? LIMIT 1",
+            (product, EQUITY),
+        ).fetchone()
+        return row is not None
 
     # ------------------------------------------------ fills
     def record_fill(self, fill: dict, cid: str, *, book: str) -> bool:
