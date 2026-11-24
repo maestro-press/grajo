@@ -225,7 +225,10 @@ export default function modelsRouter(dashboardAuth, opts = {}) {
   async function getHfToken(db) {
     const providers = await listProvidersAllFn(db);
     const row = providers.find((p) => p.id === HF_TOKEN_PROVIDER_ID);
-    return row?.apiKey || null;
+    // The row's key through the one mapper (an opened plaintext, never the stored
+    // cell), and never a request with a key that cannot be read here.
+    if (!row || row.keyState === "unreadable") return null;
+    return row.apiKey || null;
   }
 
   // Every /api/models/* route requires a valid dashboard session — see

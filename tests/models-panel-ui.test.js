@@ -246,7 +246,7 @@ test("loadPanelData: reprobe failure is honest — probe stays null, every fit b
   }
 });
 
-test("loadPanelData: hfTokenConfigured true only when the reserved provider row has a non-empty apiKey", async () => {
+test("loadPanelData: hfTokenConfigured true only when the reserved provider row holds a key", async () => {
   const base = {
     loadCatalogFn: fakeCatalog,
     getCachedProbeFn: () => ({ platform: "linux", wsl2: false, accel: "cpu", gpuName: null, vramMb: null, ramAvailableMb: 8000, diskFreeMb: 1000, unknown: [] }),
@@ -257,13 +257,14 @@ test("loadPanelData: hfTokenConfigured true only when the reserved provider row 
 
   const withToken = await loadPanelData({
     ...base, db: {},
-    listProvidersAllFn: async () => ([{ id: "crow-hf-token", apiKey: "hf_abc" }]),
+    // Presence, not the value: a sealed row's key is never read for display.
+    listProvidersAllFn: async () => ([{ id: "crow-hf-token", apiKey: "hf_abc", keyPresent: true }]),
   });
   assert.equal(withToken.hfTokenConfigured, true);
 
   const withoutToken = await loadPanelData({
     ...base, db: {},
-    listProvidersAllFn: async () => ([{ id: "crow-hf-token", apiKey: null }]),
+    listProvidersAllFn: async () => ([{ id: "crow-hf-token", apiKey: null, keyPresent: false }]),
   });
   assert.equal(withoutToken.hfTokenConfigured, false);
 

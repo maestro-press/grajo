@@ -108,8 +108,14 @@ function apiKeyFor(tokenPath) {
   return buildManagedEntries([row], { cloudDoorPort: 3001, consent: { "cloud-a": CONSENT }, consentSalt: SALT, tokenPath })["crow-c-cloud-a"].apiKey;
 }
 const SALT = "cd".repeat(32);
-const { createHmac } = await import("node:crypto");
-const CONSENT = { target: "https://api.example.com/v1", keyFp: createHmac("sha256", Buffer.from(SALT, "hex")).update("fixture-secret-123").digest("hex").slice(0, 16) };
+// The entry the product's own grant records (consentEntryFor is what
+// grantCloudConsent stores), so this fixture cannot drift from the fingerprint
+// form the reader checks.
+const { consentEntryFor } = await import("../servers/shared/cloud-consent.js");
+const CONSENT = consentEntryFor(
+  { id: "cloud-a", baseUrl: "https://api.example.com/v1", apiKey: "fixture-secret-123", provider_type: "openai-compat", gpuPolicy: null },
+  SALT, "test",
+);
 
 /** Spawn a stub pi that reports its argv, its env, and what /bin/sh -c <apiKey command> prints inside. */
 async function spawnReport({ provider = "cloud-a", model = "c1", commands = [], mode = "auto" } = {}) {

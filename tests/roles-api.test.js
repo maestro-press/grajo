@@ -10,6 +10,12 @@ import { invalidateRoleContext } from "../servers/shared/model-roles-store.js";
 import { clearProviderTaskCache } from "../servers/shared/provider-task.js";
 import { speechProfileWhere, speechProfileHost } from "../servers/shared/speech-where.js";
 import rolesApiRouter from "../servers/gateway/routes/roles-api.js";
+import { parseStoredKey } from "../servers/shared/provider-key-shape.js";
+import { providerRowToObject } from "../servers/shared/provider-row.js";
+// The add-provider route writes a provider row, whose key is sealed at rest:
+// this process runs with a keyring, exactly as the gateway does.
+import { installTestKeyring } from "./fixtures/provider-keys.mjs";
+installTestKeyring();
 
 let dir, db;
 const origWarn = console.warn;
@@ -524,7 +530,10 @@ test("POST /api/providers saves on a passing test and answers only the id and th
     assert.deepEqual(r.json, { ok: true, providerId: "openrouter", consent: "granted" });
   }, addOpts({ testFn }));
   const row = (await db.execute("SELECT api_key, models FROM providers WHERE id = 'openrouter'")).rows[0];
-  assert.equal(row.api_key, "fixture-pasted-key-777");
+  // Saved through upsertProvider, so the cell is SEALED at rest (design §1.2) and
+  // opens back to the pasted key through the read door.
+  assert.equal(parseStoredKey(row.api_key).kind, "envelope");
+  assert.equal(providerRowToObject({ id: "openrouter", api_key: row.api_key }).apiKey, "fixture-pasted-key-777");
   assert.deepEqual(JSON.parse(row.models).map((m) => m.id), ["x/y"]);
 });
 

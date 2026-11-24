@@ -9,9 +9,9 @@
  * request of any kind, so adding a provider or listing picks can import it
  * without any path to a probe.
  */
-import { createHash } from "node:crypto";
 import { isRecommendationsStale } from "./provider-recommendations.js";
 import { normalizeBaseUrl } from "./provider-presets.js";
+import { providerKeyFp, parseStoredKey } from "./provider-key-shape.js";
 
 export const PICK_CHECKS_KEY = "provider_pick_checks";
 
@@ -29,12 +29,17 @@ export async function readPickChecks(db) {
  * What a check is tied to: `fp`, the first 16 hex of sha256 of the row's
  * trimmed key (never the key itself; "" for no key), and `url`, the row's
  * normalised base URL.
+ *
+ * The fp is `providerKeyFp` — the SAME value a sealed row's envelope carries
+ * (`keyFp`), so a check made before the key was sealed still matches afterwards,
+ * and a check made in a process that cannot open the key still matches the row.
  */
 export function checkStamp(row) {
-  const raw = row?.apiKey ?? row?.api_key;
-  const key = typeof raw === "string" ? raw.trim() : "";
+  const fp = typeof row?.keyFp === "string" && row.keyFp !== ""
+    ? row.keyFp
+    : (parseStoredKey(row?.api_key).fp ?? parseStoredKey(row?.apiKey).fp ?? providerKeyFp(row?.apiKey) ?? "");
   return {
-    fp: createHash("sha256").update(key).digest("hex").slice(0, 16),
+    fp,
     url: normalizeBaseUrl(row?.baseUrl ?? row?.base_url),
   };
 }

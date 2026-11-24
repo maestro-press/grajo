@@ -131,6 +131,10 @@ export async function applyLegacyRowUpgrades({ db, listProvidersAllFn, upsertPro
         id: row.id,
         baseUrl: row.baseUrl,
         apiKey: row.apiKey ?? null,
+        // The parsed row's own cell, named explicitly: `storedKey` is
+        // non-enumerable, so nothing else here carries it, and writing the row
+        // back without it would drop a key this process cannot open.
+        storedKey: row.storedKey ?? null,
         host: row.host,
         bundleId: row.bundleId ?? null,
         description: row.description ?? null,

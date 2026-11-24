@@ -1743,12 +1743,15 @@ export async function registerModel({
   if (converted) {
     // Snapshot the bundle row being replaced so an operator can see/restore
     // what this providerId used to be (Task 9's adopt/convert UI reads this).
+    // The KEY itself is not part of the snapshot: this object is written to the
+    // model-manager state file, so it records the key's STATE ("none", "plain",
+    // "sealed", “unreadable”) and never a value or an envelope.
     state.conversions[providerId] = {
       at: new Date().toISOString(),
       row: {
         id: existingRow.id,
         base_url: existingRow.baseUrl,
-        api_key: existingRow.apiKey ?? null,
+        key_state: existingRow.keyState ?? (existingRow.apiKey ? "plain" : "none"),
         host: existingRow.host,
         bundle_id: existingRow.bundleId,
         description: existingRow.description ?? null,

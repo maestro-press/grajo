@@ -9,10 +9,13 @@
  *   dashboard_settings.llm_cloud_door_rows = {[rowId]: {target, keyFp, at, by}}
  *
  * `target` is the row's normalised base URL (origin and path, `normalizeBaseUrl`);
- * `keyFp` is the first 16 hex of HMAC-SHA256(trimmed key) under a random
- * per-box salt (`llm_cloud_consent_salt`, minted once). The key itself is never
- * stored, and the salt keeps the fingerprint from matching a plain hash of the
- * key anywhere else (N7). Both keys are instance scope: never synced.
+ * `keyFp` is the first 16 hex of HMAC-SHA256(salt, "fp1:" + fp16) under a random
+ * per-box salt (`llm_cloud_consent_salt`, minted once) — the SEALED-key form, so a
+ * row whose key is sealed can be checked without opening it, and the plaintext
+ * never enters the computation. (The one-time seal pass rewrites entries written
+ * in the old over-the-plaintext form.) The key itself is never stored, and the
+ * salt keeps the fingerprint from matching a plain hash of the key anywhere else
+ * (N7). Both keys are instance scope: never synced.
  *
  * A grant records only what the caller saw: the page's opaque token, or the
  * URL and key addProvider just wrote. Nothing is granted automatically (see
@@ -24,6 +27,7 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { normalizeBaseUrl } from "./provider-presets.js";
 import { providerRowToObject } from "./provider-row.js";
+import { parseStoredKey, providerKeyFp, sealedConsentFingerprint } from "./provider-key-shape.js";
 import { isLocalClassTarget, isForbiddenTarget, isDoorUrl } from "../gateway/models/door-resolve.js";
 import { DOOR_ID_PREFIX } from "./pi-compat.js";
 import { isIP } from "node:net";
@@ -100,18 +104,53 @@ async function ensureSalt(db) {
   return salt;
 }
 
-const keyOf = (row) => {
-  const raw = row?.apiKey ?? row?.api_key;
-  return typeof raw === "string" ? raw.trim() : "";
-};
-const targetOf = (row) => normalizeBaseUrl(row?.baseUrl ?? row?.base_url);
-
-/** First 16 hex of HMAC-SHA256(trimmed key) under `salt`; never the key or its plain hash. */
-function keyFingerprint(row, salt) {
-  return createHmac("sha256", Buffer.from(salt, "hex")).update(keyOf(row)).digest("hex").slice(0, 16);
+/**
+ * The key's IDENTITY for consent, never the key: the `fp16` a parsed row carries,
+ * else the one a sealed cell carries (no decryption either way), else the hash of
+ * the plaintext. null when the row has no key at all.
+ */
+function keyFpOf(row) {
+  if (typeof row?.keyFp === "string" && row.keyFp !== "") return row.keyFp;
+  // A stored envelope carries the identity itself, whether the caller passes the
+  // cell as `api_key` (a raw row) or as `apiKey`.
+  for (const cell of [row?.api_key, row?.apiKey]) {
+    const parsed = parseStoredKey(cell);
+    if (parsed.kind === "envelope") return parsed.fp;
+  }
+  return providerKeyFp(row?.apiKey ?? row?.api_key);
 }
 
-function entryFor(row, salt, by) {
+/** Does the row hold a key here? A sealed or unreadable cell counts as one. */
+function hasKey(row) {
+  if (typeof row?.keyPresent === "boolean") return row.keyPresent;
+  const raw = row?.apiKey ?? row?.api_key;
+  return typeof raw === "string" && raw.trim() !== "" && raw.trim() !== "none";
+}
+
+const targetOf = (row) => normalizeBaseUrl(row?.baseUrl ?? row?.base_url);
+
+/**
+ * First 16 hex of HMAC-SHA256(salt, "fp1:" + fp16); never the key or its plain
+ * hash. The sealed-key form (provider-key-shape.js) is the one identity both this
+ * map and `checkStamp` use, so one key answers to one fingerprint everywhere — and
+ * a reader holding only the stored envelope can compute it without the plaintext.
+ */
+function keyFingerprint(row, salt) {
+  return sealedConsentFingerprint(salt, keyFpOf(row) ?? "");
+}
+
+/**
+ * The entry a grant for `row` records, under `salt` and for `by`: `{target, keyFp,
+ * at, by}`. The ONE place its shape and fingerprint form are built —
+ * `grantCloudConsent` stores exactly this, and a caller that needs the entry
+ * without a store (a test fixture, a window that renders what a grant WOULD
+ * record) uses it rather than hand-rolling the HMAC, so a change to the form can
+ * never leave one writer behind.
+ * @param {object} row a provider row (row or providerRowToObject shape)
+ * @param {string} salt 64 hex
+ * @param {string} [by] who granted it
+ */
+export function consentEntryFor(row, salt, by = "unknown") {
   return { target: targetOf(row), keyFp: keyFingerprint(row, salt), at: new Date().toISOString(), by: String(by || "unknown") };
 }
 
@@ -182,7 +221,7 @@ export async function grantCloudConsent(db, rowId, { actor, expect } = {}) {
     const salt = await ensureSalt(db);
     if (!matchesExpectation(row, salt, expect)) return { ok: false, reason: "changed" };
     const all = parseMap(await readValue(db, CLOUD_CONSENT_KEY));
-    all[rowId] = entryFor(row, salt, actor);
+    all[rowId] = consentEntryFor(row, salt, actor);
     await writeValue(db, CLOUD_CONSENT_KEY, JSON.stringify(all));
     consentChanged(rowId);
     return { ok: true };
@@ -253,8 +292,7 @@ export function cloudDoorIneligibleReason(row, { isCloudTarget = (url) => isClou
   if (u.protocol !== "https:" && !allowInsecure(url)) return "insecure";
   const type = row.provider_type ?? row.providerType;
   if (type !== "anthropic" && !OPENAI_FAMILY.has(type)) return "unsupported_type";
-  const key = keyOf(row);
-  if (!key || key === "none") return "no_key";
+  if (!hasKey(row)) return "no_key";
   return null;
 }
 

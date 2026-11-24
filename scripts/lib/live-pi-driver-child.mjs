@@ -149,7 +149,7 @@ async function main(argv, env) {
       } else {
         const have = conn.prepare("SELECT id, base_url, api_key, host, models, disabled FROM providers ORDER BY id").all();
         const same = have.length === want.length && have.every((h, i) => h.id === want[i].id && h.base_url === want[i].base_url
-          && h.api_key === want[i].api_key && h.host === "local" && h.models === want[i].models && !h.disabled);
+          && h.api_key == null && h.host === "local" && h.models === want[i].models && !h.disabled);
         if (!same) throw refuse(`the scratch DB providers table must be empty or this run's registry (has ${n} other rows)`);
       }
     } else if (n !== 0) throw refuse(`the scratch DB providers table must be empty (has ${n} rows)`);
@@ -213,12 +213,18 @@ function readModelsJson(env) {
   try { return JSON.parse(readFileSync(path, "utf8")); } catch (e) { throw refuse(`PI_MODELS_JSON unreadable: ${e.message}`); }
 }
 
-/** The provider registry rows for this run: one per PI_MODELS_JSON provider (the scratch's own file). */
+/**
+ * The provider registry rows for this run: one per PI_MODELS_JSON provider (the
+ * scratch's own file). `api_key` is deliberately NULL: the scratch DB is a
+ * REGISTRY (base_url/models for the roles store, privacy ranks and the summary
+ * call), and a provider key must never be copied into a database file by a test
+ * harness — pi reads its key from models.json itself.
+ */
 function registryRows(env) {
   const m = readModelsJson(env);
   const providers = (m && m.providers) || {};
   return Object.keys(providers).sort().map((id) => ({
-    id, base_url: String(providers[id].baseUrl), api_key: providers[id].apiKey == null ? null : String(providers[id].apiKey),
+    id, base_url: String(providers[id].baseUrl), api_key: null,
     models: JSON.stringify(providers[id].models || []),
   }));
 }

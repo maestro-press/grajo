@@ -31,6 +31,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { upsertProvider, setProviderSyncManager } from "../servers/shared/providers-db.js";
+// This file exercises the write door, so it runs WITH a keyring installed (as
+// the gateway always does): a plaintext apiKey write must seal, not refuse.
+import { installTestKeyring } from "./fixtures/provider-keys.mjs";
+
+installTestKeyring();
 
 function freshLibsql() {
   const dir = mkdtempSync(join(tmpdir(), "providers-upsert-noop-"));

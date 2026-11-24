@@ -196,6 +196,27 @@ export async function mountAdminApi(app, deps) {
       } catch (err) {
         console.warn("[providers] Reconciler skipped:", err.message);
       }
+      // The same tick seals any plaintext key that appeared since the last pass
+      // (design §3.1): a bug or an older binary must not leave a key in the clear
+      // for an hour. Never throws (a deferral is an alert file), so the tick's
+      // own contract is unchanged.
+      //
+      // `allowVacuum: false`: this runs on a gateway that is serving, and clearing
+      // plaintext bytes out of freed space rewrites the whole file. A residue hit
+      // only persists the marker; the next boot's pre-listen pass (index.js) is
+      // the one pass allowed to VACUUM.
+      try {
+        const { sealPlaintextKeys } = await import("../keychain/provider-keys-sweep.js");
+        const { resolveCrowHome, resolveInstanceDataDir } = await import("../../shared/crow-home.js");
+        const { join } = await import("node:path");
+        const crowHome = resolveCrowHome();
+        const dbPath = process.env.CROW_DB_PATH
+          || join(resolveInstanceDataDir({ ...process.env, CROW_HOME: crowHome }), "crow.db");
+        const r = await sealPlaintextKeys(dbPath, { crowHome, allowVacuum: false });
+        if (r.counts?.sealed > 0) console.log(`[provider-keys] sealed ${r.counts.sealed} plaintext key(s)`);
+      } catch (err) {
+        console.warn("[provider-keys] seal pass skipped:", err?.message || err);
+      }
     };
     await reconcile();
 

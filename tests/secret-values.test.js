@@ -12,7 +12,7 @@ import { randomBytes, createHash as createHashFn } from "node:crypto";
 import Database from "better-sqlite3";
 
 const SV = await import("../servers/shared/secret-values.js");
-const { collectSecretValues, collectSecretValueSets, confirmTypedValueForCards, refreshSecretValuesFile, parseEnvPairs } = await import("../servers/shared/secret-values-collect.js");
+const { collectSecretValues, collectSecretValueSets, confirmTypedValueForCards, refreshSecretValuesFile, parseEnvPairs, setProviderKeyValuesSource } = await import("../servers/shared/secret-values-collect.js");
 const { sealSecret } = await import("../servers/sharing/secret-box.js");
 const { KEYCHAIN_DDL } = await import("../servers/gateway/keychain/schema.js");
 
@@ -124,6 +124,35 @@ test("collect: a missing or damaged source is skipped, never thrown", () => {
   writeFileSync(join(I.data, "crow.db"), "not a database");
   writeFileSync(join(I.home, "peer-tokens.json"), "{broken");
   assert.deepEqual(collectSecretValues({ env: I.env }), []);
+});
+
+test("L2: the HOST opens a sealed provider key for the display set, and a plaintext cell is never one", async () => {
+  const I = scratchInstance();
+  const seed = randomBytes(32);
+  mkdirSync(join(I.home, "secrets"), { recursive: true });
+  writeFileSync(join(I.home, "secrets", "keychain.key"), JSON.stringify({ v: 1, id: "0123456789abcdef", key: seed.toString("base64") }), { mode: 0o600 });
+  const { seal } = await import("../servers/gateway/keychain/provider-key-box.js");
+  const { providerKeyValues, installProviderKeyValuesSource } = await import("../servers/gateway/keychain/provider-key-values.js");
+  const saved = "Zq8xP2mAk9Lw4tRy-provider";
+  const planted = "Pl4nted-value-a-bot-wrote";
+  const db = new Database(join(I.data, "crow.db"));
+  db.exec("CREATE TABLE providers (id TEXT PRIMARY KEY, base_url TEXT, api_key TEXT)");
+  db.prepare("INSERT INTO providers VALUES ('p1','http://x',?)").run(seal({ slotId: "p1", plaintext: saved, key: { id: "0123456789abcdef", seed } }));
+  db.prepare("INSERT INTO providers VALUES ('p2','http://x',?)").run(planted);
+  db.close();
+  try {
+    // The host's collector is not installed unless a host process installs it:
+    // this file is bot-reachable and never imports the provider-key box itself.
+    assert.equal(collectSecretValueSets({ env: I.env }).display.includes(saved), false, "nothing is opened without the host's door");
+    installProviderKeyValuesSource();
+    assert.ok(providerKeyValues({ env: I.env }).includes(saved), "the collector opens the sealed cell");
+    const sets = collectSecretValueSets({ env: I.env });
+    assert.ok(sets.display.includes(saved), "a saved provider key is masked on display paths");
+    assert.deepEqual(sets.card, [], "and it is never in the set pi receives");
+    assert.equal(sets.display.includes(planted), false, "a plaintext cell (bot-writable) masks nothing");
+  } finally {
+    setProviderKeyValuesSource(null);
+  }
 });
 
 test("the file: <CROW_HOME>/secrets, 600 in a 700 dir, one value per line, atomic, unchanged content not rewritten", () => {

@@ -55,6 +55,12 @@ import { sign } from "../servers/sharing/identity.js";
 import { endpointHoldNoticeSource } from "../servers/shared/provider-endpoint.js";
 import * as ed from "../node_modules/@noble/ed25519/index.js";
 import { trustRemotesOnApply } from "./fixtures/trusted-apply.mjs";
+import { installTestKeyring } from "./fixtures/provider-keys.mjs";
+import { providerRowToObject } from "../servers/shared/provider-row.js";
+
+// A saved provider key is SEALED at rest now (design §1.2), so every write in
+// this file needs a keyring installed — exactly as the gateway has one.
+installTestKeyring();
 
 const A_ID = "aaaa1111-0000-4000-8000-0000000a0001";
 const B_ID = "bbbb1111-0000-4000-8000-0000000b0001";
@@ -117,7 +123,10 @@ function freshInstance(label, instanceId) {
     },
     async row(id) {
       const { rows } = await db.execute({ sql: "SELECT * FROM providers WHERE id = ?", args: [id] });
-      return rows[0] ?? null;
+      const raw = rows[0] ?? null;
+      // The row as a READER sees it: the stored cell is an envelope, and every
+      // assertion about "which key is here" means the opened plaintext.
+      return raw ? { ...raw, api_key: providerRowToObject(raw).apiKey } : null;
     },
     async conflicts() {
       const { rows } = await db.execute("SELECT COUNT(*) AS n FROM sync_conflicts");

@@ -54,6 +54,7 @@ import {
 import { readLocalMarks, markLocal, unmarkLocal, isMarkableRow, isMarkCurrent, localMarkTokenFor, ownBoxMarkTokenFor } from "../../../../../shared/provider-local-marks.js";
 import { readOwnBoxMarks, markOwnBox, unmarkOwnBox, isOwnBoxMarkableRow, isOwnBoxMarkCurrent } from "../../../../../shared/provider-local-marks.js";
 import { providerNeedsKey } from "../../../../../shared/provider-key-need.js";
+import { hasProviderKey } from "../../../../../shared/provider-key-shape.js";
 
 const BACK = "?section=llm&tab=providers";
 
@@ -119,7 +120,10 @@ export function duplicateClusters(providers) {
   const groups = new Map();
   for (const p of providers) {
     if (p.disabled) continue;
-    const k = `${normBaseUrl(p.baseUrl)}|${p.apiKey ? 1 : 0}`;
+    // Presence, not the value: a sealed row's key is never read for display, and a
+    // raw-shaped row still answers from its own cell.
+    const hasKey = p.keyPresent ?? (typeof p.apiKey === "string" && p.apiKey.trim() !== "" && p.apiKey !== "none");
+    const k = `${normBaseUrl(p.baseUrl)}|${hasKey ? 1 : 0}`;
     (groups.get(k) || groups.set(k, []).get(k)).push(p.id);
   }
   const out = new Map();
@@ -216,7 +220,8 @@ export function needsKeyLine(p, { ownInstanceId, lang = "en" } = {}) {
   if (!p || p.disabled || !ownInstanceId) return "";
   if (p.instance_id == null || p.instance_id === ownInstanceId) return "";
   if (!providerNeedsKey(p)) return "";
-  if (typeof p.apiKey === "string" && p.apiKey.trim() !== "") return "";
+  // Presence, in either shape: a parsed row answers keyPresent, a raw one its cell.
+  if (p.keyPresent || hasProviderKey(p.api_key ?? p.apiKey)) return "";
   return `<div class="llm-needs-key" role="status">${escapeHtml(t("settings.providers.needsKeyHere", lang))}</div>`;
 }
 
@@ -615,7 +620,8 @@ export default {
       const all = await listProvidersAll(db);
       const row = all.find((p) => p.id === req.body.id);
       if (row) {
-        await upsertProvider(db, { ...row, disabled: false });
+        // storedKey rides along: it is non-enumerable, so a spread would drop it.
+        await upsertProvider(db, { ...row, storedKey: row.storedKey, disabled: false });
         invalidateProvidersCache();
       }
       res.redirectAfterPost(BACK);

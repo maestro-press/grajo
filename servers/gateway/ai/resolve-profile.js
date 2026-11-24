@@ -16,6 +16,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadProviders as loadCachedProviders } from "../../shared/providers.js";
 import { localizeDbBaseUrl } from "../../shared/native-locality.js";
+import { providerRowToObject } from "../../shared/provider-row.js";
 import { getOrCreateLocalInstanceId } from "../instance-registry.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -76,6 +77,7 @@ async function resolveFromDb(db, providerId, modelId, ownInstanceIdFn = getOrCre
   } catch { return null; }
   if (!rows?.length) return null;
   const r = rows[0];
+  const key = providerRowToObject(r);
   let models = [];
   try { models = JSON.parse(r.models || "[]"); } catch {}
 
@@ -109,7 +111,13 @@ async function resolveFromDb(db, providerId, modelId, ownInstanceIdFn = getOrCre
 
   return {
     baseUrl: localizeDbBaseUrl(r.base_url, policy, ownInstanceIdFn),
-    apiKey: r.api_key || "none",
+    // The OPENED key (the keyring seam), never the stored cell: null when this
+    // process cannot read it, with `keyState` saying why. A caller must judge
+    // `keyState === "unreadable"` BEFORE sending — it may not fall back to the
+    // "none" sentinel, which would make the request look keyless instead of broken.
+    apiKey: key.apiKey,
+    keyState: key.keyState,
+    keyPresent: key.keyPresent,
     model: pickedModel,
     provider_id: providerId,
     provider_type: r.provider_type || null,
@@ -127,6 +135,8 @@ function resolveFromModelsJson(providerId, modelId) {
   return {
     baseUrl: provider.baseUrl,
     apiKey: provider.apiKey || "none",
+    keyState: provider.apiKey ? "plain" : "none",
+    keyPresent: typeof provider.apiKey === "string" && provider.apiKey !== "",
     model: pickedModel,
     provider_id: providerId,
     provider_type: null,
@@ -166,9 +176,13 @@ export async function resolveProfileToConfig(profile, db) {
     return resolveProviderConfig(db, profile.provider_id, profile.model_id || profile.defaultModel);
   }
   // Legacy direct-mode: the profile carries its own apiKey/baseUrl/model.
+  // (A profile blob is NOT part of this phase: its key is stored as it always
+  // was, so this path has no keyring state to report.)
   return {
     baseUrl: profile?.baseUrl || "",
     apiKey: profile?.apiKey || "none",
+    keyState: profile?.apiKey ? "plain" : "none",
+    keyPresent: typeof profile?.apiKey === "string" && profile.apiKey !== "",
     model: profile?.defaultModel || profile?.model || "",
     provider_id: null,
     provider_type: profile?.provider || null,

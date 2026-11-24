@@ -25,10 +25,19 @@
  *   <CROW_HOME>/secrets/peer-tokens.json,       no: hidden dir       no (not collected)
  *     secrets/peer-relay-token
  *   <data dir>/ntfy-push.json                   yes                  no
- *   crow.db providers.api_key                   yes (crow.db is      no
- *                                                writable)
+ *   crow.db providers.api_key                   yes (crow.db is      no HERE: the HOST
+ *                                                writable)            opens the sealed cells
+ *                                                                     and installs them as a
+ *                                                                     display source (see
+ *                                                                     setProviderKeyValuesSource)
  *   this process's own env (the operator's      no, not at runtime  in memory only
  *     unit env)                                                     (getSecretValues)
+ *
+ * The provider keys are a HOST-side display source. This file is bot-reachable, so
+ * it may not import the provider-key box (tests/bot-seed-import-guard): the bot
+ * engine (scripts/pi-bots/bridge.mjs) and the gateway (servers/gateway/index.js)
+ * install the collector from servers/gateway/keychain/provider-key-values.js at
+ * start-up. It feeds the DISPLAY set only, never the card set.
  *
  * The dropped sources' secrets still reach masking where it matters: the
  * gateway's own env carries its .env tokens in memory, and bundle generated
@@ -120,6 +129,32 @@ function keychainEntries({ dbPath, env, transaction = false }) {
 }
 
 /**
+ * The HOST-INSTALLED provider-key display source (design §1.2, see the header).
+ * This file is bot-reachable and may not import the provider-key box, so the host
+ * processes that CAN open a sealed cell (the bot engine at each spawn, the gateway
+ * at boot) install a collector here through servers/gateway/keychain/provider-key-values.js.
+ * Unset means an empty list: this process does not open provider keys itself, and
+ * a masking set that misses one is a gap, never a leak.
+ */
+let providerValuesSource = null;
+
+/** Install (or with null, remove) the host's provider-key display collector. */
+export function setProviderKeyValuesSource(fn) {
+  providerValuesSource = typeof fn === "function" ? fn : null;
+}
+
+/** The installed collector's values, or [] — never throws. */
+function providerKeyValues({ dbPath, env }) {
+  if (!providerValuesSource) return [];
+  try {
+    const values = providerValuesSource({ dbPath, env });
+    return Array.isArray(values) ? values.filter((v) => typeof v === "string" && v !== "") : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
  * The sets from the trusted sources above (the one place they are built).
  *   display: every trusted value (manual keychain entries, generated-shaped
  *            extension entries, generated-shaped retained bundle secrets, the
@@ -184,7 +219,7 @@ export function collectSecretValueSets({ env = process.env, dbPath } = {}) {
   // store is read for the SAME env this collection was asked about, never for
   // this process's.
   return {
-    display: normalizeValues([...manual, ...minted, ...retained, ...service, ...botGitSecretValues(env)]),
+    display: normalizeValues([...manual, ...minted, ...retained, ...service, ...providerKeyValues({ dbPath: db, env }), ...botGitSecretValues(env)]),
     card: normalizeValues(operator).filter(safeShape),
     service: normalizeValues(service),
   };

@@ -518,9 +518,15 @@ test("cloud-provider POST: a granted row redirects cloud=ok without bots=failed"
   const { tmpdir } = await import("node:os");
   const { rmScratch } = await import("./helpers/safe-rm.js");
   const { createDbClient } = await import("../servers/db.js");
+  // In production this route runs inside the gateway, which installs the provider
+  // keyring at boot: a saved key is SEALED on the way in, and without a keyring the
+  // write refuses (PROVIDER_KEY_SEAL_UNAVAILABLE -> cloud_error=save_failed). The
+  // test installs the same keyring the gateway does.
+  const { installTestKeyring } = await import("./fixtures/provider-keys.mjs");
   const dir = mkdtempSync(join(tmpdir(), "onb-consent-"));
   execFileSync(process.execPath, ["scripts/init-db.js"], { env: { ...process.env, CROW_DATA_DIR: dir }, stdio: "pipe", cwd: repoRoot });
   const db = createDbClient(join(dir, "crow.db"));
+  const { uninstall } = installTestKeyring();
   try {
     const res = makeRes();
     await handleCloudProviderPost(makePostReq({ preset: "openai", apiKey: "fixture-key-123", model: "typed-model" }), res, {
@@ -528,7 +534,7 @@ test("cloud-provider POST: a granted row redirects cloud=ok without bots=failed"
     });
     assert.ok(res.redirected.includes("cloud=ok"), res.redirected);
     assert.ok(!res.redirected.includes("bots=failed"), res.redirected);
-  } finally { try { db.close(); } catch {} rmScratch(dir); }
+  } finally { uninstall(); try { db.close(); } catch {} rmScratch(dir); }
 });
 
 test("ai step with ?cloud=ok&bots=failed shows the botsFailed line; without bots=failed it does not", async () => {

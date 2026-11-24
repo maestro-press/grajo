@@ -305,7 +305,11 @@ async function resolveVisionProfileConfig(db, device, aiProfile) {
       catch (err) { console.warn(`[meta-glasses] gpu-orchestrator load failed: ${err.message}`); }
       if (acquire) await acquireVisionProvider({ acquire, providerId: profile.provider_id });
       const { resolveProvider } = await loadResolveProv();
-      return await resolveProvider(profile.provider_id, profile.model_id);
+      const cfg = await resolveProvider(profile.provider_id, profile.model_id);
+      // A saved key this process cannot read: skip vision entirely rather than
+      // send a keyless image request (design §1.2, review round 1 M1).
+      if (cfg && (cfg.keyState === "unreadable" || (cfg.keyPresent === true && !cfg.apiKey))) return null;
+      return cfg;
     }
     if (profile.baseUrl && profile.model) {
       return { baseUrl: profile.baseUrl, apiKey: profile.apiKey || "none", model: profile.model };
@@ -1309,6 +1313,8 @@ async function _enrichGlassesPhoto({ photoId, deviceId, diskPath, mime }) {
       if (profile.provider_id) {
         const { resolveProvider } = await loadResolveProv();
         providerConfig = await resolveProvider(profile.provider_id, profile.model_id);
+        // Never dial an image request keyless (review round 1, M1).
+        if (providerConfig && (providerConfig.keyState === "unreadable" || (providerConfig.keyPresent === true && !providerConfig.apiKey))) return;
       } else if (profile.baseUrl && profile.model) {
         providerConfig = { baseUrl: profile.baseUrl, apiKey: profile.apiKey || "none", model: profile.model };
       } else { return; }

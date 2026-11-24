@@ -98,6 +98,7 @@ import { createCloudDoor, CLOUD_DOOR_DEFAULTS } from "../models/cloud-door.js";
 import { validateLlmCloudToken } from "../local-token.js";
 import { readCloudConsent, readCloudConsentSalt } from "../../shared/cloud-consent.js";
 import { providerRowToObject } from "../../shared/provider-row.js";
+import { PROVIDER_KEY_UNREADABLE } from "../../shared/provider-keyring.js";
 import { nowContext, relativeDatesContext, mentionsRelativeDay } from "../../shared/relative-dates.js";
 import { withTurnContext } from "../voice/context-echo.js";
 import { createSseEchoFilter, stripJsonEcho } from "../voice/sse-echo.js";
@@ -169,10 +170,34 @@ async function resolveKey(key) {
   const val = {
     baseUrl: (r.baseUrl || r.base_url || "").replace(/\/$/, ""),
     model: r.model || r.modelId || r.model_id || modelId,
-    apiKey: r.apiKey || r.api_key || "none",
+    apiKey: r.apiKey || "none",
+    keyState: r.keyState ?? (r.apiKey ? "sealed" : "none"),
   };
   _cache.set(key, { at: now, val });
   return val;
+}
+
+/**
+ * 503 for a provider whose saved key this process cannot read (design §3.2):
+ * zero upstream requests, never the stored cell, never a "none" fallback.
+ */
+function unreadableKeyBody(providerId) {
+  return { code: PROVIDER_KEY_UNREADABLE, message: PROVIDER_KEY_UNREADABLE, provider: providerId ?? null };
+}
+
+/**
+ * Raise (at most once per provider) the existing "needs a key on this device"
+ * bell for an unreadable key. Fire and forget: a notification-table problem must
+ * never change the door's answer.
+ */
+function noteUnreadableProviderKey(providerId) {
+  if (typeof providerId !== "string" || providerId === "") return;
+  void (async () => {
+    try {
+      const { noticeProviderKeyUnreadable } = await import("../../shared/provider-key-need.js");
+      await noticeProviderKeyUnreadable(db(), providerId);
+    } catch { /* the bell is best effort */ }
+  })();
 }
 
 function authHeaders(apiKey) {
@@ -529,6 +554,10 @@ function incomingHop(req) {
 
 /** Forward one door request and stream the response back. */
 async function forwardDoor(req, res, target, op, deps) {
+  if (target.keyState === "unreadable") {
+    noteUnreadableProviderKey(target.providerId);
+    return res.status(503).json({ error: unreadableKeyBody(target.providerId) });
+  }
   const body = { ...(req.body || {}), model: target.modelId };
   const headers = { "Content-Type": "application/json", Accept: req.headers.accept || "application/json", ...authHeaders(target.apiKey) };
   let base = target.url;
@@ -663,7 +692,10 @@ async function handleDoor(req, res, op, deps, door) {
   if (!(await doorCallerAllowed(req, deps))) {
     return doorRefusal(req, res, { message: "door addressing is limited to loopback and the tailnet, or a bearer token" });
   }
-  if (door.kind === "error") return sendDoorError(res, door);
+  if (door.kind === "error") {
+    if (door.code === PROVIDER_KEY_UNREADABLE) noteUnreadableProviderKey(door.providerId);
+    return sendDoorError(res, door);
+  }
   try { await forwardDoor(req, res, door, op, deps); }
   catch (err) { if (!res.headersSent) sendAcquireError(res, err); }
 }
@@ -914,7 +946,8 @@ function resolveKeyFrom(dbc, key) {
   return resolveProviderConfig(dbc, providerId, modelId).then((r) => ({
     baseUrl: (r.baseUrl || r.base_url || "").replace(/\/$/, ""),
     model: r.model || r.modelId || r.model_id || modelId,
-    apiKey: r.apiKey || r.api_key || "none",
+    apiKey: r.apiKey || "none",
+    keyState: r.keyState ?? (r.apiKey ? "sealed" : "none"),
     host: r.host || "local",
     providerType: r.provider_type || r.providerType || null,
   }));
@@ -972,6 +1005,12 @@ export async function completeText({ model, prompt, maxTokens = 400, timeoutMs =
   if (held) throw new CompleteTextSkipped("box_reserved");
   const up = await resolveKeyFn(model);
   if (!up || !up.baseUrl) throw new Error("completeText: no base url for the model");
+  if (up.keyState === "unreadable") {
+    // Fail closed with the code, never a keyless request and never the cell.
+    const err = new Error(PROVIDER_KEY_UNREADABLE);
+    err.code = PROVIDER_KEY_UNREADABLE;
+    throw err;
+  }
   if (isLazyLoader(up)) throw new CompleteTextSkipped("lazy_loader");
   // Never through a door: a /llm/v1 (or /llm/p/<id>/v1) base URL is another
   // gateway's router, which can start a model on demand there and applies the
@@ -1130,6 +1169,12 @@ async function handleChat(req, res, deps) {
   } catch (e) {
     return res.status(502).json({ error: { message: `model routing failed for ${key}: ${e.message}` } });
   }
+  // Neither the stored cell nor a keyless request: a key this process cannot
+  // read stops here, before the guard, the acquire and the forward.
+  if (up?.keyState === "unreadable") {
+    noteUnreadableProviderKey(providerId);
+    return res.status(503).json({ error: unreadableKeyBody(providerId) });
+  }
   let guard = await voiceTargetGuard(req, key, `${up.baseUrl}/chat/completions`, deps);
   if (guard.refusal) {
     return res.status(guard.refusal.status).json({ error: { code: guard.refusal.code, message: guard.refusal.message } });
@@ -1146,9 +1191,10 @@ async function handleChat(req, res, deps) {
       // own, so there is nothing to wait on).
       const fast = escalate ? await deps.resolveKeyFn(keys.fast).catch(() => null) : null;
       // The fallback is a forward too: it gets the same target rule, so a refused
-      // row is not dialled even though the acquire already ran.
-      const fastGuard = fast ? await voiceTargetGuard(req, keys.fast, `${fast.baseUrl}/chat/completions`, deps) : null;
-      if (fast && !fastGuard?.refusal && await deps.probeReadyFn(fast.baseUrl)) {
+      // row is not dialled even though the acquire already ran. A key this
+      // process cannot read is not a candidate either.
+      const fastGuard = fast && fast.keyState !== "unreadable" ? await voiceTargetGuard(req, keys.fast, `${fast.baseUrl}/chat/completions`, deps) : null;
+      if (fast && fast.keyState !== "unreadable" && !fastGuard?.refusal && await deps.probeReadyFn(fast.baseUrl)) {
         key = keys.fast;
         [providerId] = splitKey(key);
         up = fast;
@@ -1171,8 +1217,8 @@ async function handleChat(req, res, deps) {
       // falls back to the resident fast model with a note; anything else (or
       // a cold fast model) gets a fast 503 the client can show or wait on.
       const fast = escalate ? await deps.resolveKeyFn(keys.fast).catch(() => null) : null;
-      const fastGuard = fast ? await voiceTargetGuard(req, keys.fast, `${fast.baseUrl}/chat/completions`, deps) : null;
-      if (fast && !fastGuard?.refusal && await deps.probeReadyFn(fast.baseUrl)) {
+      const fastGuard = fast && fast.keyState !== "unreadable" ? await voiceTargetGuard(req, keys.fast, `${fast.baseUrl}/chat/completions`, deps) : null;
+      if (fast && fast.keyState !== "unreadable" && !fastGuard?.refusal && await deps.probeReadyFn(fast.baseUrl)) {
         key = keys.fast;
         [providerId] = splitKey(key);
         up = fast;
@@ -1370,6 +1416,9 @@ export default function llmRouterRouter(opts = {}) {
     cloudProvidersFn: defaultCloudProviders,
     consentFn: defaultCloudConsent,
     tenantIdFn: resolveTenantId,
+    // A broken saved key on a consented cloud row rings the same bell the /llm/v1
+    // door rings (design §3.2).
+    onUnreadableKeyFn: noteUnreadableProviderKey,
     ...CLOUD_DOOR_DEFAULTS,
     ...opts,
   };

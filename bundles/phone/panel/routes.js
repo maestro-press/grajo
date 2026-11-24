@@ -30,7 +30,14 @@ async function liveLookup(db, spec) {
   if (!spec || !spec.includes("/")) return null;
   const [providerId, ...rest] = spec.split("/");
   const row = (await db.execute({ sql: "SELECT * FROM providers WHERE id = ? AND COALESCE(disabled,0)=0", args: [providerId] })).rows[0];
-  return row ? { endpoint: { base_url: row.base_url, api_key: row.api_key || "none", model: rest.join("/"), label: spec }, row } : null;
+  if (!row) return null;
+  // The row's key through the one mapper: the OPENED plaintext, never the stored
+  // cell (an envelope is not a credential). A key this host cannot read fails
+  // closed like an absent provider, rather than placing an unauthenticated call.
+  const { providerRowToObject } = await appImport("servers/shared/provider-row.js");
+  const mapped = providerRowToObject(row);
+  if (mapped.keyState === "unreadable") return null;
+  return { endpoint: { base_url: row.base_url, api_key: mapped.apiKey || "none", model: rest.join("/"), label: spec }, row };
 }
 
 async function rowLookup(db, spec) {

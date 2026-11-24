@@ -67,6 +67,7 @@ import { providerRowToObject } from "../../servers/shared/provider-row.js";
 import { CLOUD_CONSENT_KEY, CLOUD_CONSENT_SALT_KEY } from "../../servers/shared/cloud-consent.js";
 import { findPiLabDir, piLabSupportsSecretValuesFd } from "./pi-lab-compat.mjs";
 import { refreshSecretValuesFile } from "../../servers/shared/secret-values-collect.js";
+import { installProviderKeyValuesSource } from "../../servers/gateway/keychain/provider-key-values.js";
 import { SECRET_VALUES_DISPLAY_FILENAME, SECRET_VALUES_FILENAME, anchoredPath, checkedInstanceSecretsDirs, getCardValues, rememberInstanceSecretsDirs, secretValuesPayload, secretsDir, secretsDirCurrentPath } from "../../servers/shared/secret-values.js";
 import { betterSqliteDb, isDraftTool, recordDrafts, redactMcpConfig } from "../../servers/gateway/staged/recorder.js";
 import { maskSecrets } from "../../servers/shared/secret-mask.js";
@@ -94,6 +95,13 @@ import { piProviderIdHere } from "./pi_provider_id.mjs";
 import { PiModelUnavailableError } from "./pi-model-catalog.mjs";
 import { meterBotTurn } from "./metering.mjs";
 import { getOrCreateLocalInstanceId } from "../../servers/gateway/instance-registry.js";
+
+// The provider-key display source (design §1.2, review round 1 L2): the masking
+// set includes every sealed `providers.api_key` this home can open, and only a
+// host-side process can open one. servers/shared/secret-values-collect.js no
+// longer imports the provider-key box — this engine installs the collector into
+// its seam instead, at start-up, before any spawn builds a values file.
+installProviderKeyValuesSource();
 
 /** True while any process of group `pgid` exists (EPERM still means it does). */
 function processGroupAlive(pgid) {

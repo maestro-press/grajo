@@ -62,6 +62,25 @@ test("a public base URL is never probed: named only", async () => {
   assert.equal(f.hits.length, 0);
 });
 
+test("M1: a key this process cannot read is never probed keyless", async () => {
+  // The row HOLDS a key (keyState "unreadable", or "sealed" with no plaintext),
+  // so a GET /models without it would be an unauthenticated request.
+  for (const up of [
+    { baseUrl: "http://100.64.20.5:8000/v1", model: "m", apiKey: null, keyState: "unreadable", keyPresent: true },
+    { baseUrl: "http://100.64.20.5:8000/v1", model: "m", apiKey: null, keyState: "sealed", keyPresent: true },
+  ]) {
+    let hits = 0;
+    const forcing = createToolForcing({
+      resolveKey: async () => ({ ...up }),
+      modelEntry: async () => null,
+      fetchImpl: async () => { hits += 1; return models("vllm"); },
+      now: () => 0, log: () => {}, waitMs: 5,
+    });
+    assert.deepEqual(await forcing("p/m", {}), UNKNOWN_FORCING);
+    assert.equal(hits, 0, "no probe left this process");
+  }
+});
+
 test("the model is matched by id when the server lists several", async () => {
   const f = make({ reply: () => new Response(JSON.stringify({ data: [{ id: "other", owned_by: "llamacpp" }, { id: "m", owned_by: "vllm" }] })) });
   assert.equal((await f.forcing("p/m", {})).engine, "vllm");

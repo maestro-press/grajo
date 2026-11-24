@@ -698,6 +698,35 @@ export async function runPostListenSetup(server, app, deps) {
     } finally {
       try { db?.close?.(); } catch {}
     }
+    // Seal any plaintext `providers.api_key` left by an older build (design
+    // §3.1/§3.5): migration 0040 does it once at upgrade, this covers a row a
+    // script or a rolled-back binary wrote since, and index.js's pre-listen pass
+    // covers a row written between boots. Own handle, verified pre-seal copy,
+    // never throws (a deferral is an alert file and a fixed log line, never a
+    // crash). It also rewrites a consent entry still written over a plaintext
+    // key into the sealed-key form.
+    //
+    // `allowVacuum: false` on purpose: this runs AFTER the listeners are open, and
+    // clearing plaintext bytes out of freed space rebuilds the whole file. A hit
+    // here only leaves the residue marker (provider-keys-sweep.js) for the next
+    // boot's pre-listen pass to finish.
+    try {
+      const { sealPlaintextKeys } = await import("../keychain/provider-keys-sweep.js");
+      const { resolveCrowHome, resolveInstanceDataDir } = await import("../../shared/crow-home.js");
+      const { join } = await import("node:path");
+      const crowHome = resolveCrowHome();
+      // The file `createDbClient()` would open: its env override, else the
+      // instance data dir's crow.db (crow-home.js's own resolver, which is also
+      // what the seal pass checks the home against).
+      const dbPath = process.env.CROW_DB_PATH
+        || join(resolveInstanceDataDir({ ...process.env, CROW_HOME: crowHome }), "crow.db");
+      const r = await sealPlaintextKeys(dbPath, {
+        crowHome, allowVacuum: false, log: (line) => console.log(line),
+      });
+      if (r.deferred) console.warn(`[provider-keys] seal pass deferred: ${r.reason}`);
+    } catch (err) {
+      console.warn("[provider-keys] seal pass skipped:", err?.message || err);
+    }
   });
 
   // Start auto-update checker

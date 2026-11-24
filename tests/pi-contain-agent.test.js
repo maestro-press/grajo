@@ -3,7 +3,6 @@
 // runs real sandboxes).
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
 import {
   existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs";
@@ -14,7 +13,7 @@ import { buildContainedAgentDir, containedCloudTokenPath } from "../scripts/pi-b
 import { buildContainPlan, ContainRefused } from "../scripts/pi-bots/pi_contain.mjs";
 import { wrapPiSpawn } from "../scripts/pi-bots/pi_sandbox.mjs";
 import { llmCloudTokenPath } from "../servers/gateway/local-token.js";
-import { normalizeBaseUrl } from "../servers/shared/provider-presets.js";
+import { consentEntryFor } from "../servers/shared/cloud-consent.js";
 
 const T = realpathSync(mkdtempSync(join(tmpdir(), "crow-contain-agent-")));
 const PORT = 3199;
@@ -70,14 +69,10 @@ const rows = [
     provider_type: "openai-compat", models: [{ id: "l1" }], gpuPolicy: null, disabled: false },
 ];
 const cloudRow = rows.find((r) => r.id === "Cloud Max");
-const consent = {
-  [cloudRow.id]: {
-    target: normalizeBaseUrl(cloudRow.baseUrl),
-    keyFp: createHmac("sha256", Buffer.from(SALT, "hex")).update(CLOUD_KEY.trim()).digest("hex").slice(0, 16),
-    at: "2026-11-02T00:00:00Z",
-    by: "operator",
-  },
-};
+// The entry the product's own grant records (consentEntryFor is what
+// grantCloudConsent stores): the sealed-key fingerprint form, never a hand-rolled
+// HMAC over the plaintext key.
+const consent = { [cloudRow.id]: consentEntryFor(cloudRow, SALT, "operator") };
 const NEEDED = ["local-chat", "native-owned", "external-engine", "Cloud Max", "crow-c-Cloud Max"];
 
 function build(over = {}) {

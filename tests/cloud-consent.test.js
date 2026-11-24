@@ -6,17 +6,23 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rmScratch } from "./helpers/safe-rm.js";
 import { createDbClient } from "../servers/db.js";
 import * as consentMod from "../servers/shared/cloud-consent.js";
+// addProvider writes a provider row, which now seals its key: the gateway's
+// keyring is installed here exactly as it is at boot.
+import { installTestKeyring } from "./fixtures/provider-keys.mjs";
+
+installTestKeyring();
 import {
   readCloudConsent, grantCloudConsent, revokeCloudConsent, consentVerdict, consentTokenFor,
   readCloudConsentSalt, ensureCloudConsentSalt, CLOUD_CONSENT_KEY, CLOUD_CONSENT_SALT_KEY,
 } from "../servers/shared/cloud-consent.js";
 import { isInstanceScope, isSyncable } from "../servers/gateway/dashboard/settings/sync-allowlist.js";
+import { providerKeyFp, sealedConsentFingerprint } from "../servers/shared/provider-key-shape.js";
 import { addProvider } from "../servers/gateway/ai/add-provider.js";
 import { getOrCreateLocalInstanceId } from "../servers/gateway/instance-registry.js";
 import tab from "../servers/gateway/dashboard/settings/sections/llm/providers-tab.js";
@@ -63,6 +69,29 @@ async function tick(db, id, actor = "t") {
   const salt = await ensureCloudConsentSalt(db);
   return grantCloudConsent(db, id, { actor, expect: { consentToken: consentTokenFor(await rowOf(db, id), salt) } });
 }
+
+test("F1: an entry in the OLD over-the-plaintext form fails closed as key_changed; a current grant stores the fp1 form", async () => {
+  const db = newDb();
+  // A still-PLAIN cell (no seal pass has run on this store).
+  await ins(db, "cloud-a", "https://api.example.com/v1", { key: KEY_A });
+  const salt = await ensureCloudConsentSalt(db);
+  const legacy = createHmac("sha256", Buffer.from(salt, "hex")).update(KEY_A.trim()).digest("hex").slice(0, 16);
+  await db.execute({
+    sql: "INSERT OR REPLACE INTO dashboard_settings (key, value) VALUES (?, ?)",
+    args: [CLOUD_CONSENT_KEY, JSON.stringify({
+      "cloud-a": { target: "https://api.example.com/v1", keyFp: legacy, at: "2026-10-01T00:00:00.000Z", by: "old" },
+    })],
+  });
+  assert.equal(await verdictOf(db, "cloud-a"), "key_changed", "the old form names another identity: fail closed, never grant");
+
+  // What a grant records TODAY for the same row, address and key reads ok — the
+  // reader and the writer compute the same fp1 form for a plain cell.
+  assert.deepEqual(await tick(db, "cloud-a"), { ok: true });
+  assert.equal(await verdictOf(db, "cloud-a"), "ok");
+  const entry = (await readCloudConsent(db))["cloud-a"];
+  assert.equal(entry.keyFp, sealedConsentFingerprint(salt, providerKeyFp(KEY_A)));
+  assert.notEqual(entry.keyFp, legacy, "the seal pass's rewrite target is exactly what a grant writes now");
+});
 
 test("both keys are instance scope and never synced", () => {
   for (const k of [CLOUD_CONSENT_KEY, CLOUD_CONSENT_SALT_KEY]) {

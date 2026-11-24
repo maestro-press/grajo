@@ -177,6 +177,87 @@ test("minor 2: a public-address row needs the cloud allowlist even when it carri
   assert.deepEqual(Object.keys(buildManagedEntries(cloudy, { doorBase: DOOR, cloudAllow: ["cloud-bundle"] })), ["cloud-bundle"]);
 });
 
+// --- Review round 1, H1: no opened sealed key ever lands in models.json -------
+
+test("H1: a sealed row rewritten to look LOCAL puts no plaintext in models.json (raw, base64, hex)", async () => {
+  const planted = "demo-planted-sealed-value-0f3a";
+  // What a bot can make a consented cloud row look like: a local address, an
+  // OpenAI-compatible type, a model list and a door marker. The key is sealed, so
+  // `apiKey` here is the value this process OPENED for it.
+  const forged = [
+    { id: "was-cloud", baseUrl: "http://127.0.0.1:18080/v1", apiKey: planted, keyState: "sealed", keyPresent: true,
+      bundleId: null, disabled: false, provider_type: "openai", models: [{ id: "m1" }], gpuPolicy: { door_forward: true } },
+    { id: "was-lan", baseUrl: "http://10.0.0.5:8000/v1", apiKey: planted, keyState: "sealed", keyPresent: true,
+      bundleId: "b", disabled: false, provider_type: "openai", models: [{ id: "m2" }], gpuPolicy: null },
+    // The same row in a process with NO keyring: keyState "sealed", no plaintext.
+    { id: "was-tailnet", baseUrl: "http://100.64.20.5:8000/v1", apiKey: null, keyState: "sealed", keyPresent: true,
+      bundleId: null, disabled: false, provider_type: "openai", models: [{ id: "m3" }], gpuPolicy: { door_forward: true } },
+    // A cell nothing can open gets no entry at all.
+    { id: "broken", baseUrl: "http://127.0.0.1:18081/v1", apiKey: null, keyState: "unreadable", keyPresent: true,
+      bundleId: null, disabled: false, provider_type: "openai", models: [{ id: "m4" }], gpuPolicy: { door_forward: true } },
+  ];
+  let written = null;
+  await syncPiModelsJson({}, {
+    path: "/tmp/pi/models.json", doorBase: DOOR, cloudAllow: [],
+    listProvidersAllFn: async () => forged,
+    readFileFn: () => JSON.stringify({ providers: {} }),
+    writeFileAtomicFn: (_p, data) => { written = data; },
+  });
+  assert.ok(written, "the file was written");
+  const parsed = JSON.parse(written);
+  for (const id of ["was-cloud", "was-lan", "was-tailnet"]) {
+    assert.equal(parsed.providers[id].apiKey, "none", `${id}: the none sentinel, never the opened key`);
+  }
+  assert.equal(parsed.providers.broken, undefined, "an unreadable row is not handed to pi");
+  const bytes = Buffer.from(planted, "utf8");
+  for (const form of [planted, bytes.toString("base64"), bytes.toString("hex")]) {
+    assert.equal(written.includes(form), false, `models.json carries no ${form === planted ? "raw" : "encoded"} key`);
+  }
+});
+
+// --- Review round 2, L3: a keyed non-native row reaches pi through the door ---
+
+test("L3: a keyed bundle/opt-in row points at the provider door, never at its own url with `none`", () => {
+  // A LAN llama-server started with --api-key answers 401 to the `none` sentinel;
+  // the provider door holds the real key, so pi is sent there.
+  const sealed = { id: "lan-keyed", baseUrl: "http://10.0.0.5:8000/v1", apiKey: null, keyState: "sealed", keyPresent: true,
+    bundleId: "llama-lan", disabled: false, provider_type: "openai-compat", models: [{ id: "m1" }], gpuPolicy: null };
+  const optIn = { ...sealed, id: "lan-optin", apiKey: "demo-opened-value", bundleId: null, gpuPolicy: { door_forward: true } };
+  const e = buildManagedEntries([sealed, optIn], { doorBase: DOOR });
+  assert.equal(e["lan-keyed"].baseUrl, "http://100.64.9.1:3001/llm/p/lan-keyed/v1", "the gateway's door carries the key");
+  assert.equal(e["lan-keyed"].apiKey, "none", "and no key lands in the file");
+  assert.equal(e["lan-optin"].baseUrl, "http://100.64.9.1:3001/llm/p/lan-optin/v1");
+  assert.equal(e["lan-optin"].apiKey, "none");
+  assert.equal(JSON.stringify(e).includes("demo-opened-value"), false, "an opened sealed key is never written");
+
+  // Unchanged: a legacy PLAIN cell keeps its own url and its key, and a keyless
+  // local row still gets `none` at its own url (nothing there needs a key).
+  const plain = { ...sealed, id: "lan-plain", keyState: "plain", apiKey: "demo-plain-lan-key" };
+  const keyless = { ...sealed, id: "lan-unkeyed", keyState: "none", keyPresent: false, apiKey: "none" };
+  const e2 = buildManagedEntries([plain, keyless], { doorBase: DOOR });
+  assert.equal(e2["lan-plain"].baseUrl, "http://10.0.0.5:8000/v1");
+  assert.equal(e2["lan-plain"].apiKey, "demo-plain-lan-key");
+  assert.equal(e2["lan-unkeyed"].baseUrl, "http://10.0.0.5:8000/v1");
+  assert.equal(e2["lan-unkeyed"].apiKey, "none");
+});
+
+test("L3: with no provider door, a keyed row is left out entirely, with one fixed count-only line", () => {
+  const sealed = { baseUrl: "http://10.0.0.5:8000/v1", apiKey: null, keyState: "sealed", keyPresent: true,
+    bundleId: "llama-lan", disabled: false, provider_type: "openai-compat", models: [{ id: "m1" }], gpuPolicy: null };
+  const rows = [
+    { ...sealed, id: "lan-keyed-a" },
+    { ...sealed, id: "lan-keyed-b" },
+    { ...sealed, id: "lan-unkeyed", keyState: "none", keyPresent: false, apiKey: "none" },
+  ];
+  const logs = [];
+  const e = buildManagedEntries(rows, { doorBase: null, log: (m) => logs.push(m) });
+  assert.equal(e["lan-keyed-a"], undefined, "a row pi cannot authenticate is not written at all");
+  assert.equal(e["lan-keyed-b"], undefined);
+  assert.ok(e["lan-unkeyed"], "an unkeyed local row is untouched");
+  assert.deepEqual(logs, ["[pi-models-sync] 2 keyed provider(s) skipped: no provider door on this gateway to carry the key"]);
+  assert.equal(logs.join("\n").includes("lan-keyed"), false, "count only: no ids, no values");
+});
+
 test("minor 3: the M1 boot hook closes its DB client on every run", async () => {
   const { readFileSync } = await import("node:fs");
   const { join } = await import("node:path");
@@ -190,6 +271,7 @@ test("minor 3: the M1 boot hook closes its DB client on every run", async () => 
 // as crow-c-<rowId> entries whose key is a `!cat` of the per-boot door token
 // file. Fixture keys never look like real ones.
 import { createHmac } from "node:crypto";
+import { providerKeyFp, sealedConsentFingerprint } from "../servers/shared/provider-key-shape.js";
 import { DOOR_ID_PREFIX, doorEntryId } from "../servers/shared/pi-models-sync.js";
 import { PI_BUILTIN_PROVIDER_IDS, piCompatFor } from "../servers/shared/pi-compat.js";
 import { normalizeBaseUrl } from "../servers/shared/provider-presets.js";
@@ -198,7 +280,8 @@ const SALT = "ab".repeat(32);
 const TOKEN = "/tmp/x/llm-cloud-token";
 const consentFor = (row, salt = SALT) => ({
   target: normalizeBaseUrl(row.baseUrl),
-  keyFp: createHmac("sha256", Buffer.from(salt, "hex")).update(String(row.apiKey).trim()).digest("hex").slice(0, 16),
+  // The SEALED-key form (design §3.1): HMAC(salt, "fp1:" + fp16 of the trimmed key).
+  keyFp: sealedConsentFingerprint(salt, providerKeyFp(row.apiKey) ?? ""),
   at: "2026-10-29T00:00:00.000Z", by: "test",
 });
 const cloudRow = (id, over = {}) => ({ id, baseUrl: "https://api.example.com/v1", apiKey: "fixture-secret-123", bundleId: null, disabled: false,

@@ -19,6 +19,18 @@
  * every auth resolve), so the provider key never lands in this file. Each
  * model carries the `compat` pi would have derived for the UPSTREAM URL
  * (pi-compat.js), because pi only sees the door's.
+ *
+ * A SEALED key is never written here at all (round 1, H1): a row whose key lives
+ * in a `pk1:` cell (or cannot be read in this process) is written with the
+ * `none` sentinel — a local target needs no key, and the provider door carries
+ * the real one. Only a legacy PLAIN cell is copied, as before.
+ *
+ * The `none` sentinel is only right where NOTHING checks the key. A keyed row that
+ * is not native-owned (a bundle row, an external engine, a `door_forward` opt-in)
+ * may point at a server that wants the key (a LAN llama-server started with
+ * `--api-key`), and `none` there is a 401 — so such a row is pointed at this
+ * gateway's provider door instead, and left out entirely (one fixed, count-only
+ * log line) when there is no door to point at (round 2, L3).
  */
 import { readFileSync, writeFileSync, renameSync, chmodSync, mkdirSync, existsSync, lstatSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -168,8 +180,15 @@ export function buildManagedEntries(rows, {
   const door = cloudDoorPort != null && typeof tokenPath === "string" && tokenPath !== "";
   const out = {};
   const doors = [];
+  let doorlessKeyed = 0;
   for (const r of rows) {
     if (r.disabled || r.gpuPolicy?.local_only === true) continue;
+    // A key this process could not read: no entry at all, never one that would
+    // hand pi an unauthenticated provider or a stored cell (design §1.2).
+    if (r.keyState === "unreadable") {
+      log(`[pi-models-sync] provider "${r.id}" skipped: its saved API key cannot be read on this device`);
+      continue;
+    }
     // The crow-c- namespace belongs to the door entries (minor c); pi
     // matches provider ids without regard to case, so CROW-C- is too.
     if (typeof r.id === "string" && r.id.toLowerCase().startsWith(DOOR_ID_PREFIX)) {
@@ -194,8 +213,34 @@ export function buildManagedEntries(rows, {
     const models = chatModels(r.models);
     if (!models.length || !r.baseUrl) continue;
     const native = kind === "native-owned" || kind === "native-foreign";
+    const keyState = typeof r.keyState === "string" ? r.keyState : null;
+    // Round 1 H1: pi's models.json NEVER receives an OPENED sealed key. A row's
+    // `apiKey` here is the plaintext this process opened (or, without a keyring,
+    // null with keyState "sealed") — and a bot can rewrite a sealed cloud row to
+    // look local (base_url, provider_type, models, bundle_id, gpu_policy), which
+    // would land the key in a file pi and every bot can read. A local target needs
+    // no key at all (the provider door carries the real one), so a sealed or
+    // unreadable cell writes the `none` sentinel; only a legacy PLAIN cell — the
+    // operator's own pre-seal value, never a bot's — is still written as it is.
+    //
+    // Round 2 L3: for a keyed row that is NOT native-owned (a bundle row, an
+    // external engine, a door_forward opt-in) the `none` sentinel at the row's OWN
+    // url is a 401 on a server that wants the key (a LAN llama-server started with
+    // --api-key). Such a row reaches pi through this gateway's provider door
+    // instead — the route a native row takes — so the door carries the key. With
+    // no door to point at, the row is left OUT: a row pi cannot authenticate is
+    // worse than a row pi does not have (one fixed, count-only line says so).
+    if (keyState === "sealed" && kind !== "native-owned") {
+      if (!doorBase) { doorlessKeyed += 1; continue; }
+      out[r.id] = { baseUrl: providerDoorUrl(doorBase, r.id), apiKey: "none", api: "openai-completions", models };
+      continue;
+    }
     const baseUrl = native && doorBase && kind === "native-owned" ? providerDoorUrl(doorBase, r.id) : r.baseUrl;
-    out[r.id] = { baseUrl, apiKey: r.apiKey || "none", api: "openai-completions", models };
+    const apiKey = keyState === null || keyState === "plain" ? (r.apiKey || "none") : "none";
+    out[r.id] = { baseUrl, apiKey, api: "openai-completions", models };
+  }
+  if (doorlessKeyed > 0) {
+    log(`[pi-models-sync] ${doorlessKeyed} keyed provider(s) skipped: no provider door on this gateway to carry the key`);
   }
   // pi folds provider ids to lower case, so two rows that differ only in case
   // (Cloud-A, cloud-a) would become ONE pi provider and a bot bound to one

@@ -37,6 +37,12 @@ import { createClient } from "@libsql/client";
 import modelsRouter, { requireDashboardSessionJson, HF_TOKEN_PROVIDER_ID } from "../servers/gateway/routes/models.js";
 import { _setNowFn } from "../servers/gateway/dashboard/auth.js";
 import { setProviderSyncManager } from "../servers/shared/providers-db.js";
+import { providerRowToObject } from "../servers/shared/provider-row.js";
+import { parseStoredKey } from "../servers/shared/provider-key-shape.js";
+// The HF token is written through upsertProvider, which seals it: this process
+// runs with a keyring, exactly as the gateway does.
+import { installTestKeyring } from "./fixtures/provider-keys.mjs";
+installTestKeyring();
 import { loadState, registryKey } from "../servers/gateway/models/state.js";
 import { actAsServe, serveHeaders } from "./fixtures/serve-peer.mjs";
 actAsServe(); // this process's HTTP client stands in for tailscaled (the Serve socket owner)
@@ -1320,9 +1326,13 @@ test("hf-token: GET before/after POST reports only { configured }, never the raw
       console.warn = originalWarn;
       console.error = originalError;
     }
-    // Verify storage path directly: the exact providers.api_key column, under the reserved id.
+    // Verify storage path directly: the reserved id's api_key cell, SEALED at rest
+    // (design §1.2), and the read door opening it back to the token.
     const row = await h.db.execute({ sql: "SELECT api_key, disabled, models, gpu_policy FROM providers WHERE id = ?", args: [HF_TOKEN_PROVIDER_ID] });
-    assert.equal(row.rows[0].api_key, "hf_super-secret-value-should-never-leak");
+    assert.equal(parseStoredKey(row.rows[0].api_key).kind, "envelope", "the token is sealed at rest");
+    assert.equal(String(row.rows[0].api_key).includes("hf_super-secret-value-should-never-leak"), false);
+    assert.equal(providerRowToObject({ id: HF_TOKEN_PROVIDER_ID, api_key: row.rows[0].api_key }).apiKey,
+      "hf_super-secret-value-should-never-leak", "and opens back to it");
     assert.equal(Number(row.rows[0].disabled), 1, "never an active routing candidate");
     assert.deepEqual(JSON.parse(row.rows[0].models), []);
     // Fix round 1: local_only marker — never broadcast to paired instances.

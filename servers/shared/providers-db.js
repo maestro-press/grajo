@@ -29,6 +29,7 @@
  */
 
 import { readFileSync } from "fs";
+import { timingSafeEqual } from "node:crypto";
 import { createDbClient } from "../db.js";
 import { getOrCreateLocalInstanceId } from "../gateway/instance-registry.js";
 import { getOwnAddresses, isLocallyOrchestratable } from "./locality.js";
@@ -37,6 +38,8 @@ import { modelsJsonSearchPaths } from "./models-json-paths.js";
 import { emitOrQueue } from "./sync-emit.js";
 import { clearProviderKeyNeededNotice } from "./provider-key-need.js";
 import { providerRowToObject } from "./provider-row.js";
+import { parseStoredKey, providerKeyFp } from "./provider-key-shape.js";
+import { keyringOpen, keyringSeal, PROVIDER_KEY_SEAL_UNAVAILABLE } from "./provider-keyring.js";
 import { inferHost, repairHostDecision } from "./provider-host.js";
 import { isExternalEngine, engineShapeError, externalEngineConflict } from "./provider-engine.js";
 
@@ -73,7 +76,8 @@ function inferProviderType(apiField) {
 /**
  * Seed the providers table from models.json IF the table is currently empty.
  * Idempotent: after first run, edits live in the DB, not in models.json.
- * Returns { seeded: number, skipped_managed: number, source: path|null }.
+ * Returns { seeded: number, skipped_managed: number, skipped_key_unavailable:
+ * number, source: path|null }.
  */
 export async function seedProvidersFromModelsJson(db) {
   const dbClient = db || createDbClient();
@@ -86,11 +90,24 @@ export async function seedProvidersFromModelsJson(db) {
   const instanceId = getOrCreateLocalInstanceId();
   let count = 0;
   let skippedManaged = 0;
+  let skippedKeyUnavailable = 0;
   for (const [id, p] of Object.entries(config.providers)) {
     if (id.startsWith("$")) continue; // JSON-schema meta keys
     // §11.7: M1's own output is never re-imported (a DB restore would turn a
     // native row into a self-pointing door row).
     if (managedIds.has(id)) { skippedManaged++; continue; }
+    // A models.json entry's key is sealed on the way in, exactly like every
+    // other write: this INSERT is raw SQL, so it must ask for the cell itself.
+    // Without a keyring the row is skipped, never written in the clear.
+    let keyCell = null;
+    try {
+      keyCell = keyCellForWrite(id, p.apiKey ?? null, undefined);
+    } catch (err) {
+      if (!isSealUnavailable(err)) throw err;
+      noteSealSkip("providers-seed", id);
+      skippedKeyUnavailable++;
+      continue;
+    }
     await dbClient.execute({
       sql: `INSERT OR IGNORE INTO providers
             (id, base_url, api_key, host, bundle_id, description, models, lamport_ts, instance_id)
@@ -98,7 +115,7 @@ export async function seedProvidersFromModelsJson(db) {
       args: [
         id,
         p.baseUrl || "",
-        p.apiKey || null,
+        keyCell,
         inferHost(p.baseUrl, p.host),
         p.bundleId || null,
         p.$description || p.description || null,
@@ -108,7 +125,7 @@ export async function seedProvidersFromModelsJson(db) {
     });
     count++;
   }
-  return { seeded: count, skipped_managed: skippedManaged, source: path };
+  return { seeded: count, skipped_managed: skippedManaged, skipped_key_unavailable: skippedKeyUnavailable, source: path };
 }
 
 /**
@@ -116,7 +133,13 @@ export async function seedProvidersFromModelsJson(db) {
  * returned, so existing callers (providers.js `healthMatrix`, orchestrator
  * `resolveProvider`) continue to work.
  *
- * Shape: { providers: { <id>: { baseUrl, apiKey, host, bundleId, models[] } }, _source }
+ * Shape: { providers: { <id>: { baseUrl, apiKey, keyPresent, keyFp, keyState, host,
+ * bundleId, models[] } }, _source }
+ *
+ * Each row goes through `providerRowToObject`, the one mapper: `apiKey` is the
+ * OPENED plaintext (a legacy plain cell, or a sealed cell the gateway's keyring
+ * opens), and `keyState` says what this process could read there — an
+ * "unreadable" key is a null apiKey that no request path may mistake for "none".
  *
  * `ownInstanceId` defaults to this gateway's own instance id (Task 7's
  * `localizeNativeRow`); every native row this instance owns (per
@@ -134,19 +157,7 @@ export async function loadProvidersFromDb(db, { ownInstanceId = getOrCreateLocal
 
   const providers = {};
   for (const r of rows) {
-    let models = [];
-    try { models = JSON.parse(r.models || "[]"); } catch {}
-    let gpuPolicy = null;
-    try { gpuPolicy = r.gpu_policy ? JSON.parse(r.gpu_policy) : null; } catch {}
-    providers[r.id] = localizeNativeRow({
-      baseUrl: r.base_url,
-      apiKey: r.api_key,
-      host: r.host,
-      bundleId: r.bundle_id,
-      description: r.description,
-      models,
-      gpuPolicy,
-    }, ownInstanceId);
+    providers[r.id] = localizeNativeRow(providerRowToObject(r), ownInstanceId);
   }
   return { providers, _source: "db:providers" };
 }
@@ -209,6 +220,97 @@ async function emitSync(db, op, row) {
   }
 }
 
+// ─── provider keys at rest (design §1.2) ───────────────────────────────────
+//
+// A `providers.api_key` cell holds one of three shapes (provider-key-shape.js):
+// the `none` sentinel, a legacy PLAINTEXT value, or a `pk1:` envelope sealed
+// with this install's keychain key. This module is the one write door, so the
+// rules live here:
+//
+//   - a write seals a plaintext value through the keyring seam, and REFUSES
+//     (`PROVIDER_KEY_SEAL_UNAVAILABLE`) when no keyring is installed in this
+//     process — nothing is written in the clear, ever, by accident;
+//   - a well-formed envelope passes through unchanged (a writer round-tripping a
+//     parsed row), and the `none` sentinel is kept as it came;
+//   - "the same key" is decided by OPENING the stored cell and comparing
+//     fingerprints in constant time — never by the fingerprint alone, because a
+//     fingerprint that matches a different envelope is still another cell. A cell
+//     that does not open counts as CHANGED (fail closed);
+//   - a row whose key is unchanged keeps its stored cell, so a re-save does not
+//     mint a new envelope (no churn, no new nonce).
+//
+// Nothing here logs or returns a key value or an envelope.
+
+/** The incoming cell for a write: an explicit `storedKey` (a parsed row's own cell) wins over apiKey. */
+function incomingKeyCell(provider) {
+  if (typeof provider?.storedKey === "string" && provider.storedKey !== "") return provider.storedKey;
+  return provider?.apiKey ?? provider?.api_key ?? null;
+}
+
+/**
+ * Is `incomingPlain` the key `storedCell` already holds? Opens the cell (a plain
+ * cell is its own plaintext) and compares the two fingerprints in constant time.
+ * False for the `none` sentinel, a malformed cell, an empty incoming value and a
+ * cell that does not open here (an open failure is "changed", fail closed).
+ */
+/**
+ * Is `incomingPlain` the key `storedCell` already holds? Opens the cell (a plain
+ * cell is its own plaintext) and compares the two fingerprints in constant time.
+ * False for the `none` sentinel, a malformed cell, an empty incoming value and a
+ * cell that does not open here (an open failure is "changed", fail closed).
+ *
+ * Exported because it is the ONE answer to "the same key?" (design §1.1): the
+ * seal's no-op check and the add-provider reuse check both ask it, and a sealed
+ * cell is judged by OPENING it — never by the fingerprint its envelope carries
+ * (round 1, L1). It needs the installed keyring; without one nothing opens, so
+ * every sealed cell counts as changed.
+ *
+ * @param {string} slotId the provider row id (part of the envelope's AAD)
+ * @param {unknown} storedCell the row's `providers.api_key`
+ * @param {unknown} incomingPlain the value the caller is about to save
+ * @returns {boolean}
+ */
+export function sameKeyCell(slotId, storedCell, incomingPlain) {
+  const stored = parseStoredKey(storedCell);
+  if (stored.kind === "none" || stored.kind === "malformed") return false;
+  // An incoming ENVELOPE is a cell being written back as it is (a round-tripped
+  // parsed row): the same cell byte for byte, or a change.
+  if (parseStoredKey(incomingPlain).kind === "envelope") return incomingPlain === storedCell;
+  const incomingFp = providerKeyFp(incomingPlain);
+  if (!incomingFp) return false;
+  const storedPlain = stored.kind === "envelope" ? keyringOpen(slotId, storedCell) : storedCell;
+  if (typeof storedPlain !== "string") return false;
+  const storedFp = providerKeyFp(storedPlain);
+  if (!storedFp) return false;
+  return timingSafeEqual(Buffer.from(storedFp, "utf8"), Buffer.from(incomingFp, "utf8"));
+}
+
+/**
+ * The cell to WRITE for `incoming`, given what the row holds today.
+ * Throws PROVIDER_KEY_SEAL_UNAVAILABLE (and writes nothing) for a plaintext
+ * value in a process with no keyring.
+ */
+function keyCellForWrite(slotId, incoming, existingCell) {
+  const parsed = parseStoredKey(incoming);
+  if (parsed.kind === "none") return incoming ?? null;
+  if (parsed.kind === "envelope") return incoming;
+  if (existingCell !== undefined && sameKeyCell(slotId, existingCell, incoming)) return existingCell;
+  return keyringSeal(slotId, incoming);
+}
+
+const isSealUnavailable = (err) => err?.code === PROVIDER_KEY_SEAL_UNAVAILABLE;
+
+// Per-row skips for a process with no keyring: one fixed line per (where, id) per
+// process, and NEVER the value.
+const _keySealSkipLogged = new Set();
+function noteSealSkip(where, id) {
+  const key = `${where}:${id}`;
+  if (_keySealSkipLogged.has(key)) return;
+  _keySealSkipLogged.add(key);
+  console.warn(`[${where}] ${id} skipped: ${PROVIDER_KEY_SEAL_UNAVAILABLE}: a saved provider key cannot be sealed in this process`);
+}
+export function _resetKeySealSkipLogForTest() { _keySealSkipLogged.clear(); }
+
 /**
  * Canonical deep-equal for parsed-JSON values: recursive, object-key-order
  * insensitive, array-order sensitive. Used by the upsert no-op comparator so
@@ -235,7 +337,9 @@ function canonicalJsonEqual(a, b) {
  *   - base_url/host/bundle_id/description/provider_type: (x ?? null), String
  *     coercion on non-null (libsql may return non-string cell types).
  *   - disabled: both sides → Number(x) ? 1 : 0 (libsql can return BigInt).
- *   - api_key: null ≡ "" (both mean "no key"), otherwise strict.
+ *   - api_key: two `none` cells (null, "", "none") are equal; anything else is
+ *     judged by sameKeyCell — the stored cell opened and compared with the
+ *     incoming plaintext in constant time, never by fingerprint alone.
  *   - models: canonical deep-equal of JSON.parse(dbRow.models) vs the incoming
  *     array. DB-side parse failure → CHANGED (R2-m3 FAIL-OPEN: the good
  *     incoming content overwrites the corruption; fail-closed would make a
@@ -253,8 +357,11 @@ function upsertIsNoop(existing, w) {
   if (s(existing.description) !== s(w.description)) return false;
   if (s(existing.provider_type) !== s(w.providerType)) return false;
   if ((Number(existing.disabled) ? 1 : 0) !== (Number(w.disabled) ? 1 : 0)) return false;
-  const keyNorm = (x) => (x == null ? "" : String(x));
-  if (keyNorm(existing.api_key) !== keyNorm(w.apiKey)) return false;
+  const storedKeyNone = parseStoredKey(existing.api_key).kind === "none";
+  const incomingKeyNone = parseStoredKey(w.apiKey).kind === "none";
+  // null ≡ "" ≡ "none": every spelling of "no key" is the same absence.
+  if (storedKeyNone !== incomingKeyNone) return false;
+  if (!storedKeyNone && !sameKeyCell(w.id, existing.api_key, w.apiKey)) return false;
   let dbModels;
   try { dbModels = JSON.parse(existing.models); } catch { return false; } // fail-open
   if (!canonicalJsonEqual(dbModels, w.models)) return false;
@@ -368,6 +475,13 @@ function assertExternalEngineWrite({ incomingBundleId, incomingPolicyRaw, stored
  * `{ id, lamport_ts: <current>, unchanged: true }` WITHOUT writing, bumping
  * lamport, or emitting to peers — unchanged content must never manufacture
  * sync churn (the 211-conflict restart war).
+ *
+ * The key column is sealed here (see "provider keys at rest" above): a plaintext
+ * value arrives from the operator, the dashboard, models.json or a bundle
+ * manifest, and leaves as an envelope. A process with no keyring REFUSES rather
+ * than writing it in the clear: nothing is written, and the error's `code` is
+ * PROVIDER_KEY_SEAL_UNAVAILABLE so a caller that can run beside the gateway
+ * (the stdio reconcile) degrades instead of crashing.
  */
 export async function upsertProvider(db, provider) {
   if (!provider || !provider.id) throw new Error("provider.id required");
@@ -388,9 +502,12 @@ export async function upsertProvider(db, provider) {
     storedRow: existed ? rows[0] : null,
   });
 
+  const incomingKey = incomingKeyCell(provider);
+
   if (existed && upsertIsNoop(rows[0], {
+    id: provider.id,
     baseUrl: provider.baseUrl || provider.base_url || "",
-    apiKey: provider.apiKey ?? provider.api_key ?? null,
+    apiKey: incomingKey,
     host,
     bundleId: provider.bundleId ?? provider.bundle_id ?? null,
     description: provider.description ?? null,
@@ -404,7 +521,10 @@ export async function upsertProvider(db, provider) {
 
   const newTs = Math.max(Number(currentTs), Number(provider.lamport_ts || 0)) + 1;
 
-  const storedKey = provider.apiKey ?? provider.api_key ?? null;
+  // The write image of the key: none as it came, an envelope unchanged, the
+  // stored cell when the key is the same, otherwise a fresh seal. Throws (and
+  // writes nothing) when this process cannot seal.
+  const storedKey = keyCellForWrite(provider.id, incomingKey, existed ? rows[0].api_key : undefined);
 
   await db.execute({
     sql: `INSERT INTO providers
@@ -629,7 +749,9 @@ export async function reenableProviderPreservingContent(db, id) {
   const all = await listProvidersAll(db);
   const row = all.find((p) => p.id === id);
   if (!row) return null;
-  return upsertProvider(db, { ...row, disabled: false });
+  // `storedKey` is non-enumerable, so a spread loses it: name it, or a row whose
+  // key this process cannot open would be written back with no key at all.
+  return upsertProvider(db, { ...row, storedKey: row.storedKey, disabled: false });
 }
 
 /**
@@ -649,9 +771,10 @@ export async function repairProviderHosts(db, {
     // Per-row isolation (external-engine review round 2): only an
     // EXTERNAL_ENGINE_* refusal is swallowed; anything else still throws.
     try {
-      await upsertProvider(db, { ...row, host: next });
+      await upsertProvider(db, { ...row, storedKey: row.storedKey, host: next });
       changes.push({ id: row.id, from: row.host, to: next });
     } catch (err) {
+      if (isSealUnavailable(err)) { noteSealSkip("providers-repair", row.id); continue; }
       if (!isEngineWriteError(err)) throw err;
       noteEngineSkip("providers-repair", row.id, err);
     }
@@ -710,18 +833,21 @@ export async function repairProviderHosts(db, {
  * @returns {Promise<{ upserted: number, unchanged: number, skipped_disabled: number,
  *                     skipped_unowned: number, skipped_native: number, skipped_managed: number,
  *                     reenabled: number, repaired: number,
+ *                     skipped_key_unavailable: number,
  *                     failed: number, source: string|null }>}
  *   `upserted` counts actual writes; `unchanged` counts owned entries whose
  *   content already converged (D2 no-op suppression); `failed` counts entries
  *   refused by external-engine write validation (EXTERNAL_ENGINE_*), each
- *   logged once per row id per process (see noteEngineSkip).
+ *   logged once per row id per process (see noteEngineSkip);
+ *   `skipped_key_unavailable` counts entries this process could not seal (no
+ *   keyring here), each logged once and never written in the clear.
  */
 export async function syncProvidersFromModelsJson(db, { force = false, manual = false, ownAddrs } = {}) {
   if (manual && force) throw new Error("syncProvidersFromModelsJson: manual and force cannot be combined");
   const dbClient = db || createDbClient();
   const addrs = ownAddrs || getOwnAddresses(); // fresh every run — see doc comment
   const { path, config, managedIds } = readModelsJson();
-  const counters = { upserted: 0, unchanged: 0, skipped_disabled: 0, skipped_unowned: 0, skipped_native: 0, skipped_managed: 0, skipped_absent: 0, reenabled: 0, repaired: 0, failed: 0 };
+  const counters = { upserted: 0, unchanged: 0, skipped_disabled: 0, skipped_unowned: 0, skipped_native: 0, skipped_managed: 0, skipped_absent: 0, reenabled: 0, repaired: 0, skipped_key_unavailable: 0, failed: 0 };
   const entries = config?.providers
     ? Object.entries(config.providers).filter(([id]) => !id.startsWith("$"))
     : [];
@@ -787,6 +913,13 @@ export async function syncProvidersFromModelsJson(db, { force = false, manual = 
       if (res.unchanged) counters.unchanged++;
       else counters.upserted++;
     } catch (err) {
+      // A process without the keyring (a stdio server, a CLI) cannot seal a
+      // models.json key: the row is skipped, never written in the clear.
+      if (isSealUnavailable(err)) {
+        counters.skipped_key_unavailable++;
+        noteSealSkip("providers-reconcile", id);
+        continue;
+      }
       if (!isEngineWriteError(err)) throw err; // DB/emit failures surface exactly as before
       counters.failed++;
       noteEngineSkip("providers-reconcile", id, err);

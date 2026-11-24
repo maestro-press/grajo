@@ -31,6 +31,10 @@ import {
 } from "../servers/gateway/models/manager.js";
 import { loadState, saveState } from "../servers/gateway/models/state.js";
 import { upsertProvider, setProviderSyncManager } from "../servers/shared/providers-db.js";
+// A provider row's saved key is sealed at rest (design §1.2): this process runs
+// with a keyring, as the gateway does.
+import { installTestKeyring } from "./fixtures/provider-keys.mjs";
+installTestKeyring();
 
 // ---------------------------------------------------------------------------
 // Harness

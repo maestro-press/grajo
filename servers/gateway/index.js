@@ -357,6 +357,76 @@ try {
 // Initialize OAuth tables
 await initOAuthTables();
 
+// Provider-key box (design §1.2): install the gateway's keyring into the shared
+// seam BEFORE anything reads a `providers` row. Every reader that turns a row into
+// a request target goes through providerRowToObject (provider-row.js) and asks
+// this seam to open a sealed `api_key`; every writer asks it to seal one. Doing it
+// here — before the seed/reconcile, the settings mounts and any route — means no
+// code path can mistime it and read a sealed cell as "no key". A missing or
+// invalid key file installs a REFUSING keyring (reads null, seals throw), so the
+// failure is closed, never a plaintext write. Never throws.
+//
+// A FRESH INSTALL has no keychain key yet, and the keyring alone would never make
+// one — every save would refuse forever (review round 1, H2). So BEFORE installing
+// it, mint this instance's first key by the §3.2 rule (nothing to orphan: no
+// `crow_keychain` row and no `pk1:` envelope anywhere). Anything else leaves the
+// key missing on purpose: the refusing keyring and the warning below stay, and the
+// seal pass or migration 0040 raises `keychain-key-missing` with the shared
+// refusal sentence when they meet what is already sealed.
+try {
+  const { mintProviderKeyAtBoot } = await import("./keychain/boot-key.js");
+  const mintDb = createDbClient();
+  try {
+    const r = await mintProviderKeyAtBoot({ db: mintDb, crowHome: process.env.CROW_HOME || undefined });
+    if (r.action === "minted") console.log("[provider-keys] minted this instance's first keychain key");
+  } finally {
+    try { mintDb.close(); } catch { /* already closed */ }
+  }
+} catch (err) {
+  console.warn("[provider-keys] first-key check skipped:", err?.message);
+}
+
+try {
+  const { installGatewayProviderKeyring } = await import("./keychain/provider-key-box.js");
+  const installed = installGatewayProviderKeyring({ crowHome: process.env.CROW_HOME || undefined });
+  if (!installed) {
+    console.warn("[provider-keys] no usable keychain key: sealed provider keys cannot be read and no key can be saved until it is restored");
+  }
+  // The masking set's provider keys (review round 1, L2): servers/shared/
+  // secret-values-collect.js is bot-reachable and never imports the box, so this
+  // HOST process installs the collector that opens the sealed cells for it.
+  const { installProviderKeyValuesSource } = await import("./keychain/provider-key-values.js");
+  installProviderKeyValuesSource();
+} catch (err) {
+  console.error("[provider-keys] keyring install failed:", err.message);
+}
+
+// The ONE seal pass that may REBUILD crow.db (design §3.5, round 2): plaintext
+// bytes an earlier write left in a freed page are cleared with
+// `secure_delete = ON; VACUUM` plus a truncated WAL checkpoint, which rewrites the
+// whole file — so it runs here, after the keyring exists and BEFORE the HTTP
+// listeners open, and nowhere else. Migration 0040 (its post-settle child
+// included), the post-listen boot pass and the hourly tick pass
+// `allowVacuum: false`: they seal, but when they find residue they only leave the
+// residue marker (<CROW_HOME>/secrets/provider-keys-state.json) for this pass to
+// finish on the next boot. It also seals any plaintext cell an older binary or a
+// script left since the migration ran, so nothing is in the clear once a request
+// can arrive. Own handle, verified pre-seal copy, never throws.
+try {
+  const { sealPlaintextKeys } = await import("./keychain/provider-keys-sweep.js");
+  const { resolveCrowHome, resolveInstanceDataDir } = await import("../shared/crow-home.js");
+  const { join } = await import("node:path");
+  const crowHome = resolveCrowHome();
+  // The same file `createDbClient()` opens, resolved the same way
+  // (crow-home.js), which is also what the pass judges the home against.
+  const dbPath = process.env.CROW_DB_PATH
+    || join(resolveInstanceDataDir({ ...process.env, CROW_HOME: crowHome }), "crow.db");
+  const r = await sealPlaintextKeys(dbPath, { crowHome, allowVacuum: true, log: (line) => console.log(line) });
+  if (r.deferred) console.warn(`[provider-keys] seal pass deferred: ${r.reason}`);
+} catch (err) {
+  console.warn("[provider-keys] seal pass skipped:", err?.message || err);
+}
+
 // Keyed token verifiers (§8 PR 2 of the keyed-token-hashes design): create or load the
 // HMAC key, convert every existing oauth_tokens row of the three families
 // (oauth:access / oauth:refresh / dashboard:session) to its `h1.` form, and alarm on any

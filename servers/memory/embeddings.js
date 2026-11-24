@@ -12,6 +12,8 @@
 import { loadProviders } from "../shared/providers.js";
 import { createDbClient } from "../db.js";
 import { localizeDbBaseUrl } from "../shared/native-locality.js";
+import { providerRowToObject } from "../shared/provider-row.js";
+import { PROVIDER_KEY_NOT_IN_PROCESS, PROVIDER_KEY_UNREADABLE } from "../shared/provider-keyring.js";
 import { getOrCreateLocalInstanceId } from "../gateway/instance-registry.js";
 import { resolveProviderForTask, EMBED_TASKS } from "../shared/provider-task.js";
 import { guardedFetch } from "../gateway/ai/adapter-guard.js";
@@ -51,7 +53,30 @@ async function resolveEmbedConfig(providerName) {
   const embedModel = models.find((m) => m && EMBED_TASK_SET.has(m.task)) || models[0];
   const model = embedModel?.id || "default";
   const dim = embedModel?.dim || null;
-  return { baseUrl: p.baseUrl, apiKey: p.apiKey, model, dim, name: providerName };
+  return { baseUrl: p.baseUrl, apiKey: p.apiKey, keyPresent: !!p.keyPresent, keyState: p.keyState, model, dim, name: providerName };
+}
+
+/**
+ * Stop a sender in a process with NO keyring before it makes a request for a row
+ * whose key is stored but cannot be produced here (design §1.2, §5). Never the
+ * value, never a keyless request: the caller degrades on the thrown code.
+ *
+ * @param {{apiKey?: string|null, keyPresent?: boolean, keyState?: string}} cfg
+ */
+export function assertProviderKeyInProcess(cfg) {
+  if (!cfg) return;
+  if (cfg.keyState === "unreadable") {
+    const err = new Error(PROVIDER_KEY_UNREADABLE);
+    err.code = PROVIDER_KEY_UNREADABLE;
+    throw err;
+  }
+  const hasPlain = typeof cfg.apiKey === "string" && cfg.apiKey !== "" && cfg.apiKey !== "none";
+  if (hasPlain) return;
+  if (cfg.keyPresent || cfg.keyState === "sealed") {
+    const err = new Error(PROVIDER_KEY_NOT_IN_PROCESS);
+    err.code = PROVIDER_KEY_NOT_IN_PROCESS;
+    throw err;
+  }
 }
 
 /** Cold-cache providers-table read for one embedding provider.
@@ -66,18 +91,19 @@ export async function loadProviderFromDb(id, { ownInstanceIdFn = getOrCreateLoca
     const db = createDbClient();
     try {
       const { rows } = await db.execute({
-        sql: "SELECT base_url, api_key, models, gpu_policy FROM providers WHERE id = ? AND (disabled IS NULL OR disabled = 0) LIMIT 1",
+        sql: "SELECT * FROM providers WHERE id = ? AND (disabled IS NULL OR disabled = 0) LIMIT 1",
         args: [id],
       });
       if (!rows.length) return null;
-      let models = [];
-      try { models = JSON.parse(rows[0].models || "[]"); } catch {}
-      let gpuPolicy = null;
-      try { gpuPolicy = rows[0].gpu_policy ? JSON.parse(rows[0].gpu_policy) : null; } catch {}
+      // The one mapper: apiKey is the OPENED plaintext (null here — this process
+      // has no keyring), keyState says what the cell holds.
+      const row = providerRowToObject(rows[0]);
       return {
-        baseUrl: localizeDbBaseUrl(rows[0].base_url, gpuPolicy, ownInstanceIdFn),
-        apiKey: rows[0].api_key,
-        models,
+        baseUrl: localizeDbBaseUrl(rows[0].base_url, row.gpuPolicy, ownInstanceIdFn),
+        apiKey: row.apiKey,
+        keyPresent: row.keyPresent,
+        keyState: row.keyState,
+        models: row.models,
       };
     } finally {
       db.close?.();
@@ -104,6 +130,8 @@ export async function loadProviderFromDb(id, { ownInstanceIdFn = getOrCreateLoca
  */
 export async function embedText(text, { providerName, guard } = {}) {
   const cfg = await resolveEmbedConfig(providerName || (await resolveDefaultProvider()));
+  // A stored key this process cannot produce stops HERE (no request at all).
+  assertProviderKeyInProcess(cfg);
   const isArray = Array.isArray(text);
   const input = isArray ? text : [text];
 

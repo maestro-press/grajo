@@ -21,6 +21,8 @@ import { isExternalEngine } from "../../shared/provider-engine.js";
 import { classifyIp } from "../../shared/ip-classify.js";
 import { forwardedAddrs } from "../../shared/peer-class.js";
 import { isAddonRelayAddr } from "../../shared/bot-doors.js";
+import { providerKeyState } from "../../shared/provider-row.js";
+import { PROVIDER_KEY_UNREADABLE } from "../../shared/provider-keyring.js";
 
 export const DOOR_PROVIDER_HEADER = "x-crow-provider";
 export const DOOR_HOP_HEADER = "x-crow-door-hop";
@@ -97,6 +99,11 @@ function modelIdsOf(p) {
 function forward(providers, providerId, modelId, hop) {
   const p = providers[providerId];
   if (!p) return { kind: "error", status: 404, code: "UNKNOWN_PROVIDER", message: `no enabled provider "${providerId}"` };
+  // A saved key this process cannot read: the door never sends the request
+  // unauthenticated and never forwards the stored cell. 503, zero upstream work.
+  if (providerKeyState(p) === "unreadable") {
+    return { kind: "error", status: 503, code: PROVIDER_KEY_UNREADABLE, message: PROVIDER_KEY_UNREADABLE, providerId };
+  }
   const doorKind = doorKindOf(p);
   if (doorKind === "unmanaged") {
     return { kind: "error", status: 400, code: "NOT_FORWARDABLE", message: `provider "${providerId}" is not a Crow-managed local model (native, external engine or bundle) and has no door_forward opt-in` };
@@ -122,7 +129,7 @@ function forward(providers, providerId, modelId, hop) {
   if ((isDoorUrl(url) && Number(hop) >= 1) || Number(hop) >= 2) {
     return { kind: "error", status: 508, code: "DOOR_LOOP", message: `refusing a second door hop to ${providerId}` };
   }
-  return { kind: "forward", providerId, modelId: mid, url, apiKey: p.apiKey || "none", doorKind };
+  return { kind: "forward", providerId, modelId: mid, url, apiKey: p.apiKey || "none", keyState: providerKeyState(p), doorKind };
 }
 
 export function resolveDoorTarget({ providers = {}, providerHeader = null, model = null, companionModelIds = [], hop = 0 } = {}) {

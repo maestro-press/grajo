@@ -17,6 +17,8 @@ import { readEnvFile, resolveEnvPath } from "../env-manager.js";
 import { resolveProviderConfig } from "./resolve-profile.js";
 import { guardedFetch } from "./adapter-guard.js";
 import { timeoutSignal, AI_TIMEOUT_MS } from "../../shared/http-timeout.js";
+import { providerKeyUnreadable } from "../../shared/provider-row.js";
+import { PROVIDER_KEY_UNREADABLE } from "../../shared/provider-keyring.js";
 
 // Lazy-loaded adapter modules
 const ADAPTER_LOADERS = {
@@ -188,6 +190,13 @@ export async function getAiProfiles(db, { includeKeys = false } = {}) {
  * truthy sentinel — do NOT strip to "" or null. Local vLLM/llama.cpp
  * endpoints ignore the Bearer value but still need a non-empty string.
  * See commits 85611fc / 8c56bef for the bug this fixed.
+ *
+ * The OTHER direction is a refusal (design §1.2, review round 1 M1): a row whose
+ * saved key this process cannot read is never "none". `providerKeyUnreadable`
+ * answers that for an unreadable cell AND for a row that HOLDS a key with no
+ * plaintext to send (a sealed cell in a process with no keyring, an envelope
+ * under another key) — both throw PROVIDER_KEY_UNREADABLE here, before an
+ * adapter exists, so zero upstream requests can leave unauthenticated.
  */
 export async function createAdapterFromProfile(profile, model, db = null) {
   let providerLabel = profile.provider;
@@ -197,6 +206,12 @@ export async function createAdapterFromProfile(profile, model, db = null) {
 
   if (profile.provider_id && db) {
     const cfg = await resolveProviderConfig(db, profile.provider_id, resolvedModel || null);
+    if (providerKeyUnreadable(cfg)) {
+      throw Object.assign(new Error(PROVIDER_KEY_UNREADABLE), {
+        code: PROVIDER_KEY_UNREADABLE,
+        provider: profile.provider_id,
+      });
+    }
     providerLabel = cfg.provider_type || providerLabel || "openai";
     // "none" is the bundle-registered sentinel for local OpenAI-compatible
     // endpoints (vLLM / llama.cpp) that ignore the Bearer token. Pass it

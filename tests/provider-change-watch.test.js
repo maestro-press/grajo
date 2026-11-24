@@ -20,6 +20,10 @@ import { join } from "node:path";
 
 import { createDbClient } from "../servers/db.js";
 import { providersFingerprint, upsertProvider } from "../servers/shared/providers-db.js";
+// Saving a provider key seals it (design §1.2): this process runs with a keyring,
+// as the gateway does.
+import { installTestKeyring } from "./fixtures/provider-keys.mjs";
+installTestKeyring();
 import { createProviderChangeWatch } from "../servers/shared/provider-change-watch.js";
 import { syncPiModelsJson } from "../servers/shared/pi-models-sync.js";
 

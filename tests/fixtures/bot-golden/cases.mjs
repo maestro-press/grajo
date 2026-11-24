@@ -39,7 +39,6 @@
  * code itself does. (contain-plans.json was re-recorded once, for the
  * masked-folder fix — see tests/bot-path-golden.test.js's header.)
  */
-import { createHmac } from "node:crypto";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { connect, createServer as createNetServer } from "node:net";
@@ -49,7 +48,7 @@ import { dirname, join } from "node:path";
 import { buildContainPlan, ContainRefused } from "../../../scripts/pi-bots/pi_contain.mjs";
 import { buildContainedAgentDir } from "../../../scripts/pi-bots/pi_contain_agent.mjs";
 import { startEgressRelay } from "../../../scripts/pi-bots/pi_egress.mjs";
-import { normalizeBaseUrl } from "../../../servers/shared/provider-presets.js";
+import { consentEntryFor } from "../../../servers/shared/cloud-consent.js";
 
 // ---- normalisation -------------------------------------------------------
 
@@ -358,14 +357,10 @@ export function buildContainCases() {
         provider_type: "openai-compat", models: [{ id: "l1" }], gpuPolicy: null, disabled: false },
     ];
     const cloudRow = rows.find((r) => r.id === "Cloud Max");
-    const consent = {
-      [cloudRow.id]: {
-        target: normalizeBaseUrl(cloudRow.baseUrl),
-        keyFp: createHmac("sha256", Buffer.from(SALT, "hex")).update(CLOUD_KEY.trim()).digest("hex").slice(0, 16),
-        at: "2026-11-02T00:00:00Z",
-        by: "operator",
-      },
-    };
+    // The entry the product's own grant records: consentEntryFor is what
+    // grantCloudConsent stores, so the fixture can never compute a stale
+    // fingerprint form of its own.
+    const consent = { [cloudRow.id]: consentEntryFor(cloudRow, SALT, "operator") };
     const NEEDED = ["local-chat", "native-owned", "external-engine", "Cloud Max", "crow-c-Cloud Max"];
 
     // The agent test builds its generated dir (buildContainedAgentDir) first and

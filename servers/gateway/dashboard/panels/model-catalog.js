@@ -270,7 +270,7 @@ export async function loadPanelData({
   if (db) {
     try {
       const providers = await listProvidersAllFn(db);
-      hfTokenConfigured = providers.some((p) => p.id === HF_TOKEN_PROVIDER_ID && !!p.apiKey);
+      hfTokenConfigured = providers.some((p) => p.id === HF_TOKEN_PROVIDER_ID && !!p.keyPresent);
     } catch {
       hfTokenConfigured = false; // best-effort; the client-side GET /api/models/hf-token is authoritative
     }

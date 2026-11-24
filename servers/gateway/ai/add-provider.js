@@ -10,9 +10,10 @@
 import { createHash } from "node:crypto";
 import { presetById, normalizeBaseUrl, ANTHROPIC_VERSION } from "../../shared/provider-presets.js";
 import { recommendedFor, candidatePick, presetForRow, entryKind, bareModelId, RECOMMENDATION_ROLES } from "../../shared/provider-recommendations.js";
-import { upsertProvider, listProvidersAll } from "../../shared/providers-db.js";
+import { upsertProvider, listProvidersAll, sameKeyCell } from "../../shared/providers-db.js";
 import { invalidateProvidersCache } from "../../shared/providers.js";
 import { isDoorUrl } from "../models/door-resolve.js";
+import { parseStoredKey } from "../../shared/provider-key-shape.js";
 import { safeRequest, readJson, preflightRefused } from "../models/safe-upstream.js";
 // Read-only check storage: this module never runs a pick check itself.
 import { readPickChecks, checkIn, checkKindFor } from "../../shared/pick-checks.js";
@@ -246,8 +247,15 @@ export function providerIdFor(presetId, { rows = [], baseUrl, apiKey } = {}) {
     if (id.toLowerCase().startsWith(DOOR_ID_PREFIX)) continue;
     const row = byId.get(id);
     if (!row) return { id, reuse: false };
-    const rowKey = row.apiKey ?? row.api_key ?? null;
-    if (normalizeBaseUrl(row.baseUrl ?? row.base_url) === wantUrl && (rowKey || "") === wantKey) return { id, reuse: true };
+    // "The same key" is asked of the ONE door that can answer it (sameKeyCell):
+    // it OPENS a sealed cell through the keyring and compares the two
+    // fingerprints in constant time. The fingerprint an envelope carries is NOT
+    // the answer on its own — a fp that matches a different cell is still
+    // another key (review round 1, L1).
+    const rowStored = row.storedKey ?? row.api_key ?? row.apiKey ?? null;
+    const rowKeyless = parseStoredKey(rowStored).kind === "none";
+    const sameKey = rowKeyless ? wantKey === "" : sameKeyCell(id, rowStored, wantKey);
+    if (normalizeBaseUrl(row.baseUrl ?? row.base_url) === wantUrl && sameKey) return { id, reuse: true };
   }
   throw new Error("no free provider id");
 }

@@ -14,6 +14,8 @@ import { readFileSync, existsSync, statSync } from "fs";
 import { createDbClient } from "../db.js";
 import { repoModelsJsonSearchPaths } from "./models-json-paths.js";
 import { guardedFetch } from "../gateway/ai/adapter-guard.js";
+import { parseStoredKey } from "./provider-key-shape.js";
+import { PROVIDER_KEY_UNREADABLE } from "./provider-keyring.js";
 
 // -----------------------------------------------------------------------
 // Cache layer — providers are read many times per orchestration; cache DB
@@ -142,6 +144,14 @@ export async function probeProvider(name, cfg, { timeoutMs = 3000, guard } = {})
 
   if (!cfg.baseUrl) {
     return { ...out, ok: false, error: "no baseUrl" };
+  }
+  // A key this process cannot read: no probe request at all (and never the
+  // stored cell as a credential).
+  if (cfg.keyState === "unreadable") {
+    return { ...out, ok: false, error: PROVIDER_KEY_UNREADABLE };
+  }
+  if (parseStoredKey(cfg.apiKey).kind === "envelope") {
+    return { ...out, ok: false, error: PROVIDER_KEY_UNREADABLE };
   }
 
   // Construct /v1/models URL from the provider's baseUrl

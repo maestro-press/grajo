@@ -7,6 +7,7 @@ import { t, tJs } from "../../../shared/i18n.js";
 import { upsertSetting } from "../../registry.js";
 import { renderScopeToggle, scopeToggleScript } from "../../../shared/scope-toggle.js";
 import { listProvidersAll } from "../../../../../shared/providers-db.js";
+import { providerRowToObject } from "../../../../../shared/provider-row.js";
 import { DEFAULT_ROUTES } from "../../../../ai/smart-router.js";
 
 // Canonical route ids the Smart Chat router dispatches to. Keep in sync
@@ -58,6 +59,9 @@ export default {
         if (!p?.provider_id) return p;
         const reg = byId.get(p.provider_id);
         if (!reg) return p;
+        // The row's key through the one mapper: the panel shows a MASK of the
+        // last four characters, so it must never be handed the stored cell.
+        const regKey = providerRowToObject(reg);
         let regModels = [];
         try {
           const parsed = JSON.parse(reg.models || "[]");
@@ -67,7 +71,7 @@ export default {
           ...p,
           provider: p.provider || reg.provider_type || null,
           baseUrl: p.baseUrl || reg.base_url || "",
-          apiKey: p.apiKey || reg.api_key || "",
+          apiKey: p.apiKey || (regKey.keyPresent ? (regKey.apiKey ?? "") : ""),
           models: (Array.isArray(p.models) && p.models.length) ? p.models : regModels,
         };
       });

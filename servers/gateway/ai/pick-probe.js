@@ -12,6 +12,7 @@ import { presetById, normalizeBaseUrl, ANTHROPIC_VERSION } from "../../shared/pr
 import { candidatePick, presetForRow, entryKind, RECOMMENDATION_ROLES } from "../../shared/provider-recommendations.js";
 import { listProvidersAll } from "../../shared/providers-db.js";
 import { safeRequest, readJson } from "../models/safe-upstream.js";
+import { PROVIDER_KEY_UNREADABLE } from "../../shared/provider-keyring.js";
 import { PICK_CHECKS_KEY, readPickChecks, pickCheckOf, isProbeKind, checkStamp } from "../../shared/pick-checks.js";
 
 // The read side lives in pick-checks.js (no request path); re-exported here for existing callers.
@@ -25,7 +26,7 @@ const discard = (res) => { try { res?.stream?.destroy?.(); } catch {} };
 function requestFor(row, modelId, kind) {
   const preset = presetForRow(row) ? presetById(presetForRow(row)) : null;
   const base = normalizeBaseUrl(row.baseUrl || row.base_url);
-  const key = typeof (row.apiKey ?? row.api_key) === "string" ? (row.apiKey ?? row.api_key).trim() : "";
+  const key = typeof row.apiKey === "string" ? row.apiKey.trim() : "";
   const anthropic = preset?.authStyle === "anthropic";
   const headers = { "content-type": "application/json" };
   if (anthropic) { if (key) headers["x-api-key"] = key; headers["anthropic-version"] = ANTHROPIC_VERSION; }
@@ -71,6 +72,8 @@ function judge(json, kind, anthropic) {
 
 /** One probe. Resolves `{ok, code}`; never throws, never carries the key. */
 export async function probePick(row, modelId, { kind = "chat", requestFn = safeRequest, timeoutMs = 20000 } = {}) {
+  // A key this process cannot read is not a failed model: no request at all.
+  if (row?.keyState === "unreadable") return { ok: false, code: PROVIDER_KEY_UNREADABLE };
   let req;
   try { req = requestFor(row || {}, modelId, kind); } catch { return { ok: false, code: "unreachable" }; }
   let res;
@@ -78,7 +81,7 @@ export async function probePick(row, modelId, { kind = "chat", requestFn = safeR
     res = await requestFn(req.url, { method: "POST", headers: req.headers, body: req.body, mode: req.mode, timeoutMs });
   } catch (err) {
     if (err?.code === "TIMEOUT") return { ok: false, code: "timeout" };
-    console.warn(`[pick-probe] request failed: ${typeof err?.code === "string" && err.code.length <= 40 && !err.code.includes(row?.apiKey || row?.api_key || "\u0000") ? err.code : "error"}`);
+    console.warn(`[pick-probe] request failed: ${typeof err?.code === "string" && err.code.length <= 40 && !err.code.includes(row?.apiKey || "\u0000") ? err.code : "error"}`);
     return { ok: false, code: "unreachable" };
   }
   const status = Number(res?.status);

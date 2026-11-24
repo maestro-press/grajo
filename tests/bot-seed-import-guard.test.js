@@ -18,6 +18,14 @@
  *                                    stored credential's verifier is computed with. A bot that
  *                                    read it could forge the very rows the keyed hashes exist
  *                                    to protect, so it is host-only like the two above.
+ *   servers/gateway/keychain/key.js — <CROW_HOME>/secrets/keychain.key: the keychain's OWN key
+ *                                    (never the instance seed). It seals saved provider API keys
+ *                                    and add-on secrets, so a bot that read it could open both.
+ *   servers/gateway/keychain/provider-key-box.js — the provider-key box sealed under that key:
+ *                                    the envelope, its AAD and its fingerprint. A bot that could
+ *                                    import it could derive over the key; provider keys reach a
+ *                                    bot only through servers/shared/provider-keyring.js, whose
+ *                                    implementation the GATEWAY installs.
  *
  * "Bot-reachable" is DERIVED, not hard-coded:
  *   - every stdio server the bot catalog can emit (CORE_SERVERS + CONDITIONAL_SERVERS): the
@@ -75,6 +83,10 @@ const GUARDED_MODULES = [
   "servers/sharing/identity.js",
   "servers/sharing/secret-box.js",
   "servers/shared/token-mac.js",
+  // The keychain's OWN key, and the provider-key box sealed under it: a bot that
+  // read either could open every saved provider key and every add-on secret.
+  "servers/gateway/keychain/key.js",
+  "servers/gateway/keychain/provider-key-box.js",
 ].map((p) => resolve(ROOT, p));
 
 /** Where those modules live: not a ROOT of the walk, see the header. */
@@ -99,7 +111,10 @@ export const ALLOWED_HOST_SIDE = Object.freeze({
     "the bot ENGINE — the host process that spawns pi; a bot never loads it. Its one seed import " +
     "is identity.js's identityDataDir, used only as the ANCHOR of the directory whose " +
     "identity.json the child's sandbox must mask (it is handed to identityCandidates()); the " +
-    "path is passed on and the seed itself is never read, opened or derived from.",
+    "path is passed on and the seed itself is never read, opened or derived from. It also " +
+    "installs the provider-key DISPLAY source (servers/gateway/keychain/provider-key-values.js) " +
+    "into servers/shared/secret-values-collect.js's seam, so the masking set can include the " +
+    "saved provider keys — the values are masked, never handed to a bot.",
   "scripts/pi-bots/identity-candidates.mjs":
     "the ONE list of identity-named files a spawn must mask. Its identity.js import sits inside " +
     "identityAnchors(), the host-side anchor resolver called by the bridge's spawn path and by " +
@@ -139,6 +154,31 @@ export const ALLOWED_HOST_SIDE = Object.freeze({
     "secret-box is only its AES-GCM helper and this module never reads identity.json. " +
     "Bot-reachable code reaches it through servers/shared/addon-secrets.js's sync reader, " +
     "which reads an add-on's own listed env keys — the intended door.",
+  "servers/shared/addon-secrets.js":
+    "the add-on keychain seam — a REVIEWED door between bot-reachable code and " +
+    "servers/gateway/keychain/key.js (now on the guarded list). It reasons only about an " +
+    "add-on's own env NAMES: the sync reader opens exactly the names that add-on's spawn was " +
+    "given, and the sealer needs the same key to seal a save. It never reads the instance " +
+    "seed, never lists another add-on's keys, and never touches provider keys: those have TWO " +
+    "reviewed doors of their own, and neither is this one — the read/write seam " +
+    "servers/shared/provider-keyring.js (whose cryptographic half, " +
+    "servers/gateway/keychain/provider-key-box.js, is host side and refused here), and the " +
+    "HOST-ONLY display collector servers/gateway/keychain/provider-key-values.js, which the bot " +
+    "engine installs into the masking set and no bot-reachable file imports.",
+  "servers/gateway/addon-keys-paths.js":
+    "the REVIEWED path pair, not host-side: it resolves {dbPath, keyPath} for the gateway's own " +
+    "add-on seal and for a bundled add-on's install-time reader (bundles/campaigns/server/key.js " +
+    "reaches it through the app root). It returns two PATHS and never opens either; the key " +
+    "module it imports is the same one servers/shared/addon-secrets.js is allowed to reach, and " +
+    "a bot that holds the path still cannot read <CROW_HOME>/secrets in the walled tiers.",
+  "servers/shared/secret-values-collect.js":
+    "the DISPLAY set's collector, not host-side: it collects the secret values the surface " +
+    "masks (so a saved key never appears in a card, a panel or an audit line). It reaches " +
+    "keychain/key.js only to OPEN a keychain row for that masking set; the opened values are " +
+    "masked and never returned to a caller as usable credentials. It does NOT import the " +
+    "provider-key box (round 1, L2): the host processes that can open a sealed provider key " +
+    "(this engine, and the gateway at boot) install that part through " +
+    "servers/gateway/keychain/provider-key-values.js and its seam (setProviderKeyValuesSource).",
   "servers/gateway/routes/bundles.js":
     "the gateway's add-on routes: its identity read is inside injectSharedStorage, an async " +
     "bundle-INSTALL path that only the gateway runs. A bot child loads this module only " +
@@ -444,6 +484,26 @@ test("no bot-reachable file uses a non-literal import specifier (a reviewed list
     "Use a literal specifier, or add the file to ALLOWED_DYNAMIC_IMPORT with the reason its target " +
     "can only be a known set. Offenders: " + offenders.join(", "),
   );
+});
+
+test("the keychain key and the provider-key box are guarded too, and only a reviewed door reaches them", () => {
+  const keyModule = resolve(ROOT, "servers", "gateway", "keychain", "key.js");
+  const box = resolve(ROOT, "servers", "gateway", "keychain", "provider-key-box.js");
+  assert.ok(GUARDED_MODULES.includes(keyModule), "the keychain's own key belongs in the guarded set");
+  assert.ok(GUARDED_MODULES.includes(box), "the provider-key box seals under that key");
+  // Both specifier shapes a bot-reachable file could use.
+  assert.equal(namesSeedModule("../gateway/keychain/key.js", resolve(ROOT, "servers/shared/x.js"), { root: ROOT }), true);
+  assert.equal(namesSeedModule("servers/gateway/keychain/provider-key-box.js", resolve(ROOT, "scripts/pi-bots/x.mjs"), { root: ROOT }), true);
+  const files = botReachableFiles().map((f) => relative(ROOT, f).split(sep).join("/"));
+  assert.equal(files.includes("servers/gateway/keychain/key.js"), false, "the key module is host-only");
+  assert.equal(files.includes("servers/gateway/keychain/provider-key-box.js"), false, "the box is host-only");
+  // The seam a bot IS allowed to call carries no imports and no key material.
+  const seam = readFileSync(resolve(ROOT, "servers/shared/provider-keyring.js"), "utf8");
+  assert.equal(/^\s*import\s/m.test(seam), false, "servers/shared/provider-keyring.js imports nothing");
+  // A bot-reachable chain may reach the keychain key only through the reviewed doors.
+  const { violations } = walkSeedImports(botReachableFiles());
+  assert.equal(violations.some((v) => v.spec.includes("keychain/key")), false,
+    "no bot-reachable chain imports the keychain key module");
 });
 
 test("the token-mac key module is guarded like the seed, and no bot entry reaches it", () => {

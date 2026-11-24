@@ -8,7 +8,7 @@
 
 import { loadProviders } from "../shared/providers.js";
 import { resolveProviderForTask, RERANK_TASKS } from "../shared/provider-task.js";
-import { loadProviderFromDb } from "./embeddings.js";
+import { loadProviderFromDb, assertProviderKeyInProcess } from "./embeddings.js";
 import { guardedFetch } from "../gateway/ai/adapter-guard.js";
 
 const RERANK_TIMEOUT_MS = 10_000;
@@ -28,7 +28,7 @@ async function resolveRerankConfig(providerName) {
   const models = Array.isArray(p.models) ? p.models : [];
   const rerankModel = models.find((m) => m && RERANK_TASK_SET.has(m.task)) || models[0];
   const model = rerankModel?.id || "default";
-  return { baseUrl: p.baseUrl, apiKey: p.apiKey, model, name: providerName };
+  return { baseUrl: p.baseUrl, apiKey: p.apiKey, keyPresent: !!p.keyPresent, keyState: p.keyState, model, name: providerName };
 }
 
 /**
@@ -56,6 +56,13 @@ export async function rerank(query, candidates, { topK = 10, providerName, guard
     cfg = await resolveRerankConfig(providerName);
   } catch {
     return candidates.slice(0, topK); // no provider, fallback
+  }
+  // A stored key this process cannot produce: no request at all. Same degrade as
+  // "no provider" (identity order), so search keeps working.
+  try {
+    assertProviderKeyInProcess(cfg);
+  } catch {
+    return candidates.slice(0, topK);
   }
 
   const body = JSON.stringify({

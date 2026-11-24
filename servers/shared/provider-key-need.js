@@ -33,6 +33,8 @@ import { isIP } from "node:net";
 import { hostnameOf } from "./provider-host.js";
 import { isLocalNetworkIp } from "./ip-classify.js";
 import { presetHostFor } from "./provider-recommendations.js";
+import { hasProviderKey } from "./provider-key-shape.js";
+import { providerRowToObject } from "./provider-row.js";
 
 /** The providers settings tab — where a key is entered. */
 export const PROVIDERS_SETTINGS_URL = "/dashboard/settings?section=llm&tab=providers";
@@ -169,8 +171,10 @@ export async function noticeProviderKeyNeeded(db, id) {
   if (!row) return "no-row";
   if (Number(row.disabled)) return "disabled";
   if (!providerNeedsKey(row)) return "keyless";
-  const key = typeof row.api_key === "string" ? row.api_key.trim() : "";
-  if (key !== "") return "has-key";
+  // A SEALED or malformed cell is a key this device HOLDS: answering "has-key"
+  // is right (the notice asks for one to be entered, and one is), and the
+  // unreadable case has its own notice below.
+  if (hasProviderKey(row.api_key)) return "has-key";
 
   const source = providerKeyNoticeSource(id);
   // Any notice for this id counts, whatever the operator did with it: re-raising
@@ -195,6 +199,50 @@ export async function noticeProviderKeyNeeded(db, id) {
     priority: "normal",
     title: fill(t("providers.needsKeyTitle", lang), { name: providerDisplayName(row) }),
     body: t("providers.needsKeyBody", lang),
+    action_url: PROVIDERS_SETTINGS_URL,
+  });
+  return created ? "raised" : "filtered";
+}
+
+/**
+ * "This provider's saved key cannot be read on this device" (design §3.2).
+ *
+ * Same notice, same source (so the two never stack), same title text
+ * (`providers.needsKeyTitle`) and deliberately NO body: the operator's answer to
+ * "it needs a key here" is the same either way — enter the key again — and the
+ * body that explains a key arriving from a paired device would be false here.
+ * Raised by the model door when a saved key does not open (a damaged key file, a
+ * value sealed by another install), never for a row with no key at all.
+ *
+ * @param {object} db
+ * @param {string} id provider id
+ * @returns {Promise<"raised"|"already"|"readable"|"disabled"|"no-row"|"no-id"|"filtered">}
+ */
+export async function noticeProviderKeyUnreadable(db, id) {
+  if (typeof id !== "string" || id === "") return "no-id";
+  const { rows } = await db.execute({ sql: "SELECT * FROM providers WHERE id = ?", args: [id] });
+  const row = rows[0];
+  if (!row) return "no-row";
+  if (Number(row.disabled)) return "disabled";
+  if (providerRowToObject(row).keyState !== "unreadable") return "readable";
+
+  const source = providerKeyNoticeSource(id);
+  const { rows: prior } = await db.execute({
+    sql: "SELECT id, metadata FROM notifications WHERE source = ?",
+    args: [source],
+  });
+  if (prior.some((n) => !noticeWasAnswered(n.metadata))) return "already";
+
+  const [{ createNotification }, { t, fill }] = await Promise.all([
+    import("./notifications.js"),
+    import("../gateway/dashboard/shared/i18n.js"),
+  ]);
+  const lang = await readLang(db);
+  const created = await createNotification(db, {
+    type: "system",
+    source,
+    priority: "normal",
+    title: fill(t("providers.needsKeyTitle", lang), { name: providerDisplayName(row) }),
     action_url: PROVIDERS_SETTINGS_URL,
   });
   return created ? "raised" : "filtered";

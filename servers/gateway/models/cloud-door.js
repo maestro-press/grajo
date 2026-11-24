@@ -68,6 +68,9 @@ import { StringDecoder } from "node:string_decoder";
 import { isLocalPeer } from "../../shared/peer-class.js";
 import { isLocalClassTarget, isForbiddenTarget, isDoorUrl } from "./door-resolve.js";
 import { consentVerdict, cloudDoorIneligibleReason } from "../../shared/cloud-consent.js";
+import { providerKeyState } from "../../shared/provider-row.js";
+import { parseStoredKey } from "../../shared/provider-key-shape.js";
+import { PROVIDER_KEY_UNREADABLE } from "../../shared/provider-keyring.js";
 import { redactHeaderValue, redactSecrets, redactThenTruncate, maxSecretBytes } from "../../shared/redact-secrets.js";
 import { safeRequest } from "./safe-upstream.js";
 import { extractUsageFromOpenAIResponse, extractUsageFromAnthropicStream } from "../../shared/metering.js";
@@ -101,7 +104,16 @@ export function isCloudTarget(url) {
 }
 
 const authStyleOf = (row) => (String(row?.provider_type ?? row?.providerType ?? "").toLowerCase() === "anthropic" ? "anthropic" : "bearer");
-const keyOf = (row) => { const k = row?.apiKey ?? row?.api_key; return typeof k === "string" ? k.trim() : ""; };
+/**
+ * The key to send. Only the OPENED plaintext a parsed row carries: a raw row's
+ * stored cell is never sent (an envelope is not a credential), and an unreadable
+ * key is refused before we get here.
+ */
+const keyOf = (row) => {
+  const k = row?.apiKey;
+  if (typeof k !== "string" || k === "none") return "";
+  return parseStoredKey(k).kind === "envelope" ? "" : k.trim();
+};
 const modelIdsOf = (row) => (Array.isArray(row?.models) ? row.models : []).map((m) => (typeof m === "string" ? m : m?.id)).filter((x) => typeof x === "string" && x);
 
 /**
@@ -138,6 +150,9 @@ export function resolveCloudTarget({
   if (why === "insecure") return err(400, "INSECURE_TARGET", "the cloud door sends keys over https only");
   if (why === "unsupported_type") return err(400, "UNSUPPORTED_TYPE", "the cloud door serves openai-style and anthropic providers only");
   if (why === "no_key") return err(400, "NO_KEY", "this provider has no key");
+  // A key this process cannot read: 503 before any consent check, so the answer
+  // says "broken here" rather than "no key" — and nothing is sent upstream.
+  if (providerKeyState(row) === "unreadable") return err(503, PROVIDER_KEY_UNREADABLE, PROVIDER_KEY_UNREADABLE);
   if (why) return err(400, "NOT_ELIGIBLE", "the cloud door does not serve this provider");
   const entry = consent && typeof consent === "object" && Object.hasOwn(consent, providerId) ? consent[providerId] : null;
   const verdict = consentVerdict(row, entry, { salt });
@@ -253,6 +268,9 @@ function usageFrom(tap, authStyle) {
 export function createCloudDoor(deps) {
   const timeouts = { ...CLOUD_TIMEOUTS, ...(deps.cloudTimeouts || {}) };
   const maxConcurrent = Number.isInteger(deps.cloudMaxConcurrent) && deps.cloudMaxConcurrent > 0 ? deps.cloudMaxConcurrent : CLOUD_MAX_CONCURRENT;
+  // The bell a broken saved key rings (design §3.2). A seam, so this module keeps
+  // no db handle of its own; the router hands it over.
+  const onUnreadableKey = typeof deps.onUnreadableKeyFn === "function" ? deps.onUnreadableKeyFn : () => {};
   let inFlight = 0;
 
   async function gate(req, res, next) {
@@ -284,7 +302,10 @@ export function createCloudDoor(deps) {
       providers: providers || {}, consent: consent || {}, salt, providerId, op, model: body.model,
       isCloudTarget: deps.isCloudTargetFn, allowInsecure: deps.allowInsecureFn, beta: req.query?.beta === "true",
     });
-    if (target.kind === "error") return send(res, target.status, target.code, target.message);
+    if (target.kind === "error") {
+      if (target.code === PROVIDER_KEY_UNREADABLE) onUnreadableKey(providerId);
+      return send(res, target.status, target.code, target.message);
+    }
     await forward(req, res, target, body);
   }
 

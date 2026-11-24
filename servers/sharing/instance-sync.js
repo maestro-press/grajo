@@ -59,6 +59,7 @@ import { SYNC_PB_KEY_PREFIX, SYNC_PB_CLEARED_PREFIX } from "../shared/self-dial-
 import { mintLamport, advanceCounter, stampSql, ensureLamportOriginColumn, incomingLosesLww } from "../shared/sync-stamp.js";
 import { deleteContactArtifactComments } from "../shared/artifact-comment-delete.js";
 import { noticeProviderKeyNeeded } from "../shared/provider-key-need.js";
+import { hasProviderKey } from "../shared/provider-key-shape.js";
 import { providerEndpointChanged, noticeProviderEndpointHeld } from "../shared/provider-endpoint.js";
 import { withWriteContext, peerWriteContext } from "../shared/history/write-context.js";
 import {
@@ -3634,8 +3635,9 @@ export class InstanceSyncManager {
       });
       const localRow = localRows[0];
       if (!localRow) return false; // no local row: nothing here holds a key for it
-      const localKey = typeof localRow.api_key === "string" ? localRow.api_key.trim() : "";
-      if (localKey === "") return false; // keyless here (a LAN llama.cpp): update freely
+      // A SEALED or malformed cell is a key this device holds: an address change
+      // must not carry it to a new endpoint. (Reading the shape, never the value.)
+      if (!hasProviderKey(localRow.api_key)) return false; // keyless here (a LAN llama.cpp): update freely
       if (!providerEndpointChanged(localRow.base_url, row.base_url)) return false;
 
       const { rows: prior } = await this.db.execute({

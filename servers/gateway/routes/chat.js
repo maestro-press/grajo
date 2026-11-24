@@ -25,6 +25,7 @@ import { openStream } from "../streams/sse.js";
 import { resolveProviderConfig } from "../ai/resolve-profile.js";
 import { checkVendorSwitch } from "../ai/vendor-guard.js";
 import { listProvidersAll, findUsableProviderRow } from "../../shared/providers-db.js";
+import { PROVIDER_KEY_UNREADABLE } from "../../shared/provider-keyring.js";
 import { chooseProvider as smartRoute, stripSlashCommand, SmartChatDisabled, resolveSmartTierKeys } from "../ai/smart-router.js";
 import { fixedWindowLimit } from "../middleware/rate-limit.js";
 import { recordUsageEvent } from "../../shared/metering.js";
@@ -793,6 +794,12 @@ export default function chatRouter(dashboardAuth) {
           // models.json if no DB row matches.
           const cfg = await resolveProviderConfig(db, effectiveProvider, effectiveModel).catch(() => null);
           resolvedProviderCfg = cfg;
+          // A saved key this process cannot read: say so, never dial keyless.
+          if (cfg && cfg.keyState === "unreadable") {
+            sendEvent("error", { message: PROVIDER_KEY_UNREADABLE, code: PROVIDER_KEY_UNREADABLE });
+            closeStream();
+            return;
+          }
           if (cfg) {
             const { createAdapterFromProfile: fromProfile } = await import("../ai/provider.js");
             // DB rows for bundle-registered local providers (crow-swap-*,
@@ -838,6 +845,11 @@ export default function chatRouter(dashboardAuth) {
           // provider/model (Quick Chat). Fall back to env on miss.
           const cfg = await resolveProviderConfig(db, effectiveProvider, effectiveModel).catch(() => null);
           resolvedProviderCfg = cfg;
+          if (cfg && cfg.keyState === "unreadable") {
+            sendEvent("error", { message: PROVIDER_KEY_UNREADABLE, code: PROVIDER_KEY_UNREADABLE });
+            closeStream();
+            return;
+          }
           if (cfg) {
             const { createAdapterFromProfile: fromProfile } = await import("../ai/provider.js");
             // DB rows for bundle-registered local providers (crow-swap-*,

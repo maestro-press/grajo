@@ -15,6 +15,8 @@
 
 import { readFile } from "node:fs/promises";
 import { guardedFetch } from "./adapter-guard.js";
+import { providerKeyUnreadable } from "../../shared/provider-row.js";
+import { PROVIDER_KEY_UNREADABLE } from "../../shared/provider-keyring.js";
 
 /**
  * @param {object} opts
@@ -38,6 +40,12 @@ export async function analyzeImage({
 }) {
   if (!providerConfig?.baseUrl || !providerConfig?.model) {
     throw new Error("analyzeImage: providerConfig.baseUrl and .model required");
+  }
+  // Review round 1 (M1): a vision profile's provider row whose key this process
+  // cannot read is a REFUSAL, never a keyless request (the row is bot-writable,
+  // so this is the same rule as every adapter's).
+  if (providerKeyUnreadable(providerConfig)) {
+    throw Object.assign(new Error(PROVIDER_KEY_UNREADABLE), { code: PROVIDER_KEY_UNREADABLE });
   }
   let bytes = imageBytes;
   if (!bytes && imagePath) bytes = await readFile(imagePath);

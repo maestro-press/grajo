@@ -14,6 +14,7 @@
  * waitMs: a slow answer is used from the next turn on.
  */
 import { isLocalBase } from "../ai/adapters/openai.js";
+import { providerKeyUnreadable } from "../../shared/provider-row.js";
 
 export const ENGINE_FORCING = Object.freeze({
   vllm: Object.freeze({ named: true, required: true }),
@@ -61,6 +62,11 @@ export function createToolForcing({ resolveKey, modelEntry = async () => null, f
       const up = await resolveKey(key);
       const base = String(up?.baseUrl || "").replace(/\/+$/, "");
       if (!base || !isLocalBase(base)) return UNKNOWN_FORCING;          // never probed: named only, as before
+      // A key this process cannot read is never probed keyless (review round 1,
+      // M1): the row HOLDS a key, so a `GET /models` without it would be an
+      // unauthenticated request to a server that then answers as it likes. Stay
+      // on the safe default (named only); the next turn asks again.
+      if (providerKeyUnreadable(up)) return UNKNOWN_FORCING;
       const id = `${base}|${up.model || ""}`;                            // a provider re-pointed to another server is a new entry
       const hit = cache.get(id);
       if (hit && now() - hit.at < hit.ttl) return hit.val;
