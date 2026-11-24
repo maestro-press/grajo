@@ -85,6 +85,7 @@ produce at least one finding, and the allowed snippets have to produce none.
 from __future__ import annotations
 
 import ast
+import sys
 import textwrap
 from pathlib import Path
 
@@ -1136,3 +1137,983 @@ def test_scan_flags_a_bypass(filename: str, source: str) -> None:
 def test_scan_allows_the_gateway_paths(filename: str, source: str) -> None:
     findings = scan_source(filename, source)
     assert findings == [], "\n".join(findings)
+
+
+# ---------------------------------------------------------------- the lab's offline surface
+#
+# Nothing under `lab/` may name an order-placement surface: the research lab
+# only describes a desired trade and fills it arithmetically.  This scan is
+# static and scoped by path, so a file counts as lab code only when its path
+# from the package root starts with "lab/".
+#
+# The surface it refuses is every way of reaching an order:
+#
+# * the gateway's own name and the write methods the package spells out:
+#   `OrderGateway`, `create_order`, `deposit`, `limit_order_gtc`.
+# * any name carrying one of the prefixes `place_`, `cancel`, `create_order`,
+#   `edit_`, `market_order`, `limit_order` or `preview_order`.  That covers the
+#   SDK's order entry points along with the adapter's write methods:
+#   `place_limit`, `cancel_orders`, `create_order`, `edit_order`,
+#   `market_order_buy`, `limit_order_gtd`, `preview_order`.
+# * an import of the exchange adapter, absolute or relative, and the `exchange`
+#   name pulled out of the package it lives in: `import crow_coinbase.exchange`,
+#   `from crow_coinbase.exchange import Exchange`, `from ..exchange import
+#   Exchange`, `from crow_coinbase import exchange`, `from .. import exchange`.
+#   An adapter in hand is the live account in hand, whatever the lab means to do
+#   with it.
+#
+# The adapter is not the only module that carries the live account, so imports
+# are also an allowlist: the standard library and the lab package, nothing else.
+# `credentials` opens the API key, `router` forwards a write to the adapter,
+# `gateway` places the order, and a name reached without an import (through
+# `vars`, a `globals()` subscript, `getattr` with a computed name, `importlib`)
+# is the same reach spelled differently.
+
+LAB_FORBIDDEN_NAMES = frozenset(
+    {
+        "OrderGateway",
+        "create_order",
+        "deposit",
+        "limit_order_gtc",
+        "preview_order",
+    }
+)
+LAB_FORBIDDEN_PREFIXES = (
+    "place_",
+    "cancel",
+    "create_order",
+    "edit_",
+    "market_order",
+    "limit_order",
+    "preview_order",
+)
+
+
+# The import allowlist: the lab package and the standard library.  `urllib` is
+# standard library as well, but only the one module that fetches candles may
+# import it.
+LAB_PACKAGE = "crow_coinbase.lab"
+LAB_URLLIB_FILES = frozenset({"lab/feeds.py"})
+
+# Ways of reaching a name without spelling it out.
+LAB_DYNAMIC_CALLS = frozenset({"vars", "__import__", "eval", "exec", "compile"})
+LAB_NAMED_LOOKUPS = frozenset({"getattr", "setattr"})
+LAB_SCOPE_CALLS = frozenset({"globals", "locals"})
+
+
+def _lab_name_forbidden(name: str) -> bool:
+    """True when *name* is a name the lab must not spell."""
+    return name in LAB_FORBIDDEN_NAMES or name.startswith(LAB_FORBIDDEN_PREFIXES)
+
+
+def _lab_depth(relative_path: str) -> int:
+    """Directories between `lab/` and the file: `lab/feeds.py` -> 0, `lab/rules/band.py` -> 1."""
+    return len(relative_path.split("/")) - 2
+
+
+def _lab_module_allowed(module: str) -> bool:
+    """True for the lab package itself and everything below it."""
+    return module == LAB_PACKAGE or module.startswith(LAB_PACKAGE + ".")
+
+
+def _lab_stdlib_module(module: str) -> bool:
+    """True for a standard-library module path (`decimal`, `urllib.request`)."""
+    top = module.split(".")[0]
+    return top == "__future__" or top in sys.stdlib_module_names
+
+
+def _lab_called_name(call: ast.Call) -> str:
+    """The last part of the callee: `vars` for `vars(...)`, `__setattr__` for `object.__setattr__(...)`."""
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return ""
+
+
+def scan_lab_source(relative_path: str, source: str) -> list[str]:
+    """One finding per way a lab file reaches the live account, else an empty list.
+
+    *relative_path* is the file's path from the package root.  A path outside
+    `lab/` is not lab code, so the scan says nothing about it.
+
+    The name rule: names reached through syntax (identifiers, attribute names,
+    definitions, arguments, keywords and imports) count wherever they appear; a
+    string constant counts when it is exactly a forbidden name, or carries a
+    forbidden prefix and no whitespace, so prose that merely uses the word is
+    left alone.  An import of the exchange adapter counts as well — under its
+    package path, under a relative path, or as the `exchange` name pulled out
+    of the package — and is reported by the module it names.
+
+    The import allowlist, because a module in hand is the live account in hand:
+
+    * An absolute import is allowed only from the standard library
+      (`sys.stdlib_module_names`, plus `__future__`) or from the lab package
+      itself (`crow_coinbase.lab` and everything below it).  Every other
+      `crow_coinbase.*` import is a finding — `import crow_coinbase`,
+      `from crow_coinbase import api`, `from crow_coinbase.credentials import
+      CredentialSlot` — and so is any third-party module.
+    * `urllib` is a rule of its own: standard library, but only `lab/feeds.py`
+      (the one module that fetches) may import it.  Anywhere else it is a
+      finding.
+    * A relative import may climb no further than the lab package.  With
+      `depth` the number of directories between `lab/` and the file
+      (`lab/feeds.py` -> 0, `lab/rules/band.py` -> 1), a relative import at
+      level L stays inside `lab/` while L <= depth + 1 and escapes when it is
+      greater: `from . import store` in `lab/feeds.py` and `from ..sim import
+      Gates` in `lab/rules/band.py` are lab code, while `from .. import api` in
+      a top-level lab file, `from ..router import ExchangeRouter` in
+      `lab/feeds.py` and `from ...credentials import X` in `lab/rules/band.py`
+      are findings whatever they name.
+    * A name reached without an import is a finding too: `importlib`, and calls
+      to `vars`, `__import__`, `eval`, `exec` and `compile`, plus a subscript
+      of `globals()`/`locals()`.  `getattr`/`setattr` are allowed only with a
+      plain string literal for the name, so `getattr(module, "SIMULATOR",
+      None)` passes and `getattr(mod, "Order" + "Gateway")` does not.
+    """
+    if not relative_path.startswith("lab/"):
+        return []
+    tree = ast.parse(source, filename=relative_path)
+    findings: list[str] = []
+    adapter = "crow_coinbase.exchange"
+    depth = _lab_depth(relative_path)
+    urllib_allowed = relative_path in LAB_URLLIB_FILES
+
+    def add(node: ast.AST, name: str) -> None:
+        findings.append(
+            f"{relative_path}:{getattr(node, 'lineno', 0)}: "
+            f"lab code references {name!r}"
+        )
+
+    def add_import(node: ast.AST, module: str, why: str) -> None:
+        findings.append(
+            f"{relative_path}:{getattr(node, 'lineno', 0)}: "
+            f"lab code imports {module!r} ({why})"
+        )
+
+    def inspect(node: ast.AST, name) -> None:
+        if isinstance(name, str) and name and _lab_name_forbidden(name):
+            add(node, name)
+
+    def is_adapter_module(module: str) -> bool:
+        """True for the exchange adapter's module path, or one below it."""
+        return module == adapter or module.startswith(adapter + ".")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            inspect(node, node.id)
+        elif isinstance(node, ast.Attribute):
+            inspect(node, node.attr)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            inspect(node, node.name)
+        elif isinstance(node, ast.arg):
+            inspect(node, node.arg)
+        elif isinstance(node, ast.keyword):
+            inspect(node, node.arg)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                reached = False
+                if is_adapter_module(alias.name):
+                    add(node, alias.name)
+                    reached = True
+                for name in {alias.name, _last_part(alias.name), alias.asname}:
+                    inspect(node, name)
+                if reached:
+                    continue
+                if top == "importlib":
+                    add_import(node, alias.name, "a dynamic import is refused")
+                elif top == "urllib" and not urllib_allowed:
+                    add_import(
+                        node, alias.name, "urllib is only allowed in lab/feeds.py"
+                    )
+                elif top == "crow_coinbase":
+                    if not _lab_module_allowed(alias.name):
+                        add_import(node, alias.name, "not the lab package")
+                elif not _lab_stdlib_module(alias.name):
+                    add_import(node, alias.name, "not the standard library")
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            reached = False
+            if is_adapter_module(module):
+                add(node, module)
+                reached = True
+            elif node.level >= 1 and (
+                module == "exchange" or module.startswith("exchange.")
+            ):
+                add(node, module)
+                reached = True
+            if module:
+                inspect(node, _last_part(module))
+            for alias in node.names:
+                if (
+                    not reached
+                    and alias.name == "exchange"
+                    and (node.level >= 1 or module in ("", "crow_coinbase"))
+                ):
+                    add(
+                        node,
+                        f"{module}.{alias.name}" if module else alias.name,
+                    )
+                    reached = True
+                for name in {alias.name, _last_part(alias.name), alias.asname}:
+                    inspect(node, name)
+            if reached:
+                continue
+            if node.level >= 1:
+                if node.level > depth + 1:
+                    add_import(
+                        node,
+                        "." * node.level + module,
+                        f"level {node.level} climbs out of the lab package",
+                    )
+            elif module:
+                top = module.split(".")[0]
+                if top == "importlib":
+                    add_import(node, module, "a dynamic import is refused")
+                elif top == "urllib" and not urllib_allowed:
+                    add_import(
+                        node, module, "urllib is only allowed in lab/feeds.py"
+                    )
+                elif top == "crow_coinbase":
+                    if not _lab_module_allowed(module):
+                        add_import(node, module, "not the lab package")
+                elif not _lab_stdlib_module(module):
+                    add_import(node, module, "not the standard library")
+        elif isinstance(node, ast.Call):
+            called = _lab_called_name(node)
+            if called in LAB_DYNAMIC_CALLS:
+                add(node, called)
+            elif called in LAB_NAMED_LOOKUPS:
+                name = node.args[1] if len(node.args) > 1 else None
+                if not (isinstance(name, ast.Constant) and isinstance(name.value, str)):
+                    add(node, f"{called} with a name that is not a literal")
+        elif isinstance(node, ast.Subscript):
+            value = node.value
+            if isinstance(value, ast.Call) and _lab_called_name(value) in LAB_SCOPE_CALLS:
+                add(node, f"{_lab_called_name(value)}()[...]")
+        elif isinstance(node, ast.Constant):
+            value = node.value
+            if not isinstance(value, str) or not value:
+                continue
+            if value in LAB_FORBIDDEN_NAMES:
+                add(node, value)
+            elif value.startswith(LAB_FORBIDDEN_PREFIXES) and not any(
+                char.isspace() for char in value
+            ):
+                add(node, value)
+    return findings
+
+
+def test_lab_tree_has_no_order_surface():
+    """The lab tree comes back clean, and its rule and simulator files are in the walk."""
+    files = sorted((SRC / "lab").rglob("*.py"))
+    assert files, f"no python files found under {SRC / 'lab'}"
+
+    scanned: set[str] = set()
+    findings: list[str] = []
+    for path in files:
+        relative = path.relative_to(SRC).as_posix()
+        scanned.add(relative)
+        findings.extend(scan_lab_source(relative, path.read_text(encoding="utf-8")))
+
+    # An empty or mis-rooted glob would make the findings assertion vacuous.
+    for expected in (
+        "lab/sim.py",
+        "lab/gridsim.py",
+        "lab/rules/band.py",
+        "lab/rules/event_veto.py",
+        "lab/__main__.py",
+        "lab/feeds.py",
+    ):
+        assert expected in scanned, f"{expected} not scanned; saw {sorted(scanned)}"
+
+    assert findings == [], "\n".join(findings)
+
+
+LAB_NEGATIVE_CASES = [
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            gw = OrderGateway()
+            """
+        ),
+        id="lab-order-gateway-name",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            from ..gateway import OrderGateway
+            """
+        ),
+        id="lab-order-gateway-import",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            ex.place_limit(x)
+            """
+        ),
+        id="lab-place-limit-attribute",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            def cancel_all(ex):
+                pass
+            """
+        ),
+        id="lab-cancel-function-name",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            getattr(ex, "cancel_orders")
+            """
+        ),
+        id="lab-cancel-orders-string",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            ex.create_order(x)
+            """
+        ),
+        id="lab-create-order-attribute",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            deposit(1)
+            """
+        ),
+        id="lab-deposit-name",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            ex.limit_order_gtc(x)
+            """
+        ),
+        id="lab-limit-order-gtc-attribute",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            x = {"place_limit": 1}
+            """
+        ),
+        id="lab-place-limit-string",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            f(cancel=True)
+            """
+        ),
+        id="lab-cancel-keyword",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            ex.edit_order(x)
+            """
+        ),
+        id="lab-edit-order-attribute",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            def edit_order_preview():
+                pass
+            """
+        ),
+        id="lab-edit-prefix-function",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            ex.market_order_buy(x)
+            """
+        ),
+        id="lab-market-order-attribute",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            ex.limit_order_gtd(x)
+            """
+        ),
+        id="lab-limit-order-gtd-attribute",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            getattr(ex, "limit_order_fok")
+            """
+        ),
+        id="lab-limit-order-string",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            ex.preview_order(x)
+            """
+        ),
+        id="lab-preview-order-attribute",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            import crow_coinbase.exchange
+            """
+        ),
+        id="lab-import-exchange-module",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            from crow_coinbase.exchange import Exchange
+            """
+        ),
+        id="lab-from-exchange-import",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            from crow_coinbase import exchange
+            """
+        ),
+        id="lab-from-package-import-exchange",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            from ..exchange import Exchange
+            """
+        ),
+        id="lab-relative-exchange-import",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            from .. import exchange
+            """
+        ),
+        id="lab-relative-package-import-exchange",
+    ),
+    # ---- the CLI and the fetchers are lab code too
+    pytest.param(
+        "lab/__main__.py",
+        _module(
+            """
+            ex.place_limit(x)
+            """
+        ),
+        id="lab-cli-place-limit-attribute",
+    ),
+    pytest.param(
+        "lab/__main__.py",
+        _module(
+            """
+            from crow_coinbase.exchange import MarketData
+            """
+        ),
+        id="lab-cli-from-exchange-import",
+    ),
+    pytest.param(
+        "lab/__main__.py",
+        _module(
+            """
+            from ..exchange import Exchange
+            """
+        ),
+        id="lab-cli-relative-exchange-import",
+    ),
+    pytest.param(
+        "lab/__main__.py",
+        _module(
+            """
+            gateway = OrderGateway()
+            """
+        ),
+        id="lab-cli-order-gateway-name",
+    ),
+    pytest.param(
+        "lab/__main__.py",
+        _module(
+            """
+            client.cancel_orders(ids)
+            """
+        ),
+        id="lab-cli-cancel-orders-attribute",
+    ),
+    pytest.param(
+        "lab/feeds.py",
+        _module(
+            """
+            ex.deposit(5)
+            """
+        ),
+        id="lab-feeds-deposit-name",
+    ),
+    pytest.param(
+        "lab/feeds.py",
+        _module(
+            """
+            from .. import exchange
+            """
+        ),
+        id="lab-feeds-relative-package-import-exchange",
+    ),
+    # ---- the engine's other live-account modules are not lab code either
+    #
+    # The level arithmetic matters: `lab/rules/band.py` sits in the package
+    # `crow_coinbase.lab.rules`, so its `from .` (level 1) is `lab/rules` and its
+    # `from ..` (level 2) is still the lab package; only level 3 reaches the
+    # engine root.  In `lab/feeds.py`, whose package is `crow_coinbase.lab`
+    # itself, level 2 is already the engine root.
+    pytest.param(
+        "lab/feeds.py",
+        _module(
+            """
+            from ..credentials import CredentialSlot
+            """
+        ),
+        id="lab-relative-credentials-import",
+    ),
+    pytest.param(
+        "lab/rules/band.py",
+        _module(
+            """
+            from ...credentials import CredentialSlot
+            """
+        ),
+        id="lab-relative-import-climbs-out-of-a-subpackage",
+    ),
+    pytest.param(
+        "lab/feeds.py",
+        _module(
+            """
+            from ..router import ExchangeRouter
+            """
+        ),
+        id="lab-relative-router-import",
+    ),
+    pytest.param(
+        "lab/feeds.py",
+        _module(
+            """
+            from .. import api
+            """
+        ),
+        id="lab-relative-package-import-api",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            from .. import gateway
+            """
+        ),
+        id="lab-relative-package-import-gateway",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            from crow_coinbase.credentials import CredentialSlot
+            """
+        ),
+        id="lab-absolute-credentials-import",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            from crow_coinbase import api
+            """
+        ),
+        id="lab-absolute-package-import-api",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            import crow_coinbase.gateway
+            """
+        ),
+        id="lab-absolute-gateway-module",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            import crow_coinbase
+            """
+        ),
+        id="lab-absolute-package-import",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            import requests
+            """
+        ),
+        id="lab-third-party-import",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            import urllib.request
+            """
+        ),
+        id="lab-urllib-outside-feeds",
+    ),
+    pytest.param(
+        "lab/__main__.py",
+        _module(
+            """
+            import urllib.request
+            """
+        ),
+        id="lab-cli-urllib-import",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            import importlib
+            """
+        ),
+        id="lab-importlib-import",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            from importlib import import_module
+            """
+        ),
+        id="lab-from-importlib-import",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            import sys
+
+            vars(sys.modules)["Order" + "Gateway"]
+            """
+        ),
+        id="lab-vars-lookup",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            globals()[next(iter(globals()), "gateway")]
+            """
+        ),
+        id="lab-globals-lookup",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            getattr(mod, "Order" + "Gateway")
+            """
+        ),
+        id="lab-getattr-computed-name",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            setattr(mod, name, value)
+            """
+        ),
+        id="lab-setattr-computed-name",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            __import__("crow_coinbase.gateway")
+            """
+        ),
+        id="lab-dunder-import-call",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            exec(read_source(db_path))
+            """
+        ),
+        id="lab-exec-call",
+    ),
+]
+
+
+LAB_ALLOWED_CASES = [
+    pytest.param(
+        "lab/rules/band.py",
+        _module(
+            """
+            from decimal import Decimal
+            """
+        ),
+        id="lab-decimal-import",
+    ),
+    pytest.param(
+        "lab/rules/band.py",
+        _module(
+            """
+            Order(side="BUY", qty=1)
+            """
+        ),
+        id="lab-order-call",
+    ),
+    pytest.param(
+        "lab/rules/band.py",
+        _module(
+            """
+            def rearm():
+                "cancel the resting rung and place a new one"
+                return None
+            """
+        ),
+        id="lab-prose-docstring",
+    ),
+    pytest.param(
+        "lab/rules/band.py",
+        _module(
+            """
+            class Orders:
+                pass
+            """
+        ),
+        id="lab-orders-class",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            limit = 1
+            edited = 2
+            """
+        ),
+        id="lab-near-miss-names",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            x = "edit order flow"
+            """
+        ),
+        id="lab-prose-string",
+    ),
+    pytest.param(
+        "lab/sim.py",
+        _module(
+            """
+            venue = "exchange"
+            """
+        ),
+        id="lab-exchange-word-string",
+    ),
+    # ---- what the CLI and the fetchers do need to spell
+    pytest.param(
+        "lab/__main__.py",
+        _module(
+            """
+            def authorize(request):
+                request.add_header("Authorization", "Token x")
+                return request
+            """
+        ),
+        id="lab-cli-authorization-header",
+    ),
+    pytest.param(
+        "lab/__main__.py",
+        _module(
+            """
+            def build_parser():
+                parser = None
+                parser.add_argument("--db")
+                return parser
+            """
+        ),
+        id="lab-cli-argparse-flag",
+    ),
+    pytest.param(
+        "lab/feeds.py",
+        _module(
+            """
+            import urllib.request
+            """
+        ),
+        id="lab-feeds-urllib-import",
+    ),
+    pytest.param(
+        "lab/feeds.py",
+        _module(
+            """
+            def authorize(request):
+                request.add_header("Authorization", "Token x")
+                return request
+            """
+        ),
+        id="lab-feeds-authorization-header",
+    ),
+    pytest.param(
+        "lab/feeds.py",
+        _module(
+            """
+            def build_parser():
+                parser = None
+                parser.add_argument("--db")
+                return parser
+            """
+        ),
+        id="lab-feeds-argparse-flag",
+    ),
+    # ---- what the lab may reach instead: its own package and the stdlib
+    pytest.param(
+        "lab/rules/band.py",
+        _module(
+            """
+            from ..sim import Gates
+            """
+        ),
+        id="lab-relative-parent-stays-in-lab",
+    ),
+    pytest.param(
+        "lab/studies/buy_timing.py",
+        _module(
+            """
+            from ..metrics import max_drawdown
+            """
+        ),
+        id="lab-study-parent-stays-in-lab",
+    ),
+    pytest.param(
+        "lab/feeds.py",
+        _module(
+            """
+            from .store import Bar
+            """
+        ),
+        id="lab-relative-sibling-import",
+    ),
+    pytest.param(
+        "lab/feeds.py",
+        _module(
+            """
+            from . import store
+            """
+        ),
+        id="lab-relative-package-import-store",
+    ),
+    pytest.param(
+        "lab/feeds.py",
+        _module(
+            """
+            from crow_coinbase.lab.store import Bar
+            """
+        ),
+        id="lab-absolute-lab-import",
+    ),
+    pytest.param(
+        "lab/feeds.py",
+        _module(
+            """
+            import urllib.request, urllib.error, urllib.parse
+            """
+        ),
+        id="lab-feeds-urllib-stack",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            import json, math, sqlite3
+            """
+        ),
+        id="lab-stdlib-imports",
+    ),
+    pytest.param(
+        "lab/store.py",
+        _module(
+            """
+            getattr(module, "SIMULATOR", None)
+            """
+        ),
+        id="lab-getattr-literal-name",
+    ),
+]
+
+
+@pytest.mark.parametrize("filename,source", LAB_NEGATIVE_CASES)
+def test_lab_scan_flags_order_surface(filename: str, source: str) -> None:
+    findings = scan_lab_source(filename, source)
+    assert findings, f"{filename}: no finding for\n{source}"
+
+
+@pytest.mark.parametrize("filename,source", LAB_ALLOWED_CASES)
+def test_lab_scan_allows_plain_code(filename: str, source: str) -> None:
+    findings = scan_lab_source(filename, source)
+    assert findings == [], "\n".join(findings)
+
+
+def test_lab_scan_is_scoped_to_lab():
+    source = _module(
+        """
+        ex.place_limit(x)
+        """
+    )
+    assert scan_lab_source("lab/rules/band.py", source) != []
+    assert scan_lab_source("api.py", source) == []
+
+
+def test_lab_scan_flags_a_cli_module_that_reaches_an_order():
+    """A CLI module is lab code: reaching an order surface is a finding.
+
+    The walk over the real tree covers `lab/__main__.py` once it is there; this
+    is the negative case that keeps the scan from waving a CLI module through.
+    """
+    bad_cli = _module(
+        """
+        def run(argv):
+            return exchange.place_limit(argv)
+        """
+    )
+    findings = scan_lab_source("lab/__main__.py", bad_cli)
+    assert findings
+    assert all(finding.startswith("lab/__main__.py:") for finding in findings)
