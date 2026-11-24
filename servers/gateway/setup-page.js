@@ -50,7 +50,10 @@ const translations = {
  * Express handler for GET /setup
  */
 export async function setupPageHandler(req, res) {
-  const passwordConfigured = await isPasswordSet().catch(() => false);
+  // A password state that cannot be read counts as SET, exactly as bootSetupToken
+  // does (setup-token.js): `false` here would render the form that takes a new
+  // password on a DB error — the one answer that must never be guessed.
+  const passwordConfigured = await isPasswordSet().catch(() => true);
 
   // Once password is set, setup page is done — redirect to login
   if (passwordConfigured) {

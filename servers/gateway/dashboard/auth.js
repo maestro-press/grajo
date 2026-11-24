@@ -41,6 +41,9 @@ import { isDirectLoopback } from "./setup-token.js";
 // name (../cookie-names.js), because the extension proxy strips the whole list
 // before forwarding a request to a bundle's backend (queue item #51).
 import { SESSION_COOKIE, HOST_SESSION_COOKIE } from "../cookie-names.js";
+// The out-of-database half of "is a password set?" (password-set-marker.js):
+// the marker lives in <CROW_HOME>/secrets, where no contained bot can reach.
+import { hasPasswordSetMarker, writePasswordSetMarker } from "./password-set-marker.js";
 
 export function hashToken(t) { return createHash('sha256').update(t).digest('hex'); }
 
@@ -291,9 +294,11 @@ export function sessionTokenFromRequest(req) {
 }
 
 /**
- * Check if a password has been set.
+ * True when the `password_hash` row itself is in the database (the marker is
+ * not consulted). Boot catch-up reads this to heal an install that set a
+ * password before the marker existed.
  */
-export async function isPasswordSet() {
+export async function hasPasswordRow() {
   const db = createDbClient();
   try {
     const result = await db.execute({
@@ -304,6 +309,23 @@ export async function isPasswordSet() {
   } finally {
     db.close();
   }
+}
+
+/**
+ * Check if a password has been set.
+ *
+ * The row OR the marker counts. The row alone is not enough for the security
+ * answer: anything that can write crow.db (a contained bot has it read-write)
+ * can DELETE the row, and "no password" is what makes the login page offer
+ * first-run setup — where a direct-loopback request on a single-user box may
+ * set a password without the setup token (allowFirstRun, setup-token.js). The
+ * marker sits in <CROW_HOME>/secrets, which the bot sandbox does not bind, and
+ * it is never removed, so a deleted row leaves the instance LOCKED (login form,
+ * failed logins, `npm run reset-password` to recover) instead of re-opened.
+ */
+export async function isPasswordSet() {
+  if (hasPasswordSetMarker()) return true;
+  return hasPasswordRow();
 }
 
 /**
@@ -324,6 +346,10 @@ export async function setPassword(password, { keepSession = null } = {}) {
       sql: "INSERT INTO dashboard_settings (key, value, updated_at) VALUES ('password_hash', ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = datetime('now')",
       args: [hash, hash],
     });
+    // The row is written: record it where crow.db cannot reach (see
+    // isPasswordSet). Written before the session revocation below, and never
+    // removed — a marker without a row is locked, never a first run.
+    writePasswordSetMarker();
     let revoked = 0;
     try {
       const res = keepSession
@@ -395,6 +421,14 @@ export function passwordSessionScopes(onHost) {
 }
 
 /**
+ * The failed-login error when the password_hash row is missing. A marker
+ * without a row is LOCKED, and this is the branch it fails with; the login
+ * route recognizes it to show the `npm run reset-password` hint (the string is
+ * the user-visible text and is unchanged).
+ */
+export const NO_PASSWORD_SET_ERROR = "No password set.";
+
+/**
  * Attempt login. Returns session token on success, null on failure.
  * `opts.onHost` (5th argument): whether the login request came from this
  * machine; anything but `false` stores an 'onhost' session.
@@ -414,7 +448,7 @@ export async function attemptLogin(password, ip, deviceTrustToken = null, userAg
       sql: "SELECT value FROM dashboard_settings WHERE key = 'password_hash'",
       args: [],
     });
-    if (result.rows.length === 0) return { error: "No password set." };
+    if (result.rows.length === 0) return { error: NO_PASSWORD_SET_ERROR };
 
     const valid = await verifyPassword(password, result.rows[0].value);
     if (!valid) {

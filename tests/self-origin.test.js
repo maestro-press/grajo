@@ -25,6 +25,10 @@ import { actAsServe, serveHeaders } from "./fixtures/serve-peer.mjs";
 const tmpDir = mkdtempSync(join(tmpdir(), "crow-self-origin-"));
 execFileSync(process.execPath, ["scripts/init-db.js"], { env: { ...process.env, CROW_DATA_DIR: tmpDir }, stdio: "pipe" });
 process.env.CROW_DATA_DIR = tmpDir;
+// This file sets a dashboard password (setPassword, and the first-run POST below),
+// which also records <CROW_HOME>/secrets/dashboard-password-set. Keep that marker in
+// this scratch dir, never in whatever home the test happened to run under.
+process.env.CROW_HOME = join(tmpDir, "home");
 actAsServe();
 
 const { setInterfaceTableForTests } = await import("../servers/shared/ip-classify.js");
@@ -33,7 +37,18 @@ const { isLocalPasswordSessionOn, isLocalPasswordSession } = await import("../se
 const { passwordSessionScopes, attemptLogin, complete2faLogin } = await import("../servers/gateway/dashboard/auth.js");
 const { isLocalDashboardSession } = await import("../bundles/phone/server/authority.js");
 const { createDbClient } = await import("../servers/db.js");
+const { passwordSetMarkerPath } = await import("../servers/gateway/dashboard/password-set-marker.js");
 const db = createDbClient(join(tmpDir, "crow.db"));
+
+/**
+ * Back to a first run: no `password_hash` row AND no "a password was set" marker.
+ * The marker (password-set-marker.js) is what stops a deleted row from re-opening
+ * first-run setup, so the genuine first run these tests simulate has neither.
+ */
+async function clearPasswordState() {
+  await db.execute("DELETE FROM dashboard_settings WHERE key = 'password_hash'");
+  rmSync(passwordSetMarkerPath(), { force: true });
+}
 
 const TABLE = {
   lo: [{ address: "127.0.0.1", netmask: "255.0.0.0", family: "IPv4", cidr: "127.0.0.1/8" }, { address: "::1", netmask: "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", family: "IPv6", cidr: "::1/128" }],
@@ -195,7 +210,7 @@ test("attemptLogin / complete2faLogin store 'dashboard onhost' unless told the l
   assert.equal(await scopesOf((await complete2faLogin("10.0.0.5", { onHost: true })).token), "dashboard onhost");
   assert.equal(await scopesOf((await complete2faLogin("10.0.0.5")).token), "dashboard onhost");
   assert.equal(await scopesOf((await complete2faLogin("10.0.0.42", { onHost: false })).token), "dashboard");
-  await db.execute("DELETE FROM dashboard_settings WHERE key = 'password_hash'");
+  await clearPasswordState();
 });
 
 test("the real login route: a login from the box is 'dashboard onhost', still signed in from a laptop, never the owner; the laptop's own login is", async () => {
@@ -255,7 +270,7 @@ test("the real login route: a login from the box is 'dashboard onhost', still si
     assert.ok(loopTok, "a session cookie");
     assert.equal(await scopesOf(loopTok), "dashboard onhost");
   });
-  await db.execute("DELETE FROM dashboard_settings WHERE key = 'password_hash'");
+  await clearPasswordState();
 });
 
 // ---- the phone bundle's call approvals use the same check ----------------------------------
@@ -367,7 +382,7 @@ test("the real 2FA routes: a password step from the box mints 'dashboard onhost'
   } finally {
     clock.mock.restore();
     await totpMod.disable2fa();
-    await db.execute("DELETE FROM dashboard_settings WHERE key = 'password_hash'");
+    await clearPasswordState();
   }
 });
 

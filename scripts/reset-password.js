@@ -12,8 +12,10 @@ import { scrypt, randomBytes } from "node:crypto";
 import { createClient } from "@libsql/client";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
+import { resolveCrowHome } from "../servers/shared/crow-home.js";
+import { writePasswordSetMarker } from "../servers/gateway/dashboard/password-set-marker.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -94,19 +96,54 @@ async function main() {
 
   const hash = await hashPassword(password);
 
+  await writePasswordRecord(dbPath, hash);
+  console.log("\nPassword reset successfully. You can now log in.");
+}
+
+/**
+ * Write the new password hash, then record it where crow.db cannot reach.
+ *
+ * A reset is a password being SET: the marker in <CROW_HOME>/secrets
+ * (password-set-marker.js) is written right after the row. Without it a
+ * deleted/never-written password row would make the dashboard look un-set-up
+ * and re-open first-run setup. The home is resolved exactly as the gateway
+ * resolves it (CROW_HOME → ~/.crow), so a reset run for another instance must
+ * carry that instance's CROW_HOME.
+ *
+ * Exported so the write path can be tested without the interactive prompts.
+ */
+export async function writePasswordRecord(dbPath, hash) {
   const db = createClient({ url: `file:${dbPath}` });
   try {
     await db.execute({
       sql: "INSERT INTO dashboard_settings (key, value, updated_at) VALUES ('password_hash', ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = datetime('now')",
       args: [hash, hash],
     });
-    console.log("\nPassword reset successfully. You can now log in.");
+    writePasswordSetMarker({ crowHome: resolveCrowHome() });
   } finally {
     db.close();
   }
 }
 
-main().catch((err) => {
-  console.error(`Error: ${err.message}`);
-  process.exit(1);
-});
+// Only run the prompts when this file IS the program (`npm run reset-password`),
+// never when a test imports the write path above.
+//
+// Both sides are compared as REAL paths: Node resolves import.meta.url through
+// symlinks, so resolving argv[1] alone (e.g. `node bin/reset-password.js` when
+// bin/ or the script is a symlink) left the two unequal and the script exited 0
+// having done nothing. If the comparison itself fails, run main(): argv[1] that
+// cannot be resolved is this program being run in a way we cannot verify, and
+// staying silent is the worse failure.
+const invokedDirectly = (() => {
+  try {
+    return realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return true;
+  }
+})();
+if (invokedDirectly) {
+  main().catch((err) => {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  });
+}

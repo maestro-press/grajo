@@ -44,12 +44,20 @@ export default {
 
     // Verify current password
     const result = await db.execute("SELECT value FROM dashboard_settings WHERE key = 'password_hash'");
-    if (result.rows.length > 0) {
-      const valid = await verifyPassword(current_password, result.rows[0].value);
-      if (!valid) {
-        res.redirectAfterPost("/dashboard/settings?section=password&error=wrong_current");
-        return true;
-      }
+    // A missing row is NOT "there is no current password to check". The record
+    // can be deleted by anything that can write crow.db (a contained bot), and
+    // letting the change through unverified would hand the dashboard to whoever
+    // holds this session — or to the deleted-row cleanup itself. Refuse with the
+    // existing wrong-current-password message; the owner recovers with
+    // `npm run reset-password` (which rewrites the row and the marker).
+    if (result.rows.length === 0) {
+      res.redirectAfterPost("/dashboard/settings?section=password&error=wrong_current");
+      return true;
+    }
+    const valid = await verifyPassword(current_password, result.rows[0].value);
+    if (!valid) {
+      res.redirectAfterPost("/dashboard/settings?section=password&error=wrong_current");
+      return true;
     }
 
     const strength = validatePasswordStrength(password);

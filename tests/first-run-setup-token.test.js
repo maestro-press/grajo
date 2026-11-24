@@ -15,7 +15,7 @@ import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs";
-import { mkdtempSync, statSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, statSync, existsSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
@@ -109,6 +109,7 @@ const { createDbClient } = await import("../servers/db.js");
 const { default: dashboardRouter } = await import("../servers/gateway/dashboard/index.js");
 const { setupPageHandler } = await import("../servers/gateway/setup-page.js");
 const { isPasswordSet } = await import("../servers/gateway/dashboard/auth.js");
+const { passwordSetMarkerPath } = await import("../servers/gateway/dashboard/password-set-marker.js");
 const {
   getSetupToken,
   tokenMatches,
@@ -178,9 +179,12 @@ const post = (path, fields, { peer = LAN, headers = {} } = {}) =>
     body: new URLSearchParams(fields).toString(),
   });
 
-/** Back to a fresh instance: no password, a token file on disk. */
+/** Back to a fresh instance: no password, no "a password was set" marker, a
+ *  token file on disk. The marker (password-set-marker.js) is what stops a
+ *  deleted password row from re-opening setup, so a real first run has none. */
 async function resetFirstRun() {
   await db.execute("DELETE FROM dashboard_settings WHERE key = 'password_hash'");
+  rmSync(passwordSetMarkerPath(HOME), { force: true });
   clearSetupToken({ crowHome: HOME });
   return getSetupToken({ crowHome: HOME }).token;
 }
@@ -415,6 +419,7 @@ test("MINOR 4: getSetupToken does not recreate the file once a password exists",
     assert.equal(existsSync(TOKEN_FILE), false, "and no file is written back");
   } finally {
     await db.execute("DELETE FROM dashboard_settings WHERE key = 'password_hash'");
+    rmSync(passwordSetMarkerPath(HOME), { force: true });
   }
 });
 

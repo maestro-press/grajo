@@ -26,6 +26,7 @@ import {
   sendNetworkRefusal,
   mintSsoSession,
   SSO_SESSION_MAX_AGE,
+  NO_PASSWORD_SET_ERROR,
 } from "./auth.js";
 // The one Crow cookie-name list (../cookie-names.js), shared with every setter
 // and with the extension proxy that strips these cookies before forwarding.
@@ -300,8 +301,14 @@ export default function dashboardRouter(mcpAuthMiddleware, { renderLayout: rende
     const result = await attemptLogin(password, req.ip, deviceTrustToken, userAgent, { onHost: isSelfOrigin(req), next });
     if (result.error) {
       let lockoutHelp = "";
+      const hostedMode = !!process.env.CROW_HOSTED;
+      // The self-hosted recovery hint, in one place: a lockout and a locked
+      // instance (marker present, password row gone) recover the same way.
+      const selfHostedResetHint = () => `<div style="margin-top:1rem;padding:1rem;background:var(--crow-bg-deep,#1a1a1a);border:1px solid var(--crow-border,#333);border-radius:8px;font-size:0.85rem">
+            <p style="color:var(--crow-text-secondary,#aaa)">${t("login.lockoutSelfHosted", lang)}</p>
+            <pre style="margin-top:0.5rem;font-size:0.8rem;color:var(--crow-text-primary)">npm run reset-password</pre>
+          </div>`;
       if (result.locked) {
-        const hostedMode = !!process.env.CROW_HOSTED;
         if (hostedMode) {
           const instanceId = process.env.CROW_GATEWAY_URL || "your instance";
           lockoutHelp = `<div style="margin-top:1rem;padding:1rem;background:var(--crow-bg-deep,#1a1a1a);border:1px solid var(--crow-border,#333);border-radius:8px;font-size:0.85rem">
@@ -310,11 +317,15 @@ export default function dashboardRouter(mcpAuthMiddleware, { renderLayout: rende
             <p style="margin-top:0.25rem;font-size:0.75rem;color:var(--crow-text-tertiary,#666)">Instance: ${instanceId}</p>
           </div>`;
         } else {
-          lockoutHelp = `<div style="margin-top:1rem;padding:1rem;background:var(--crow-bg-deep,#1a1a1a);border:1px solid var(--crow-border,#333);border-radius:8px;font-size:0.85rem">
-            <p style="color:var(--crow-text-secondary,#aaa)">${t("login.lockoutSelfHosted", lang)}</p>
-            <pre style="margin-top:0.5rem;font-size:0.8rem;color:var(--crow-text-primary)">npm run reset-password</pre>
-          </div>`;
+          lockoutHelp = selfHostedResetHint();
         }
+      } else if (result.error === NO_PASSWORD_SET_ERROR && !hostedMode) {
+        // isPasswordSet() said yes from the marker but the row is gone (a
+        // contained bot deleted it): the instance is locked with nothing to
+        // verify against. Show the same existing recovery hint a lockout shows,
+        // so the error is not a dead end. Hosted installs already have the
+        // "Forgot password?" link under the form.
+        lockoutHelp = selfHostedResetHint();
       }
       return res.type("html").send(renderLogin({ isSetup: false, error: result.error, lockoutHelp, lang, next }));
     }

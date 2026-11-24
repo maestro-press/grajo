@@ -845,6 +845,19 @@ try {
   // token file exists and say where it is — the FILE PATH only, never the token
   // (the journal is broader than the owner). Silent once a password exists
   // (servers/gateway/dashboard/setup-token.js).
+  //
+  // Before it, the boot catch-up for installs that set a password before the
+  // marker existed: the password_hash row is there, so record it in
+  // <CROW_HOME>/secrets (password-set-marker.js) — nothing to write when the
+  // marker is already there, so a reboot does not rewrite it. Needed before
+  // bootSetupToken, which now reads the marker through isPasswordSet().
+  try {
+    const { bootPasswordSetMarker } = await import("./dashboard/password-set-marker.js");
+    await bootPasswordSetMarker();
+  } catch (err) {
+    console.warn("[auth] could not record the dashboard password state:", err.message);
+  }
+
   try {
     const { bootSetupToken } = await import("./dashboard/setup-token.js");
     await bootSetupToken();
