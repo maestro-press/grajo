@@ -19,6 +19,40 @@ import { collectHealthSignals } from "../dashboard/panels/nest/health-signals.js
 import * as fixItStore from "../../shared/fix-it/store.js";
 import { readSetting } from "../dashboard/settings/registry.js";
 import { SUPPORTED_LANGS } from "../dashboard/shared/i18n.js";
+import { ONCE } from "../../shared/schedule-core.js";
+
+/** A fired reminder row: the bell's only rows with Done / Stop reminding. Never a missed/failed notice. */
+export const isFiredReminder = (n) =>
+  !!n && n.type === "reminder" && n.source === "scheduler" && n.schedule_id !== null && n.schedule_id !== undefined;
+
+/**
+ * Add `recurring` to the fired reminder rows: is the schedule still there, and is it not a one-off?
+ * Computed from the schedules row on every list — never stored on the notification (a schedule can be
+ * deleted or re-created, and a stored copy would go stale). Rows of any other kind are returned as
+ * they are, so nothing else in the bell changes shape. A row whose schedule is gone is not recurring
+ * (there is nothing left to stop).
+ */
+async function withRecurring(db, notifications) {
+  const ids = [...new Set(notifications.filter(isFiredReminder).map((n) => Number(n.schedule_id)))]
+    .filter((id) => Number.isInteger(id) && id > 0);
+  if (!ids.length) return notifications;
+  const byId = new Map();
+  try {
+    const { rows } = await db.execute({
+      sql: `SELECT id, cron_expression FROM schedules WHERE id IN (${ids.map(() => "?").join(",")})`,
+      args: ids,
+    });
+    for (const r of rows) byId.set(Number(r.id), r.cron_expression);
+  } catch {
+    // No schedules table (a database from before it existed): nothing to stop, rows unchanged.
+    return notifications;
+  }
+  return notifications.map((n) => {
+    if (!isFiredReminder(n)) return n;
+    const cron = byId.get(Number(n.schedule_id));
+    return { ...n, recurring: cron !== undefined && cron !== ONCE };
+  });
+}
 
 export default function notificationsRouter(dashboardAuth, { collectSignals = collectHealthSignals } = {}) {
   const router = Router();
@@ -57,10 +91,10 @@ export default function notificationsRouter(dashboardAuth, { collectSignals = co
       const { rows } = await db.execute({ sql, args: params });
 
       // Parse metadata JSON
-      const notifications = rows.map((r) => ({
+      const notifications = await withRecurring(db, rows.map((r) => ({
         ...r,
         metadata: r.metadata ? JSON.parse(r.metadata) : null,
-      }));
+      })));
 
       res.json({ notifications, count: notifications.length });
     } catch (err) {

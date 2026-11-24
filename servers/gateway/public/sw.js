@@ -101,33 +101,145 @@ self.addEventListener("fetch", (e) => {
 
 self.addEventListener("push", (e) => {
   const data = e.data?.json() || {};
-  e.waitUntil(
-    self.registration.showNotification(data.title || "Crow", {
-      body: data.body || "",
-      icon: "/icons/crow-icon.svg",
-      badge: "/icons/crow-icon.svg",
-      data: { url: data.url || "/dashboard" },
-    })
-  );
+  e.waitUntil(showPush(data));
 });
 
+/**
+ * Show a push. A fired recurring reminder's payload also carries its notification id and the
+ * words of its "Stop reminding" action (R2) plus the after-stop notice (R4) — both resolved
+ * server-side, because a service worker has no i18n module. Every other push is shown exactly
+ * as before, and so is its notification data. The notification data never holds a secret: the
+ * action fetches the CSRF token itself (GET /dashboard/csrf) when it is tapped.
+ */
+function showPush(data) {
+  const stop = reminderStop(data);
+  const options = {
+    body: data.body || "",
+    icon: "/icons/crow-icon.svg",
+    badge: "/icons/crow-icon.svg",
+    data: { url: data.url || "/dashboard" },
+  };
+  if (stop) {
+    options.actions = stop.actions;
+    options.data.reminder = stop.reminder;
+  }
+  return self.registration.showNotification(data.title || "Crow", options);
+}
+
+/**
+ * What a push's notification offers as actions, and what the action needs later:
+ * `{ actions, reminder }` for a fired recurring reminder, otherwise null. Pure.
+ *
+ * Requires all three of `recurring === true`, a positive integer `id` and the label text: an
+ * old gateway's payload (or one whose words could not be resolved) shows no action rather than
+ * one with words of our own.
+ */
+function reminderStop(payload) {
+  if (!payload || payload.recurring !== true) return null;
+  const id = Number(payload.id);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  if (typeof payload.stopLabel !== "string" || !payload.stopLabel) return null;
+  return {
+    actions: [{ action: "stop", title: payload.stopLabel }],
+    reminder: { id, stoppedText: typeof payload.stoppedText === "string" ? payload.stoppedText : "" },
+  };
+}
+
+/**
+ * Did the stop request actually happen? "done" only for a 2xx answer whose JSON says
+ * `{ ok: true }`. A login redirect is not a refusal the owner can act on (both requests use
+ * `redirect: "manual"`, so a redirect arrives as `type === "opaqueredirect"`), a non-2xx is a
+ * refusal (the route answers 409 / 403 for R8 and for a non-owner session) and a non-JSON body
+ * means some page answered instead of the route: all of those are "open" — the tap then opens
+ * the reminder, where the owner can see what happened. Pure.
+ */
+function stopOutcome(res, body) {
+  if (!res || res.redirected || res.type === "opaqueredirect" || !res.ok) return "open";
+  return body && body.ok === true ? "done" : "open";
+}
+
+/** The JSON body of an answer that may carry one, else null (a redirect, a refusal, a page). */
+async function jsonAnswer(res) {
+  if (!res || res.redirected || res.type === "opaqueredirect" || !res.ok) return null;
+  try {
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * POST the dashboard's stop route (#72 part 1) for this notification: the CSRF token first
+ * (GET /dashboard/csrf — the token is server-bound and never in a cookie), then the POST with
+ * the `X-Crow-Csrf` header. Both are same-origin, so the session cookie rides along; both use
+ * `redirect: "manual"`, so an expired session (a redirect to the login page) is told apart
+ * from a refusal. → "done" | "open".
+ */
+async function requestStop(id) {
+  let answer;
+  try {
+    const csrf = await jsonAnswer(await fetch("/dashboard/csrf", {
+      credentials: "same-origin",
+      redirect: "manual",
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+    }));
+    if (!csrf || typeof csrf.token !== "string" || !csrf.token) return "open";
+    answer = await fetch("/dashboard/reminders/" + encodeURIComponent(id) + "/stop", {
+      method: "POST",
+      credentials: "same-origin",
+      redirect: "manual",
+      cache: "no-store",
+      headers: { "X-Crow-Csrf": csrf.token, Accept: "application/json" },
+    });
+  } catch {
+    return "open";
+  }
+  return stopOutcome(answer, await jsonAnswer(answer));
+}
+
+/** The reminder's notification was stopped: replace it with the R4 words the payload carried. */
+function showStopped(reminder, title, url) {
+  return self.registration.showNotification(title || "Crow", {
+    body: reminder.stoppedText || "",
+    icon: "/icons/crow-icon.svg",
+    badge: "/icons/crow-icon.svg",
+    data: { url: url || "/dashboard" },
+  });
+}
+
+/** Focus an open dashboard window (Turbo knows the route) or open a new one. */
+function openDashboard(url) {
+  return self.clients
+    .matchAll({ type: "window", includeUncontrolled: true })
+    .then((windowClients) => {
+      // Focus existing window if one is open
+      for (const client of windowClients) {
+        if (client.url.includes("/dashboard/") && "focus" in client) {
+          client.navigate(url);
+          return client.focus();
+        }
+      }
+      // Otherwise open a new window
+      return self.clients.openWindow(url);
+    });
+}
+
 self.addEventListener("notificationclick", (e) => {
-  e.notification.close();
   // /dashboard routes per device mode (new → Chat, classic → the nest).
   const url = e.notification.data?.url || "/dashboard";
-  e.waitUntil(
-    self.clients
-      .matchAll({ type: "window", includeUncontrolled: true })
-      .then((windowClients) => {
-        // Focus existing window if one is open
-        for (const client of windowClients) {
-          if (client.url.includes("/dashboard/") && "focus" in client) {
-            client.navigate(url);
-            return client.focus();
-          }
-        }
-        // Otherwise open a new window
-        return self.clients.openWindow(url);
-      })
-  );
+  // "Stop reminding" (a recurring reminder's action) stops the schedule, then says so; any
+  // trouble (a login redirect, a refusal, a network error) opens the reminder instead.
+  const reminder = e.action === "stop" ? e.notification.data?.reminder : null;
+  const title = e.notification.title;
+  e.notification.close();
+  if (reminder) {
+    e.waitUntil(
+      requestStop(reminder.id).then((outcome) =>
+        outcome === "done" ? showStopped(reminder, title, url) : openDashboard(url)
+      )
+    );
+    return;
+  }
+  e.waitUntil(openDashboard(url));
 });

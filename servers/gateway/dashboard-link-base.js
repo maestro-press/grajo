@@ -107,9 +107,33 @@ export async function resolveDashboardBase(db, { env = process.env, localInstanc
  * @returns {Promise<string>} a base with no trailing slash, or ""
  */
 export async function resolveClickBase(db, { env = process.env } = {}) {
-  const override = text((env == null ? "" : env).NTFY_CLICK_BASE_URL).trim();
+  const override = ntfyClickOverride({ env });
   if (override) return override.replace(/\/+$/, "");
   return resolveDashboardBase(db, { env });
+}
+
+/**
+ * The `NTFY_CLICK_BASE_URL` override as given (trimmed), or "" when it names none. The ONE rule both
+ * `resolveClickBase` and a caller that must know whether the override is in play (`hasNtfyClickOverride`,
+ * the scheduler's reminders) read.
+ *
+ * @param {{env?: object}} [opts]
+ * @returns {string}
+ */
+export function ntfyClickOverride({ env = process.env } = {}) {
+  return text((env == null ? "" : env).NTFY_CLICK_BASE_URL).trim();
+}
+
+/**
+ * Is a satellite's ntfy click base set at all? When it is, a push's click target is built for the HOME
+ * instance, so a link that names something of THIS instance's (a schedule id) would land on the wrong
+ * box and must be left out of the ntfy message instead.
+ *
+ * @param {{env?: object}} [opts]
+ * @returns {boolean}
+ */
+export function hasNtfyClickOverride(opts = {}) {
+  return ntfyClickOverride(opts) !== "";
 }
 
 export default resolveDashboardBase;

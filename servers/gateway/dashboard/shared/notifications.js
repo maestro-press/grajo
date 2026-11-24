@@ -45,6 +45,13 @@ export function sharedNotifJs(lang) {
     if (n.source === 'sharing:voice_memo_unverified') return '${tJs("notif.notContactMemoWarning", lang)}';
     return '';
   }
+  // #72: a FIRED reminder row is the only row with Done / Stop reminding. Never a missed or
+  // failed notice: those are source 'scheduler:missed' and their acknowledgement drives the
+  // Schedule problems strip. The server sends 'recurring' for these rows only.
+  function isFiredReminder(n) {
+    return !!n && n.type === 'reminder' && n.source === 'scheduler' && n.schedule_id != null;
+  }
+
   // Only http(s) links and same-site paths are followed, from any item.
   function safeNotifLink(u) {
     if (typeof u !== 'string') return '';
@@ -161,6 +168,33 @@ export function sharedNotifJs(lang) {
         time.textContent = formatTimeAgo(n.created_at);
         body.appendChild(time);
 
+        // #72: Done dismisses (a recurring reminder keeps its schedule); Stop reminding pauses
+        // the schedule and dismisses. Stop is shown only when the server said the schedule is
+        // recurring — a deleted schedule or a one-off has nothing left to stop. Text-only DOM
+        // (createElement + textContent), like every other row part above.
+        if (isFiredReminder(n)) {
+          var acts = document.createElement('div');
+          acts.className = 'notif-item-reminder-actions';
+
+          var doneBtn = document.createElement('button');
+          doneBtn.type = 'button';
+          doneBtn.className = 'notif-item-reminder-btn';
+          doneBtn.textContent = '${tJs("notif.reminderDone", lang)}';
+          doneBtn.onclick = function(e) { reminderAction(e, n.id, 'done', '${tJs("notif.reminderDoneToast", lang)}'); };
+          acts.appendChild(doneBtn);
+
+          if (n.recurring === true) {
+            var stopBtn = document.createElement('button');
+            stopBtn.type = 'button';
+            stopBtn.className = 'notif-item-reminder-btn';
+            stopBtn.textContent = '${tJs("notif.reminderStop", lang)}';
+            stopBtn.onclick = function(e) { reminderAction(e, n.id, 'stop', '${tJs("notif.reminderStoppedToast", lang)}'); };
+            acts.appendChild(stopBtn);
+          }
+
+          body.appendChild(acts);
+        }
+
         item.appendChild(body);
 
         var dismiss = document.createElement('button');
@@ -192,6 +226,36 @@ export function sharedNotifJs(lang) {
       loadNotifications();
       pollNotifications();
     } catch(e) {}
+  }
+
+  // #72: Done / Stop reminding. The routes live under /dashboard, so the session cookie rides
+  // along and the server-bound CSRF token (window.crowCsrf) is echoed as a header. The answer's
+  // own words are shown (the toast R3/R4, or R8 when Stop was refused); a refusal that carries no
+  // words (another session, not the owner's) changes nothing on screen.
+  async function reminderAction(e, id, verb, fallback) {
+    e.stopPropagation();
+    e.preventDefault();
+    try {
+      var headers = { 'Content-Type': 'application/json' };
+      var token = '';
+      try { token = typeof window.crowCsrf === 'function' ? window.crowCsrf() : ''; } catch (err) { token = ''; }
+      if (token) headers['X-Crow-Csrf'] = token;
+      var r = await fetch('/dashboard/reminders/' + encodeURIComponent(id) + '/' + verb, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: headers,
+        body: '{}'
+      });
+      var j = null;
+      try { j = await r.json(); } catch (err) { j = null; }
+      if (j && j.ok === true) {
+        if (typeof window.crowToast === 'function') window.crowToast(typeof j.text === 'string' && j.text ? j.text : fallback);
+      } else if (j && typeof j.text === 'string' && j.text) {
+        if (typeof window.crowToast === 'function') window.crowToast(j.text, { type: 'error' });
+      }
+      loadNotifications();
+      pollNotifications();
+    } catch(err) {}
   }
 
   async function dismissAllNotifications(e) {
@@ -452,6 +516,24 @@ export const headerIconsCss = `
     flex-shrink: 0;
   }
   .notif-item-dismiss:hover { color: var(--crow-error); }
+  .notif-item-reminder-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-top: 0.35rem;
+  }
+  .notif-item-reminder-btn {
+    font: inherit;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.2rem 0.55rem;
+    border: 1px solid var(--crow-border);
+    border-radius: 6px;
+    background: none;
+    color: var(--crow-text-muted);
+    cursor: pointer;
+  }
+  .notif-item-reminder-btn:hover { color: var(--crow-accent); border-color: var(--crow-accent); }
   .notif-type-icon {
     width: 24px;
     height: 24px;

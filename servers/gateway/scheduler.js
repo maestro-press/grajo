@@ -21,6 +21,7 @@ import { createNotification, cleanupNotifications } from "../shared/notification
 import { getSchedulerHook, runSchedulerHooks } from "./scheduler-hooks.js";
 import { ONCE, scheduleKind, reminderText, settleDue, graceMs, cronNext, zoneFor, missedRunInsert, ALIVE_SLACK_MS, BOTCRON_PREFIX, REPORT_TASK_GLOB } from "../shared/schedule-core.js";
 import { instanceZone, instanceLang, ownerZone, hasRunsTable, hasTzColumn } from "../shared/schedule-store.js";
+import { hasNtfyClickOverride } from "./dashboard-link-base.js";
 import { fmt } from "../shared/relative-dates.js";
 import { withWriteContext, systemWriteContext } from "../shared/history/write-context.js";
 
@@ -99,6 +100,12 @@ async function rowZone(row, zone) {
 /** Notification + reminder hooks. → null, or the error message when the notification failed. */
 async function deliverReminder(db, schedule, { late = false, lang = "en" } = {}) {
   const text = reminderText(schedule.task) || STR[lang].fallback;
+  // Every fired reminder links to ITSELF (the Schedule panel opens `?id=crow:<id>`), so a tap on the
+  // bell row, the web push or the ntfy message is one tap from Pause. Linked by SCHEDULE, not by run:
+  // run rows are pruned, and the schedule id is already on the notification row.
+  // A satellite with NTFY_CLICK_BASE_URL set publishes for the HOME instance, where this schedule id
+  // does not exist: there the ntfy message keeps no click target (the bell and web push still link
+  // here). ntfy_url: null IS "no click target"; leaving it out would fall back to action_url.
   let error = null;
   try {
     await createNotification(db, {
@@ -107,6 +114,8 @@ async function deliverReminder(db, schedule, { late = false, lang = "en" } = {})
       source: "scheduler",
       priority: "normal",
       schedule_id: schedule.id,
+      action_url: `${SCHEDULE_PAGE}?id=crow:${schedule.id}`,
+      ...(hasNtfyClickOverride() ? { ntfy_url: null } : {}),
     });
   } catch (err) {
     error = String(err?.message || err).slice(0, 200);

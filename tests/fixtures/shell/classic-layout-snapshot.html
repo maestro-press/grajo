@@ -883,6 +883,24 @@
     flex-shrink: 0;
   }
   .notif-item-dismiss:hover { color: var(--crow-error); }
+  .notif-item-reminder-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-top: 0.35rem;
+  }
+  .notif-item-reminder-btn {
+    font: inherit;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.2rem 0.55rem;
+    border: 1px solid var(--crow-border);
+    border-radius: 6px;
+    background: none;
+    color: var(--crow-text-muted);
+    cursor: pointer;
+  }
+  .notif-item-reminder-btn:hover { color: var(--crow-accent); border-color: var(--crow-accent); }
   .notif-type-icon {
     width: 24px;
     height: 24px;

@@ -66,6 +66,23 @@ test("sw.js: perch-api and SSE routes pass through, unintercepted, before any da
   }
 });
 
+test("sw.js: the recurring reminder's stop action is wired (payload → action → CSRF POST → R4 notice)", () => {
+  const sw = readFileSync(join(PUB, "sw.js"), "utf8");
+  // #72 part 2: the two pure helpers exist and the handlers call them (their behaviour is pinned in
+  // tests/push-reminder-stop.test.js, which evaluates this same file in a vm).
+  assert.ok(sw.includes("function reminderStop(payload)"), "the stop-action decision is its own helper");
+  assert.ok(sw.includes("function stopOutcome(res, body)"), "the answer's verdict is its own helper");
+  assert.match(sw, /const stop = reminderStop\(data\);/, "the push handler asks for the action");
+  assert.match(sw, /options\.actions = stop\.actions;/, "…and shows it");
+  assert.match(sw, /options\.data\.reminder = stop\.reminder;/, "…carrying the id and the words it needs later");
+  assert.match(sw, /function requestStop\(id\)/, "the action's request is its own function");
+  assert.match(sw, /fetch\("\/dashboard\/csrf", \{[^}]*redirect: "manual"/, "the token is read from the endpoint, redirect-aware");
+  assert.match(sw, /"\/dashboard\/reminders\/" \+ encodeURIComponent\(id\) \+ "\/stop"/, "the part-1 stop route");
+  assert.match(sw, /"X-Crow-Csrf": csrf\.token/, "the token rides in the dashboard's own CSRF header");
+  assert.match(sw, /outcome === "done" \? showStopped\(reminder, title, url\) : openDashboard\(url\)/,
+    "success shows R4; anything else opens the reminder");
+});
+
 test("sw.js: notifications default to /dashboard, and the offline nest copy is never a redirect", () => {
   const sw = readFileSync(join(PUB, "sw.js"), "utf8");
   assert.ok(sw.includes('data: { url: data.url || "/dashboard" }'), "push default url");

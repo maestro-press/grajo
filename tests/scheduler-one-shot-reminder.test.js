@@ -44,6 +44,9 @@ test("a due one-shot fires once and turns itself off; an ordinary reminder stays
     assert.ok(o.next_run, "next_run kept for the record");
     assert.ok(o.last_run);
     assert.equal((await notes(once)).length, 1);
+    // #72 part 0: the fired reminder links to ITSELF, so one tap on the bell / push opens it on the
+    // Schedule page (dashboard/panels/schedule.js reads ?id=crow:<schedule id>).
+    assert.equal((await notes(once))[0].action_url, `/dashboard/schedule?id=crow:${once}`);
     const d = await row(daily);
     assert.equal(Number(d.enabled), 1);
     assert.ok(new Date(d.next_run) > new Date());

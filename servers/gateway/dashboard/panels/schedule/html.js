@@ -1,7 +1,8 @@
 /**
- * Schedule panel: the page (problems strip, toolbar, agenda, one detail) and the create sheet.
- * Pure HTML from the model schedule-catalog.js builds plus a few page flags (schedule.js); no
- * file or DB access here. Every POST form carries the CSRF field, so it works without JS too.
+ * Schedule panel: the page (problems strip, toolbar, agenda, one detail), the create sheet and the
+ * edit sheet (a reminder's words and its time). Pure HTML from the model schedule-catalog.js builds
+ * plus a few page flags (schedule.js); no file or DB access here. Every POST form carries the CSRF
+ * field, so it works without JS too.
  *
  * Layout (the Skills page's pattern): one `.sc-detail` at most, rendered inside its row's <li>.
  * On a phone it sits under the row; at ≥ 769px CSS pins it as a side pane (css.js).
@@ -228,6 +229,9 @@ function detailControls(it, m) {
     return `<p class="sc-note">${esc(t("schedule.systemNote", lang))}</p><div class="sc-d-acts">${postButton(m, "delete", { id: it.id }, t("schedule.delete", lang), { cls: "btn btn-danger" })}</div>`;
   }
   acts.push(`<span class="sc-d-switch">${switchForm(m, it)}</span>`);
+  // A reminder is the one row the owner edits here (its words and its time); a bot routine is made
+  // in Bot Builder and the briefing in News.
+  if (it.kind === "reminder") acts.push(`<a class="btn btn-secondary" href="${href(qs({ id: it.ref, edit: "1" }))}#sc-${it.id}" data-sc-edit>${esc(t("schedule.edit", lang))}</a>`);
   acts.push(postButton(m, "run-now", { id: it.id }, t("schedule.runNow", lang), { cls: "btn btn-primary" }));
   if (it.kind === "bot_routine" && it.botId) acts.push(`<a class="btn btn-secondary" href="/dashboard/bot-builder?bot=${encodeURIComponent(it.botId)}&amp;tab=activity">${esc(t("schedule.openBot", lang))}</a>`);
   acts.push(postButton(m, "delete", { id: it.id }, t("schedule.delete", lang), { cls: "btn btn-danger" }));
@@ -427,7 +431,68 @@ function createSheet(m) {
       </div>
     </form>
   </dialog>
-  <noscript><style>#sc-create[data-open-on-load]{display:block;position:static;margin:0 0 1rem}</style></noscript>`;
+  <noscript><style>.sc-dialog[data-open-on-load]{display:block;position:static;margin:0 0 1rem}</style></noscript>`;
+}
+
+/**
+ * The edit sheet: the reminder's own words and its current schedule, in the create form's fields
+ * (no type choice: only a reminder reaches here).
+ *
+ * There is no stored "when" phrase, so the prefill is what the form can parse back:
+ *   - a recurring schedule whose cron describeCron can word → the When field gets those words (the
+ *     inverse of the parser, so they read back as the same schedule);
+ *   - any other recurrence (a custom expression) → the cron field holds the exact expression and the
+ *     cron section starts open. In THIS sheet the owner's typed words win: the client clears the cron
+ *     field as they type a When, and schedule-actions.editWhenFields makes the server save the same
+ *     thing, so a prefilled expression can never silently beat the words (New schedule keeps the
+ *     create form's opposite rule: there an advanced cron wins). The sheet carries that rule to its
+ *     live preview too: `data-sc-preview-mode="edit"` makes the client ask the preview route with
+ *     mode=edit, and the route resolves the fields with the same editWhenFields its Save uses — so
+ *     both fields filled (the owner typed a When, then typed into cron again) reads back as the When
+ *     that will be stored, never the expression;
+ *   - a one-off (@once) → both empty: its time is an absolute instant, not words, and the pane above
+ *     shows it under When. The owner states a time, which is also what resume demands of a passed one.
+ * The zone rides along as the reminder's own, so editing the words never re-anchors the time to
+ * whatever machine the page is open on.
+ */
+function editPrefill(it, lang) {
+  const words = it.once ? null : describeCron(it.cron, lang);
+  const cron = words || it.once ? "" : it.cron;
+  return { text: it.title || "", when: words || "", cron: cron || "", tz: it.zone || "" };
+}
+
+function editSheet(m) {
+  const { lang } = m;
+  const it = m.detail && m.detail.item;
+  if (!it || it.kind !== "reminder") return "";
+  const ed = m.edit || {};
+  const typed = ed.typed || editPrefill(it, lang);
+  const err = ed.error ? `<div class="sc-note sc-note-err" role="alert" id="sc-edit-err">${esc(ed.error)}</div>` : "";
+  const openOnLoad = !!(ed.error || ed.preview || m.editOpen);
+  return `<dialog id="sc-edit" class="sc-dialog" aria-labelledby="sc-edit-h" data-sc-preview-mode="edit"${openOnLoad ? " data-open-on-load" : ""}>
+    <form method="POST" action="${ROUTE}" id="sc-edit-form">
+      ${csrf(m)}
+      <input type="hidden" name="id" value="${esc(it.id)}">
+      <input type="hidden" name="tz" value="${esc(typed.tz)}" data-sc-tz>
+      <div class="sc-d-head"><h2 id="sc-edit-h">${esc(t("schedule.editTitle", lang))}</h2><button type="button" class="sc-close" data-sc-dismiss aria-label="${esc(t("schedule.cancel", lang))}">✕</button></div>
+      ${err}
+      <label class="sc-field" for="sc-edit-text">${esc(t("schedule.whatLabel", lang))}</label>
+      <input class="sc-input" id="sc-edit-text" name="text" maxlength="1000" required value="${esc(typed.text)}" placeholder="${esc(t("schedule.whatPlaceholder", lang))}"${ed.focus === "text" ? " autofocus" : ""}>
+      <label class="sc-field" for="sc-edit-when">${esc(t("schedule.whenLabel", lang))}</label>
+      <input class="sc-input" id="sc-edit-when" name="when" maxlength="200" value="${esc(typed.when)}" placeholder="${esc(t("schedule.whenPlaceholder", lang))}" aria-describedby="sc-edit-when-hint" autocomplete="off"${ed.focus === "when" ? " autofocus" : ""}>
+      <p class="sc-hint" id="sc-edit-when-hint">${esc(t("schedule.whenHint", lang))}</p>
+      <details class="sc-adv"${typed.cron ? " open" : ""}><summary>${esc(t("schedule.useCron", lang))}</summary>
+        <label class="sc-field" for="sc-edit-cron">${esc(t("schedule.cronLabel", lang))}</label>
+        <input class="sc-input sc-mono" id="sc-edit-cron" name="cron" maxlength="50" value="${esc(typed.cron)}" placeholder="0 9 * * 1-5" autocomplete="off">
+      </details>
+      <div class="sc-preview" id="sc-edit-preview" aria-live="polite" data-l-next="${esc(t("schedule.previewNext", lang))}" data-l-empty="${esc(t("schedule.previewEmpty", lang))}" data-lang="${esc(lang)}">${previewBlock(ed.preview, lang)}</div>
+      <div class="sc-d-acts">
+        <button type="submit" name="action" value="edit" class="btn btn-primary">${esc(t("schedule.save", lang))}</button>
+        <button type="submit" name="action" value="edit-preview" class="btn btn-secondary" formnovalidate data-sc-preview-btn>${esc(t("schedule.preview", lang))}</button>
+        <button type="button" class="btn btn-secondary" data-sc-dismiss>${esc(t("schedule.cancel", lang))}</button>
+      </div>
+    </form>
+  </dialog>`;
 }
 
 // ---------------------------------------------------------------- page
@@ -435,7 +500,8 @@ function createSheet(m) {
 /**
  * @param {object} m  the catalog model plus: lang, csrf, now, running (Map), toast, notice
  *   ({kind, text}|null), confirmDelete, create ({typed, error, preview, focus}|null),
- *   createOpen, mediaInstalled, sources (["crow", …]), filter
+ *   edit ({id, typed, error, preview, focus}|null), createOpen, editOpen, mediaInstalled,
+ *   sources (["crow", …]), filter
  */
 export function renderSchedulePage(m) {
   const { lang } = m;
@@ -452,6 +518,7 @@ export function renderSchedulePage(m) {
     <div class="sc-agenda">${agenda(m)}</div>
     <p class="sc-foot">${esc(fill(t("schedule.zoneFoot", lang), { zone: m.zone }))}</p>
     ${createSheet(m)}
+    ${editSheet(m)}
     ${toast}
   </div>`;
 }

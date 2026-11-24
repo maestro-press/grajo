@@ -1,6 +1,6 @@
 /**
- * schedule-actions — what the Schedule panel's buttons do: create a reminder from plain words,
- * pause, resume, run now, delete, and dismiss a run. Each returns { ok, code?, ... } and never
+ * schedule-actions — what the Schedule panel's buttons do: create a reminder from plain words, edit
+ * one, pause, resume, run now, delete, and dismiss a run. Each returns { ok, code?, ... } and never
  * throws for a refused request; the panel turns codes into words.
  *
  * Every write re-reads the row first and decides from its CURRENT task, so a stale page can never
@@ -34,11 +34,28 @@ async function zoneOfRow(db, row) {
 /**
  * Parse the create form's "when" (or its advanced cron field) for a reminder.
  * `tz` is the browser's zone when it sent one; the instance zone otherwise.
+ * When BOTH are filled the cron field wins here — the create form's rule. The edit sheet's opposite
+ * rule (a typed "when" wins) is applied by its caller through editWhenFields(), so the two forms
+ * each keep one rule the client and the server agree on.
  */
 export async function previewWhen(db, { when, cron, tz, lang, now = Date.now() }) {
   const zone = zoneFor(tz, await instanceZone(db));
   const text = typeof cron === "string" && cron.trim() ? cron : when;
   return { ...parseWhen(typeof text === "string" ? text : "", { lang, tz: zone, now, type: "reminder" }), zone };
+}
+
+/**
+ * The EDIT sheet's rule, the opposite of the create form's: a non-empty "when" wins over the cron
+ * field. The sheet prefills the cron field for a schedule describeCron cannot word (When starts
+ * empty there), so words the owner then types must never be silently beaten by that stale
+ * expression. ONE function decides for the edit sheet everywhere: the client clears the cron field
+ * as the owner types, previewWhen's caller in the live preview route resolves with it (mode=edit),
+ * the no-JS POST does too, and editReminder saves with it — so the read-back and the saved row can
+ * never disagree. Create is untouched: there the advanced cron wins.
+ * → the two fields to hand previewWhen.
+ */
+export function editWhenFields({ when, cron }) {
+  return { when, cron: typeof when === "string" && when.trim() ? "" : cron };
 }
 
 /** Create a reminder. → { ok:true, id, words } | { ok:false, code, hint? } */
@@ -73,6 +90,69 @@ export async function createReminder(db, { text, when, cron, tz, lang, now = Dat
     args: withTz ? [task, words.cron, nextRun, storeTz] : [task, words.cron, nextRun],
   });
   return { ok: true, id: Number(r.lastInsertRowid), words };
+}
+
+/**
+ * Edit a reminder: the words, the time, or one-off ↔ recurring. The same fields and the same rules
+ * as createReminder (parseWhen, the hourly floor, the text checks), so anything the create form
+ * refuses an edit refuses too.
+ *
+ * Only a reminder row is editable here: a bot routine is made in Bot Builder, the briefing in News
+ * and a report's row on its page, so every other row is refused with `bad-request` before anything
+ * is parsed (the panel shows Edit on reminders only, so this is the stale-page guard). `description`
+ * is left alone: createReminder never sets one on a reminder.
+ *
+ * Pause rule: a reminder the OWNER paused stays paused (enabled stays 0, the R7b toast), while a
+ * one-off that has already FIRED counts as finished, not paused — it is moved to the new time and
+ * turned back on (R7). next_run is always the new schedule's next occurrence, the value
+ * resumeSchedule would compute, so a paused row's stored next run matches its schedule and a resume
+ * keeps it; nothing fires while enabled is 0 (the ticker reads enabled = 1 rows only).
+ *
+ * → { ok:true, id, paused, words } | { ok:false, code, hint?, words? };
+ *   `paused` says which toast applies: true = the row stayed paused (R7b), false = R7.
+ */
+export async function editReminder(db, id, { text, when, cron, tz, lang, now = Date.now() }) {
+  const row = await rowOf(db, id);
+  if (!row) return { ok: false, code: "not-found" };
+  if (scheduleKind(row.task) !== "reminder") return { ok: false, code: "bad-request" };
+  const body = typeof text === "string" ? text.replace(/\s+/g, " ").trim() : "";
+  if (!body) return { ok: false, code: "empty-text" };
+  if (body.length > TEXT_MAX) return { ok: false, code: "text-too-long" };
+  // A reminder's words are never a type of their own ("pipeline:…", or News's own task).
+  const task = body.toLowerCase().startsWith(REMINDER_PREFIX) ? body : REMINDER_PREFIX + body;
+  if (scheduleKind(task) !== "reminder") return { ok: false, code: "bad-text" };
+  // The edit sheet's rule (see editWhenFields): the words the owner typed win over the cron field.
+  const words = await previewWhen(db, { ...editWhenFields({ when, cron }), tz, lang, now });
+  if (!words.ok) return { ok: false, code: "bad-when", hint: words.hint, words };
+  let nextRun;
+  if (words.cron === ONCE) {
+    const at = Date.parse(words.at);
+    if (!Number.isFinite(at) || at <= now) return { ok: false, code: "bad-when", hint: words.hint, words };
+    nextRun = iso(at);
+  } else {
+    const every = cadenceMinutes(words.cron, words.zone, now);
+    if (every !== null && every < MIN_REMINDER_EVERY) return { ok: false, code: "too-frequent", words };
+    const next = cronNext(words.cron, words.zone, now);
+    if (next === null) return { ok: false, code: "bad-when", words };
+    nextRun = iso(next);
+  }
+  // A one-off left disabled once it fired (last_run set, its time now past or gone) is finished.
+  const firedOnce = row.cron_expression === ONCE && !Number(row.enabled) && row.last_run != null
+    && !(Date.parse(row.next_run ?? "") > now);
+  const paused = !Number(row.enabled) && !firedOnce;
+  // A zone is stored only when it differs from the instance's: NULL follows the instance.
+  const withTz = await hasTzColumn(db);
+  const storeTz = withTz && words.zone !== (await instanceZone(db)) ? words.zone : null;
+  // Guarded by the row's own task, as every write here is: a row whose type changed under a stale
+  // page is left alone rather than turned into something else.
+  const r = await db.execute({
+    sql: withTz
+      ? "UPDATE schedules SET task = ?, cron_expression = ?, next_run = ?, enabled = ?, tz = ?, updated_at = datetime('now') WHERE id = ? AND task = ?"
+      : "UPDATE schedules SET task = ?, cron_expression = ?, next_run = ?, enabled = ?, updated_at = datetime('now') WHERE id = ? AND task = ?",
+    args: withTz ? [task, words.cron, nextRun, paused ? 0 : 1, storeTz, id, row.task] : [task, words.cron, nextRun, paused ? 0 : 1, id, row.task],
+  });
+  if (!Number(r.rowsAffected || 0)) return { ok: false, code: "not-found" };
+  return { ok: true, id, paused, words };
 }
 
 /** Pause. Not for the briefing (News owns it) and not for a report's row (the report page owns it). */

@@ -6,6 +6,7 @@
  */
 
 import bus from "./event-bus.js";
+import { ONCE } from "./schedule-core.js";
 import { maskSecrets, maskDeep } from "./secret-mask.js";
 import { notifyWidgetsChanged } from "../gateway/widgets/changed.js";
 
@@ -18,6 +19,31 @@ const MAX_NOTIFICATIONS = 500;
  * the row write AND at delivery, so no caller has to remember. Display-only.
  */
 const maskText = (v) => (v == null ? v : maskSecrets(v));
+
+/** A fired reminder row's shape, as far as the fan-out is concerned (the same predicate the bell's
+ *  list route calls `isFiredReminder`, redeclared here because it is a private detail of both). */
+const isFiredReminderRow = ({ type, source, schedule_id }) =>
+  type === "reminder" && source === "scheduler" && schedule_id !== null && schedule_id !== undefined;
+
+/**
+ * Is this a fired RECURRING reminder — the only notification whose web push offers
+ * "Stop reminding" (#72 part 2)? Read from the `schedules` row, never stored: a one-off
+ * (`@once`), a missed/failed notice (`source = 'scheduler:missed'`) and every other notice
+ * answer false, and so does a reminder whose schedule is already gone (nothing left to stop).
+ */
+async function isRecurringReminder(db, row) {
+  if (!isFiredReminderRow(row)) return false;
+  try {
+    const { rows } = await db.execute({
+      sql: "SELECT cron_expression FROM schedules WHERE id = ?",
+      args: [Number(row.schedule_id)],
+    });
+    return rows[0] ? rows[0].cron_expression !== ONCE : false;
+  } catch {
+    // No schedules table (a database from before it existed): nothing to stop.
+    return false;
+  }
+}
 
 /**
  * Create a notification, respecting user preferences.
@@ -33,6 +59,10 @@ const maskText = (v) => (v == null ? v : maskSecrets(v));
  * @param {string} [opts.source] - Origin identifier (e.g. 'scheduler', 'media:briefing')
  * @param {string} [opts.priority='normal'] - 'low', 'normal', 'high'
  * @param {string} [opts.action_url] - Dashboard link
+ * @param {string|null} [opts.ntfy_url] - What NTFY's click target is: a string, or `null` for NO click
+ *   target on the ntfy message alone. Omitted → the same link as `action_url`. For a caller whose link
+ *   names something of THIS instance that the ntfy reader's instance cannot open (a satellite with
+ *   NTFY_CLICK_BASE_URL set publishes for the home instance: the scheduler's reminders).
  * @param {object} [opts.metadata] - Structured data (stored as JSON)
  * @param {number} [opts.schedule_id] - FK to schedules table
  * @param {number} [opts.expires_in_minutes] - Auto-expire after N minutes
@@ -50,7 +80,9 @@ const maskText = (v) => (v == null ? v : maskSecrets(v));
  *   transaction (the Crow-to-Crow receive pipeline, R7/W1) and delivers the
  *   returned `delivery` payload itself after COMMIT.
  * @returns {Promise<{id: number, delivery: object}|null>} the row id plus the exact
- *   payload the fan-out would have received, or null if the type is filtered out
+ *   payload the fan-out would have received, or null if the type is filtered out. A fired
+ *   recurring reminder's payload also carries `id` and `recurring: true` (see below); every
+ *   other payload is unchanged.
  */
 export async function createNotification(db, opts) {
   const {
@@ -60,6 +92,7 @@ export async function createNotification(db, opts) {
     source = null,
     priority = "normal",
     action_url = null,
+    ntfy_url,
     metadata = null,
     schedule_id = null,
     expires_in_minutes = null,
@@ -87,13 +120,26 @@ export async function createNotification(db, opts) {
 
   await broadcastUnread(db);
 
+  const id = Number(result.lastInsertRowid);
+  const recurring = await isRecurringReminder(db, { type, source, schedule_id });
+
   // The payload is built once, so a caller that delivered nothing here (above)
   // can hand exactly this to deliverNotification after its own commit.
   const delivery = { title, body, action_url, priority, type };
+  // Only carried when the caller decided it, so every other notice's payload is unchanged (`undefined`
+  // is also not JSON, so a payload crossing to another host never grows a field).
+  if (ntfy_url !== undefined) delivery.ntfy_url = ntfy_url;
+  // A fired recurring reminder carries its row id and the flag that make the web push's
+  // "Stop reminding" action possible (the words are resolved at push time, in the dashboard's
+  // language). Nothing else gains a field, and the grouped re-push path carries neither.
+  if (recurring) {
+    delivery.id = id;
+    delivery.recurring = true;
+  }
   const fanOut = deliver === false ? null : deliver;
   if (typeof fanOut === "function") await fanOut(db, delivery);
 
-  return { id: Number(result.lastInsertRowid), delivery };
+  return { id, delivery };
 }
 
 /** The notification_prefs type gate: false when this type is switched off. */
@@ -142,9 +188,11 @@ async function broadcastUnread(db) {
  * row; a grouped notification's re-push calls it on its own. Every channel
  * is optional and fails silently.
  */
-export async function deliverNotification(db, { title: rawTitle, body: rawBody = null, action_url = null, priority = "normal", type = "system" }) {
+export async function deliverNotification(db, { title: rawTitle, body: rawBody = null, action_url = null, priority = "normal", type = "system", ntfy_url, id = null, recurring = false }) {
   const title = maskText(rawTitle);
   const body = maskText(rawBody);
+  // `ntfy_url` is the one channel that may take a different click target: `null` leaves the ntfy
+  // message with no target at all (see createNotification's JSDoc).
 
   // Widgets phase 1: a notification is a thing that may now wait on the owner
   // (an unread thread, a bot asking, a result to accept), so the widgets are
@@ -156,7 +204,9 @@ export async function deliverNotification(db, { title: rawTitle, body: rawBody =
   // Send web push notification (non-blocking, fails silently when not available)
   try {
     const { sendPushToAll } = await import("../gateway/push/web-push.js");
-    await sendPushToAll(db, { title, body: body || title, url: action_url });
+    // `id` + `recurring` are only set for a fired recurring reminder (createNotification); the
+    // push adds the stop action's words itself, in the owner's dashboard language.
+    await sendPushToAll(db, { title, body: body || title, url: action_url, id, recurring });
   } catch {
     // Push module not available (non-gateway context) — skip silently
   }
@@ -165,7 +215,7 @@ export async function deliverNotification(db, { title: rawTitle, body: rawBody =
   // only the click link's base (dashboard-link-base.js), never the message.
   try {
     const { sendNtfyNotification } = await import("../gateway/push/ntfy.js");
-    await sendNtfyNotification({ title, body: body || title, url: action_url, priority, type, db });
+    await sendNtfyNotification({ title, body: body || title, url: ntfy_url === undefined ? action_url : ntfy_url, priority, type, db });
   } catch {
     // ntfy module not available or not configured — skip silently
   }

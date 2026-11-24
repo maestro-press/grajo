@@ -5,7 +5,10 @@
  *
  * The model is servers/gateway/schedule-catalog.js; the buttons are schedule-actions.js. Writes
  * are plain POST forms (CSRF field + Turbo's header, 303 after POST), refused unless the request
- * is the owner's own password session at this Crow (never a peer sign-in or a signed peer call). Delete takes two POSTs: the first only opens the confirm.
+ * is the owner's own password session at this Crow (never a peer sign-in or a signed peer call).
+ * A reminder's detail also offers Edit — the create sheet's fields, filled in, saved by
+ * schedule-actions.editReminder (only a reminder is editable here).
+ * Delete takes two POSTs: the first only opens the confirm.
  * The briefing's controls are links to News → Briefings, which owns that row.
  *
  * Read-only sources (schedule-sources/: the box hold, the box ledger, the machines' timers) are
@@ -16,7 +19,7 @@
 import { t } from "../shared/i18n.js";
 import { escapeHtml, section } from "../shared/components.js";
 import { buildScheduleModel, scheduleOfRun } from "../../schedule-catalog.js";
-import { createReminder, previewWhen, pauseSchedule, resumeSchedule, runScheduleNow, deleteScheduleRow, ackRun, claimRun, releaseRun } from "../../schedule-actions.js";
+import { createReminder, editReminder, editWhenFields, previewWhen, pauseSchedule, resumeSchedule, runScheduleNow, deleteScheduleRow, ackRun, claimRun, releaseRun } from "../../schedule-actions.js";
 import { isLocalPasswordSession } from "../local-session.js";
 import { engineStatus } from "../../bot-engine-status.js";
 import { botRuntimeActive } from "./bot-runtime-flag.js";
@@ -51,6 +54,8 @@ const DONE = {
   created: "schedule.toast.created", paused: "schedule.toast.paused", resumed: "schedule.toast.resumed", ran: "schedule.toast.ran",
   queued: "schedule.toast.queued", "already-queued": "schedule.toast.alreadyQueued", deleted: "schedule.toast.deleted", dismissed: "schedule.toast.dismissed",
   "already-done": "schedule.toast.alreadyDone",
+  // An edit answers with one of two words: the next run moved (R7) or the reminder stayed paused (R7b).
+  edited: "schedule.toast.edited", "edited-paused": "schedule.toast.editedPaused",
 };
 const ERRORS = {
   "not-found": "schedule.err.notFound", owned: "schedule.err.owned", "report-owned": "schedule.err.reportOwned",
@@ -58,13 +63,20 @@ const ERRORS = {
   "bad-cron": "schedule.err.badCron", "cant-run": "schedule.err.cantRun", "delivery-failed": "schedule.err.deliveryFailed", "bad-request": "schedule.err.badRequest",
 };
 
-/** GET /dashboard/schedule/preview?when=&cron=&tz=&lang= → the read-back as JSON (session-gated by the dashboard router). */
+/**
+ * GET /dashboard/schedule/preview?when=&cron=&tz=&lang=&mode= → the read-back as JSON (session-gated
+ * by the dashboard router). `mode=edit` is the edit sheet's live preview: it resolves the two fields
+ * with schedule-actions.editWhenFields, the SAME function its no-JS Preview and its Save use, so the
+ * three can never disagree. A request without a mode is the create sheet and keeps the create rule
+ * (a filled cron wins).
+ */
 export async function schedulePreview(req, res, db) {
   const q = req.query || {};
   const lang = one(q.lang) === "es" ? "es" : "en";
   const when = (one(q.when) ?? "").slice(0, 4000);
   const cron = (one(q.cron) ?? "").slice(0, 200);
-  const p = await previewWhen(db, { when, cron, tz: one(q.tz), lang });
+  const fields = one(q.mode) === "edit" ? editWhenFields({ when, cron }) : { when, cron };
+  const p = await previewWhen(db, { ...fields, tz: one(q.tz), lang });
   res.set("Cache-Control", "no-store");
   res.json(p.ok ? { ok: true, summary: p.summary, next3: p.next3, zone: p.zone } : { ok: false, code: p.code, hint: p.hint });
 }
@@ -82,6 +94,8 @@ export default {
     const page = (status, content) => { if (status) res.status(status); return layout({ title: t("schedule.pageTitle", lang), content }); };
     const refuse = (status, key) => page(status, section(t("schedule.pageTitle", lang), `<p>${escapeHtml(t(key, lang))}</p><a href="${ROUTE}" class="btn btn-secondary">${escapeHtml(t("schedule.back", lang))}</a>`));
     let create = null;
+    // A refused edit comes back as the sheet again, filled in, exactly as a refused create does.
+    let edit = null;
 
     if (req.method === "POST") {
       if (!(await isOwnerRequest(req))) return refuse(403, "schedule.err.ownerOnly");
@@ -122,6 +136,29 @@ export default {
         return result(r.ok ? r.scheduleId : null, r, "dismissed");
       } else if (id === null) {
         return refuse(400, "schedule.err.badRequest");
+      } else if (action === "edit" || action === "edit-preview") {
+        // Editing a reminder's words or its time (schedule-actions.editReminder applies the create
+        // rules: the same parser, the hourly floor, a future time for a one-off).
+        const typed = { text: one(body.text) ?? "", when: one(body.when) ?? "", cron: one(body.cron) ?? "", tz: one(body.tz) ?? "" };
+        if (action === "edit-preview") {
+          // The edit sheet's rule (editWhenFields): a typed When wins over the cron field, so the
+          // no-JS Preview reads back exactly what Save will store.
+          const p = await previewWhen(db, { ...editWhenFields(typed), tz: typed.tz, lang });
+          edit = { id, typed, preview: p, focus: "when" };
+          res.status(422);
+        } else {
+          const r = await editReminder(db, id, { text: typed.text, when: typed.when, cron: typed.cron, tz: typed.tz, lang });
+          if (r.ok) { to(r.id, { done: r.paused ? "edited-paused" : "edited" }); return; }
+          // Only a whole reminder is editable here, so a gone row or any other row's row is a plain refusal.
+          if (r.code === "not-found" || r.code === "bad-request") return to(r.code === "not-found" ? null : id, { error: r.code });
+          const msg = r.code === "empty-text" ? t("schedule.err.emptyText", lang)
+            : r.code === "text-too-long" ? t("schedule.err.textTooLong", lang)
+              : r.code === "bad-text" ? t("schedule.err.badText", lang)
+                : r.code === "too-frequent" ? t("schedule.err.tooFrequent", lang)
+                  : r.hint || t("schedule.previewBad", lang);
+          edit = { id, typed, error: msg, preview: r.words || null, focus: /text/.test(r.code) ? "text" : "when" };
+          res.status(422);
+        }
       } else if (action === "pause") {
         return result(id, await pauseSchedule(db, id), "paused");
       } else if (action === "resume" || action === "run-now") {
@@ -144,8 +181,8 @@ export default {
       }
     }
 
-    const query = create ? {} : (req.query || {});
-    let selected = null;
+    const query = create || edit ? {} : (req.query || {});
+    let selected = edit ? edit.id : null;
     const idParam = one(query.id);
     if (idParam && /^crow:\d{1,12}$/.test(idParam)) selected = Number(idParam.slice(5));
     const runParam = intOf(one(query.run));
@@ -177,6 +214,8 @@ export default {
         && model.detail.item.kind !== "report",
       create,
       createOpen: one(query.new) === "1",
+      edit,
+      editOpen: one(query.edit) === "1",
       mediaInstalled: !!getPanel("media"),
       sources: model.sources,
       filter: model.filter,

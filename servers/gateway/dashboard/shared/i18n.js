@@ -388,6 +388,14 @@ export const translations = {
   "notif.ram": { en: "RAM", es: "RAM" },
   "notif.cpus": { en: "CPUs", es: "CPUs" },
   "notif.uptime": { en: "Uptime", es: "Tiempo activo" },
+  // #72: the bell's buttons on a FIRED reminder row, and the toasts they raise. Approved copy
+  // (EN/ES) — the private engineering notes, R1/R2/R3/R4/R8; the same string serves the bell
+  // button and the web push's action.
+  "notif.reminderDone": { en: "Done", es: "Hecho" },
+  "notif.reminderStop": { en: "Stop reminding", es: "Dejar de recordar" },
+  "notif.reminderDoneToast": { en: "Done.", es: "Hecho." },
+  "notif.reminderStoppedToast": { en: "Stopped. Turn it back on in Schedule.", es: "Detenido. Puedes reactivarlo en Agenda." },
+  "notif.reminderStopRefused": { en: "This reminder has changed. Open Schedule to stop it.", es: "Este recordatorio ha cambiado. Abre Agenda para detenerlo." },
   // N1c-10: the one-time "keep a copy of your identity off this machine"
   // notification (servers/gateway/boot/identity-backup-nudge.js). The en text
   // is the operator's ruling, verbatim.
@@ -5056,6 +5064,8 @@ export const translations = {
   "schedule.p.pausedSystem": { en: "Paused during the upgrade: it belonged to a retired runner and could never run.", es: "En pausa por la actualización: pertenecía a un ejecutor retirado y nunca podía ejecutarse." },
   "schedule.p.noNext": { en: "It has no next run: its schedule ({cron}) can't be read.", es: "No tiene próxima ejecución: no se puede leer su horario ({cron})." },
   "schedule.createTitle": { en: "New schedule", es: "Nueva programación" },
+  "schedule.edit": { en: "Edit", es: "Editar" },
+  "schedule.editTitle": { en: "Edit reminder", es: "Editar recordatorio" },
   "schedule.typeLabel": { en: "Type", es: "Tipo" },
   "schedule.briefingInNews": { en: "set in News → Briefings", es: "se configura en Noticias → Resúmenes" },
   "schedule.botInBuilder": { en: "made in Bot Builder", es: "se crean en el constructor de bots" },
@@ -5072,6 +5082,8 @@ export const translations = {
   "schedule.previewBad": { en: "Crow couldn't tell when that is.", es: "Crow no entiende cuándo es eso." },
   "schedule.save": { en: "Save", es: "Guardar" },
   "schedule.toast.created": { en: "Saved. It runs at the time shown.", es: "Guardado. Se ejecutará a la hora indicada." },
+  "schedule.toast.edited": { en: "Saved. Its next run is shown below.", es: "Guardado. Su próxima ejecución aparece abajo." },
+  "schedule.toast.editedPaused": { en: "Saved. It stays paused.", es: "Guardado. Sigue en pausa." },
   "schedule.toast.paused": { en: "Paused.", es: "En pausa." },
   "schedule.toast.resumed": { en: "Turned back on. Its next run is shown below.", es: "Reactivado. Su próxima ejecución aparece abajo." },
   "schedule.toast.ran": { en: "Done: the reminder was sent now. Its next run is unchanged.", es: "Hecho: el recordatorio se envió ahora. Su próxima ejecución no cambia." },

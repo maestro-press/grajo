@@ -124,6 +124,7 @@ import { c2cApiRouter } from "../routes/c2c-api.js";
 import perchInteractiveApiRouter from "../routes/perch-interactive-api.js";
 import perchDictationRouter from "../routes/perch-dictation.js";
 import voiceHandoffsRouter from "../routes/voice-handoffs.js";
+import remindersRouter from "../routes/reminders.js";
 import stagedPageRouter from "../routes/staged-page.js";
 import mailApiRouter from "../routes/mail-api.js";
 import { forgetTokenProviderForAccount, tokenProviderForAccount } from "../boot/mail-boot.js";
@@ -992,6 +993,11 @@ export default function dashboardRouter(mcpAuthMiddleware, { renderLayout: rende
   // refused upstream, its own dashboardAuth on its prefix; see
   // routes/voice-handoffs.js's header.
   router.use(voiceHandoffsRouter(dashboardAuth));
+
+  // The bell's reminder buttons (Done / Stop reminding on a fired reminder row). Same slot and rails
+  // as the phone confirm page above: session + CSRF, Funnel refused upstream, its own dashboardAuth
+  // and owner check on its prefix; see routes/reminders.js's header.
+  router.use(remindersRouter(dashboardAuth));
 
   // The staged draft's standalone page (spec §12): a draft a bot made from a
   // channel turn or a job has no Perch chat to draw its card in, so the
