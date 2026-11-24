@@ -68,7 +68,7 @@ registerAddonUnsealer("gateway");
 
 import { mcpAuthRouter, createOAuthMetadata } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { mcpAuthMetadataRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
-import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { createBearerAuthMiddleware } from "./bearer-auth.js";
 import { getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import express from "express";
 import rateLimit from "express-rate-limit";
@@ -764,7 +764,7 @@ if (!noAuth) {
   } catch (err) {
     // Belt-and-suspenders for F-INSTALL-8: a fresh appliance must never be
     // dead-on-arrival because OAuth *discovery* couldn't mount. MCP transports
-    // stay behind requireBearerAuth (below); only the OAuth dance endpoints
+    // stay behind the bearer middleware (below); only the OAuth dance endpoints
     // are missing in this state.
     console.error(`[oauth] Failed to mount OAuth routes: ${err.message}. ` +
       `Remote MCP OAuth is disabled until CROW_GATEWAY_URL is a valid HTTPS URL.`);
@@ -798,7 +798,10 @@ if (!noAuth) {
     },
   };
 
-  authMiddleware = requireBearerAuth({
+  // ONE instance for every OAuth fallback in the process, and the one place a
+  // relayed (contained-bot) socket is refused it — see bearer-auth.js. A mount
+  // that falls back to OAuth therefore cannot forget the relay check.
+  authMiddleware = createBearerAuthMiddleware({
     verifier: tokenVerifier,
     requiredScopes: [],
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(serverUrl),

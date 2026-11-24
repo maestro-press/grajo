@@ -52,6 +52,7 @@ before(async () => {
   rt = createKioskRuntime({
     Router: express.Router, json: express.json, WebSocketServer,
     isAllowedNetwork: () => true,
+    isRelayed: () => false,
     csrfMiddleware: (req, res, next) => next(),
     openDb: db, deviceStore: store,
     settings: { readSetting: async (d, k) => settings.get(k) ?? null, writeSetting: async (d, k, v) => { settings.set(k, v); } },

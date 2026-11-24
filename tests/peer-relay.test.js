@@ -36,7 +36,10 @@ const BRAVO = "inst-bravo-0002";
 const CHARLIE = "inst-charlie-0003";
 const DELTA = "inst-delta-0004"; // selected by the bot, no crow_instances row
 const ECHO = "inst-echo-0005"; // a trusted peer the bot did NOT select
-const PEER_TOKENS = { [BRAVO]: "bravo-peer-bearer-" + randomBytes(6).toString("hex"), [CHARLIE]: "charlie-peer-bearer-" + randomBytes(6).toString("hex"), [ECHO]: "echo-peer-bearer-x" };
+// A REMOTE-looking peer (a documentation address, never dialled here: the test
+// stubs fetchImpl), for the relayed-caller control below.
+const ROMEO = "inst-romeo-0006";
+const PEER_TOKENS = { [BRAVO]: "bravo-peer-bearer-" + randomBytes(6).toString("hex"), [CHARLIE]: "charlie-peer-bearer-" + randomBytes(6).toString("hex"), [ECHO]: "echo-peer-bearer-x", [ROMEO]: "romeo-peer-bearer-x" };
 const PAIR_KEYS = { [BRAVO]: randomBytes(32).toString("hex") }; // charlie has no pair key (S-P2)
 // B6: the relay signature binds the bot session; the ids are filled in before().
 let ACTOR = { botId: "hank", sessionId: null, threadId: "discord:42", gatewayType: "discord" };
@@ -83,7 +86,9 @@ before(async () => {
   ins.run(BRAVO, "bravo", BRAVO, `http://127.0.0.1:${upstreamPort}/`);
   ins.run(CHARLIE, "charlie", CHARLIE, `http://127.0.0.1:${upstreamPort}/charlie`);
   ins.run(ECHO, "echo", ECHO, `http://127.0.0.1:${upstreamPort}/echo`);
-  const def = { tools: { remote_mcp: [`${BRAVO}::crow-memory`, `${CHARLIE}::crow-memory`, `${DELTA}::crow-memory`, `${BRAVO}::crow-blog`] } };
+  // Remote, never dialled by the real relay app; a stub fetch proves forwarding.
+  ins.run(ROMEO, "romeo", ROMEO, "http://192.0.2.10:3001/");
+  const def = { tools: { remote_mcp: [`${BRAVO}::crow-memory`, `${CHARLIE}::crow-memory`, `${DELTA}::crow-memory`, `${BRAVO}::crow-blog`, `${ROMEO}::crow-memory`] } };
   d.prepare("INSERT INTO pi_bot_defs (bot_id, display_name, definition) VALUES (?, ?, ?)").run("hank", "Hank Bot", JSON.stringify(def));
   d.prepare("INSERT INTO pi_bot_defs (bot_id, display_name, definition, enabled) VALUES (?, ?, ?, 0)").run("dora", "Dora Bot", JSON.stringify(def));
   d.prepare("INSERT OR REPLACE INTO dashboard_settings (key, value) VALUES ('feature_flags', ?)").run(JSON.stringify({ remote_invocation: true }));
@@ -411,4 +416,145 @@ test("refused: a disabled bot, even with a valid signature and a live session", 
   const r = await post(`/peer-relay/${BRAVO}/memory/mcp`, { headers: { Authorization: `Bearer ${relayToken}`, ...actorHeaders(dora) } });
   assertRefused(r, 403, /not enabled/);
   assert.equal((await post(`/peer-relay/${BRAVO}/memory/mcp`, { headers: good() })).status, 200, "positive control");
+});
+
+// ---------------------------------------------------------------------------
+// THE CONFUSED DEPUTY (security review 2026-11): crow_instances.gateway_url is
+// bot-writable, so a relayed caller (a contained bot's egress relay, mark
+// 127.0.0.1→127.0.77.1) must not make this gateway dial ITSELF — that hop opens
+// a fresh, UNMARKED loopback socket carrying the peer bearer this gateway minted
+// for the same box. Any port counts. A remote-looking peer still forwards.
+// ---------------------------------------------------------------------------
+
+/** A request from a chosen SOURCE address (fetch cannot bind one). */
+function postFrom(localAddress, path, { headers = {}, body = INIT, base = relayBase } = {}) {
+  const url = new URL(base);
+  const data = JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: url.hostname, port: url.port, path, method: "POST", localAddress,
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "content-length": Buffer.byteLength(data), ...headers },
+    }, (res) => {
+      let text = "";
+      res.setEncoding("utf8");
+      res.on("data", (d) => { text += d; });
+      res.on("end", () => {
+        let json = null;
+        try { json = JSON.parse(text); } catch { /* SSE */ }
+        resolve({ status: res.statusCode, json, text });
+      });
+    });
+    req.on("error", reject);
+    req.end(data);
+  });
+}
+
+test("refused: a RELAYED caller may not relay to this gateway's own address", async () => {
+  const { RELAY_SOURCE_V4 } = await import("../servers/shared/bot-doors.js");
+  // Positive control: the very same call from plain loopback still reaches the peer.
+  const ok = await postFrom("127.0.0.1", `/peer-relay/${BRAVO}/memory/mcp`, { headers: good() });
+  assert.equal(ok.status, 200, ok.text);
+  assert.equal(seen.length, 1, "the operator-side relay is untouched");
+  seen.length = 0;
+
+  const relayed = await postFrom(RELAY_SOURCE_V4, `/peer-relay/${BRAVO}/memory/mcp`, { headers: good() });
+  assert.equal(relayed.status, 403, relayed.text);
+  assert.equal(relayed.json?.jsonrpc, "2.0");
+  assert.match(relayed.json.error.message, /relayed caller may not relay to this gateway/);
+  assert.equal(seen.length, 0, "nothing was dialled");
+});
+
+test("a RELAYED caller still forwards to a REMOTE peer (prod's trusted peers are all remote hosts)", async () => {
+  const { RELAY_SOURCE_V4 } = await import("../servers/shared/bot-doors.js");
+  const calls = [];
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+  app.use(peerRelayRouter({
+    createDbClient: () => createDbClient(dbPath),
+    deps: {
+      keyLookup: () => null,
+      getCreds: (id) => (PEER_TOKENS[id] ? { auth_token: PEER_TOKENS[id], signing_key: null } : null),
+      localId: () => LOCAL,
+      fetchImpl: async (url, init) => {
+        calls.push({ url, method: init?.method, authorization: init?.headers?.authorization });
+        return { status: 200, headers: { get: () => null }, body: null };
+      },
+    },
+  }));
+  const srv = http.createServer(app);
+  const port = await listen(srv);
+  try {
+    const base = `http://127.0.0.1:${port}`;
+    const r = await postFrom(RELAY_SOURCE_V4, `/peer-relay/${ROMEO}/memory/mcp`, { headers: good(), base });
+    assert.equal(r.status, 200, r.text);
+    assert.deepEqual(calls, [{ url: "http://192.0.2.10:3001/memory/mcp", method: "POST", authorization: `Bearer ${PEER_TOKENS[ROMEO]}` }]);
+  } finally {
+    srv.closeAllConnections?.();
+    await new Promise((res) => srv.close(() => res()));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// NO REDIRECTS, AND FAIL-CLOSED ON AN UNRESOLVABLE PEER NAME.
+// ---------------------------------------------------------------------------
+
+test("refused: a peer answering 307 is never followed (the peer bearer does not ride a redirect)", async () => {
+  const { RELAY_SOURCE_V4 } = await import("../servers/shared/bot-doors.js");
+  const calls = [];
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
+  app.use(peerRelayRouter({
+    createDbClient: () => createDbClient(dbPath),
+    deps: {
+      keyLookup: () => null,
+      getCreds: (id) => (PEER_TOKENS[id] ? { auth_token: PEER_TOKENS[id], signing_key: null } : null),
+      localId: () => LOCAL,
+      fetchImpl: async (url, init) => {
+        calls.push({ url, redirect: init?.redirect });
+        return { status: 307, headers: { get: (h) => (h === "location" ? "http://127.0.0.1:1/elsewhere" : null) }, body: null };
+      },
+    },
+  }));
+  const srv = http.createServer(app);
+  const port = await listen(srv);
+  try {
+    const r = await postFrom(RELAY_SOURCE_V4, `/peer-relay/${ROMEO}/memory/mcp`, { headers: good(), base: `http://127.0.0.1:${port}` });
+    assert.equal(r.status, 502, r.text);
+    assert.equal(r.json?.jsonrpc, "2.0");
+    assert.match(r.json.error.message, /peer is unreachable/);
+    assert.deepEqual(calls, [{ url: "http://192.0.2.10:3001/memory/mcp", redirect: "manual" }], "asked once, redirect never followed");
+  } finally {
+    srv.closeAllConnections?.();
+    await new Promise((res) => srv.close(() => res()));
+  }
+});
+
+test("refused: a RELAYED caller may not relay to a peer whose gateway_url does not resolve (fail closed)", async () => {
+  const { RELAY_SOURCE_V4 } = await import("../servers/shared/bot-doors.js");
+  // A peer row whose NAME never resolves: ownTargetOf cannot clear it as "not
+  // this box", and our lookup and the fetch's are two resolutions of the same
+  // name. A relayed caller fails closed; the operator's own relay is untouched.
+  const UNRESOLVABLE = "inst-nemo-0007";
+  const d = new Database(dbPath);
+  const before = d.prepare("SELECT definition FROM pi_bot_defs WHERE bot_id = 'hank'").get().definition;
+  try {
+    d.prepare("INSERT OR REPLACE INTO crow_instances (id, name, crow_id, gateway_url, status, trusted) VALUES (?, ?, ?, ?, 'active', 1)")
+      .run(UNRESOLVABLE, "nemo", UNRESOLVABLE, "http://never-resolves.invalid:3001/");
+    const def = JSON.parse(before);
+    def.tools.remote_mcp.push(`${UNRESOLVABLE}::crow-memory`);
+    d.prepare("UPDATE pi_bot_defs SET definition = ? WHERE bot_id = 'hank'").run(JSON.stringify(def));
+  } finally { d.close(); }
+  try {
+    seen.length = 0;
+    const r = await postFrom(RELAY_SOURCE_V4, `/peer-relay/${UNRESOLVABLE}/memory/mcp`, { headers: good() });
+    assert.equal(r.status, 403, r.text);
+    assert.match(r.json.error.message, /relayed caller may not relay to this gateway/);
+    assert.equal(seen.length, 0, "nothing was dialled");
+  } finally {
+    const d2 = new Database(dbPath);
+    try {
+      d2.prepare("UPDATE pi_bot_defs SET definition = ? WHERE bot_id = 'hank'").run(before);
+      d2.prepare("DELETE FROM crow_instances WHERE id = ?").run(UNRESOLVABLE);
+    } finally { d2.close(); }
+  }
 });

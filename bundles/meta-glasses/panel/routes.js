@@ -83,6 +83,7 @@ async function loadS3()           { return import(pathToFileURL(join(gatewayDir,
 
 const { isAllowedNetwork } = await appImport("servers/gateway/dashboard/auth.js");
 const { classifyPeer } = await appImport("servers/shared/peer-class.js");
+const { isRelayedSocket } = await appImport("servers/shared/bot-doors.js");
 const { csrfMiddleware } = await appImport("servers/gateway/dashboard/shared/csrf.js");
 const { musicUpstreamConfig, openPinnedUpstream, UpstreamRefused } = await appImport("servers/gateway/media/pinned-upstream.js");
 const { registerSchedulerHook } = await appImport("servers/gateway/scheduler-hooks.js");
@@ -144,9 +145,13 @@ async function verifyGlassesToken(deviceId, token) {
   } finally { try { db.close(); } catch {} }
 }
 
-/** Express gate for device-token routes. Runs BEFORE any body is read. Sets req.glassesDevice. */
+/** Express gate for device-token routes. Runs BEFORE any body is read. Sets req.glassesDevice.
+ *  A socket the egress relay opened is refused first: it is loopback by address, but a device
+ *  token's hash lives in bot-writable crow.db (`meta_glasses_devices`), so a contained bot could
+ *  pair itself and talk as a paired glasses device. Only a path-scoped door token may authenticate
+ *  a relayed caller (servers/shared/bot-doors.js). */
 async function deviceTokenAuth(req, res, next) {
-  if (req.headers["tailscale-funnel-request"] || !isAllowedNetwork(req)) return res.status(403).json({ ok: false, error: "network_refused" });
+  if (req.headers["tailscale-funnel-request"] || !isAllowedNetwork(req) || isRelayedSocket(req.socket)) return res.status(403).json({ ok: false, error: "network_refused" });
   const deviceId = typeof req.query.device_id === "string" ? req.query.device_id : "";
   const header = req.headers["authorization"] || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
@@ -1006,8 +1011,9 @@ export function setupWebSocket(server) {
 
     const refuse = (status, reason) => { try { socket.write(`HTTP/1.1 ${status} ${reason}\r\n\r\n`); } catch {} socket.destroy(); };
     // An upgrade never passes through Express, so the gateway's Funnel refusal and network
-    // rule are applied here, before anything else is looked at.
-    if (req.headers["tailscale-funnel-request"] || !isAllowedNetwork(req)) return refuse(403, "Forbidden");
+    // rule are applied here, before anything else is looked at. A relayed socket (a contained
+    // bot's egress relay) never opens a glasses session: the device token's hash is bot-writable.
+    if (req.headers["tailscale-funnel-request"] || !isAllowedNetwork(req) || isRelayedSocket(req.socket)) return refuse(403, "Forbidden");
 
     const params = new URL(url, "http://localhost").searchParams;
     const deviceId = params.get("device_id");

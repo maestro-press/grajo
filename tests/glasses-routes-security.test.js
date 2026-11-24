@@ -18,6 +18,7 @@ import { actAsServe, serveHeaders } from "./fixtures/serve-peer.mjs";
 import { csrfTokenFor } from "./helpers/csrf-token.mjs";
 import express from "express";
 import { WebSocket } from "ws";
+import { RELAY_SOURCE_V4 } from "../servers/shared/bot-doors.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // Its own home and database inside the suite's scratch home: another glasses test file pairs
@@ -154,6 +155,31 @@ test("photo upload: thirty a minute per device, then 429", async () => {
   for (let i = 0; i < 33; i += 1) { const r = await upload("b", "glasses-b", ""); if (r.status === 200) ok += 1; else if (r.status === 429) limited += 1; await r.arrayBuffer(); }
   assert.deepEqual({ ok, limited }, { ok: 30, limited: 3 });
   assert.equal((await upload("a", "glasses-a", "")).status, 200, "another device is not affected");
+});
+
+test("a relayed socket (a contained bot's egress relay) never carries a device token", async () => {
+  // The relay binds 127.0.77.1 (servers/shared/bot-doors.js RELAY_SOURCE_V4): loopback by
+  // ADDRESS, so the network rule alone would serve it. A device token's hash lives in
+  // bot-writable crow.db (`meta_glasses_devices`, servers/shared/device-store.js), so a
+  // contained bot could pair itself and talk as a paired device — the mark is refused first.
+  const rawPost = (localAddress) => new Promise((res, rej) => {
+    const req = http.request({
+      host: "127.0.0.1", port: srv.address().port, path: "/api/meta-glasses/photo?device_id=glasses-a",
+      method: "POST", localAddress,
+      headers: { ...TAILNET, authorization: `Bearer ${tokens.a}`, "content-type": "image/jpeg", "content-length": 8 },
+    }, (r) => {
+      const chunks = [];
+      r.on("data", (c) => chunks.push(c));
+      r.on("end", () => res({ status: r.statusCode, body: Buffer.concat(chunks).toString("utf8") }));
+    });
+    req.setTimeout(TIMEOUT_MS, () => req.destroy(new Error("no answer to a raw POST within " + TIMEOUT_MS + " ms")));
+    req.on("error", rej);
+    req.end(Buffer.from("JPEGDATA"));
+  });
+  assert.equal((await rawPost("127.0.0.1")).status, 200, "the same device token over plain loopback is served, unchanged");
+  const refused = await rawPost(RELAY_SOURCE_V4);
+  assert.equal(refused.status, 403, "a relayed socket is refused whatever token it presents");
+  assert.match(refused.body, /network_refused/);
 });
 
 /** GET over a RAW request: fetch() collapses `%2e%2e` before the request leaves,

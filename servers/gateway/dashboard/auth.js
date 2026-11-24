@@ -44,6 +44,10 @@ import { SESSION_COOKIE, HOST_SESSION_COOKIE } from "../cookie-names.js";
 // The out-of-database half of "is a password set?" (password-set-marker.js):
 // the marker lives in <CROW_HOME>/secrets, where no contained bot can reach.
 import { hasPasswordSetMarker, writePasswordSetMarker } from "./password-set-marker.js";
+// The egress relay's mark on a socket it opened (a contained bot's only path to
+// this gateway). A relayed socket is never the owner — the same rule bearer-auth.js
+// applies to OAuth, applied here to the session cookie.
+import { isRelayedSocket } from "../../shared/bot-doors.js";
 
 export function hashToken(t) { return createHash('sha256').update(t).digest('hex'); }
 
@@ -1029,6 +1033,11 @@ export function sendNetworkRefusal(req, res) {
  * isAllowedNetwork.
  */
 export function loginNetworkAllowed(req) {
+  // A relayed socket (a contained bot, via the egress relay's mark) never signs
+  // in — see dashboardAuth's note on the mark. crow.db is bot-writable, so
+  // `password_hash` is a value a bot can replace with its own; the login form
+  // must not be a door.
+  if (isRelayedSocket(req?.socket)) return false;
   return isAllowedNetwork(req) || isDirectLoopback(req);
 }
 
@@ -1051,6 +1060,21 @@ export function loginNetworkAllowed(req) {
  * servers/gateway/ai/tool-executor.js).
  */
 export function dashboardAuth(req, res, next) {
+  // A socket the egress relay opened is refused FIRST, before the network gate.
+  // The mark is about the path, never a header, so nothing this caller sends can
+  // undo it — and it has to sit ahead of isAllowedNetwork, which
+  // CROW_DASHBOARD_PUBLIC (or a Serve/proxy shape a relayed socket can imitate)
+  // would otherwise open. A contained bot has crow.db bound read-write, so it
+  // can mint its own `oauth_tokens` session row; only the path-scoped door
+  // tokens (and the OAuth refusal in bearer-auth.js) are about a relayed caller.
+  // The answer is the page the network gate already sends a bare loopback caller
+  // (sendNetworkRefusal): no new text, and a relayed socket gets no dashboard
+  // route, no session cookie and no owner write context.
+  if (isRelayedSocket(req.socket)) {
+    sendNetworkRefusal(req, res);
+    return;
+  }
+
   // Network check
   if (!isAllowedNetwork(req)) {
     sendNetworkRefusal(req, res);
@@ -1117,7 +1141,12 @@ export function dashboardAuth(req, res, next) {
  * session store. Resolves the session token, or null. Never throws.
  */
 export async function sessionFromRequest(req) {
-  if (!req || !req.headers || !isAllowedNetwork(req)) return null;
+  if (!req || !req.headers) return null;
+  // A relayed socket carries no session, exactly as if the cookie were absent
+  // (see dashboardAuth's note on the mark): the egress relay's mark is never the
+  // owner, and the network gate below can be opened by CROW_DASHBOARD_PUBLIC.
+  if (isRelayedSocket(req.socket)) return null;
+  if (!isAllowedNetwork(req)) return null;
   const { token, migrate } = sessionFromCookies(req);
   if (!token) return null;
   try {

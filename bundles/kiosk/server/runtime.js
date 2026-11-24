@@ -366,6 +366,18 @@ export function displayItems({ lang = "en", sources = [], forYou = forYouEnabled
 }
 
 export function createKioskRuntime(deps) {
+  // A relayed socket is loopback by ADDRESS, so the two checks that keep owner/device
+  // authority off the egress relay's mark (the announce routes and the display socket)
+  // need this predicate. It is REQUIRED rather than optional: a wiring that forgets it
+  // must fail at construction, never silently fail open (a missing dep used to skip the
+  // mark check entirely). bundles/kiosk/panel/routes.js passes core's isRelayedSocket.
+  if (!deps || typeof deps.isRelayed !== "function") {
+    throw new TypeError("createKioskRuntime: deps.isRelayed is required (the egress relay's mark must never pass for loopback)");
+  }
+  /** Fail closed: a predicate that throws answers "relayed", which is the answer that refuses. */
+  const isRelayed = (req) => {
+    try { return deps.isRelayed(req) === true; } catch { return true; }
+  };
   const now = deps.now || Date.now;
   const log = deps.log || ((m) => console.log(m));
   const pairing = createPairingStore({ now });
@@ -852,6 +864,12 @@ export function createKioskRuntime(deps) {
         if (!ok) return res.status(401).json({ error: "unauthorized" });
         return next();
       }
+      // A BOT's egress relay (isRelayedSocket, servers/shared/bot-doors.js) is loopback by
+      // address too, but it is a contained bot, not this machine's own tool server: the
+      // announce token is owner authority whose hash lives in bot-writable crow.db, so it
+      // is never accepted from that mark and the mark never falls through to the loopback
+      // check below (same answer directLoopback gives a non-local caller).
+      if (isRelayed(req)) return res.status(403).json({ error: "loopback_only" });
       if (!directLoopback(req)) return res.status(403).json({ error: "loopback_only" });
       const auth = String(req.headers.authorization || "");
       const ok = await withDb((db) => deps.announceToken.validate(db, auth.startsWith("Bearer ") ? auth.slice(7) : ""));
@@ -1175,6 +1193,10 @@ export function createKioskRuntime(deps) {
       // ws-upgrade-claim.js) never answers this request with its 404.
       req.crowWsClaimed = true;
       if (req.headers["tailscale-funnel-request"] || !deps.isAllowedNetwork(req)) return refuse(socket, 403, "Forbidden");
+      // A BOT's egress relay is loopback by address, but a display (or a dashboard session mode)
+      // is never a relayed caller: the kiosk device token's hash lives in bot-writable crow.db
+      // (`meta_glasses_devices`), so a contained bot could pair itself and speak as a display.
+      if (isRelayed(req)) return refuse(socket, 403, "Forbidden");
       if (path === "/api/kiosk/session") return accept(req, socket, head);   // paired displays: the token arrives in hello
       // Session mode. Everything is decided BEFORE the upgrade: a browser page on another site can
       // make the browser send the cookie, so the handshake must come from this origin, and the

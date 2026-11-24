@@ -30,8 +30,15 @@
  *      predates the table holds none; any other read failure)        else 403/503
  *      and the bot's row selected (instanceId, capability)          else 403
  *   6. a trusted peer row with a gateway_url                         else 404
+ *      whose host is not THIS gateway when the caller is relayed
+ *      (egress relay mark; any port — a confused deputy), and whose
+ *      host resolves (a name we cannot resolve is not cleared as
+ *      "not this box": fail closed)                                else 403
  *      and a peer bearer                                             else 502
  *   7. a JSON-RPC batch                                              -32600
+ *   8. one forward, `redirect: "manual"` — a 3xx is answered as the same 502
+ *      "the peer is unreachable" and never followed (a redirect would move the
+ *      peer bearer to a host none of the checks above judged).
  * A peer with no pair key is forwarded unsigned (its label falls back to
  * "Crow (via <name>)"), logged once per (bot, peer) per hour. The name signed
  * is the bot row's display_name, never anything the request carries.
@@ -45,6 +52,8 @@ import { TRUSTED_PEER_SQL } from "../../shared/peer-trust.js";
 import { signRemoteActor } from "../../shared/remote-actor.js";
 import { validatePeerRelayToken } from "../local-token.js";
 import { getOrCreateLocalInstanceId } from "../instance-registry.js";
+import { isRelayedSocket } from "../../shared/bot-doors.js";
+import { ownTargetOf } from "../models/self-target.js";
 import { defaultPairKey } from "../../shared/sync-pair-binding.js";
 import { getPeerCreds } from "../../shared/peer-credentials.js";
 import { readSetting } from "../dashboard/settings/registry.js";
@@ -198,6 +207,22 @@ export function peerRelayRouter({ createDbClient, deps = {} } = {}) {
         peer = r.rows[0] || null;
       } catch { peer = null; }
       if (!peer) return refuse(res, 404, "unknown or untrusted peer", { id });
+      // A relayed caller (a contained bot's egress relay) must not make this
+      // gateway dial ITSELF. `crow_instances.gateway_url` is bot-writable (it is
+      // written through instance sync, and a contained bot has crow.db bound
+      // read-write), so a loopback or own-host row would send this gateway's own
+      // peer bearer to an unmarked same-box socket — the relay mark is not on the
+      // hop this route opens, so every "a relayed socket is never the owner/peer"
+      // rule would be bypassed in one request. Any port counts (a co-hosted
+      // sibling gateway listens on another one). A gateway_url whose NAME does not
+      // resolve cannot be cleared either, and our lookup and the fetch's are two
+      // resolutions of the same name, so it is refused the same way (fail closed).
+      // Prod trusted peers are remote hosts, so nothing legitimate breaks; full
+      // host pinning is a later lane.
+      if (isRelayedSocket(req.socket)) {
+        const own = await ownTargetOf(peer.gateway_url, { ports: null });
+        if (own.own || own.unresolved) return refuse(res, 403, "a relayed caller may not relay to this gateway", { id });
+      }
       let creds = null;
       try { creds = await getCreds(instanceId); } catch { creds = null; }
       if (!creds || typeof creds.auth_token !== "string" || !creds.auth_token) return refuse(res, 502, "no credentials for this peer", { id });
@@ -232,9 +257,16 @@ export function peerRelayRouter({ createDbClient, deps = {} } = {}) {
       res.on("close", () => { if (!res.writableEnded) ac.abort(); });
       let upstream;
       try {
-        upstream = await fetchImpl(url, { method: req.method, headers, body, signal: ac.signal });
+        // NO REDIRECTS: a 3xx is never followed. A peer that answers 307 would
+        // otherwise move this relay (and the peer bearer on it) to a host none of
+        // the checks above judged, on a fresh socket of Node's own choosing.
+        upstream = await fetchImpl(url, { method: req.method, headers, body, signal: ac.signal, redirect: "manual" });
       } catch {
         if (ac.signal.aborted) return;
+        return refuse(res, 502, "the peer is unreachable", { id });
+      }
+      if (upstream.status >= 300 && upstream.status < 400) {
+        try { upstream.body?.cancel?.()?.catch?.(() => {}); } catch { /* the body is irrelevant */ }
         return refuse(res, 502, "the peer is unreachable", { id });
       }
 

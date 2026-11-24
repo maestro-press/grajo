@@ -1,6 +1,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import express from "express";
+import http from "node:http";
 import { writeFileSync, chmodSync, unlinkSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -216,4 +217,55 @@ test("optional mode: INVALID signature must 401, never fall through to the handl
   assert.equal(r.status, 401);
   assert.equal((await r.json()).error, "peer_auth_failed");
   assert.equal(lastAuditError(), "hmac_mismatch");
+});
+
+// ---------------------------------------------------------------------------
+// A relayed socket is never a paired instance — even with a signature that
+// verifies. Both factors (the HMAC and the bearer checked against
+// crow_instances.auth_token_hash, a bot-writable row) are things a contained bot
+// can forge, so the mark is refused before either is looked at; the reason lands
+// in the audit row, never in the response.
+// ---------------------------------------------------------------------------
+
+/** A GET from a chosen SOURCE address (fetch cannot bind one). */
+function getFrom(localAddress, path, headers) {
+  const url = new URL(baseUrl);
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: url.hostname, port: url.port, path, method: "GET", localAddress, headers }, (res) => {
+      let text = "";
+      res.setEncoding("utf8");
+      res.on("data", (d) => { text += d; });
+      res.on("end", () => {
+        let json = null;
+        try { json = JSON.parse(text); } catch { /* not JSON */ }
+        resolve({ status: res.statusCode, json, body: text });
+      });
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+test("a RELAYED socket is refused as relayed_socket, whatever signature it carries", async () => {
+  const { RELAY_SOURCE_V4 } = await import("../servers/shared/bot-doors.js");
+  const signed = () => signRequest({
+    method: "GET",
+    path: "/required",
+    body: "",
+    authToken: TEST_AUTH_TOKEN,
+    signingKey: TEST_SIGNING_KEY,
+    sourceInstanceId: TEST_SOURCE_ID,
+  });
+
+  // The positive control: this exact signature is good from loopback.
+  _resetNonceCache();
+  const ok = await getFrom("127.0.0.1", "/required", signed());
+  assert.equal(ok.status, 200, ok.body);
+  assert.equal(ok.json.valid, true);
+
+  _resetNonceCache();
+  const relayed = await getFrom(RELAY_SOURCE_V4, "/required", signed());
+  assert.equal(relayed.status, 401, relayed.body);
+  assert.equal(relayed.json.error, "peer_auth_failed", "the one body every peer refusal gets");
+  assert.equal(lastAuditError(), "relayed_socket", "the audit row names the real reason");
 });

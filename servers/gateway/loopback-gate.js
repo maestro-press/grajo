@@ -4,6 +4,7 @@
  * refusal and a throw in a step is that step's refusal (fail closed).
  */
 import { isLocalPeer } from "../shared/peer-class.js";
+import { isRelayedSocket } from "../shared/bot-doors.js";
 
 const REFUSE_LOG_WINDOW_MS = 3_600_000;
 const REFUSE_LOG_CAP = 64;
@@ -45,9 +46,16 @@ export function readActorHeaders(headers = {}) {
 const refuse = (status, code) => ({ ok: false, status, code });
 
 export async function loopbackActorGate(req, { validateToken, verify, resolve }) {
-  // step 2: only a genuine same-box caller, never one that came through auth'd instance/cross-host paths
+  // step 2: only a genuine same-box caller, never one that came through auth'd instance/cross-host paths.
+  //
+  // A socket the egress relay opened is loopback by ADDRESS (the relay binds
+  // 127.0.77.1) but it is not this machine's caller: a contained bot's socket
+  // reaches here with its own relayed request. These mounts are owner authority
+  // (the `services` and `satellite-tools` tool families), and their family
+  // token's verifier lives in bot-writable crow.db, so the mark is refused with
+  // the same answer as any other non-local peer — no token is even looked at.
   try {
-    if (!isLocalPeer(req.socket?.remoteAddress, req.headers) || req.instanceAuth || req.crossHostAuth) return refuse(404, "not_found");
+    if (!isLocalPeer(req.socket?.remoteAddress, req.headers) || isRelayedSocket(req.socket) || req.instanceAuth || req.crossHostAuth) return refuse(404, "not_found");
   } catch { return refuse(404, "not_found"); }
 
   // step 3: bearer token

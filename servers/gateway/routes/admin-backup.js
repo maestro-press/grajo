@@ -16,7 +16,10 @@
  *
  * Auth: localhost-only. Optionally also requires a bearer token set via
  * CROW_BACKUP_TOKEN, for defence-in-depth if the gateway ever gets reverse-
- * proxied in a way that lets remote clients look like 127.0.0.1.
+ * proxied in a way that lets remote clients look like 127.0.0.1. A socket the
+ * egress relay opened (a contained bot, servers/shared/bot-doors.js) is refused
+ * as if it were remote: it is loopback by address, and crow.db is bound into
+ * the bot.
  *
  * Scope note (Crow Artifacts): this endpoint backs up the DATABASE only.
  * Artifact content blobs live in <dataDir>/artifacts/ (local store) or the
@@ -37,6 +40,7 @@ import {
 } from "../../shared/backup-naming.js";
 import { coHostedDataDirWarning } from "../../shared/crow-home.js";
 import { classifyPeer } from "../../shared/peer-class.js";
+import { isRelayedSocket } from "../../shared/bot-doors.js";
 
 // Kept for existing callers/tests; the logic lives in shared/backup-naming.js.
 export function getInstanceLabel() {
@@ -164,13 +168,19 @@ function foreignError(dest, owner) {
 
 /** Localhost only: a bare loopback peer with no forwarding or tailscale-*
  * headers (peer class "local"). Serve traffic and a loopback caller carrying
- * forwarding headers are refused. Exported for tests. */
+ * forwarding headers are refused. A socket the egress relay opened is refused
+ * too: it is loopback by ADDRESS (the relay binds 127.0.77.1) but it is a
+ * contained bot's request, and a backup is a copy of the whole database a bot
+ * has bound read-write — owner authority, never a relayed caller's. Exported
+ * for tests. */
 export function requireLocalhost(req, res, next) {
   const peer = req.crowPeer || classifyPeer(req);
-  if (peer.via === "local") return next();
+  if (peer.via === "local" && !isRelayedSocket(req.socket)) return next();
   return res.status(403).json({ error: "backup endpoint is localhost-only", got: peer.client });
 }
 
+/** The optional CROW_BACKUP_TOKEN factor. Never reached by a relayed socket
+ * (requireLocalhost runs first and refuses it). */
 function requireToken(req, res, next) {
   const required = process.env.CROW_BACKUP_TOKEN;
   if (!required) return next();

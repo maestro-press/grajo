@@ -81,6 +81,9 @@ export async function startBarRig() {
     return kiosk.createKioskRuntime({
       Router: express.Router, json: express.json, WebSocketServer,
       isAllowedNetwork: auth.isAllowedNetwork, csrfMiddleware: csrf.csrfMiddleware, csrfTokenAccepted: csrf.csrfTokenAccepted,
+      // The runtime REQUIRES a mark check (a missing one must fail closed). This rig is a plain-loopback
+      // browser harness, never a bot's egress relay, so nothing here is ever marked.
+      isRelayed: () => false,
       sessionFromRequest: auth.sessionFromRequest, verifySession: auth.verifySession,
       openDb: () => createDbClient(), deviceStore: store,
       settings: { readSetting: registry.readSetting, writeSetting: registry.writeSetting },

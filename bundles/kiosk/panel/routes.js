@@ -37,7 +37,7 @@ const { ensureKioskAnnounceToken, validateKioskAnnounceToken } = await appImport
 // The add-on door: a walled kiosk reaches /api/kiosk/internal through its own egress
 // forwarder, whose sockets carry the add-on mark. That mark and the door-token check are
 // core policy, so both are imported rather than restated here.
-const { isAddonRelayAddr } = await appImport("servers/shared/bot-doors.js");
+const { isAddonRelayAddr, isRelayedSocket } = await appImport("servers/shared/bot-doors.js");
 const { validateAddonDoorToken } = await appImport("servers/shared/addon-doors.js");
 const { PERCH_TOKENS } = await appImport("servers/gateway/dashboard/shared/design-tokens.js");
 const { readPortrait } = await appImport("servers/sharing/profile-avatar.js");
@@ -89,6 +89,10 @@ const runtime = createKioskRuntime({
   files: { publicDir: join(BUNDLE_DIR, "public"), birdSvgPath: join(APP_ROOT, "bundles", "ramble", "server", "bird-svg.cjs") },
   announceToken: { validate: validateKioskAnnounceToken },
   addonDoor: { isAddonRelayed: (req) => isAddonRelayAddr(req.socket?.remoteAddress), validate: validateAddonDoorToken },
+  // A contained bot's egress relay is loopback too, but it is never this machine's own tool
+  // server: the kiosk's announce token and a display's device token are owner/device authority
+  // whose hashes live in bot-writable crow.db.
+  isRelayed: (req) => isRelayedSocket(req.socket),
   addonEnv, dataDir: resolveDataDir(),
   registerVoiceSurface,
 });

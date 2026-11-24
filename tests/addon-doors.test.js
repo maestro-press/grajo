@@ -124,6 +124,8 @@ async function kioskApp(t, { addonDoor = true } = {}) {
     json: express.json,
     WebSocketServer,
     isAllowedNetwork: () => true,
+    // The kiosk runtime REQUIRES this now (a missing mark check must fail closed, never open).
+    isRelayed: () => false,
     csrfMiddleware: (req, res, next) => next(),
     openDb: db,
     deviceStore: { listDevices: async () => [], findDevice: async () => null, verifyToken: async () => null, normalizeKioskSettings: (x) => x },

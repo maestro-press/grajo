@@ -33,6 +33,7 @@ import { chmodSync, linkSync, mkdirSync, readFileSync, unlinkSync, writeFileSync
 import { basename, join } from "node:path";
 import { resolveCrowHome } from "../../shared/crow-home.js";
 import { isLocalPeer } from "../../shared/peer-class.js";
+import { isRelayedSocket } from "../../shared/bot-doors.js";
 import { isLoopbackHost } from "./same-origin.js";
 
 export const SETUP_TOKEN_FILENAME = "setup-token";
@@ -159,6 +160,10 @@ export function clearSetupToken({ crowHome = resolveCrowHome() } = {}) {
  * isLoopbackHost (same-origin.js) — the Host has to name this machine.
  */
 export function isDirectLoopback(req) {
+  // A socket the egress relay opened is loopback by ADDRESS only (the relay
+  // binds 127.0.77.1): it is a contained bot's request, never this machine's
+  // console, so it is not "direct" here. See allowFirstRun.
+  if (isRelayedSocket(req?.socket)) return false;
   return isLocalPeer(req?.socket?.remoteAddress, req?.headers || {});
 }
 
@@ -236,6 +241,12 @@ export function hasOtherHumanAccounts({ passwdPath = "/etc/passwd", uid = proces
  *   pass it on in the form), null on the direct-loopback exemption.
  */
 export function allowFirstRun(req, { crowHome = resolveCrowHome(), from = "body", hasPassword = false, env = process.env, passwdPath, uid } = {}) {
+  // A socket the egress relay opened never claims the instance, neither through
+  // the loopback exemption below (it is a contained bot, not this machine's
+  // user, and crow.db — which the bot binds read-write — holds the password
+  // hash this gate is about protecting) nor with the token itself. Only this
+  // machine's own console sets the first password.
+  if (isRelayedSocket(req?.socket)) return { allowed: false, token: null };
   if (
     !process.env.CROW_SETUP_TOKEN &&
     isDirectLoopback(req) &&

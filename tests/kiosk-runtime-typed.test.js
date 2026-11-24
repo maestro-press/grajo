@@ -37,6 +37,7 @@ function deps() {
   return {
     Router: express.Router, json: express.json, WebSocketServer,
     isAllowedNetwork: () => true,
+    isRelayed: () => false,
     csrfMiddleware: (req, res, next) => next(),
     // Session mode's three seams, answered here so the overlay's socket needs no dashboard login.
     sessionFromRequest: async () => SESSION_TOKEN,

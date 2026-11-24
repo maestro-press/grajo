@@ -31,6 +31,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "crypto";
 import { getPeerCreds } from "./peer-credentials.js";
 import { peerTrust } from "./peer-trust.js";
+import { isRelayedSocket } from "./bot-doors.js";
 
 /** The one body every refused signed call gets (PT-1). */
 export const PEER_AUTH_FAILED = "peer_auth_failed";
@@ -447,6 +448,13 @@ export function crossHostVerifyMiddleware(dbClient, {
       return res.status(401).json({ error: "missing_x_crow_source" });
     }
 
+    // A socket the egress relay opened is never a paired instance. One of the
+    // two factors below — the bearer, checked against `crow_instances.auth_token_hash`
+    // — lives in bot-writable crow.db, and the row is picked by the caller's own
+    // X-Crow-Source header, so a contained bot could write a peer row it can
+    // satisfy and then call as that peer. A relayed caller gets the same one
+    // body every other peer refusal gets (the reason lands in the audit row
+    // only); only a path-scoped door token may authenticate it.
     // Every refusal from here on has ONE body (PT-1): an unauthenticated
     // caller must not learn which instance ids exist, are revoked or paused.
     // The specific reason is written to the cross_host_calls audit row only.
@@ -462,6 +470,8 @@ export function crossHostVerifyMiddleware(dbClient, {
       } catch { /* audit must not break the refusal */ }
       return res.status(401).json({ error: PEER_AUTH_FAILED });
     };
+
+    if (isRelayedSocket(req.socket)) return refuse({ error: "relayed_socket" });
 
     // The row first: a peer credential is accepted only while the peer's row
     // passes the one trust predicate (trusted=1, active/offline). Revoked,

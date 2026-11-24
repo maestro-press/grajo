@@ -31,6 +31,7 @@ function runtimeDeps(over = {}) {
   return {
     Router: express.Router, json: express.json, WebSocketServer,
     isAllowedNetwork: () => tailnet,
+    isRelayed: () => false,
     csrfMiddleware: (req, res, next) => next(),
     openDb: db, deviceStore: store,
     settings: { readSetting: async (d, k) => settings.get(k) ?? null, writeSetting: async (d, k, v) => { settings.set(k, v); } },
@@ -1146,7 +1147,10 @@ test("ticket mount: a refused upstream is a 502 with the reason in the log by co
 test("the gateway builds the kiosk runtime without a relay of its own: the production relay has no test socket", async () => {
   const { readFileSync } = await import("node:fs");
   const src = readFileSync(new URL("../bundles/kiosk/panel/routes.js", import.meta.url), "utf8");
-  assert.doesNotMatch(src, /relay|createConnection|connect:/, "panel/routes.js passes no relay and no socket override to the runtime");
+  // The only relay-shaped thing the panel passes is the bot relay's MARK predicate (core's
+  // isRelayedSocket): no relay implementation and no socket override.
+  assert.doesNotMatch(src, /createRelay|createConnection|connect:|relay\s*:/, "panel/routes.js passes no relay and no socket override to the runtime");
+  assert.match(src, /isRelayed: \(req\) => isRelayedSocket\(req\.socket\)/, "the bot relay's mark comes from core's isRelayedSocket");
   const rtSrc = readFileSync(new URL("../bundles/kiosk/server/runtime.js", import.meta.url), "utf8");
   assert.match(rtSrc, /const relay = deps\.relay \|\| createRelay\(\);/, "the default relay is built with no options");
 });

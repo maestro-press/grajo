@@ -73,6 +73,7 @@ before(async () => {
   rt = kiosk.createKioskRuntime({
     Router: express.Router, json: express.json, WebSocketServer,
     isAllowedNetwork: auth.isAllowedNetwork,
+    isRelayed: () => false,
     csrfMiddleware: csrf.csrfMiddleware,
     csrfTokenAccepted: csrf.csrfTokenAccepted,
     sessionFromRequest: auth.sessionFromRequest,
@@ -398,6 +399,7 @@ test("without the core session helpers (an older gateway) the bundle offers no s
   const k = kiosk.createKioskRuntime({
     Router: express.Router, json: express.json, WebSocketServer,
     isAllowedNetwork: () => true, csrfMiddleware: (req, res, next) => next(),
+    isRelayed: () => false,
     openDb: open, deviceStore: store,
     settings: { readSetting: registry.readSetting, writeSetting: registry.writeSetting },
     voice: { runVoiceTurn: async () => ({}), speakText: async () => true },
@@ -432,6 +434,7 @@ async function serve(voice, extra = {}) {
   const k = kiosk.createKioskRuntime({
     Router: express.Router, json: express.json, WebSocketServer,
     isAllowedNetwork: auth.isAllowedNetwork, csrfMiddleware: csrf.csrfMiddleware, csrfTokenAccepted: csrf.csrfTokenAccepted,
+    isRelayed: () => false,
     sessionFromRequest: auth.sessionFromRequest, verifySession: auth.verifySession,
     openDb: open, deviceStore: store,
     settings: { readSetting: registry.readSetting, writeSetting: registry.writeSetting },
@@ -787,6 +790,7 @@ async function barServe({ verifySession = auth.verifySession, barCheckTimeoutMs 
   const k = kiosk.createKioskRuntime({
     Router: express.Router, json: express.json, WebSocketServer,
     isAllowedNetwork: auth.isAllowedNetwork, csrfMiddleware: csrf.csrfMiddleware, csrfTokenAccepted: csrf.csrfTokenAccepted,
+    isRelayed: () => false,
     sessionFromRequest: auth.sessionFromRequest, verifySession,
     ...(barCheckTimeoutMs ? { barCheckTimeoutMs } : {}),
     openDb: open, deviceStore: store,
@@ -990,6 +994,7 @@ test("B3 endpoint: absent without the core session helpers (an older gateway)", 
   const k = kiosk.createKioskRuntime({
     Router: express.Router, json: express.json, WebSocketServer,
     isAllowedNetwork: () => true, csrfMiddleware: (req, res, next) => next(),
+    isRelayed: () => false,
     openDb: open, deviceStore: store,
     settings: { readSetting: registry.readSetting, writeSetting: registry.writeSetting },
     voice: { runVoiceTurn: async () => ({}), speakText: async () => true },

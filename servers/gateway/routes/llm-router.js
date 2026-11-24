@@ -59,6 +59,14 @@
  * there the token is the only gate. Provider server tools (web_search and the
  * like) pass, since they run on the user's own key; OpenRouter's
  * models/route/provider and anthropic's mcp_servers are stripped.
+ *
+ * A RELAYED SOCKET (a contained bot's egress relay, or a walled add-on's mark —
+ * servers/shared/bot-doors.js isRelayedSocket) never authenticates as the owner
+ * here: the local MCP token, the models token and a paired instance's peer token
+ * all have their verifier in bot-writable crow.db, so a bot could write one and
+ * present it. Such a caller keeps the door it legitimately has — the source rule
+ * (a bot reaches /llm/v1 and /llm/p with no bearer at all) and the cloud door's
+ * own token — and nothing else (doorCallerAllowed).
  */
 
 import express from "express";
@@ -68,6 +76,7 @@ import { resolveProviderConfig } from "../ai/resolve-profile.js";
 import { maybeAcquireLocalProvider, warmProviderByName } from "../gpu-orchestrator.js";
 import { requesterTag } from "../requester-tag.js";
 import { ReservedError, readReservation } from "../box-reservation.js";
+import { isRelayedSocket } from "../../shared/bot-doors.js";
 import { ServingClassError } from "../models/serving-class.js";
 import { connectTimeout, isTimeoutError, LLM_CONNECT_TIMEOUT_MS } from "../../shared/http-timeout.js";
 import { isLazyLoader } from "../../shared/lazy-loader.js";
@@ -82,6 +91,7 @@ import { classifyIp } from "../../shared/ip-classify.js";
 import { isForeignInstanceHost } from "../../shared/provider-host.js";
 import { getOrCreateLocalInstanceId, validateInstanceToken } from "../instance-registry.js";
 import { providerDoorUrl } from "../models/door.js";
+import { ownTargetOf, isAllowedSelfPath, isRebindableHost } from "../models/self-target.js";
 import { createCloudDoor, CLOUD_DOOR_DEFAULTS } from "../models/cloud-door.js";
 import { validateLlmCloudToken } from "../local-token.js";
 import { readCloudConsent, readCloudConsentSalt } from "../../shared/cloud-consent.js";
@@ -330,6 +340,23 @@ let doorIdentityFailureLogged = false;
 
 async function doorCallerAllowed(req, deps) {
   const socketAddr = deps.remoteAddressFn(req);
+  // A socket the egress relay opened (a contained bot, or a walled add-on) is
+  // never the owner here. Both credentials this door's bearer check knows are
+  // owner/lifecycle authority whose verifier lives in bot-writable crow.db: the
+  // full local MCP token and the models token (`mcp_local_token_hash` /
+  // `mcp_models_token_hash` in dashboard_settings), and the classifier below
+  // also tries a paired instance's per-peer token (`crow_instances.auth_token_hash`).
+  // A contained bot has crow.db bound read-write, so it can write any of those
+  // and then present its own value — the same hole localTokenAuthMiddleware
+  // closes for the full local token (servers/gateway/local-token.js: a relayed
+  // socket simply never authenticates with it).
+  //
+  // What a relayed caller keeps: the door's own source rule (a bot reaches
+  // /llm/v1 and /llm/p with no bearer at all, on its loopback mark) and the
+  // path-scoped cloud door (/llm/c, models/cloud-door.js, its own token and
+  // consent). Only the owner-authority bearers are refused, and only on the
+  // mark: nothing about a non-relayed caller changes.
+  const relayed = isRelayedSocket(req.socket);
   // Today's answer first, unchanged: the socket AND every forwarded address
   // loopback/tailnet (final review I1), or a bearer the door's check accepts.
   let allowed;
@@ -337,7 +364,7 @@ async function doorCallerAllowed(req, deps) {
     allowed = true;
   } else {
     const h = req.headers.authorization || "";
-    allowed = h.startsWith("Bearer ") && (await deps.doorAuthFn(h.slice(7)));
+    allowed = !relayed && h.startsWith("Bearer ") && (await deps.doorAuthFn(h.slice(7)));
     // Admitted by the credential alone: exactly the case the census exists for.
     if (allowed) logBearerAdmission(req, deps, socketAddr);
   }
@@ -355,8 +382,13 @@ async function doorCallerAllowed(req, deps) {
       req.crowDoor = await deps.classifyDoorCallerFn(req, {
         remoteAddressFn: deps.remoteAddressFn,
         classifyPeerFn: deps.classifyPeerFn,
-        localTokenFn: deps.localTokenFn,
-        peerTokenFn: deps.peerTokenFn,
+        // The classifier names the credential a caller presented. On a relayed
+        // socket neither resolver is asked at all: a bot-written hash must not
+        // even be NAMED owner or peer authority there (under
+        // CROW_LLM_DOOR_ENFORCE=1 that class is what admits a caller), and the
+        // refusal above is the only answer either token can earn.
+        localTokenFn: relayed ? async () => false : deps.localTokenFn,
+        peerTokenFn: relayed ? async () => null : deps.peerTokenFn,
         ownerLogin: deps.ownerLoginFn(),
         nowFn: deps.nowFn,
         // Shadow mode memoises a token's verdict; enforcement never does, so a
@@ -495,9 +527,6 @@ function incomingHop(req) {
 
 /** Forward one door request and stream the response back. */
 async function forwardDoor(req, res, target, op, deps) {
-  if (target.doorKind === "native-owned" || target.doorKind === "bundle") {
-    await deps.acquireFn(target.providerId, { requester: requesterTag(req) });
-  }
   const body = { ...(req.body || {}), model: target.modelId };
   const headers = { "Content-Type": "application/json", Accept: req.headers.accept || "application/json", ...authHeaders(target.apiKey) };
   let base = target.url;
@@ -514,13 +543,55 @@ async function forwardDoor(req, res, target, op, deps) {
   // at hop >= 2 (508), so even a non-door-shaped self-loop terminates.
   headers[DOOR_HOP_HEADER] = String(incomingHop(req) + 1);
   const url = `${base}/${op}`;
+  // THE CONFUSED DEPUTY (security review 2026-11). `base` came from a providers
+  // row — bot-writable in every field (base_url, api_key, gpu_policy) — so a
+  // relayed caller (a contained bot, or a walled add-on: isRelayedSocket) could
+  // point it at this BOX with a path that is not a model operation
+  // (`/llm/models/<m>/start?x=`, `/llm/acquire`, the kiosk announce routes …)
+  // and hand it an api_key it chose. The forward then leaves as a fresh,
+  // UNMARKED loopback socket, so every "a relayed socket never authenticates as
+  // the owner" rule is bypassed in one hop. Refused BEFORE acquireFn, so a
+  // refused forward never starts or evicts a model either.
+  //
+  // The rule is a PATH rule, not a port rule: co-hosted sibling gateways exist
+  // (crow :3001 and crow-r4 :3008 on one box), so "any port" is judged, and the
+  // only targets allowed on this host are `/v1/<op>` (a model server's own port)
+  // and `/llm/v1/<op>` (this gateway's own door, which a bot may already call),
+  // with no query and no fragment (models/self-target.js isAllowedSelfPath).
+  // A name we could not resolve is refused too: our lookup and the fetch's are
+  // two resolutions of the same name.
+  const own = await ownTargetOf(url);
+  if (isRelayedSocket(req.socket)) {
+    if (own.unresolved || (own.own && !isAllowedSelfPath(url))) {
+      return res.status(403).json({ error: { code: "SELF_TARGET_REFUSED", message: `provider "${target.providerId}" points at this gateway; a relayed caller may not use it as a forward` } });
+    }
+  }
+  // Unconditional (relayed or not, and the one thing every own-host target gets):
+  // a provider's api_key never travels to a forward that lands on this box. The
+  // key came from the same bot-writable row, and none of the server types Crow
+  // launches on this host (native llama-server, an inference bundle, an external
+  // engine) takes a bearer — see the launch layer: buildLlamaServerArgs passes no
+  // --api-key, bundle providers are registered with apiKey "none", and an
+  // external engine has no auth at all.
+  if (own.own) delete headers.Authorization;
+  if (target.doorKind === "native-owned" || target.doorKind === "bundle") {
+    await deps.acquireFn(target.providerId, { requester: requesterTag(req) });
+  }
   let upstream;
   try {
     const t = connectTimeout(LLM_CONNECT_TIMEOUT_MS);
-    upstream = t.disarm(await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: t.signal }));
+    // NO REDIRECTS: a 3xx is never followed. A redirect from a model server is
+    // either a misconfiguration or an attempt to move the forward somewhere the
+    // own-host checks above never judged, and Node would follow it on a fresh
+    // socket of its own.
+    upstream = t.disarm(await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: t.signal, redirect: "manual" }));
   } catch (e) {
     const msg = isTimeoutError(e) ? `upstream connect timeout after ${Math.round(LLM_CONNECT_TIMEOUT_MS / 1000)}s` : `upstream ${target.providerId} unreachable: ${e.message}`;
     return res.status(502).json({ error: { code: "UPSTREAM_UNREACHABLE", message: msg } });
+  }
+  if (upstream.status >= 300 && upstream.status < 400) {
+    try { upstream.body?.cancel?.()?.catch?.(() => {}); } catch { /* the body is irrelevant */ }
+    return res.status(502).json({ error: { code: "UPSTREAM_UNREACHABLE", message: `upstream ${target.providerId} unreachable: redirect ${upstream.status} not followed` } });
   }
   console.log(`[llm-router] door ${op} -> ${target.providerId}/${target.modelId} (${target.doorKind}) requester=${requesterTag(req)}`);
   res.status(upstream.status);
@@ -841,13 +912,24 @@ export async function completeText({ model, prompt, maxTokens = 400, timeoutMs =
   // summary ended empty_output, 2026-10-30). This is short structured writing: no thinking. Only a
   // provider on our own boxes gets the llama.cpp/vLLM flag; a cloud endpoint may reject unknown fields.
   if (up.host !== "cloud") body.chat_template_kwargs = { enable_thinking: false };
+  // The same two rules as the door and the voice path (see forwardDoor): never
+  // hand a provider's api_key to a forward that lands on this box (the row, and
+  // so the key, came from bot-writable crow.db), and never follow a redirect.
+  // `redirect: "manual"` leaves a 3xx as an !ok status, so it answers the fixed
+  // "upstream status" error below instead of being followed on a new socket.
+  const headers = { "Content-Type": "application/json", ...authHeaders(up.apiKey) };
+  if ((await ownTargetOf(`${up.baseUrl}/chat/completions`)).own) delete headers.Authorization;
   const res = await fetchFn(`${up.baseUrl}/chat/completions`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...authHeaders(up.apiKey) },
+    headers,
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(timeoutMs),
+    redirect: "manual",
   });
-  if (!res.ok) throw new Error(`completeText: upstream status ${res.status}`);
+  if (!res.ok) {
+    try { res.body?.cancel?.()?.catch?.(() => {}); } catch { /* the body is irrelevant */ }
+    throw new Error(`completeText: upstream status ${res.status}`);
+  }
   let json;
   try { json = await res.json(); } catch { throw new Error("completeText: invalid upstream body"); }
   try {
@@ -980,6 +1062,35 @@ async function handleChat(req, res, deps) {
   // Forward to the chosen upstream, rewriting the model field to its real id.
   body.model = up.model;
   const url = `${up.baseUrl}/chat/completions`;
+  // The same confused deputy the door refuses (forwardDoor): this path resolves
+  // its target from the same bot-writable providers row (resolveKeyFn), so a
+  // relayed caller could repoint the fast/escalate row at this box with a path
+  // that is not a model operation (`/llm/models/<m>/start?x=` is what
+  // `${base}/chat/completions` turns such a row into) and the forward would
+  // leave as a fresh, UNMARKED loopback socket.
+  //
+  // Two rules, relayed callers only (nothing else changes):
+  //
+  //  a) REBINDING. The row's host must be an IP literal (any), `localhost` or a
+  //     `*.ts.net` name — the same shape the door's own forward already requires
+  //     of a forwardable row. A relayed caller naming any OTHER DNS name is
+  //     refused HERE, on the host string alone, so no resolver is asked and no
+  //     request leaves this process (a name is a resolution the row's writer
+  //     does not control, and our lookup and the fetch's are two of them).
+  //  b) THE PATH RULE. A target on this HOST (any port, co-hosted siblings
+  //     included) is allowed only for `/v1/<op>` / `/llm/v1/<op>` with no query
+  //     and no fragment; a name we could not resolve is refused (fail closed).
+  // The Authorization strip below is unconditional — see the door's note.
+  const relayed = isRelayedSocket(req.socket);
+  if (relayed && isRebindableHost(up.baseUrl)) {
+    return res.status(400).json({ error: { code: "NOT_FORWARDABLE", message: `the model key ${key} is not on a loopback, private or tailnet address; the door never forwards to the internet` } });
+  }
+  const own = await ownTargetOf(url);
+  if (relayed && (own.unresolved || (own.own && !isAllowedSelfPath(url)))) {
+    return res.status(403).json({ error: { code: "SELF_TARGET_REFUSED", message: `the model key ${key} points at this gateway; a relayed caller may not use it as a forward` } });
+  }
+  const upHeaders = { "Content-Type": "application/json", Accept: "text/event-stream", ...authHeaders(up.apiKey) };
+  if (own.own) delete upHeaders.Authorization;
   const t0 = Date.now();
   const role = roleOf();
   console.log(`[llm-router] route=${routeLabel} -> ${key} (${up.model})${role ? ` role=${role}` : ""} cloud=${cloudOf()} stream=${!!body.stream} requester=${requester}`);
@@ -987,17 +1098,23 @@ async function handleChat(req, res, deps) {
   let upstream;
   try {
     const t = connectTimeout(LLM_CONNECT_TIMEOUT_MS);
+    // NO REDIRECTS (see forwardDoor): a 3xx is a 502, never followed.
     upstream = t.disarm(await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "text/event-stream", ...authHeaders(up.apiKey) },
+      headers: upHeaders,
       body: JSON.stringify(body),
       signal: t.signal,
+      redirect: "manual",
     }));
   } catch (e) {
     const msg = isTimeoutError(e)
       ? `upstream connect timeout after ${Math.round(LLM_CONNECT_TIMEOUT_MS / 1000)}s`
       : `upstream ${url} unreachable: ${e.message}`;
     return res.status(502).json({ error: { message: msg } });
+  }
+  if (upstream.status >= 300 && upstream.status < 400) {
+    try { upstream.body?.cancel?.()?.catch?.(() => {}); } catch { /* the body is irrelevant */ }
+    return res.status(502).json({ error: { code: "UPSTREAM_UNREACHABLE", message: `upstream ${url} unreachable: redirect ${upstream.status} not followed` } });
   }
 
   // Mirror status + content-type; stream the body straight through (SSE or JSON).

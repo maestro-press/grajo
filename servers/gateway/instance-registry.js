@@ -11,6 +11,7 @@
 
 import { randomBytes, createHash } from "crypto";
 import { resolvePeerLabel } from "../shared/peer-label.js";
+import { isRelayedSocket } from "../shared/bot-doors.js";
 import {
   existsSync, readFileSync, writeFileSync, mkdirSync, lstatSync, chmodSync,
   openSync, closeSync, fsyncSync, linkSync, unlinkSync,
@@ -1017,6 +1018,15 @@ export async function validateInstanceToken(db, token, opts = {}) {
  * Express middleware for instance-to-instance auth.
  * Checks for Bearer token in Authorization header and validates against instance registry.
  * Sets req.instanceAuth = { instance } on success.
+ *
+ * A socket the egress relay opened never authenticates as a paired instance:
+ * the verifier here is `crow_instances.auth_token_hash`, which lives in
+ * bot-writable crow.db, so a contained bot could write its own value into a
+ * peer row and then present it as that peer (which is peer/instance authority:
+ * federated tool calls, sync and the exposure cards all read req.instanceAuth).
+ * Only a path-scoped door token may authenticate a relayed caller
+ * (servers/shared/bot-doors.js). Nothing is rejected here — the request simply
+ * falls through unauthenticated to the other rails, exactly as a bad token does.
  */
 export function instanceAuthMiddleware(db) {
   return async (req, res, next) => {
@@ -1024,6 +1034,7 @@ export function instanceAuthMiddleware(db) {
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
       return next(); // No bearer token — fall through to other auth methods
     }
+    if (isRelayedSocket(req.socket)) return next();
 
     const token = authHeader.slice(7);
     const instance = await validateInstanceToken(db, token);
