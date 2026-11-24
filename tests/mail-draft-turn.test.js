@@ -62,6 +62,8 @@ process.on("exit", () => {
 const CROW_DB = join(process.env.CROW_DATA_DIR, "crow.db");
 const CROW_HOME = process.env.CROW_HOME;
 const DRAFTBOT_ROOT = join(ROOT, "bots", "draftbot");
+// The bot the post-turn review cases run as: its own world root, nothing shared with draftbot.
+const REVIEWBOT_ROOT = join(ROOT, "bots", "reviewbot");
 
 /** The bot the plan describes: a def that grants gmail, web, files and messaging. */
 function botDef(overrides = {}) {
@@ -109,7 +111,7 @@ const {
   resolvedMailDraftTurnDir,
 } = await import("../scripts/pi-bots/mcp_writer.mjs");
 const { getOrCreateLocalInstanceId } = await import("../servers/gateway/instance-registry.js");
-const { buildToolsCsv, toolAllowlist, handleInbound } = await import("../scripts/pi-bots/bridge.mjs");
+const { buildToolsCsv, toolAllowlist, handleInbound, _setSkillReviewForTest } = await import("../scripts/pi-bots/bridge.mjs");
 const { initGatewayActorKey, verifyMailDraftActorSig, _resetActorKeyForTest } = await import("../scripts/pi-bots/actor-sig.mjs");
 
 /** The one path a drafting turn's world root may be: `<CROW_HOME>/mail-draft-turns/<botId>/<draftId>`. */
@@ -259,6 +261,11 @@ before(async () => {
   seedBot("escbot", botDef({ models: { default: "stub/m1", escalation: "cloudy/m1" } }));
   // A bot whose def carries a spawn_env key: a drafting turn gets none of it.
   seedBot("envbot", botDef({ spawn_env: { DRAFT_TEST_MARKER: "1" } }));
+  // Self-learning on, so a review would fire on any turn the bridge lets reach it.
+  seedBot("reviewbot", botDef({
+    session_dir: REVIEWBOT_ROOT,
+    permission_policy: { bash: "deny", write_paths: [], skill_learning: "auto", skill_learning_auto_override: true },
+  }));
   initGatewayActorKey();
   account = await makeAccount();
 });
@@ -1014,6 +1021,44 @@ describe("the drafting turn at the bridge", () => {
     for (const name of THREE) assert.ok(!csv.includes(name), name);
     const config = JSON.parse(readFileSync(paths.mcpPath, "utf8"));
     assert.equal(Object.hasOwn(config.mcpServers, MAIL_DRAFT_SERVER), false);
+  });
+
+  test("a drafting turn fires no post-turn skill review, even with skill_learning auto", async () => {
+    const seen = [];
+    const prev = _setSkillReviewForTest((args) => { seen.push(args); return Promise.resolve(); });
+    try {
+      const paths = capturePaths();
+      const draftId = "md-00000000000000a1";
+      const { option } = draftingTurnFor(draftId, { botId: "reviewbot" });
+      const result = await handleInbound({
+        bot_id: "reviewbot", gateway_type: "mail-draft", gateway_thread_id: "mail-draft:" + draftId,
+        user_message: "draft it", log: () => {}, sendReply: async () => {}, draftingTurn: option,
+      });
+      assert.equal(result.action, "asked", "the drafting turn itself still ran");
+      assert.equal(existsSync(paths.argvPath), true, "the stub pi ran the turn");
+      assert.deepEqual(seen, [], "the locked turn carries outside text, so no review is fired");
+    } finally {
+      _setSkillReviewForTest(prev);
+    }
+  });
+
+  test("an ordinary unlocked turn of the same bot still fires the post-turn skill review", async () => {
+    // The control for the case above: without it, a bridge that never reviews anything would pass.
+    const seen = [];
+    const prev = _setSkillReviewForTest((args) => { seen.push(args); return Promise.resolve(); });
+    try {
+      capturePaths();
+      const result = await handleInbound({
+        bot_id: "reviewbot", gateway_type: "gmail", gateway_thread_id: "reviewbot-chat-thread",
+        user_message: "hello", log: () => {}, sendReply: async () => {},
+      });
+      assert.equal(result.action, "asked", "the plain turn reaches the asked/executed branch");
+      assert.equal(seen.length, 1, "exactly one review is fired");
+      assert.equal(seen[0].bot_id, "reviewbot");
+      assert.equal(seen[0].transcript.user, "hello", "and it is handed this turn's transcript");
+    } finally {
+      _setSkillReviewForTest(prev);
+    }
   });
 
   test("a drafting turn's config is closed-world: the operator's global servers are disabled", async () => {

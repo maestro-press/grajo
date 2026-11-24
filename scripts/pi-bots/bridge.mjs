@@ -665,6 +665,17 @@ export function _resetUnhideableLogForTest() {
   unhideableLogged.clear();
 }
 
+/** The post-turn skill review the bridge calls. A module-level binding so a test can record the
+ *  call (see `_setSkillReviewForTest`); the default is the real one. */
+let skillReviewImpl = runSkillReview;
+/** Test-only: swap the skill review for a recorder; `null` restores the real one. Returns the
+ *  previous implementation so a test can put it back in a `finally`. */
+export function _setSkillReviewForTest(fn) {
+  const prev = skillReviewImpl;
+  skillReviewImpl = fn || runSkillReview;
+  return prev;
+}
+
 /**
  * Whether the home the masks are built from is the one this gateway resolves.
  * A null on EITHER side (a home that is gone, or nothing resolved) is a
@@ -2719,8 +2730,12 @@ export async function handleInbound(opts) {
   // skill_learning mode + the idle-only countLivePi()===0 check, so a no-op turn
   // costs nothing. pi is already closed, so on an otherwise-idle node the gate
   // sees 0 live pi. Errors are swallowed inside runSkillReview.
-  if (postTurn && (result.action === "asked" || result.action === "executed")) {
-    runSkillReview({ bot_id, def, crowHome, sessionDir, transcript: postTurn,
+  // A locked drafting turn never reviews itself: its transcript carries untrusted outside text
+  // (inbound mail), and the review resolves its own model and gets the bot's spawn_env, so the
+  // drafting turn's model gate does not cover the review's own pi spawn — in `skill_learning: auto`
+  // mode that would turn outside text into standing instructions.
+  if (drafting === null && postTurn && (result.action === "asked" || result.action === "executed")) {
+    skillReviewImpl({ bot_id, def, crowHome, sessionDir, transcript: postTurn,
       log: (m) => log("[skill-review] " + m) }).catch(() => {});
   }
   // The seam's receipt, only when it ran: the caller asserts the fixture server was the one block replaced.
