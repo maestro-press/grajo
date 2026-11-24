@@ -99,7 +99,7 @@ test("save → list carries metadata only; open returns the plaintext; the colum
   assert.ok(!JSON.stringify(e).includes("p a$s"), "list never carries the secret");
   assert.equal(await K.openEntrySecret(db, key, id), "p a$s'w\"d");
   const raw = (await db.execute({ sql: "SELECT secret_sealed FROM crow_keychain WHERE id = ?", args: [id] })).rows[0].secret_sealed;
-  assert.match(raw, /^enc:v1:/);
+  assert.match(raw, /^enc:v2:/);
 });
 
 test("C7 — restored without the key: entries list as unreadable, open/first-view throw KEYCHAIN_KEY_MISSING, never crash", async () => {

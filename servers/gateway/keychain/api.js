@@ -19,7 +19,7 @@ import {
   exportableEntries, importEntries, ensureWriteKey, isPanelConnectionSecret,
 } from "./store.js";
 import { vaultwardenStatus, saveToVault } from "./vault-save.js";
-import { recordKeychainExport, recordKeychainImport, exportSnapshot } from "./reminder.js";
+import { recordKeychainExport, recordKeychainImport, exportSnapshot, snapshotWithout } from "./reminder.js";
 import { createExportTickets } from "./export-tickets.js";
 import { invalidateHealthCache } from "../dashboard/panels/nest/health-signals.js";
 
@@ -90,6 +90,9 @@ export function keychainApiRouter({
       // A Crow Mail password is removed with its account, never here (plan 2, Task 9).
       if (err?.code === "KEYCHAIN_MAIL_ROW") { if (!res.headersSent) res.status(409).json({ error: "mail_row" }); return; }
       if (err?.code === "KEYCHAIN_KEY_INVALID") { if (!res.headersSent) res.status(409).json({ code: "key_invalid", error: err.message }); return; }
+      // An old-style (`enc:v1:`) row after the keychain's AAD era is refused like an unreadable
+      // one: it is never opened. The answer reuses the fixed "nothing was revealed" line.
+      if (err?.code === "KEYCHAIN_LEGACY_FORM") { if (!res.headersSent) res.status(409).json({ code: "legacy_form", error: "Keychain error. Nothing was revealed." }); return; }
       console.error("[keychain] request failed:", err?.code || err?.name || "error");
       if (!res.headersSent) res.status(500).json({ error: "Keychain error. Nothing was revealed." });
     } finally {
@@ -216,11 +219,26 @@ export function keychainApiRouter({
     const key = readKey();
     if (!key) return res.status(409).json(KEY_MISSING);
     const snapshot = await exportSnapshot(db, key.id).catch(() => null);
-    const entries = await exportableEntries(db, key);
+    // A row this database refuses (an old-style blob after the era, a value in a spelling this
+    // release never wrote, a legacy row under another key) is left OUT of the file instead of
+    // failing the whole Export. One log line, counts only, and `skipped` in the answer is a
+    // number (no user-visible text changes).
+    let skipped = 0;
+    const skippedIds = [];
+    const entries = await exportableEntries(db, key, {
+      onSkipped: (n, ids) => {
+        skipped = n;
+        skippedIds.push(...ids);
+        console.warn(`keychain export: ${n} entr${n === 1 ? "y" : "ies"} could not be opened and ${n === 1 ? "was" : "were"} left out`);
+      },
+    });
     const file = await sealExport(entries, passphrase);
     const filename = `crow-keychain-${new Date().toISOString().slice(0, 10)}.json`;
-    const { token, expiresAt } = tickets.issue(req.dashboardSession, { file, filename, keyId: key.id, snapshot, count: entries.length });
-    res.json({ ok: true, count: entries.length, filename, token, download: `${BASE}/export/file/${token}`, expires_at: new Date(expiresAt).toISOString() });
+    // A row that is not in the file was not exported: its fingerprint comes out of the snapshot
+    // the reminder and the off-site upload gate read, so it stays listed as not exported.
+    const recorded = snapshotWithout(snapshot, skippedIds);
+    const { token, expiresAt } = tickets.issue(req.dashboardSession, { file, filename, keyId: key.id, snapshot: recorded, count: entries.length });
+    res.json({ ok: true, count: entries.length, skipped, filename, token, download: `${BASE}/export/file/${token}`, expires_at: new Date(expiresAt).toISOString() });
   }));
 
   const TICKET_ERRORS = {

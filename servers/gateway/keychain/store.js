@@ -12,9 +12,25 @@
  * and the seal and migration read-back proofs. Rows sealed under another key (a crow.db
  * restored onto a machine without the key file) are listed as readable:false and throw
  * KeychainKeyMissingError on open — never a crash, never a wrong plaintext.
+ *
+ * EVERY sealed value is BOUND to its row (secret-box v2, `enc:v2:`): the AAD is
+ * `rowAad(row, keyId)` over the row's own (kind, bundle_id, env_key, connection_uuid), so a
+ * blob copied into another row — or a row whose bound columns were changed under it — fails
+ * its tag check instead of yielding a plaintext. Every seal in this file uses the AAD of the
+ * row's FINAL bound columns, and every open uses the AAD of the row it READ, so the two can
+ * never drift. `enc:v1:` rows are still opened (no AAD) BEFORE the conversion era and are
+ * REFUSED after it (`keychain/aad-era.js`): the era records that nothing this release writes
+ * is v1 any more, so a v1 blob is a value something else put there.
  */
 import { timingSafeEqual } from "node:crypto";
-import { sealSecret, openSecret } from "../../sharing/secret-box.js";
+import {
+  isCanonicalSealed, isSealedV1, isSealedV2, openSecret, openSecretBound, sealSecretBound,
+} from "../../sharing/secret-box.js";
+import { resolveCrowHome } from "../../shared/crow-home.js";
+import {
+  aadSecretsDirFromHome, eraConvertedAsync, eraConvertedFromFile, eraConvertedSync,
+  raiseLegacyFormAlarmAsync, raiseLegacyFormAlarmSync,
+} from "./aad-era.js";
 import { serviceById, isPanelService } from "../../shared/service-catalog.js";
 import { KEYCHAIN_DDL, KEYCHAIN_CONNECTION_COLUMN, KEYCHAIN_SERVICE_INDEX_DDL } from "./schema.js";
 import { keychainKeyState, createKeychainKey, KeychainKeyInvalidError } from "./key.js";
@@ -67,10 +83,96 @@ export class KeychainRowsMissingError extends Error {
   }
 }
 
+/**
+ * A keychain row that holds an `enc:v1:` blob after the conversion era: nothing this release
+ * writes is v1 any more, so the row is refused exactly like an unreadable one — never
+ * opened, never handed to an add-on child. The same refusal covers a `enc:v2:` value whose
+ * base64 body is not the canonical form this release writes (whitespace added around it, its
+ * `=` pad stripped): Node's decoder ignores both, so such a value WOULD open, and it is a
+ * spelling no Crow wrote. The message is internal (no client shows it; the
+ * keychain API answers with its fixed "nothing was revealed" line) and carries no value.
+ */
+export class KeychainLegacyFormError extends Error {
+  constructor() {
+    super("This saved password is in the old sealed form, which this database now refuses.");
+    this.code = "KEYCHAIN_LEGACY_FORM";
+  }
+}
+
 const META_COLS = "id, kind, label, bundle_id, env_key, username, url, origin, status, key_id, created_at, updated_at, first_view_until, connection_uuid";
+/** The `crow_keychain` columns a seal is BOUND to (every SELECT that feeds an open reads them). */
+const BOUND_COLS = "kind, bundle_id, env_key, connection_uuid";
 const iso = (d) => (d instanceof Date ? d : new Date()).toISOString();
 const cleanText = (v, max = 512) => (v === undefined || v === null || String(v).trim() === "" ? null : String(v).slice(0, max));
 const box = (key) => ({ seed: key.seed });
+
+/**
+ * The associated data a sealed keychain value is bound to: this row's own identity plus the
+ * key id. A blob copied into ANY other row (another kind, bundle, env key or connection, or
+ * another key) has a different AAD, so AES-GCM's tag check fails and the copy opens nothing.
+ *
+ * Not bound, deliberately: label, username, url, status and first_view_until — those change
+ * legitimately on a row whose secret did not. `manual` rows therefore bind only their kind:
+ * their values only ever go to the owner, so a manual-to-manual copy gains a bot nothing,
+ * while every manual<->extension/service swap fails on `kind`.
+ */
+export function rowAad(row, keyId) {
+  return Buffer.from(JSON.stringify([
+    "crow-keychain-v2",
+    row?.kind ?? null,
+    row?.bundle_id ?? null,
+    row?.env_key ?? null,
+    row?.connection_uuid ?? null,
+    keyId ?? null,
+  ]), "utf8");
+}
+
+/** The bound-column object for a row an operation is about to WRITE (its final values). */
+const boundRow = (kind, bundleId, envKey, connectionUuid) => ({
+  kind,
+  bundle_id: bundleId ?? null,
+  env_key: envKey ?? null,
+  connection_uuid: connectionUuid ?? null,
+});
+
+/** Seal one value for the row it is about to be written to. */
+function sealRow(row, key, plaintext) {
+  return sealSecretBound(plaintext, box(key), rowAad(row, key.id));
+}
+
+/** The SECRETS dir whose era state file decides whether a v1 row still opens (null: none). */
+function eraDirOf(crowHome) {
+  if (typeof crowHome === "string" && crowHome !== "") return aadSecretsDirFromHome(crowHome);
+  try { return aadSecretsDirFromHome(resolveCrowHome()); } catch { return null; }
+}
+
+/**
+ * Open ONE row's value with the AAD of the row that was READ. v2 opens only with that AAD, and
+ * only in the CANONICAL base64 form (`isCanonicalSealed`): `"<blob>\n"`, a space after the prefix
+ * and a padding-stripped body are different strings that the decoder opens to the same plaintext,
+ * so a value in any other spelling is refused like an old-form one. v1 opens with no AAD before
+ * the era and is refused (and alarmed) after it. `legacyRefused` is the caller's era verdict;
+ * `alarm` records a refusal (best effort, never throws).
+ */
+function openSealedRow(row, key, { legacyRefused = false, alarm = null } = {}) {
+  const blob = row?.secret_sealed;
+  if (isSealedV1(blob)) {
+    if (legacyRefused) {
+      try { alarm?.(row); } catch { /* an alarm never changes the refusal */ }
+      throw new KeychainLegacyFormError();
+    }
+    return openSecret(blob, box(key));
+  }
+  if (isSealedV2(blob)) {
+    if (!isCanonicalSealed(blob)) {
+      try { alarm?.(row); } catch { /* an alarm never changes the refusal */ }
+      throw new KeychainLegacyFormError();
+    }
+    return openSecretBound(blob, box(key), rowAad(row, key.id));
+  }
+  // Not sealed at all (a legacy plaintext cell): the v1 opener's answer is null.
+  return openSecret(blob, box(key));
+}
 
 function requireKey(key) {
   if (!key || typeof key.id !== "string" || !Buffer.isBuffer(key.seed)) throw new KeychainKeyMissingError();
@@ -163,7 +265,7 @@ function extensionValues(key, { bundleId, envKey, label, username = null, url = 
     label: cleanText(label) || envKey,
     username: cleanText(username),
     url: cleanText(url, 2048),
-    sealed: sealSecret(secret, box(key)),
+    sealed: sealRow(boundRow("extension", bundleId, envKey, null), key, secret),
     ts: iso(now),
     fvu: firstView ? new Date((now || new Date()).getTime() + FIRST_VIEW_MS).toISOString() : null,
   };
@@ -176,11 +278,12 @@ function extensionValues(key, { bundleId, envKey, label, username = null, url = 
  * (timingSafeEqual needs equal-length buffers): a different length is a different value.
  * Never returns, logs or throws the value itself.
  */
-export function rowSecretEquals(row, key, plaintext) {
+export function rowSecretEquals(row, key, plaintext, { legacyRefused = null, crowHome = null } = {}) {
   if (!row || !key || row.key_id !== key.id || typeof plaintext !== "string") return false;
+  if (isSealedV1(row.secret_sealed) && (legacyRefused ?? eraConvertedFromFile(eraDirOf(crowHome)))) return false;
   let current;
   try {
-    current = openSecret(row.secret_sealed, box(key));
+    current = openSealedRow(row, key);
   } catch {
     return false;
   }
@@ -228,6 +331,7 @@ export async function saveExtensionSecret(db, key, opts = {}) {
   if (existing) {
     await db.execute({
       sql: `UPDATE crow_keychain SET label = ?, username = ?, url = ?, secret_sealed = ?, key_id = ?, origin = ?, status = 'active',
+              connection_uuid = NULL,
               first_view_until = CASE WHEN ? AND secret_sealed = ? THEN first_view_until ELSE ? END, updated_at = ? WHERE id = ?`,
       args: [label, username, url, sealed, key.id, opts.origin, keepFirstView ? 1 : 0, keepFirstView ? opts.keepFirstViewPinnedTo : null, fvu, ts, existing.id],
     });
@@ -261,7 +365,7 @@ export async function rememberExtensionSecret(db, key, opts = {}) {
           VALUES ('extension', ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
           ON CONFLICT (bundle_id, env_key) WHERE kind = 'extension' DO UPDATE SET
             label = excluded.label, username = excluded.username, url = excluded.url, secret_sealed = excluded.secret_sealed,
-            key_id = excluded.key_id, origin = excluded.origin, status = 'active',
+            key_id = excluded.key_id, origin = excluded.origin, status = 'active', connection_uuid = NULL,
             first_view_until = excluded.first_view_until, updated_at = excluded.updated_at
           WHERE crow_keychain.status != 'active' OR crow_keychain.key_id != excluded.key_id
           RETURNING id`,
@@ -285,7 +389,9 @@ export async function saveServiceSecret(db, key, { connectionUuid, bundleId, env
   const bundle = typeof bundleId === "string" ? cleanText(bundleId.trim(), 200) : null;
   if (!bundle) throw new Error("keychain: a service secret needs a bundle id");
   if (!envKey || typeof envKey !== "string" || typeof secret !== "string" || secret === "") throw new Error("keychain: envKey and a secret are required");
-  const sealed = sealSecret(secret, box(key));
+  // The row this write lands on is keyed by (kind 'service', connection uuid, env key) and its
+  // bundle is this call's: that is the row's FINAL bound identity, so that is its AAD.
+  const sealed = sealRow(boundRow("service", bundle, envKey, uuid), key, secret);
   const ts = iso(now);
   const lbl = cleanText(label) || envKey;
   // `created` comes from this pre-read, so two concurrent FIRST saves of one pair may both report
@@ -320,18 +426,19 @@ export async function serviceSecretsFor(db, key, connectionUuid, { allowedKeys }
   if (!key || typeof key.id !== "string" || !Buffer.isBuffer(key.seed)) throw new KeychainKeyMissingError();
   const allowed = new Set(allowedKeys.filter((k) => typeof k === "string" && k));
   const { rows } = await db.execute({
-    sql: "SELECT env_key, key_id, secret_sealed FROM crow_keychain WHERE kind = 'service' AND connection_uuid = ? AND status = 'active' ORDER BY id",
+    sql: `SELECT env_key, key_id, secret_sealed, ${BOUND_COLS} FROM crow_keychain WHERE kind = 'service' AND connection_uuid = ? AND status = 'active' ORDER BY id`,
     args: [connectionUuid],
   });
   const mine = rows.filter((r) => r.key_id === key.id);
   if (rows.length > 0 && mine.length === 0) throw new KeychainKeyMissingError();
+  const legacyRefused = await eraConvertedAsync(db, eraDirOf());
   const out = {};
   for (const r of mine) {
     if (!allowed.has(r.env_key)) continue;
     try {
-      const v = openSecret(r.secret_sealed, box(key));
+      const v = openSealedRow(r, key, { legacyRefused, alarm: (row) => raiseLegacyFormAlarmAsync(db, row) });
       if (typeof v === "string" && v) out[r.env_key] = v;
-    } catch { /* damaged row: skip, never log */ }
+    } catch { /* damaged or refused row: skip, never log */ }
   }
   return out;
 }
@@ -353,18 +460,19 @@ export async function extensionSecretsFor(db, key, bundleId, allowedKeys) {
   if (!key || typeof key.id !== "string" || !Buffer.isBuffer(key.seed)) throw new KeychainKeyMissingError();
   const allowed = new Set(allowedKeys.filter((k) => typeof k === "string" && k));
   const { rows } = await db.execute({
-    sql: "SELECT env_key, key_id, secret_sealed FROM crow_keychain WHERE kind = 'extension' AND bundle_id = ? AND status = 'active' ORDER BY id",
+    sql: `SELECT env_key, key_id, secret_sealed, ${BOUND_COLS} FROM crow_keychain WHERE kind = 'extension' AND bundle_id = ? AND status = 'active' ORDER BY id`,
     args: [bundleId],
   });
   const mine = rows.filter((r) => r.key_id === key.id);
   if (rows.length > 0 && mine.length === 0) throw new KeychainKeyMissingError();
+  const legacyRefused = await eraConvertedAsync(db, eraDirOf());
   const out = {};
   for (const r of mine) {
     if (!allowed.has(r.env_key)) continue;
     try {
-      const v = openSecret(r.secret_sealed, box(key));
+      const v = openSealedRow(r, key, { legacyRefused, alarm: (row) => raiseLegacyFormAlarmAsync(db, row) });
       if (typeof v === "string" && v) out[r.env_key] = v;
-    } catch { /* damaged row: skip, never log */ }
+    } catch { /* damaged or refused row: skip, never log */ }
   }
   return out;
 }
@@ -383,17 +491,22 @@ export async function extensionSecretsFor(db, key, bundleId, allowedKeys) {
  * Callers: servers/shared/addon-secrets.js readAddonSecretsSync (spawn hydration, the Bot
  * Builder probe, the seal's and the migration's read-back proofs); the satellite agent's
  * reader. There is no async equivalent for a plaintext add-on secret.
+ *
+ * `eraDir` names the SECRETS dir whose era state file decides whether an `enc:v1:` row is
+ * still openable; addon-secrets.js passes `dirname(keyPath)`, which is the same dir for a plain
+ * path, the pibot host's anchored `/proc/self/fd/<N>` path and the satellite's own key path.
  */
-export function extensionSecretsSync(rawDb, key, bundleId, names, { kind = "extension" } = {}) {
+export function extensionSecretsSync(rawDb, key, bundleId, names, { kind = "extension", eraDir = null } = {}) {
   const wanted = [...new Set((Array.isArray(names) ? names : []).filter((n) => typeof n === "string" && n !== ""))];
   if (typeof bundleId !== "string" || bundleId === "" || isSystemBundleId(bundleId) || wanted.length === 0) return {};
   requireKey(key);
   let rows;
   try {
-    rows = rawDb.prepare("SELECT env_key, key_id, secret_sealed FROM crow_keychain WHERE kind = ? AND bundle_id = ? AND status = 'active'").all(kind, bundleId);
+    rows = rawDb.prepare(`SELECT env_key, key_id, secret_sealed, ${BOUND_COLS} FROM crow_keychain WHERE kind = ? AND bundle_id = ? AND status = 'active'`).all(kind, bundleId);
   } catch {
     throw new KeychainRowsMissingError(wanted);
   }
+  const legacyRefused = eraConvertedSync(rawDb, eraDir ?? eraDirOf());
   const byName = new Map();
   for (const r of rows) if (r && typeof r.env_key === "string") byName.set(r.env_key, r);
   const out = {};
@@ -402,7 +515,7 @@ export function extensionSecretsSync(rawDb, key, bundleId, names, { kind = "exte
     if (!r || r.key_id !== key.id) throw new KeychainRowsMissingError(wanted);
     let v;
     try {
-      v = openSecret(r.secret_sealed, box(key));
+      v = openSealedRow(r, key, { legacyRefused, alarm: (row) => raiseLegacyFormAlarmSync(rawDb, row) });
     } catch {
       throw new KeychainRowsMissingError(wanted);
     }
@@ -481,7 +594,7 @@ export async function addManualSecret(db, key, { label, username = null, url = n
   const ts = iso();
   const r = await db.execute({
     sql: "INSERT INTO crow_keychain (kind, label, username, url, secret_sealed, key_id, origin, created_at, updated_at) VALUES ('manual', ?, ?, ?, ?, ?, 'manual', ?, ?)",
-    args: [cleanText(label), cleanText(username), cleanText(url, 2048), sealSecret(secret, box(key)), key.id, ts, ts],
+    args: [cleanText(label), cleanText(username), cleanText(url, 2048), sealRow(boundRow("manual", null, null, null), key, secret), key.id, ts, ts],
   });
   return { id: Number(r.lastInsertRowid) };
 }
@@ -505,7 +618,7 @@ export async function pendingFirstViews(db, { now, keyId = null } = {}) {
 }
 
 async function sealedRow(db, id) {
-  const { rows } = await db.execute({ sql: "SELECT secret_sealed, key_id FROM crow_keychain WHERE id = ?", args: [Number(id)] });
+  const { rows } = await db.execute({ sql: `SELECT secret_sealed, key_id, ${BOUND_COLS} FROM crow_keychain WHERE id = ?`, args: [Number(id)] });
   return rows[0] || null;
 }
 
@@ -515,7 +628,8 @@ export async function openEntrySecret(db, key, id) {
   const row = await sealedRow(db, id);
   if (!row) return null;
   if (!key || row.key_id !== key.id) throw new KeychainKeyMissingError();
-  return openSecret(row.secret_sealed, box(key));
+  const legacyRefused = await eraConvertedAsync(db, eraDirOf());
+  return openSealedRow(row, key, { legacyRefused, alarm: (r) => raiseLegacyFormAlarmAsync(db, r) });
 }
 
 /** Atomically spends a live first-view grant. Plaintext once, then null forever. */
@@ -523,12 +637,19 @@ export async function consumeFirstView(db, key, id, { now } = {}) {
   await ensureKeychainTable(db);
   const row = await sealedRow(db, id);
   if (row && (!key || row.key_id !== key.id)) throw new KeychainKeyMissingError();
+  // A refused row is refused BEFORE its window is spent: a v1 blob after the era is not a
+  // value anybody may look at, and burning the grant would hide that from the owner.
+  const legacyRefused = await eraConvertedAsync(db, eraDirOf());
+  if (row && isSealedV1(row.secret_sealed) && legacyRefused) {
+    try { await raiseLegacyFormAlarmAsync(db, row); } catch { /* see openSealedRow */ }
+    throw new KeychainLegacyFormError();
+  }
   const { rows } = await db.execute({
-    sql: "UPDATE crow_keychain SET first_view_until = NULL WHERE id = ? AND first_view_until IS NOT NULL AND first_view_until > ? RETURNING secret_sealed",
+    sql: `UPDATE crow_keychain SET first_view_until = NULL WHERE id = ? AND first_view_until IS NOT NULL AND first_view_until > ? RETURNING secret_sealed, ${BOUND_COLS}`,
     args: [Number(id), iso(now)],
   });
   if (!rows[0]) return null;
-  return openSecret(rows[0].secret_sealed, box(key));
+  return openSealedRow(rows[0], key, { legacyRefused });
 }
 
 /**
@@ -585,14 +706,34 @@ export async function reactivateBundleEntries(db, bundleId, envKeys) {
 }
 
 /** Every READABLE entry with its plaintext, for the user's passphrase-encrypted Export. A panel-only
- *  connection's secret is its own bundle panel's and never leaves here. */
-export async function exportableEntries(db, key) {
+ *  connection's secret is its own bundle panel's and never leaves here.
+ *
+ *  One refused (`enc:v1:` after the era, a v2 value in a spelling this release never wrote, or a
+ *  legacy row under another key) or damaged row must not cost the owner the whole Export: it is
+ *  SKIPPED and every other entry still leaves. `onSkipped` gets the COUNT and the IDS of the rows
+ *  left out, so the caller can keep them out of the Export's fingerprint snapshot (a row that is
+ *  not in the file must not read "exported") as well as log a count (this module logs nothing at
+ *  all: a value or a row detail must never reach a log through the store); the export result keeps
+ *  its shape, so no user-visible text changes. */
+export async function exportableEntries(db, key, { onSkipped = null } = {}) {
   requireKey(key);
   const out = [];
+  const skippedIds = [];
   for (const e of await listEntries(db, { keyId: key.id })) {
     if (!e.readable) continue;
     if (e.kind === "service" && await isPanelConnectionSecret(db, e)) continue;
-    out.push({ kind: e.kind, label: e.label, bundle_id: e.bundle_id, env_key: e.env_key, username: e.username, url: e.url, origin: e.origin, status: e.status, connection_uuid: e.connection_uuid || null, secret: await openEntrySecret(db, key, e.id) });
+    let secret;
+    try {
+      secret = await openEntrySecret(db, key, e.id);
+    } catch {
+      skippedIds.push(Number(e.id));
+      continue;
+    }
+    if (typeof secret !== "string" || secret === "") { skippedIds.push(Number(e.id)); continue; }
+    out.push({ kind: e.kind, label: e.label, bundle_id: e.bundle_id, env_key: e.env_key, username: e.username, url: e.url, origin: e.origin, status: e.status, connection_uuid: e.connection_uuid || null, secret });
+  }
+  if (skippedIds.length > 0 && typeof onSkipped === "function") {
+    try { onSkipped(skippedIds.length, skippedIds); } catch { /* reporting never fails an export */ }
   }
   return out;
 }
@@ -635,22 +776,34 @@ export async function isPanelConnectionSecret(db, entry) {
  * which hides these values from approval cards and pushes; never returned to a client.
  * Rows sealed under another key, a missing table, or a row that fails to open are skipped.
  */
-export function readableSecretsSync(rawDb, key) {
+export function readableSecretsSync(rawDb, key, { eraDir = null } = {}) {
   if (!key || typeof key.id !== "string" || !Buffer.isBuffer(key.seed)) return [];
   let rows;
   try {
-    rows = rawDb.prepare("SELECT id, kind, label, secret_sealed FROM crow_keychain WHERE key_id = ?").all(key.id);
+    rows = rawDb.prepare(`SELECT id, kind, label, secret_sealed, ${BOUND_COLS} FROM crow_keychain WHERE key_id = ?`).all(key.id);
   } catch {
     return [];
   }
+  const legacyRefused = eraConvertedSync(rawDb, eraDir ?? eraDirOf());
   const out = [];
   for (const r of rows) {
     try {
-      const v = openSecret(r.secret_sealed, box(key));
+      const v = openSealedRow(r, key, { legacyRefused, alarm: (row) => raiseLegacyFormAlarmSync(rawDb, row) });
       if (typeof v === "string" && v) out.push({ id: Number(r.id), kind: r.kind, label: r.label, secret: v });
-    } catch { /* damaged row: skip */ }
+    } catch { /* damaged or refused row: skip */ }
   }
   return out;
+}
+
+/**
+ * The ids of this key's rows the era REFUSES: an `enc:v1:` blob after the conversion. Such a
+ * row is unreadable for every purpose that decides whether a row already HOLDS a value (an
+ * Import restoring an Export over it). Empty before the era, when v1 still opens.
+ */
+async function refusedLegacyIds(db, key) {
+  if (!(await eraConvertedAsync(db, eraDirOf()))) return new Set();
+  const { rows } = await db.execute({ sql: "SELECT id FROM crow_keychain WHERE key_id = ? AND substr(secret_sealed, 1, 7) = 'enc:v1:'", args: [key.id] });
+  return new Set(rows.map((r) => Number(r.id)));
 }
 
 /**
@@ -661,10 +814,15 @@ export function readableSecretsSync(rawDb, key) {
  * A service entry keeps its connection_uuid as is and is matched on (uuid, env_key) only: it is
  * never attached to a local connection by id or label. A uuid no local connection has stays
  * unattached for good (uuids are never reused), so its secret reaches no child.
+ *
+ * A row the era REFUSES (`enc:v1:` after the conversion) counts as UNREADABLE here, so an
+ * Export restores over it instead of being skipped as "already saved".
  */
 export async function importEntries(db, key, entries) {
   requireKey(key);
   const current = await listEntries(db, { keyId: key.id });
+  const refused = await refusedLegacyIds(db, key);
+  const readableRow = (c) => c.readable && !refused.has(Number(c.id));
   let imported = 0;
   let skipped = 0;
   const ids = [];
@@ -674,7 +832,7 @@ export async function importEntries(db, key, entries) {
     if (!e || typeof e.secret !== "string" || e.secret === "" || !KINDS.has(e.kind) || !cleanText(e.label)) { skipped++; continue; }
     if (e.kind === "extension") {
       if (!e.bundle_id || !e.env_key) { skipped++; continue; }
-      if (current.some((c) => c.kind === "extension" && c.bundle_id === e.bundle_id && c.env_key === e.env_key && c.readable)) { skipped++; continue; }
+      if (current.some((c) => c.kind === "extension" && c.bundle_id === e.bundle_id && c.env_key === e.env_key && readableRow(c))) { skipped++; continue; }
       const origin = e.origin === "generated" ? "generated" : "typed";
       // The owner's re-authenticated import of their own export is the recovery path, so it may
       // bring back a Crow-owned entry (the off-site key); add-on paths never may.
@@ -685,14 +843,14 @@ export async function importEntries(db, key, entries) {
     } else if (e.kind === "service") {
       const uuid = typeof e.connection_uuid === "string" ? e.connection_uuid.trim() : "";
       if (!uuid || !e.env_key || !e.bundle_id) { skipped++; continue; }
-      if (current.some((c) => c.kind === "service" && c.connection_uuid === uuid && c.env_key === e.env_key && c.readable)) { skipped++; continue; }
+      if (current.some((c) => c.kind === "service" && c.connection_uuid === uuid && c.env_key === e.env_key && readableRow(c))) { skipped++; continue; }
       const { id } = await saveServiceSecret(db, key, { connectionUuid: uuid, bundleId: e.bundle_id || null, envKey: e.env_key, label: e.label, secret: e.secret });
       // A disconnected row stays disconnected (never served) after an import, as an uninstalled one stays removed.
       if (e.status === "extension_removed" || e.status === "disconnected") await db.execute({ sql: "UPDATE crow_keychain SET status = ? WHERE id = ?", args: [e.status, id] });
       ids.push(id);
       imported++;
     } else {
-      const dup = current.some((c) => c.kind === "manual" && c.readable && c.label === cleanText(e.label) && (c.username || null) === cleanText(e.username) && (c.url || null) === cleanText(e.url, 2048));
+      const dup = current.some((c) => c.kind === "manual" && readableRow(c) && c.label === cleanText(e.label) && (c.username || null) === cleanText(e.username) && (c.url || null) === cleanText(e.url, 2048));
       if (dup) { skipped++; continue; }
       await addManualSecret(db, key, { label: e.label, username: e.username, url: e.url, secret: e.secret });
       imported++;

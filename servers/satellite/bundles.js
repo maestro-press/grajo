@@ -38,7 +38,7 @@ import { composeEnv, loadComposeModel, looksLikeHostPath } from "../gateway/comp
 import { envValueProblem, parseEnvText, pathEnvKeys, updateEnvText } from "../gateway/bundle-env-codec.js";
 import { planGeneratedEnv, writePrivateFile } from "../gateway/bundle-env-secrets.js";
 import { composeProjectName } from "../gateway/bundle-lifecycle.js";
-import { loadKeychainKey } from "../gateway/keychain/key.js";
+import { keychainKeyPath, loadKeychainKey } from "../gateway/keychain/key.js";
 import { ensureWriteKey, markBundleRemoved, readableSecretsSync, saveExtensionSecret } from "../gateway/keychain/store.js";
 import { launcherPin } from "../shared/resolve-command.js";
 import { redactSecrets } from "../shared/redact-secrets.js";
@@ -181,7 +181,7 @@ export function createBundleManager({
     const out = Object.values(envOf(id)).filter(nonBlank).map(String);
     for (const v of Object.values(readJson(addonsPath, {})?.[id]?.env || {})) if (nonBlank(v)) out.push(String(v));
     const key = loadKeychainKey({ crowHome: satHome });
-    for (const e of readableSecretsSync(db, key)) out.push(e.secret);
+    for (const e of readableSecretsSync(db, key, { eraDir: join(satHome, "secrets") })) out.push(e.secret);
     return out;
   }
 
@@ -261,7 +261,7 @@ export function createBundleManager({
         }
         let readBack = null;
         try {
-          readBack = readAddonSecretsSync(id, keys, { unsealer: "satellite", rawDb: db, key });
+          readBack = readAddonSecretsSync(id, keys, { unsealer: "satellite", rawDb: db, key, keyPath: keychainKeyPath(satHome) });
         } catch { /* proved below: no read-back is the same failure as a wrong one */ }
         for (const name of keys) if (!readBack || readBack[name] !== seal[name]) throw new Error(KEYS_SAVE_FAILED);
         const rest = { ...env };
@@ -581,7 +581,7 @@ export function createBundleManager({
                   secret: split.seal[name], origin: "typed", now: new Date(now()),
                 });
               }
-              const readBack = readAddonSecretsSync(id, keys, { unsealer: "satellite", rawDb: db, key });
+              const readBack = readAddonSecretsSync(id, keys, { unsealer: "satellite", rawDb: db, key, keyPath: keychainKeyPath(satHome) });
               for (const name of keys) if (readBack[name] !== split.seal[name]) throw new Error(KEYS_SAVE_FAILED);
             } catch (err) {
               // Fixed sentence, no value: nothing was written to the .env or the entry.

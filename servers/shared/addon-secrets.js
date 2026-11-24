@@ -23,7 +23,7 @@
  * only when names were actually listed.
  */
 import { createRequire } from "node:module";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { isDefaultCrowHome, resolveInstanceDataDir, sameDbLocation } from "./crow-home.js";
 import { isLoaderEnvName, withoutLoaderEnv } from "./loader-env.js";
 import { isSecretEnvName } from "./secret-values.js";
@@ -290,6 +290,18 @@ function mapReadError(err, bundleId, names) {
 }
 
 /**
+ * The SECRETS directory a key path names: `<secrets>/keychain.key` -> `<secrets>`. Only the
+ * keychain's AAD-era state file is read through it (never a value, never a key). The dir itself
+ * — never a home derived by stripping another component — is what the era needs: the pibot host
+ * reads the key through an fd-anchored `/proc/self/fd/<N>/keychain.key`, whose parent is the
+ * anchored secrets dir, not a `<home>/secrets` path two levels up.
+ */
+function secretsDirOf(keyPath) {
+  if (typeof keyPath !== "string" || keyPath === "") return null;
+  return dirname(keyPath);
+}
+
+/**
  * The listed secrets of one add-on, SYNCHRONOUSLY: `{ NAME: plaintext }`, all names or a
  * throw. Only a process that registered an unsealer role (or passed one) may call this —
  * anything else, and any process with CROW_ADDON_HOST set (an add-on child's env), gets
@@ -326,7 +338,9 @@ export function readAddonSecretsSync(bundleId, names, { unsealer, dbPath, keyPat
     // against an instance it was not given. Every real caller passes both paths.
     const k = key || (typeof keyPath === "string" && keyPath !== "" ? loadKeychainKey({ path: keyPath }) : null);
     if (!k) throw new AddonKeysUnavailableError("KEY_MISSING", bundleId, wanted);
-    return extensionSecretsSync(db, k, bundleId, wanted, { kind: ADDON_KEY_KIND });
+    // The era state file lives beside the key file (the secrets dir), so the key path the caller
+    // handed us names the instance whose era rules apply — never a guessed home.
+    return extensionSecretsSync(db, k, bundleId, wanted, { kind: ADDON_KEY_KIND, eraDir: secretsDirOf(keyPath) });
   } catch (err) {
     throw mapReadError(err, bundleId, wanted);
   } finally {

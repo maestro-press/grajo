@@ -86,7 +86,7 @@ test("the off-site key is created once, reused, and never sits in the clear", as
   assert.equal(rows.length, 1, "one fixed entry, so a second call can never mint a second key");
   assert.equal(rows[0].kind, "extension");
   assert.equal(rows[0].origin, "generated");
-  assert.match(rows[0].secret_sealed, /^enc:v1:/);
+  assert.match(rows[0].secret_sealed, /^enc:v2:/);
   assert.ok(!rows[0].secret_sealed.includes(first.key.toString("base64")), "sealed, not stored in the clear");
 });
 

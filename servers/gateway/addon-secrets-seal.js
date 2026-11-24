@@ -33,6 +33,7 @@ import {
 } from "../shared/addon-secrets.js";
 import { cardContext, cardText } from "./fix-it/card-copy.js";
 import { gatewayKeychainPaths } from "./addon-keys-paths.js";
+import { aadSecretsDirFromHome, eraConvertedAsync } from "./keychain/aad-era.js";
 import { keychainKeyState, loadKeychainKey } from "./keychain/key.js";
 import { countEntries, ensureWriteKey, rowSecretEquals, saveExtensionSecret } from "./keychain/store.js";
 
@@ -189,7 +190,7 @@ function specMap(manifest) {
 async function priorExtensionRow(db, bundleId, name) {
   try {
     const { rows } = await db.execute({
-      sql: "SELECT label, username, url, origin, key_id, secret_sealed FROM crow_keychain WHERE kind = 'extension' AND bundle_id = ? AND env_key = ? AND status = 'active' LIMIT 1",
+      sql: "SELECT label, username, url, origin, key_id, secret_sealed, kind, bundle_id, env_key, connection_uuid FROM crow_keychain WHERE kind = 'extension' AND bundle_id = ? AND env_key = ? AND status = 'active' LIMIT 1",
       args: [bundleId, name],
     });
     return (rows && rows[0]) || null;
@@ -324,10 +325,13 @@ export async function sealEntrySecrets({ bundleId, entry, manifest = null, origi
     // value: the same value is pushed into the entry after that save, so the seal here owns the
     // VALUE and must not erase the rest. For a DIFFERENT (or unreadable) value the row gets
     // this save's metadata and origin, and its first-view window is cleared — a new value must
-    // not become viewable inside a window an older value earned.
+    // not become viewable inside a window an older value earned. After the keychain's AAD era
+    // an `enc:v1:` row is never "the same value" (see rowSecretEquals): it is refused like an
+    // unreadable row, and this save reseals a v2 value under this row's own AAD.
+    const era = await eraConvertedAsync(db, aadSecretsDirFromHome(d.crowHome()));
     for (const name of names) {
       const prior = await priorExtensionRow(db, bundleId, name);
-      const unchanged = rowSecretEquals(prior, key, seal[name]);
+      const unchanged = rowSecretEquals(prior, key, seal[name], { legacyRefused: era });
       // The prior row's own provenance survives when the value did not change; a row written
       // by a first-admin setup is still `generated` after the MCP entry re-seals it.
       const keptOrigin = unchanged && (prior.origin === "generated" || prior.origin === "typed") ? prior.origin : null;

@@ -212,6 +212,20 @@ export async function startAgent({ env = process.env, now = Date.now, out = cons
   // A rolled-back update's migration: its backup goes back before satellite.db is opened.
   applyPendingDbRestore(satHome, out);
   const db = openSatelliteDb(satHome);
+  // Keychain AAD era: satellite.db holds its own `crow_keychain`, sealed under
+  // `$SAT_HOME/secrets/keychain.key`, so the same conversion runs here before anything can
+  // spawn a bundle (its hydration reads this keychain). The satellite has no dashboard
+  // settings store to mirror the era into, so `mirror: false`: its state file is the trigger.
+  // Never throws, and a fresh satellite with no rows is simply marked.
+  try {
+    const { runKeychainAadBoot } = await import("../gateway/boot/keychain-aad.js");
+    const { SATELLITE_DB_FILE } = await import("./db.js");
+    await runKeychainAadBoot({
+      dbPath: join(satHome, SATELLITE_DB_FILE), crowHome: satHome, mirror: false, log: out,
+    });
+  } catch (err) {
+    out(`satellite: keychain AAD conversion skipped: ${err?.message || err}`);
+  }
   const key = ensureSatelliteKey(satHome, { now: now() });
   let handle = null;
   // The supervised restart: close cleanly, then exit with the code the unit restarts on.

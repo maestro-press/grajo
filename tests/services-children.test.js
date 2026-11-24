@@ -1137,7 +1137,7 @@ test("fingerprints: a notion token transplanted into an HA connection's HA_TOKEN
     const ha = await connect("home-assistant", { config: { HA_URL: "http://127.0.0.1:8123" }, secrets: { HA_TOKEN: "test-token-ha-1" } });
     const nt = await connect("notion", { secrets: { NOTION_TOKEN: "test-token-notion-9" } });
     const start = () => withDb((d) => C.ensureChild(d, ha.uuid, { crowHome: HOME }));
-    const refusedAtSpawn = async (label) => {
+    const refusedAtSpawn = async (label, { copiedBlob = false } = {}) => {
       const before = spawnCount();
       let err = null;
       const logs = [];
@@ -1145,12 +1145,24 @@ test("fingerprints: a notion token transplanted into an HA connection's HA_TOKEN
       console.warn = (...a) => { logs.push(a.map(String).join(" ")); };
       try { await start(); } catch (e) { err = e; } finally { console.warn = orig; }
       assert.ok(err instanceof C.ChildError, `${label}: refused`);
-      assert.equal(err.code, "not_active", label);
-      assert.equal(err.reason, "fingerprint_mismatch", label);
       assert.equal(spawnCount(), before, `${label}: nothing spawned`);
-      assert.deepEqual(logs, ["[services] connection values changed since connect, child not started"], `${label}: one fixed line`);
       assert.ok(!logs.join("").includes("test-token"), `${label}: no value logged`);
       const row = await withDb((d) => SC.getConnection(d, ha.uuid));
+      if (copiedBlob) {
+        // A copied keychain blob no longer opens at all (it is sealed for the row it came from),
+        // so the connection is refused one step EARLIER than the fingerprint check: the declared
+        // secret has no readable value. That is the same class a damaged row always got, and it
+        // is the retryable one (the row is not the owner's to keep 'active' while its credential
+        // does not open). Nothing spawns and no value is logged either way.
+        assert.equal(err.code, "child_unavailable", label);
+        assert.deepEqual(logs, ["services: credentials missing, child not started"], `${label}: one fixed line`);
+        assert.equal(row.status, "error", `${label}: the connection is flagged, not silently served`);
+        assert.equal(row.lastError, "child_unavailable", label);
+        return;
+      }
+      assert.equal(err.code, "not_active", label);
+      assert.equal(err.reason, "fingerprint_mismatch", label);
+      assert.deepEqual(logs, ["[services] connection values changed since connect, child not started"], `${label}: one fixed line`);
       assert.equal(row.status, "active", `${label}: the row is left as it is`);
     };
 
@@ -1160,7 +1172,8 @@ test("fingerprints: a notion token transplanted into an HA connection's HA_TOKEN
     assert.equal(spawnCount(), n0 + 1);
     await C.stopChild(ha.uuid);
 
-    // The transplant: notion's sealed blob into HA's HA_TOKEN row (same key id; the seal has no AAD).
+    // The transplant: notion's sealed blob into HA's HA_TOKEN row (same key id). The blob is
+    // bound to the notion row now, so this copy opens nothing at all.
     const own = await withDb(async (d) => (await d.execute({ sql: "SELECT secret_sealed, key_id FROM crow_keychain WHERE connection_uuid = ? AND env_key = 'HA_TOKEN'", args: [ha.uuid] })).rows[0]);
     await withDb((d) => d.execute({
       sql: `UPDATE crow_keychain SET secret_sealed = (SELECT secret_sealed FROM crow_keychain WHERE connection_uuid = ? AND env_key = 'NOTION_TOKEN'),
@@ -1168,7 +1181,7 @@ test("fingerprints: a notion token transplanted into an HA connection's HA_TOKEN
             WHERE connection_uuid = ? AND env_key = 'HA_TOKEN'`,
       args: [nt.uuid, nt.uuid, ha.uuid],
     }));
-    await refusedAtSpawn("transplanted token");
+    await refusedAtSpawn("transplanted token", { copiedBlob: true });
     await withDb((d) => d.execute({ sql: "UPDATE crow_keychain SET secret_sealed = ?, key_id = ? WHERE connection_uuid = ? AND env_key = 'HA_TOKEN'", args: [own.secret_sealed, own.key_id, ha.uuid] }));
     assert.ok((await start()).client, "the owner's own token again: starts");
     await C.stopChild(ha.uuid);

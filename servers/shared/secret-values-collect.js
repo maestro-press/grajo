@@ -50,7 +50,7 @@
  */
 import Database from "better-sqlite3";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { resolveInstanceDataDir } from "./crow-home.js";
 import {
   SECRET_VALUES_DISPLAY_FILENAME, SECRET_VALUES_FILENAME, anchoredPath, cardHashOf, normalizeValues, plausibleSecretValue,
@@ -123,7 +123,10 @@ function keychainEntries({ dbPath, env, transaction = false }) {
     db = new Database(dbPath, { readonly: true, fileMustExist: true });
     db.pragma("busy_timeout = 2000");
     const key = loadKeychainKey({ path: keyPath });
-    return transaction ? db.transaction(() => readableSecretsSync(db, key))() : readableSecretsSync(db, key);
+    // The era state file lives in the same (anchored) secrets dir as the key: the same dir the
+    // pibot host has, never a home path this process would have to guess.
+    const eraDir = dirname(keyPath);
+    return transaction ? db.transaction(() => readableSecretsSync(db, key, { eraDir }))() : readableSecretsSync(db, key, { eraDir });
   } catch { return []; }
   finally { if (db) { try { db.close(); } catch { /* closed */ } } }
 }

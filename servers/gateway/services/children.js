@@ -595,9 +595,11 @@ async function start(db, r, conn, service, { key, crowHome, repair }) {
   }
 
   // Review C1: the values about to be injected must be the ones the owner connected. A bot that
-  // writes crow.db could copy another connection's sealed token into this row (the seal has no
-  // AAD) or point an address at its own listener; the keyed fingerprints in the hidden dir catch
-  // both. Refused before anything spawns; never logs a value; never records an error on the row.
+  // writes crow.db could copy another connection's sealed token into this row or point an address
+  // at its own listener; the keyed fingerprints in the hidden dir catch the address, and the copied
+  // token never even opens (a keychain value is sealed BOUND to its row, keychain/store.js rowAad),
+  // so it is refused above as a missing credential. Refused before anything spawns; never logs a
+  // value; never records an error on the row for the fingerprint case.
   if (!verifyConnectionFingerprints(conn, service, { config: conn.config, secrets }, { crowHome })) {
     console.warn("[services] connection values changed since connect, child not started");
     r.state = "stopped";

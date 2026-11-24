@@ -39,7 +39,7 @@ import { CallToolRequestSchema, CallToolResultSchema, ErrorCode, ListToolsReques
 import { canonicalJson, RESULT_CAP_BYTES, sha256Hex } from "../shared/satellite-protocol.js";
 import { checkLauncherArgs, resolveAddonCommand } from "../shared/resolve-command.js";
 import { installedPath, readInstalled } from "../gateway/bundle-core.js";
-import { loadKeychainKey } from "../gateway/keychain/key.js";
+import { keychainKeyPath, loadKeychainKey } from "../gateway/keychain/key.js";
 import { ADDON_KEYS_UNREADABLE, AddonKeysUnavailableError, hydrateAddonEntry } from "../shared/addon-secrets.js";
 import { memAvailableMb } from "./gate.js";
 import { readTextOrNull } from "./status.js";
@@ -237,7 +237,7 @@ export function createMcpHost({
     // caller logs it and answers START_FAILED_TEXT.
     let run;
     try {
-      run = hydrateAddonEntry(id, config, { unsealer: "satellite", rawDb: db, key: loadKeychainKey({ crowHome: satHome }) });
+      run = hydrateAddonEntry(id, config, { unsealer: "satellite", rawDb: db, key: loadKeychainKey({ crowHome: satHome }), keyPath: keychainKeyPath(satHome) });
     } catch (err) {
       if (!(err instanceof AddonKeysUnavailableError)) throw err;
       const names = err.names.length ? `: ${err.names.join(", ")}` : "";

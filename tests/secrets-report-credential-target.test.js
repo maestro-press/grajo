@@ -381,7 +381,7 @@ test("a save writes a sealed keychain row and a proposed credential, and nothing
   assert.equal(keychain[0].env_key, "REPORT_CREDENTIAL");
   assert.equal(keychain[0].status, "active");
   assert.equal(keychain[0].key_id, key.id);
-  assert.match(keychain[0].secret_sealed, /^enc:v1:/);
+  assert.match(keychain[0].secret_sealed, /^enc:v2:/);
   assert.equal(keychain[0].secret_sealed.includes(SECRET), false, "the value is sealed, not stored");
   assert.match(keychain[0].connection_uuid, /^[0-9a-f-]{36}$/);
 

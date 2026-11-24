@@ -9,17 +9,22 @@
  *
  * "In an Export" = the entry's sealed value was fingerprinted by the last export, or it came
  * in through an Import (it is in that file). A re-sealed value (a re-mint, a re-save) has a
- * new fingerprint, so it counts again. The fingerprints are a LOCAL setting (not in the sync
- * allowlist): another instance's export says nothing about this machine's keys. audit_log is
- * not used: it is pruned after 90 days. Manual entries are the user's own and never counted.
+ * new fingerprint, so it counts again. The one re-seal that is NOT a new value is the AAD
+ * conversion (same plaintext, new ciphertext): `remapExportFingerprintsSync` in
+ * `keychain/export-fingerprint.js` moves those fingerprints inside the conversion transaction,
+ * so a converted entry neither re-appears in this reminder nor closes the off-site upload gate.
+ * The fingerprints are a LOCAL setting (not in the sync allowlist): another instance's export
+ * says nothing about this machine's keys. audit_log is not used: it is pruned after 90 days.
+ * Manual entries are the user's own and never counted.
  */
-import { createHash } from "node:crypto";
 import { readSetting, writeSetting } from "../dashboard/settings/registry.js";
+import { EXPORT_FINGERPRINTS_SETTING, exportFingerprint } from "./export-fingerprint.js";
 import { ensureKeychainTable } from "./store.js";
 
-export const LAST_EXPORT_SETTING = "keychain_export_fingerprints";
+/** The local-scope setting this record lives in (see export-fingerprint.js). */
+export const LAST_EXPORT_SETTING = EXPORT_FINGERPRINTS_SETTING;
 
-const fp = (sealed) => createHash("sha256").update(String(sealed)).digest("hex").slice(0, 32);
+const fp = exportFingerprint;
 
 async function readState(db) {
   try {
@@ -45,6 +50,23 @@ export async function exportSnapshot(db, keyId) {
   const fps = {};
   for (const r of await rows(db, keyId, { activeOnly: false })) fps[Number(r.id)] = fp(r.secret_sealed);
   return fps;
+}
+
+/**
+ * A snapshot taken before the Export was built, with the rows the Export could NOT open taken
+ * back out. Those rows were never in the file, so their current blob must not read "exported":
+ * the reminder keeps listing them as not exported, and `offsiteKeyInExport` stays false for a
+ * refused off-site key (its upload gate must not open on a key the owner's file does not hold).
+ * The snapshot is still taken BEFORE the seal, so an entry saved while the file was built is
+ * fingerprinted by neither (a false reminder, never a false all-clear).
+ */
+export function snapshotWithout(snapshot, ids) {
+  if (!snapshot || typeof snapshot !== "object") return snapshot;
+  const skip = new Set((Array.isArray(ids) ? ids : []).map(Number));
+  if (skip.size === 0) return snapshot;
+  const out = {};
+  for (const [id, value] of Object.entries(snapshot)) if (!skip.has(Number(id))) out[id] = value;
+  return out;
 }
 
 /** After an Export built from `snapshot` was sealed. */

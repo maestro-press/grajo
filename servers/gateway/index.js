@@ -447,6 +447,35 @@ try {
   console.warn("[provider-keys] seal pass skipped:", err?.message || err);
 }
 
+// Keychain AAD era (keychain envelope v2): bind every saved password to the row it belongs
+// to, then record the era in which an old-style (`enc:v1:`) value is REFUSED — a blob copied
+// into another keychain row from then on fails its tag check instead of being handed to a
+// child. It runs HERE, after the provider-key pass and long before listen, so no spawn, reveal
+// or export can read a row the converter has not seen; it opens its own handle and never
+// throws. A missing key file records nothing (old-style values stay accepted) and says so.
+try {
+  const { runKeychainAadBoot } = await import("./boot/keychain-aad.js");
+  const { resolveCrowHome, resolveInstanceDataDir } = await import("../shared/crow-home.js");
+  const { join } = await import("node:path");
+  const crowHome = resolveCrowHome();
+  const dbPath = process.env.CROW_DB_PATH
+    || join(resolveInstanceDataDir({ ...process.env, CROW_HOME: crowHome }), "crow.db");
+  // The DB mirror's instance id comes from the gateway's own registry (the pass itself loads
+  // no registry: the satellite must never reach it). Best effort: a home with none still gets
+  // the state file, which is the primary trigger.
+  let mirrorInstanceId = null;
+  try {
+    const { getOrCreateLocalInstanceId } = await import("./instance-registry.js");
+    mirrorInstanceId = getOrCreateLocalInstanceId();
+  } catch { /* no registry yet: the state file is enough */ }
+  const r = await runKeychainAadBoot({ dbPath, crowHome, mirrorInstanceId, log: (line) => console.log(line) });
+  if (r.state === "skipped-key-missing") {
+    console.warn("[keychain-aad] no keychain key on this machine: old-style saved passwords stay accepted until it is restored");
+  }
+} catch (err) {
+  console.warn("[keychain-aad] conversion skipped:", err?.message || err);
+}
+
 // Keyed token verifiers (§8 PR 2 of the keyed-token-hashes design): create or load the
 // HMAC key, convert every existing oauth_tokens row of the three families
 // (oauth:access / oauth:refresh / dashboard:session) to its `h1.` form, and alarm on any
