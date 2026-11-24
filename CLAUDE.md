@@ -21,12 +21,19 @@ This repository is **public**. Process documents (design specs, implementation p
 
 ## Network exposure invariant
 
-The Crow's Nest dashboard and all private routes (MCP, AI chat, storage, push, instance sync) **must never** be reachable via Tailscale Funnel. Only `/blog`, `/robots.txt`, `/sitemap.xml`, `/.well-known/`, `/favicon.ico`, and `/manifest.json` are public-safe.
+The Crow's Nest dashboard and all private routes (MCP, AI chat, storage, push, instance sync) **must never** be reachable via Tailscale Funnel. Only `/blog`, `/robots.txt`, `/sitemap.xml`, `/.well-known/`, `/favicon.ico`, and `/manifest.json` are public-safe on the gateway.
 
-Enforced in three layers:
+One public surface exists outside the gateway: the **artifact public-link listener**. It is a separate minimal process that runs as its own system user, with no database access, no gateway imports and no route to the dashboard or any private route. It reaches the gateway only through one unix socket that systemd owns. Tailscale Funnel exposes it only through the artifacts sidecar's port 8443. It serves only:
+
+- `GET /a/<token>`: an artifact version its owner explicitly published (unchanged from D16; reports never use it);
+- `GET /r/<token>`: exactly one report version that a live report delivered to an approved recipient, never a preview;
+- `POST /r/<token>/comment`: a comment from that recipient, only when their token carries comment scope. Tokens are 43-character base64url values, stored hashed. The listener shares no code path, middleware or session handling with the gateway, strips incoming cookies, and sends a CSP `sandbox` header on every response.
+
+Enforced in four layers:
 1. Server-side middleware in `servers/gateway/index.js` rejects any request carrying `Tailscale-Funnel-Request` unless the path matches `PUBLIC_FUNNEL_PREFIXES` or `CROW_DASHBOARD_PUBLIC=true`.
 2. `isAllowedNetwork()` in `servers/gateway/dashboard/auth.js`.
-3. Funnel config — never map `/`; use `tailscale funnel --set-path=/blog`.
+3. Funnel config: never map `/`; use `tailscale funnel --set-path=/blog`. The public-link listener is the only mapping on Funnel port 8443.
+4. The public-link listener routes only `^/a/[A-Za-z0-9_-]{43}(/[^?#]*)?$`, `^/r/[A-Za-z0-9_-]{43}$` and `POST ^/r/[A-Za-z0-9_-]{43}/comment$`, and returns a sandboxed 404 for everything else; the artifact origin returns 403 to any request carrying `Tailscale-Funnel-Request`.
 
 If you touch any of these, run `tests/auth-network.test.js`.
 
