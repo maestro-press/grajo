@@ -23,6 +23,11 @@ import { forwardedAddrs } from "../../shared/peer-class.js";
 import { isAddonRelayAddr } from "../../shared/bot-doors.js";
 import { providerKeyState } from "../../shared/provider-row.js";
 import { PROVIDER_KEY_UNREADABLE } from "../../shared/provider-keyring.js";
+// The module cycle door-resolve <-> local-model-servers <-> self-target is
+// deliberate: each side calls the other's functions at CALL time only (never
+// while a module is being evaluated), and `listDoorModels` below is the sync
+// LISTING that needs the cached vouch. See models/local-model-servers.js.
+import { isKnownLocalModelTargetCached } from "./local-model-servers.js";
 
 export const DOOR_PROVIDER_HEADER = "x-crow-provider";
 export const DOOR_HOP_HEADER = "x-crow-door-hop";
@@ -157,10 +162,17 @@ export function resolveDoorTarget({ providers = {}, providerHeader = null, model
   };
 }
 
-export function listDoorModels(providers = {}) {
+export function listDoorModels(providers = {}, { isKnown = isKnownLocalModelTargetCached } = {}) {
   const out = [];
   for (const [pid, p] of Object.entries(providers)) {
     if (!forwardable(p) || isForbiddenTarget(p.baseUrl) || !isLocalClassTarget(p.baseUrl)) continue;
+    // Listing is a CLAIM that this row is a local model. An own-host row whose
+    // port no source outside crow.db vouches for is the "unverified-local" class
+    // (a bot-written loopback row pointing at its own relay): it is neither local
+    // (never offered here, never forwarded — the door re-checks at forward time)
+    // nor cloud (see isCloudRow). The cached, vouch-only predicate is used
+    // because a listing must never dial anything.
+    if (!isKnown(p.baseUrl).local) continue;
     const doorKind = doorKindOf(p);
     for (const mid of modelIdsOf(p)) out.push({ id: `${pid}/${mid}`, object: "model", owned_by: "crow", provider: pid, doorKind });
   }

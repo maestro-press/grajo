@@ -20,7 +20,18 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { containedClassifierBlock, CONTAINED_CLASSIFIER_NO_DOOR } from "../scripts/pi-bots/pi_contain_agent.mjs";
+import { resetLocalModelVouchCache } from "../servers/gateway/models/local-model-servers.js";
 import { isDoorPath } from "../servers/shared/bot-doors.js";
+
+// `doorRow` also asks the cached own-host vouch: a row whose address is this
+// machine needs a model server Crow knows about (models/local-model-servers.js).
+// The fixture rows below are loopback stubs, so this instance's home vouches 18299
+// the way a native runtime does: a reservation in models/state.json.
+const HOME = mkdtempSync(join(tmpdir(), "crow-classifier-home-"));
+process.env.CROW_HOME = HOME;
+mkdirSync(join(HOME, "models"), { recursive: true });
+writeFileSync(join(HOME, "models", "state.json"), JSON.stringify({ reservations: { voice: { port: 18299, owner: { crowHome: HOME, pid: process.pid } } } }));
+resetLocalModelVouchCache();
 
 // An uncontained spawn, for the unchanged-block case. Set before the bridge is
 // imported (lazily, below), like the other spawn tests do.

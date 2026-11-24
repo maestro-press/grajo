@@ -1367,6 +1367,13 @@ test("B12: every data-dir name the gateway itself uses is a reserved entry", () 
     if (p === "data" || p === "secrets" || p === "bundles" || p === "skills") continue; // <crowHome> names, not data-dir ones
     assert.ok(RESERVED_DATA_ENTRIES.includes(p), p + " is reserved");
   }
+  // H5: the native runtime's install root. The data dir root is bound READ-WRITE
+  // (SQLite needs it), so without this a contained bot could create
+  // `<data>/runtimes` and plant a binary where the HOST later looks for the
+  // runtime's own verified llama-server (models/local-model-servers.js).
+  assert.ok(RESERVED_DATA_ENTRIES.includes("runtimes"), "the native runtime's install root is reserved for the mask");
+  assert.ok(!RESERVED_DATA_FILES.includes("runtimes"), "runtimes is a directory, not a file");
+  assert.ok(isReservedDataEntry("runtimes"));
 
   // Walk servers/ and scripts/ for `join(<something data-ish>, "<name>")` — and the
   // `resolve(...)` form, which is how shared/lifecycle.js spells the refcount file — and

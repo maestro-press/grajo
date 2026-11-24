@@ -31,6 +31,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { Readable } from "node:stream";
 import { networkInterfaces } from "node:os";
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
@@ -410,12 +411,19 @@ test("completeText: a redirect is an error, and an own-host target never carries
 
   const seenInit = [];
   const fetchFn = async (url, init) => { seenInit.push({ url, headers: init.headers, redirect: init.redirect }); return { ok: true, json: async () => ({ choices: [{ message: { content: "S" } }] }) }; };
+  // An OWN-HOST target rides the verified transport (`requestFn`), never `fetch`:
+  // fetch cannot verify the socket it got (H1). The header rule is the same one.
+  const requestFn = async (url, opts) => {
+    seenInit.push({ url, headers: opts.headers, redirect: "manual", verifiedConnection: opts.verifiedConnection || null });
+    return { status: 200, headers: { "content-type": "application/json" }, stream: Readable.from([Buffer.from(JSON.stringify({ choices: [{ message: { content: "S" } }] }))]) };
+  };
   const at = (baseUrl) => async () => ({ baseUrl, model: "m", apiKey: "row-key", host: "local" });
-  await completeText({ model: "p/m", prompt: "hi" }, { fetchFn, resolveKeyFn: at(`http://127.0.0.1:${upstream.address().port}/v1`), reservationFn: () => null, recordUsageFn: async () => {} });
+  await completeText({ model: "p/m", prompt: "hi" }, { fetchFn, requestFn, resolveKeyFn: at(`http://127.0.0.1:${upstream.address().port}/v1`), reservationFn: () => null, recordUsageFn: async () => {} });
   assert.equal(seenInit.at(-1).headers.Authorization, undefined, "an own-host target gets no bearer, relayed or not");
-  assert.equal(seenInit.at(-1).redirect, "manual", "and never a followed redirect");
+  assert.ok(seenInit.at(-1).verifiedConnection, "and its connection is verified before a byte is written");
   await completeText({ model: "p/m", prompt: "hi" }, { fetchFn, resolveKeyFn: at("http://203.0.113.5/v1"), reservationFn: () => null, recordUsageFn: async () => {} });
   assert.equal(seenInit.at(-1).headers.Authorization, "Bearer row-key", "a target that is NOT this host keeps it (unchanged)");
+  assert.equal(seenInit.at(-1).redirect, "manual", "and never a followed redirect");
 });
 
 test("crow-llm (the prod-shaped alias row on localhost:3001/llm/v1) is never a forward at all: the door refuses it as unmanaged", async () => {

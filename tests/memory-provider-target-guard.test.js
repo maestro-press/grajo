@@ -28,6 +28,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { isKnownLocalModelTarget } from "../servers/gateway/models/local-model-servers.js";
+import { spawnUntrustedListener } from "./fixtures/untrusted-listener.mjs";
+
 const dir = mkdtempSync(join(tmpdir(), "memory-target-guard-"));
 const dbPath = join(dir, "crow.db");
 const saved = {};
@@ -213,4 +216,165 @@ test("a rebindable host that answers with THIS box is refused for embeddings, an
   );
   assert.deepEqual(calls, []);
   assert.deepEqual(hits, []);
+});
+
+// ---------------------------------------------------------------------------
+// THE LISTENER HALF, from this process: /v1/embeddings on an own-host port is
+// only a model server when something outside crow.db vouches the port AND the
+// process holding the LISTEN socket is not a bot (models/local-model-servers.js).
+// A contained bot shares the host network and can write this very row, then
+// listen on the port itself with a relay — so "loopback, /v1/embeddings" alone
+// must never be enough.
+//
+// Red-first: the bot's listener is a real HTTP server in a SEPARATE process of
+// the same uid (tests/fixtures/untrusted-listener.mjs), and a control request
+// proves it is alive after the refusals.
+// ---------------------------------------------------------------------------
+
+test("RED FIRST: the bot's own listener on an own-host port receives nothing from embedText, vouched or not", async () => {
+  const bot = await spawnUntrustedListener();
+  const home = join(dir, "empty-home");
+  try {
+    await seedProvider("squat-embed", { baseUrl: `http://127.0.0.1:${bot.port}/v1`, apiKey: "row-key-must-not-travel" });
+    // Nothing vouches the port: refused before any listener is even considered.
+    await assert.rejects(
+      () => embedText("the owner's private notes", { providerName: "squat-embed", guard: { knownLocalTargetFn: (url) => isKnownLocalModelTarget(url, { crowHome: home }) } }),
+      (e) => e.code === "SELF_TARGET_REFUSED",
+    );
+    // ... and when a Docker publish DOES vouch the port (the model container's own
+    // port, the squat), the socket's owner decides: it is not a process Crow
+    // started, so it is refused too.
+    await assert.rejects(
+      () => embedText("the owner's private notes", {
+        providerName: "squat-embed",
+        guard: { knownLocalTargetFn: (url) => isKnownLocalModelTarget(url, { crowHome: home, dockerEntries: [{ address: "127.0.0.1", port: bot.port }] }) },
+      }),
+      (e) => e.code === "SELF_TARGET_REFUSED",
+    );
+    // SECURITY: a bounded window plus the fixture's own sync round-trip, so a
+    // late-arriving hit is SEEN rather than missed — the security half never passes
+    // by asserting too early (L2).
+    await bot.settle();
+    assert.deepEqual(bot.hits, [], `SECURITY: bot received bytes: ${JSON.stringify(bot.hits)}`);
+    assert.deepEqual(hits, [], `SECURITY: an in-process fixture received bytes: ${JSON.stringify(hits)}`);
+
+    // CONTROL: the listener is reachable, so this is the refusal and not a dead fixture.
+    await bot.control({ method: "POST", path: "/v1/embeddings" });
+    assert.deepEqual(bot.hits, ["POST /v1/embeddings"], `CONTROL: bot liveness probe not observed (${JSON.stringify(bot.hits)})`);
+  } finally {
+    await bot.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// THE JUDGED ADDRESS IS THE DIALED ADDRESS (memory half). A NAME stands for
+// several addresses (`localhost` is 127.0.0.1 AND ::1), the vouch is asked about
+// ONE of them, and the request must go to THAT one — not to whatever a second
+// resolution of the name would answer. Red-first: the resolver answers ::1 first
+// and 127.0.0.1 second, a TRUSTED listener (this process) holds [::1]:P and an
+// UNTRUSTED one (a separate process of the same uid) holds 127.0.0.1:P.
+// ---------------------------------------------------------------------------
+
+/** A TRUSTED listener on [::1] (this process holds the socket), answering an
+ * embedding request. `null` when this box has no IPv6 loopback. */
+async function trustedLoopback6() {
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    seen.push({ method: req.method, path: req.url, authorization: req.headers.authorization || null });
+    req.on("data", () => {});
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ data: [{ embedding: [0.5, 0.25] }] }));
+    });
+  });
+  const listening = await new Promise((resolve) => {
+    server.once("error", () => resolve(false));
+    server.listen(0, "::1", () => resolve(true));
+  });
+  if (!listening) { try { server.close(); } catch { /* never bound */ } return null; }
+  return {
+    port: server.address().port,
+    seen,
+    close: () => new Promise((r) => { try { server.closeAllConnections?.(); } catch { /* gone */ } server.close(() => r()); }),
+  };
+}
+
+/** The own-host vouch with this box's real /proc, a Docker publish vouching the
+ * port (so the LISTENER half decides) and the caller's ONE dial address. */
+const vouchAt = (home, port) => (url, dialAddresses) => isKnownLocalModelTarget(url, {
+  crowHome: home, dockerEntries: [{ address: null, port }], dialAddresses,
+});
+
+test("RED FIRST: an embedding row naming localhost is dialled on the address the vouch judged (::1), never on the bot's 127.0.0.1 of the same port", async (t) => {
+  const trusted = await trustedLoopback6();
+  if (!trusted) return t.skip("this box has no [::1] loopback to listen on");
+  const port = trusted.port;
+  const bot = await spawnUntrustedListener({ address: "127.0.0.1", port });
+  const home = join(dir, "dial-home");
+  try {
+    await seedProvider("dial-embed", { baseUrl: `http://localhost:${port}/v1`, apiKey: "row-key-must-not-travel" });
+    const lookupFn = fakeLookup([["::1"], ["127.0.0.1"]]);
+    const vec = await embedText("hello", {
+      providerName: "dial-embed",
+      guard: { lookupFn, knownLocalTargetFn: vouchAt(home, port) },
+    });
+    assert.deepEqual([...vec], [0.5, 0.25], "the trusted ::1 listener answered");
+    assert.deepEqual(trusted.seen.map((h) => `${h.method} ${h.path}`), ["POST /v1/embeddings"]);
+    assert.equal(trusted.seen[0].authorization, null, "an own-host target never carries the row's key");
+    await bot.settle();
+    assert.deepEqual(bot.hits, [], `SECURITY: the bot's 127.0.0.1 socket on the SAME port received bytes: ${JSON.stringify(bot.hits)}`);
+    assert.equal(lookupFn.calls.length, 1, "the name was resolved exactly once: the judged address is the dialed one");
+
+    // REVERSE: the same name answering 127.0.0.1 first. The judged address is the
+    // bot's, so the row is refused — a trusted socket on ::1 of the same port does
+    // not vouch it.
+    const before = trusted.seen.length;
+    const reverse = fakeLookup([["127.0.0.1"], ["::1"]]);
+    await assert.rejects(
+      () => embedText("the owner's private notes", { providerName: "dial-embed", guard: { lookupFn: reverse, knownLocalTargetFn: vouchAt(home, port) } }),
+      (e) => e.code === "SELF_TARGET_REFUSED",
+    );
+    assert.equal(reverse.calls.length, 1);
+    await bot.settle();
+    assert.deepEqual(bot.hits, [], `SECURITY: nothing reached the bot: ${JSON.stringify(bot.hits)}`);
+    assert.equal(trusted.seen.length, before, "and the trusted ::1 socket was not dialled either");
+
+    // CONTROL: the bot's listener is alive and reachable from this process.
+    await bot.control({ method: "POST", path: "/v1/embeddings" });
+    assert.deepEqual(bot.hits, ["POST /v1/embeddings"], `CONTROL: bot liveness probe not observed (${JSON.stringify(bot.hits)})`);
+  } finally {
+    await bot.close();
+    await trusted.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// One refusal is ONE log line: a security refusal is never retried. `embedText`
+// retries a transient transport failure once; retrying `SELF_TARGET_REFUSED` would
+// repeat a decision that cannot change and print the door's line twice.
+// ---------------------------------------------------------------------------
+
+test("a refused embedText logs exactly one line (no retry of a security refusal), and rerank degrades with one line", async () => {
+  const bot = await spawnUntrustedListener();
+  // An empty home: nothing vouches the bot's port, so the guard refuses it and
+  // prints its one line per call.
+  const home = join(dir, "one-line-home");
+  try {
+    await seedProvider("one-line-embed", { baseUrl: `http://127.0.0.1:${bot.port}/v1`, apiKey: "row-key-must-not-travel" });
+    const lines = [];
+    const guard = { knownLocalTargetFn: (url) => isKnownLocalModelTarget(url, { crowHome: home }), logFn: (l) => lines.push(l), providerId: "one-line-embed" };
+    await assert.rejects(
+      () => embedText("the owner's private notes", { providerName: "one-line-embed", guard }),
+      (e) => e.code === "SELF_TARGET_REFUSED",
+    );
+    assert.equal(lines.length, 1, `one call is one line:\n${lines.join("\n")}`);
+
+    const out = await rerank("q", [{ id: 1, text: "a" }, { id: 2, text: "b" }], { topK: 2, providerName: "one-line-embed", guard });
+    assert.deepEqual(out.map((c) => c.id), [1, 2], "the reranker degrades to the input order");
+    assert.equal(lines.length, 2, `one rerank call is one more line:\n${lines.join("\n")}`);
+    await bot.settle();
+    assert.deepEqual(bot.hits, [], `SECURITY: neither call reached the bot's listener: ${JSON.stringify(bot.hits)}`);
+  } finally {
+    await bot.close();
+  }
 });

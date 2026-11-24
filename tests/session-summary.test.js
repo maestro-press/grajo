@@ -12,6 +12,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, readFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import Database from "better-sqlite3";
 
 const dir = mkdtempSync(join(tmpdir(), "session-summary-"));
@@ -34,6 +35,26 @@ const run = (sql, ...args) => { const c = raw(); try { return c.prepare(sql).run
 
 let seq = 0;
 const QUICK = "crow-local/quick-4b";
+
+/**
+ * completeText's own-host VOUCH (`models/local-model-servers.js`) is exercised
+ * for real in `tests/local-model-allowlist.test.js`. The tests here drive the
+ * summary job with a stub `fetchFn` against a row on `127.0.0.1:<port>` where no
+ * model server listens, so the vouch is stubbed to "vouched": what is under test
+ * is what the job SENDS, not the listener rule.
+ */
+const knownLocalTargetFn = async () => ({ local: true, reason: "vouched" });
+/**
+ * A `safeRequest`-SHAPED stub. `completeText` sends every OWN-HOST target through
+ * the verified transport (`requestFn`) and never through `fetch` (H1: fetch cannot
+ * verify the socket it got), so an own-host fixture states its answer here.
+ */
+function ownHostRequestFn(record, payload) {
+  return async (url, opts) => {
+    record.push({ url, ...opts, body: opts?.body ? JSON.parse(String(opts.body)) : null });
+    return { status: 200, headers: { "content-type": "application/json" }, stream: Readable.from([Buffer.from(JSON.stringify(payload))]) };
+  };
+}
 const LOCAL_SESSION = "crow-local/big-35b";
 const CLOUD = "cloudy/gpt-x";
 
@@ -435,8 +456,16 @@ test("completeText refuses a door or another instance's model, and a bad body, w
 
   // A direct local target is dialed once; a non-JSON body is a fixed error.
   const direct = async () => ({ baseUrl: "http://127.0.0.1:8011/v1", model: "m", apiKey: "none", host: "local" });
-  assert.equal(await completeText(req, { fetchFn, resolveKeyFn: direct, recordUsageFn: async () => {} }), "SUMMARY: x.");
-  await assert.rejects(() => completeText(req, { resolveKeyFn: direct, fetchFn: async () => ({ ok: true, json: async () => { throw new SyntaxError("Unexpected token < SECRET"); } }) }),
+  const dialled = [];
+  assert.equal(await completeText(req, {
+    fetchFn, requestFn: ownHostRequestFn(dialled, { choices: [{ message: { content: "SUMMARY: x." } }] }),
+    resolveKeyFn: direct, knownLocalTargetFn, recordUsageFn: async () => {},
+  }), "SUMMARY: x.");
+  assert.equal(dialled.length, 1, "an own-host target goes through the verified transport");
+  await assert.rejects(() => completeText(req, {
+    resolveKeyFn: direct, knownLocalTargetFn,
+    requestFn: async () => ({ status: 200, headers: {}, stream: Readable.from(["<html>"]) }),
+  }),
     (e) => e.message === "completeText: invalid upstream body");
 
   // Through the job: a door target is model_failed and writes nothing.
@@ -705,7 +734,10 @@ test("completeText sends nothing while the box is reserved, nor to a lazy-loadin
   }
   assert.deepEqual(fetched, [], "nothing was dialed");
   assert.equal(isLazyLoader({ baseUrl: "http://127.0.0.1:8011/v1", providerType: "openai-compat" }), false);
-  assert.equal(await completeText(req, { fetchFn, resolveKeyFn: direct, reservationFn: () => null, recordUsageFn: async () => {} }), "SUMMARY: x.");
+  assert.equal(await completeText(req, {
+    fetchFn, requestFn: ownHostRequestFn([], { choices: [{ message: { content: "SUMMARY: x." } }] }),
+    resolveKeyFn: direct, knownLocalTargetFn, reservationFn: () => null, recordUsageFn: async () => {},
+  }), "SUMMARY: x.");
 
   // Through the job: model_failed with the fixed code, nothing written, no content logged.
   const s = seedSession();
@@ -921,13 +953,15 @@ test("recall filters summary memories by the asking bot's model rank; an unknown
 test("completeText turns thinking off on our own boxes, never on a cloud endpoint (every summary was empty_output, 2026-10-30)", async () => {
   const { completeText } = await import("../servers/gateway/routes/llm-router.js");
   const bodies = [];
-  const fetchFn = async (url, opts) => { bodies.push(JSON.parse(opts.body)); return { ok: true, json: async () => ({ choices: [{ message: { content: "SUMMARY: x." } }] }) }; };
+  // BOTH rows are this box's own 127.0.0.1:8003, so both ride the verified
+  // transport (H1); the `host` field is what decides thinking, not the transport.
+  const requestFn = ownHostRequestFn(bodies, { choices: [{ message: { content: "SUMMARY: x." } }] });
   const at = (host) => async () => ({ baseUrl: "http://127.0.0.1:8003/v1", model: "m", apiKey: "none", host });
-  await completeText({ model: "p/m", prompt: "hi" }, { fetchFn, resolveKeyFn: at("local"), recordUsageFn: async () => {} });
-  await completeText({ model: "p/m", prompt: "hi" }, { fetchFn, resolveKeyFn: at("cloud"), recordUsageFn: async () => {} });
-  assert.deepEqual(bodies[0].chat_template_kwargs, { enable_thinking: false });
-  assert.equal(bodies[1].chat_template_kwargs, undefined, "a cloud endpoint may reject unknown fields");
-  assert.equal(bodies[0].max_tokens, 400);
+  await completeText({ model: "p/m", prompt: "hi" }, { requestFn, resolveKeyFn: at("local"), knownLocalTargetFn, recordUsageFn: async () => {} });
+  await completeText({ model: "p/m", prompt: "hi" }, { requestFn, resolveKeyFn: at("cloud"), knownLocalTargetFn, recordUsageFn: async () => {} });
+  assert.deepEqual(bodies[0].body.chat_template_kwargs, { enable_thinking: false });
+  assert.equal(bodies[1].body.chat_template_kwargs, undefined, "a cloud endpoint may reject unknown fields");
+  assert.equal(bodies[0].body.max_tokens, 400);
 });
 
 test("readFirstUserMessage: the operator's first message, one line, past [Dates] and briefings, secret-masked", async () => {

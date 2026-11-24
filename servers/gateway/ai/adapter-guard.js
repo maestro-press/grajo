@@ -50,6 +50,20 @@
  *      metadata host — is refused for EVERY caller, literal or resolved
  *      (`models/self-target.js` `isForbiddenSelfTarget`). An IP literal used to
  *      be called "not this host" and simply dialled.
+ *   d. THE OWN-HOST VOUCH (`models/local-model-servers.js`
+ *      `isKnownLocalModelTarget`) applies to EVERY kind (model, speech, ollama,
+ *      probe, embed/rerank). An own-host address is only half a decision: a
+ *      contained bot shares the host network (CROW_PI_CONTAIN_NET=off) and has
+ *      crow.db bound read-write, so it can write the very row that names
+ *      `http://127.0.0.1:<free port>/v1` and then listen there itself with a
+ *      relay — "loopback" proves nothing about WHO is listening. So the port
+ *      must be vouched by a source outside crow.db (a Docker/compose publish, a
+ *      live native reservation, an operator pin, this gateway's own listen port,
+ *      or a listening socket THIS process owns) AND the process holding the
+ *      LISTEN socket must not be a bot. Asked in `judgeAdapterTarget`, so both
+ *      dial paths (the fetch and the WebSocket connect) carry it, and
+ *      `guard.knownLocalTargetFn` is the seam a test stubs with its own vouch
+ *      snapshot exactly as `lookupFn`/`requestFn` are.
  *
  * The own-host path rule is picked per call kind (`selfPathAllowed`): a model
  * call may reach a model operation, the operator's health probe may also read
@@ -66,17 +80,28 @@
  * `redirect: "manual"` — the same "a forward never follows a redirect" rule the
  * door and the voice path apply.
  *
+ * AN OWN-HOST TARGET NEVER USES `fetch` ANY MORE (H1). `fetch` cannot verify the
+ * socket it got, and the own-host race is about exactly that socket: a same-uid
+ * bot can open a SO_REUSEPORT listener on the model's port between the LISTEN
+ * check and the connect. So every own-host call goes through `safeRequest` with
+ * `verifiedConnection` (`models/verified-connect.js`): a fresh, unpooled
+ * connection (`Connection: close`) whose ACCEPTED end is verified before the
+ * request is written, refused as `connection-not-trusted` otherwise.
+ *
  * Refusal is `Error` with `code: "SELF_TARGET_REFUSED"` and
  * `safe-upstream.js`'s fixed wording ("Crow will not contact that address"):
  * no new user-visible text, and the bot-written URL is never quoted back.
  */
 import { Readable } from "node:stream";
+import { isIP } from "node:net";
 import {
-  pinnedTargetOf, pinnedLookup, isAllowedSelfPath, isRebindableHost,
+  pinnedTargetOf, pinnedLookup, dialAt, isAllowedSelfPath, isRebindableHost,
   isAllowedSelfProbePath, isAllowedSelfSpeechPath, isAllowedSelfOllamaPath,
-  isOwnHostOllamaPort,
+  isOwnHostOllamaPort, targetHost,
 } from "../models/self-target.js";
 import { safeRequest } from "../models/safe-upstream.js";
+import { CONNECTION_NOT_TRUSTED } from "../models/verified-connect.js";
+import { isKnownLocalModelTarget, logOwnHostTargetRefusal, describeTarget } from "../models/local-model-servers.js";
 import { LLM_CONNECT_TIMEOUT_MS } from "../../shared/http-timeout.js";
 
 /** The refusal every adapter raises; wording is safe-upstream.js's, unchanged. */
@@ -158,9 +183,13 @@ export function selfPathAllowed(url, kind = "model", { port } = {}) {
  * the own-host path rule of every kind judges ANY port — an own-host model
  * server lives on any port — except `ollama`, which requires an own-host Ollama
  * port, 11434) and `kind` (which own-host path rule applies; see
- * `selfPathAllowed`).
+ * `selfPathAllowed`). Two more belong to the own-host VOUCH (see
+ * `ownHostListenerVouched`): `knownLocalTargetFn` (the predicate, defaulting to
+ * `isKnownLocalModelTarget` with the same `ownAddrs`/`lookupFn`) and `logFn`
+ * (where the ONE refusal line goes; `providerId` only names it).
  */
-export async function judgeAdapterTarget(url, { ownAddrs, lookupFn, kind = "model" } = {}) {
+export async function judgeAdapterTarget(url, guard = {}) {
+  const { ownAddrs, lookupFn, kind = "model" } = guard;
   const opts = {};
   if (ownAddrs) opts.ownAddrs = ownAddrs;
   if (lookupFn) opts.lookupFn = lookupFn;
@@ -176,11 +205,73 @@ export async function judgeAdapterTarget(url, { ownAddrs, lookupFn, kind = "mode
   // never an IP literal and never a localhost name (both are known addresses).
   if (target.unresolved) return { mode: "refused", target };
   if (target.own && !selfPathAllowed(url, kind, { port: target.port })) return { mode: "refused", target };
+  // ... and the address rule passing is not the decision either: on this host the
+  // PORT must be vouched from outside crow.db and the listener holding it must not
+  // be a bot (models/local-model-servers.js). Judged BEFORE any socket opens, for
+  // every kind, so a bot's own relay on loopback is refused by the adapters, the
+  // speech paths, the health probe and the memory server's embed/rerank alike.
+  // The vouch also PICKS the address: a name stands for several (`localhost` is
+  // 127.0.0.1 AND ::1) and it judges them in order, so its `address` — carried here
+  // as `dial` — is the ONE literal the transport is pinned to (an IP-literal target
+  // keeps `dial: null`: the URL already carries that address).
+  let dial = null;
+  if (target.own) {
+    const vouched = await ownHostListenerVouched(url, guard, target);
+    if (!vouched) return { mode: "refused", target };
+    dial = vouched.dial;
+  }
   if (isRebindableHost(url)) {
     if (target.own || !target.pinned) return { mode: "refused", target };
     return { mode: "pinned", target, pinned: target.pinned };
   }
-  return { mode: target.own ? "own" : "direct", target };
+  return { mode: target.own ? "own" : "direct", target, dial };
+}
+
+/**
+ * The LISTENER half of an own-host target, asked at dial time: is this port a
+ * model server this instance already knows about — vouched by a source outside
+ * crow.db (a Docker/bundle compose publish, a live native reservation, an
+ * operator pin, this gateway's own listen port, or a listening socket this very
+ * process owns) AND held by a process that is not a bot?
+ *
+ * A `providers` row (and a `stt_profiles`/`tts_profiles` row) is bot-writable, so
+ * the row can never vouch for itself; the answer comes from the host. Everything
+ * is `models/local-model-servers.js`'s rule, not a second copy — this only feeds
+ * it the guard's own `ownAddrs`/`lookupFn` (so a test's fixture host is judged as
+ * the test described it), every answer `pinnedTargetOf` resolved, in order
+ * (`dialAnswers`), and logs the refusal once. A throw is a refusal.
+ *
+ * `dial` is load-bearing: the vouch judges the addresses the name stood for IN
+ * ORDER and answers with the ONE it accepted, so a name that stands for several
+ * addresses (`localhost` is 127.0.0.1 AND ::1) can neither pass the vouch on one
+ * answer and be connected to another, nor be refused only because the resolver put
+ * an address first that nothing listens on. This returns `{ dial }` — the pin
+ * (`dialAt`), or null for an IP literal, whose URL already carries its address — or
+ * null when the vouch refused (one log line, once).
+ */
+async function ownHostListenerVouched(url, guard = {}, target = null) {
+  const vouchDeps = {};
+  if (guard.ownAddrs) vouchDeps.ownAddrs = guard.ownAddrs;
+  if (guard.lookupFn) vouchDeps.lookupFn = guard.lookupFn;
+  const dialAddresses = Array.isArray(target && target.dialAnswers) && target.dialAnswers.length
+    ? target.dialAnswers.map((a) => a.address)
+    : (target && target.dial ? [target.dial.address] : undefined);
+  if (dialAddresses) vouchDeps.dialAddresses = dialAddresses;
+  const judge = guard.knownLocalTargetFn
+    || ((u, dials) => isKnownLocalModelTarget(u, dials ? { ...vouchDeps, dialAddresses: dials } : vouchDeps));
+  let verdict = null;
+  try { verdict = await judge(url, dialAddresses); } catch { verdict = null; }
+  if (verdict && verdict.local === true) {
+    // Only a NAME needs pinning: an IP-literal target's URL already carries the
+    // address the socket opens to.
+    return { dial: target && target.dial ? dialAt(verdict, target.dial) : null };
+  }
+  const { address, port } = describeTarget(url);
+  logOwnHostTargetRefusal(
+    { address: (verdict && verdict.address) || address, port, providerId: guard.providerId || "?", reason: (verdict && verdict.reason) || "listener-not-trusted" },
+    guard.logFn || ((line) => console.log(line)),
+  );
+  return null;
 }
 
 /** A web ReadableStream's whole body as text (the fetch Response shape adapters use). */
@@ -245,12 +336,33 @@ export async function guardedFetch(url, { method = "POST", headers = {}, body, s
   if (decision.mode === "refused") throw selfTargetRefused();
   // Never the row's key on a request that lands on this box.
   const sendHeaders = decision.mode === "own" ? withoutCredentials(headers) : headers;
-  if (decision.mode === "pinned") {
-    // A rebindable name: safeRequest opens the socket to the EXACT addresses
-    // vetted above (pinnedLookup), never to a second answer for the name.
-    // allowAddressFn is safe: `pinned` already passed the own-host/forbidden
-    // vetting. idleTimeoutMs 0: once the headers are in, a quiet SSE stream is
-    // not a failure (the same shape fetch has).
+  // WHERE THE SOCKET OPENS. Two cases need a pinned transport, and both are about
+  // the same thing: the address that was judged must be the address connected to,
+  // with no second resolution in between.
+  //   - a rebindable NAME (mode "pinned"): `pinnedTargetOf` vetted one answer;
+  //   - an OWN-HOST target whose host is a NAME (mode "own" with `dial`):
+  //     `localhost` is 127.0.0.1 AND ::1, the vouch judged them IN ORDER and
+  //     ACCEPTED one (`dial`), so the socket is opened to that literal — never to
+  //     whatever a fresh lookup of the name would answer. An own-host IP literal
+  //     needs no pinning: the URL already carries the address the socket opens to.
+  const pinTo = decision.mode === "pinned"
+    ? decision.pinned
+    : (decision.mode === "own" ? (decision.dial || (decision.target && decision.target.dial) || null) : null);
+  // OWN-HOST: never `fetch` (it cannot verify the socket it got), always the
+  // verified, unpooled connection. `ownAddress` is the ONE address that was
+  // judged: the vouch's pin for a NAME, or the URL's own literal.
+  const ownHost = decision.mode === "own";
+  let ownAddress = null;
+  if (ownHost) {
+    ownAddress = (pinTo && pinTo.address) || targetHost(url) || null;
+    if (!ownAddress) throw selfTargetRefused();
+  }
+  if (pinTo || ownHost) {
+    // The host name still rides the URL (only the socket's address is pinned), so
+    // https keeps its SNI and certificate check. allowAddressFn is safe: `pinTo`
+    // already passed the own-host/forbidden vetting. idleTimeoutMs 0: once the
+    // headers are in, a quiet SSE stream is not a failure (the same shape fetch
+    // has).
     const pinnedHeaders = { ...sendHeaders };
     let requestBody = body;
     if (isFormData(body)) {
@@ -264,11 +376,25 @@ export async function guardedFetch(url, { method = "POST", headers = {}, body, s
       }
     }
     const requestFn = guard.requestFn || safeRequest;
-    const res = await requestFn(url, {
-      method, headers: pinnedHeaders, body: requestBody, signal,
-      timeoutMs: timeoutMs ?? LLM_CONNECT_TIMEOUT_MS, idleTimeoutMs: 0,
-      lookupFn: pinnedLookup(decision.pinned), allowAddressFn: () => true,
-    });
+    let res;
+    try {
+      res = await requestFn(url, {
+        method, headers: pinnedHeaders, body: requestBody, signal,
+        timeoutMs: timeoutMs ?? LLM_CONNECT_TIMEOUT_MS, idleTimeoutMs: 0,
+        lookupFn: pinnedLookup(pinTo || { address: ownAddress, family: isIP(ownAddress) }), allowAddressFn: () => true,
+        // The ACCEPTED connection is verified before a request byte is written
+        // (H1). An own-host IP literal needs no pin for the ADDRESS, only this.
+        verifiedConnection: ownHost
+          ? { address: ownAddress, deps: guard.vouchDeps, log: guard.logFn, providerId: guard.providerId }
+          : null,
+      });
+    } catch (err) {
+      // A connection that is not Crow's own is the same refusal as a listener
+      // nobody trusts, with its own reason (the transport already logged the one
+      // line for it: `models/verified-connect.js`).
+      if (err && err.code === CONNECTION_NOT_TRUSTED) throw selfTargetRefused();
+      throw err;
+    }
     return responseFromStream(res);
   }
   const fetchFn = guard.fetchFn || fetch;

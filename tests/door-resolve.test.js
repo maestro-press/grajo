@@ -145,7 +145,10 @@ test("an unknown header provider or a model the provider does not serve is 404",
 });
 
 test("listDoorModels lists forwardable models only, qualified", () => {
-  const ids = listDoorModels(P).map((m) => m.id);
+  // The own-host VOUCH is a separate question (tests/local-model-allowlist.test.js):
+  // this test is about the door-kind/address filters, and its fixture addresses are
+  // placeholders nothing vouches for.
+  const ids = listDoorModels(P, { isKnown: () => ({ local: true, reason: "vouched" }) }).map((m) => m.id);
   assert.ok(ids.includes("crow-chat/qwen3.6-35b-a3b"));
   assert.ok(ids.includes("lan-optin/optin-model"));
   assert.equal(ids.some((id) => id.startsWith("qwen-cloud/") || id.startsWith("lan-box/") || id.startsWith("evil-bundle/")), false);

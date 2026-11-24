@@ -268,7 +268,29 @@ export async function mountAdminApi(app, deps) {
       // loopback cloud door; consent and salt are re-read on every run.
       const { readCloudConsent, readCloudConsentSalt, onCloudConsentChange } = await import("../../shared/cloud-consent.js");
       const { llmCloudTokenPath } = await import("../local-token.js");
+      const { primeLocalModelVouch, logUnvouchedProviderRows } = await import("../models/local-model-servers.js");
       const target = piModelsSyncPath();
+      // The own-host allowlist (models/local-model-servers.js) decides which rows on
+      // THIS machine are offered to pi; its LISTING half is sync and vouch-only, so
+      // the Docker half of that snapshot is warmed here, once, before the first run.
+      await primeLocalModelVouch();
+      // S1: after that first snapshot, one line per ENABLED provider row whose
+      // own-host target nothing vouches for AT REST, so an operator can see why the
+      // door will refuse it (and what to do: run it as a known model container, or
+      // pin it). LOGS ONLY — no decision here, and it dials nothing.
+      try {
+        const { loadProvidersFromDb } = await import("../../shared/providers-db.js");
+        const rowsDb = createDbClient();
+        try {
+          const loaded = await loadProvidersFromDb(rowsDb);
+          const rows = Object.entries(loaded?.providers || {}).map(([id, row]) => ({ ...row, id }));
+          logUnvouchedProviderRows(rows);
+        } finally {
+          try { rowsDb.close(); } catch { /* already closed */ }
+        }
+      } catch (err) {
+        console.warn(`[local-model] provider boot check skipped: ${err.message}`);
+      }
       if (target) {
         let timer = null;
         // One short-lived DB client per run, always closed (final review minor 3:

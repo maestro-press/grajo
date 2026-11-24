@@ -14,6 +14,10 @@
  *     path is never reused here.
  *   - An IP-literal host never reaches `lookup`, so it is checked up front by
  *     the same rule.
+ *   - `verifiedConnection` (an OWN-HOST target): the socket is opened HERE, to
+ *     the one judged address, and the ACCEPTED connection is verified before a
+ *     single request byte is written (`models/verified-connect.js`, H1). It is
+ *     never pooled, and it always says `Connection: close`.
  *
  * The rule, by mode:
  *   - "cloud": the address must be public (`isPublicIp`), and neither this
@@ -36,8 +40,16 @@ import { classifyIp, isPublicIp, isOwnNetworkIp } from "../../shared/ip-classify
 import { getOwnAddresses } from "../../shared/locality.js";
 import { isForbiddenTarget, canonicalTargetHost } from "./door-resolve.js";
 import { gatewayPort } from "./door.js";
+import { openVerifiedSocket, CONNECTION_NOT_TRUSTED } from "./verified-connect.js";
 
 const fail = (code, message) => Object.assign(new Error(message), { code });
+
+/** An abort is fetch's `AbortError`: the callers' abort signals — and the
+ * classification that reads them (a speech job's `voice_timeout`, a dictation
+ * route's `stt_timeout`) — were written against fetch, where an aborted request
+ * rejects with `name: "AbortError"`. The code stays ABORTED for the paths that key
+ * on it. */
+const aborted = () => Object.assign(fail("ABORTED", "the request was aborted"), { name: "AbortError" });
 
 const OTHER_REFUSED_CLASSES = new Set(["unspecified", "linklocal", "multicast", "invalid"]);
 const LOOPBACKISH = new Set(["loopback", "unspecified"]);
@@ -111,8 +123,17 @@ const isLocalhostName = (h) => h === "localhost" || h.endsWith(".localhost");
  * `null` when the URL may go on to a lookup, else "BAD_URL" (not http(s), or
  * credentials in it) or "FORBIDDEN_TARGET" (metadata/link-local, or an IP
  * literal, or a `localhost` name, refused by `addressRefused`).
+ *
+ * `allowAddressFn` is the caller's own vetting, the same seam `guardedLookup` has:
+ * a caller that has judged this target itself (`models/self-target.js`) and is
+ * connecting to ONE literal it vetted (`allowAddressFn: () => true`) is not
+ * refused again by the class/port rules — an own-host model server is refused by
+ * the class rule in "cloud" mode and by the gateway-port rule in "other" mode,
+ * yet a vetted own-host model call is exactly what such a caller sends. What is
+ * NOT skipped is `isForbiddenTarget`: a metadata/link-local address is refused
+ * whatever the caller believes it vetted.
  */
-export function preflightRefused(url, { mode = "cloud", gatewayPortValue, ownAddrs } = {}) {
+export function preflightRefused(url, { mode = "cloud", gatewayPortValue, ownAddrs, allowAddressFn } = {}) {
   let u;
   try { u = url instanceof URL ? url : new URL(url); } catch { return "BAD_URL"; }
   if (u.protocol !== "http:" && u.protocol !== "https:") return "BAD_URL";
@@ -122,6 +143,7 @@ export function preflightRefused(url, { mode = "cloud", gatewayPortValue, ownAdd
   const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase().replace(/\.$/, "");
   // A localhost name always means loopback (RFC 6761), so it is judged as one before any lookup.
   const literal = isIP(host) ? host : isLocalhostName(host) ? "127.0.0.1" : null;
+  if (literal && allowAddressFn?.(host, literal)) return null;
   if (literal && addressRefused(literal, { mode, port, gatewayPortValue, ownAddrs })) return "FORBIDDEN_TARGET";
   return null;
 }
@@ -137,16 +159,26 @@ export function preflightRefused(url, { mode = "cloud", gatewayPortValue, ownAdd
  * `timeoutMs`.
  * `transport` is a test seam standing in for node:http / node:https.
  * `signal` (an AbortSignal) destroys the request, before or after the
- * response headers, with err.code ABORTED (the door passes a client abort on).
+ * response headers, with err.code ABORTED and err.name `AbortError` — fetch's own
+ * shape, which is what a speech job's `voice_timeout` and a dictation route's
+ * `stt_timeout` classify on (the door passes a client abort on by code).
+ *
+ * `verifiedConnection` (OWN-HOST targets only, H1) is `{ address, deps, log,
+ * providerId }`: the connection is opened HERE, to exactly `address`, verified as
+ * the accepted connection of a listener Crow trusts
+ * (`models/verified-connect.js`), and only then handed to http(s) — with
+ * `agent: false` and `Connection: close`, so nothing is pooled. A connection that
+ * is not accepted as Crow's own raises `CONNECTION_NOT_TRUSTED` before a request
+ * byte exists. The header can be added by the caller too; it is forced here.
  */
 export function safeRequest(url, {
   method = "GET", headers = {}, body, mode = "cloud", timeoutMs = 8000, idleTimeoutMs = timeoutMs,
-  lookupFn = dns.lookup, allowAddressFn = () => false, transport, signal,
+  lookupFn = dns.lookup, allowAddressFn = () => false, transport, signal, verifiedConnection = null,
 } = {}) {
   return new Promise((resolve, reject) => {
-    if (signal?.aborted) return reject(fail("ABORTED", "the request was aborted"));
+    if (signal?.aborted) return reject(aborted());
     const deadline = Date.now() + timeoutMs;
-    const refused = preflightRefused(url, { mode });
+    const refused = preflightRefused(url, { mode, allowAddressFn });
     if (refused === "BAD_URL") return reject(fail("BAD_URL", "not an http(s) URL Crow can use"));
     if (refused) return reject(fail("FORBIDDEN_TARGET", "Crow will not contact that address"));
     const u = new URL(url);
@@ -157,27 +189,72 @@ export function safeRequest(url, {
     // "Other" servers refuse a chunked POST).
     const sized = typeof body === "string" || Buffer.isBuffer(body);
     const hasLength = Object.keys(headers || {}).some((h) => h.toLowerCase() === "content-length");
-    const sendHeaders = sized && !hasLength ? { ...headers, "content-length": Buffer.byteLength(body) } : headers;
+    let sendHeaders = sized && !hasLength ? { ...headers, "content-length": Buffer.byteLength(body) } : headers;
+    // OWN-HOST: one connection per request, always (see verified-connect.js a).
+    if (verifiedConnection && !Object.keys(sendHeaders || {}).some((h) => h.toLowerCase() === "connection")) {
+      sendHeaders = { ...sendHeaders, Connection: "close" };
+    }
+    const openSocket = verifiedConnection
+      ? openVerifiedSocket({
+        address: verifiedConnection.address || host,
+        port,
+        family: isIP(verifiedConnection.address || host) || undefined,
+        servername: u.protocol === "https:" ? host : null,
+        tls: u.protocol === "https:",
+        deps: verifiedConnection.deps || {},
+        log: verifiedConnection.log,
+        providerId: verifiedConnection.providerId,
+        timeoutMs: Math.max(1, Math.min(timeoutMs, 10_000)),
+      })
+      : null;
     let settled = false;
     const done = (fn, v) => { if (!settled) { settled = true; clearTimeout(timer); fn(v); } };
-    const req = lib.request({
-      protocol: u.protocol, hostname: host, port, method,
-      path: u.pathname + u.search, headers: sendHeaders, agent: false,
-      lookup: guardedLookup({ mode, lookupFn, allowAddressFn, port }),
-    }, (res) => done(resolve, { status: res.statusCode, headers: res.headers, stream: res, deadline }));
-    const timer = setTimeout(() => req.destroy(fail("TIMEOUT", `no answer in ${timeoutMs} ms`)), timeoutMs);
-    // A socket with no byte for `idleTimeoutMs` is cut. The caller that streams a
-    // long answer sets 0: once the headers are in, a quiet SSE stream is not a
-    // failure (the same shape as fetch, whose connect deadline is disarmed).
-    if (idleTimeoutMs > 0) req.setTimeout(idleTimeoutMs, () => req.destroy(fail("TIMEOUT", `idle for ${idleTimeoutMs} ms`)));
-    req.on("error", (err) => done(reject, err));
-    if (signal) {
-      const onAbort = () => req.destroy(fail("ABORTED", "the request was aborted"));
-      signal.addEventListener("abort", onAbort, { once: true });
-      req.on("close", () => signal.removeEventListener("abort", onAbort));
-    }
-    if (body != null) req.write(body);
-    req.end();
+    let timer = null;
+    // The response stream, once the headers are in. An abort AFTER the headers
+    // has to reach the BODY reader as the abort, not as a bare "aborted" from the
+    // stream teardown: a caller reading the body (every adapter does) classifies a
+    // timeout by the error's name, and that name is what fetch gave it.
+    let responseStream = null;
+    const send = (preconnected) => {
+      // A one-request Agent whose createConnection answers the socket we already
+      // opened and verified: node writes the request onto THAT connection, and
+      // never pools it (the Agent is never reused).
+      let agent;
+      if (preconnected) {
+        const AgentCtor = u.protocol === "https:" ? https.Agent : http.Agent;
+        agent = new AgentCtor({ keepAlive: false, maxSockets: 1 });
+        agent.createConnection = () => preconnected;
+      }
+      const req = lib.request({
+        protocol: u.protocol, hostname: host, port, method,
+        path: u.pathname + u.search, headers: sendHeaders,
+        agent: preconnected ? agent : false,
+        lookup: guardedLookup({ mode, lookupFn, allowAddressFn, port }),
+      }, (res) => { responseStream = res; done(resolve, { status: res.statusCode, headers: res.headers, stream: res, deadline }); });
+      timer = setTimeout(() => req.destroy(fail("TIMEOUT", `no answer in ${timeoutMs} ms`)), timeoutMs);
+      // A socket with no byte for `idleTimeoutMs` is cut. The caller that streams a
+      // long answer sets 0: once the headers are in, a quiet SSE stream is not a
+      // failure (the same shape as fetch, whose connect deadline is disarmed).
+      if (idleTimeoutMs > 0) req.setTimeout(idleTimeoutMs, () => req.destroy(fail("TIMEOUT", `idle for ${idleTimeoutMs} ms`)));
+      req.on("error", (err) => done(reject, err));
+      if (signal) {
+        const onAbort = () => {
+          const err = aborted();
+          if (responseStream) { try { responseStream.destroy(err); } catch { /* already gone */ } }
+          req.destroy(err);
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        req.on("close", () => signal.removeEventListener("abort", onAbort));
+      }
+      if (body != null) req.write(body);
+      req.end();
+    };
+    if (!openSocket) { send(null); return; }
+    openSocket.then((socket) => {
+      if (settled) { try { socket.destroy(); } catch { /* gone */ } return; }
+      if (signal?.aborted) { try { socket.destroy(); } catch { /* gone */ } done(reject, aborted()); return; }
+      send(socket);
+    }, (err) => done(reject, err));
   });
 }
 

@@ -65,6 +65,11 @@ process.env.CROW_APP_ROOT ||= __appRoot;
 // import above), so import-time constants already see its values.
 // The gateway is the registered add-on unsealer for this process (PR1, 0.5).
 registerAddonUnsealer("gateway");
+// M1: THIS process is the gateway, so it is the one process allowed to judge a
+// Crow door URL on this host as anything other than "door-url-from-child"
+// (models/local-model-servers.js). Children — the memory MCP server, a pi-bots
+// host process, a bundle server — never reach this line and fail closed.
+markGatewayProcess();
 
 import { mcpAuthRouter, createOAuthMetadata } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { mcpAuthMetadataRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
@@ -85,6 +90,7 @@ import { startActivatedProxySocket, closeProxySocket } from "./proxy-socket.js";
 // that holds the keychain seed and the artifacts runtime a recipient page needs.
 import { closeDoorServer, startActivatedDoor } from "./reports/public-door.js";
 import { gatewayListenHost } from "./listen-host.js";
+import { markGatewayProcess } from "./models/local-model-servers.js";
 
 import { validateRoomToken } from "../sharing/server.js";
 import { createDbClient } from "../db.js";

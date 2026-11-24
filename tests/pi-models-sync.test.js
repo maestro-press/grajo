@@ -1,7 +1,26 @@
 // tests/pi-models-sync.test.js
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { buildManagedEntries, mergeManaged, piModelsSyncPath, syncPiModelsJson, CROW_MANAGED_KEY } from "../servers/shared/pi-models-sync.js";
+import { resetLocalModelVouchCache } from "../servers/gateway/models/local-model-servers.js";
+
+// A row on THIS machine is only offered to pi when a source outside crow.db
+// vouches for its address and port (models/local-model-servers.js). The fixture
+// below has one such row (a loopback-stored native model on 18100), so this
+// instance's home vouches it the way Crow's own native runtime does: a
+// reservation in models/state.json.
+const HOME = mkdtempSync(join(tmpdir(), "crow-pi-models-home-"));
+process.env.CROW_HOME = HOME;
+mkdirSync(join(HOME, "models"), { recursive: true });
+writeFileSync(join(HOME, "models", "state.json"), JSON.stringify({ reservations: {
+  "qwen3.5-4b": { port: 18100, owner: { crowHome: HOME, pid: process.pid } },
+  "was-cloud": { port: 18080, owner: { crowHome: HOME, pid: process.pid } },
+  "broken": { port: 18081, owner: { crowHome: HOME, pid: process.pid } },
+} }));
+resetLocalModelVouchCache();
 
 const DOOR = "http://100.64.9.1:3001/llm/v1";
 const rows = [

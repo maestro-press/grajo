@@ -27,13 +27,28 @@ delete process.env.CROW_DB_PATH;
 mkdirSync(process.env.CROW_HOME, { recursive: true });
 mkdirSync(process.env.CROW_DATA_DIR, { recursive: true });
 const DOOR_ROW = "contain-net-test-local";
+// The contain tier's agent dir is DOOR-ONLY, and `doorRow` (scripts/pi-bots/
+// pi_contain_agent.mjs) asks the cached own-host vouch before it writes a
+// models.json. This fixture's provider row is a LOOPBACK TEST UPSTREAM that no
+// container, bundle or pin publishes, so the fixture vouches its port the way a
+// native runtime does: a reservation in <CROW_HOME>/models/state.json naming a
+// live pid of our own uid (the same fixture shape tests/contain-classifier.test.js
+// uses). Without it the spawn refuses with "contain refused: provider … has no
+// door" — the row is bot-writable, so a port nobody vouches for is not a model
+// server.
+const DOOR_PORT = 18299;
+mkdirSync(join(process.env.CROW_HOME, "models"), { recursive: true });
+writeFileSync(
+  join(process.env.CROW_HOME, "models", "state.json"),
+  JSON.stringify({ reservations: { "contain-net-test-door": { port: DOOR_PORT, owner: { pid: process.pid } } } }),
+);
 before(async () => {
   execFileSync(process.execPath, ["scripts/init-db.js"], { env: { ...process.env }, stdio: "pipe", cwd: REPO });
   const [{ CROW_DB }, { default: Database }] = await Promise.all([import("../scripts/pi-bots/bridge.mjs"), import("better-sqlite3")]);
   const conn = new Database(CROW_DB);
   try {
     conn.prepare("INSERT OR REPLACE INTO providers (id, base_url, models, host, disabled, bundle_id) VALUES (?, ?, ?, 'local', 0, ?)")
-      .run(DOOR_ROW, "http://127.0.0.1:18299/v1", JSON.stringify([{ id: "m" }]), "contain-net-test-bundle");
+      .run(DOOR_ROW, `http://127.0.0.1:${DOOR_PORT}/v1`, JSON.stringify([{ id: "m" }]), "contain-net-test-bundle");
   } finally { conn.close(); }
 });
 after(() => rmSync(INST, { recursive: true, force: true }));

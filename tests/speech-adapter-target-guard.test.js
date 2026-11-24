@@ -26,7 +26,7 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { isIP } from "node:net";
 import { WebSocketServer } from "ws";
 
@@ -45,6 +45,8 @@ import {
   judgeAdapterTarget, guardedFetch, withoutCredentials, carriesCredentials,
   guardSocketTarget, selfTargetRefused, SELF_REFUSED_MESSAGE,
 } from "../servers/gateway/ai/adapter-guard.js";
+import { isKnownLocalModelTarget } from "../servers/gateway/models/local-model-servers.js";
+import { fakeProcRoot, loopbackLookup } from "./fixtures/vouch-proc.mjs";
 
 const AUDIO = Buffer.from("ID3fake-mp3-bytes");
 
@@ -113,8 +115,17 @@ test("no STT/TTS adapter opens its own socket: each one imports the guard and ca
 // `finalUrl` is the URL the adapter actually builds.
 // ---------------------------------------------------------------------------
 
+/**
+ * The own-host VOUCH (`models/local-model-servers.js`) is exercised for real in
+ * `tests/local-model-allowlist.test.js` (a fake /proc + a fake vouch snapshot, real
+ * listeners). This file's decision table is about the ADDRESS and PATH rule, so
+ * the vouch is stubbed to "vouched": the prod profile shapes below name ports a
+ * container publishes, and nothing listens on them in a test sandbox.
+ */
+const vouched = async () => ({ local: true, reason: "vouched" });
+
 async function decide(finalUrl, headers, lookupFn) {
-  const decision = await judgeAdapterTarget(finalUrl, { kind: "speech", lookupFn: lookupFn || publicLookup });
+  const decision = await judgeAdapterTarget(finalUrl, { kind: "speech", lookupFn: lookupFn || publicLookup, knownLocalTargetFn: vouched });
   return { mode: decision.mode, headers: decision.mode === "own" ? withoutCredentials(headers) : headers };
 }
 
@@ -157,6 +168,48 @@ test("the prod speech profiles stay allowed: own-host ones lose the key, hosted 
 });
 
 // ---------------------------------------------------------------------------
+// The prod speech shapes and the REAL vouch: a Docker-published port whose
+// LISTEN socket docker-proxy holds as ROOT (uid 0). That listener is trusted
+// without any pid lookup, which is exactly why a container-installed speech
+// server keeps working while a bot's own listener on the same port does not.
+// ---------------------------------------------------------------------------
+
+test("the prod speech shapes pass the real vouch: a docker-proxy (uid 0) listener on a Docker-published port is a speech server", async () => {
+  // faster-whisper runs at http://localhost:8004/v1 and Kokoro at
+  // http://localhost:8880/v1 on the operator's box, both published by a container.
+  const procRoot = fakeProcRoot({ rows: [
+    { address: "127.0.0.1", port: 8004, uid: 0 },
+    { address: "0.0.0.0", port: 8880, uid: 0 },
+  ] });
+  const vouchDeps = {
+    crowHome: procRoot, procRoot, uid: 7100, selfPid: -1,
+    ownAddrs: new Set(["127.0.0.1"]), lookupFn: loopbackLookup,
+    dockerEntries: [{ address: "127.0.0.1", port: 8004 }, { address: "", port: 8880 }],
+  };
+  try {
+    const knownLocalTargetFn = (url) => isKnownLocalModelTarget(url, vouchDeps);
+    const ownAddrs = vouchDeps.ownAddrs;
+    for (const url of [
+      "http://localhost:8004/v1/audio/transcriptions",
+      "http://localhost:8880/v1/audio/speech",
+      "http://localhost:8880/v1/audio/voices",
+    ]) {
+      const d = await judgeAdapterTarget(url, { kind: "speech", knownLocalTargetFn, ownAddrs, lookupFn: loopbackLookup });
+      assert.equal(d.mode, "own", `${url} is a prod speech shape and must stay usable`);
+    }
+    // The SAME addresses, with no Docker publish and no other vouch: refused. The
+    // rule is the vouch, never the port number or the address class.
+    const unvouched = (url) => isKnownLocalModelTarget(url, { ...vouchDeps, dockerEntries: [] });
+    for (const url of ["http://localhost:8004/v1/audio/transcriptions", "http://localhost:8880/v1/audio/speech"]) {
+      const d = await judgeAdapterTarget(url, { kind: "speech", knownLocalTargetFn: unvouched, ownAddrs, lookupFn: loopbackLookup, logFn: () => {} });
+      assert.equal(d.mode, "refused", `${url} with nothing vouching the port`);
+    }
+  } finally {
+    rmSync(procRoot, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // An own-host speech server still works, and never sees a credential.
 // ---------------------------------------------------------------------------
 
@@ -194,7 +247,7 @@ test("whisper.cpp on this box is dialled at POST /inference", async () => {
 
 test("an own-host speech target is allowed at the EXACT four operations only, never a path that merely ends in one", async () => {
   for (const path of ["/v1/audio/transcriptions", "/v1/audio/speech", "/v1/audio/voices", "/inference"]) {
-    const d = await judgeAdapterTarget(`http://127.0.0.1:8004${path}`, { kind: "speech" });
+    const d = await judgeAdapterTarget(`http://127.0.0.1:8004${path}`, { kind: "speech", knownLocalTargetFn: vouched });
     assert.equal(d.mode, "own", `${path} is a reviewed speech operation`);
   }
   for (const path of [

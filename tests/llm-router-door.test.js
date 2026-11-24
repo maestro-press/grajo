@@ -5,11 +5,22 @@ process.env.COMPANION_ESCALATION_MODEL = "crow-chat/qwen3.6-35b-a3b";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import express from "express";
 import llmRouterRouter from "../servers/gateway/routes/llm-router.js";
 import { isTrustedDoorSource } from "../servers/gateway/models/door-resolve.js";
+import { resetLocalModelVouchCache } from "../servers/gateway/models/local-model-servers.js";
 import { ReservedError } from "../servers/gateway/box-reservation.js";
 import { ServingClassError } from "../servers/gateway/models/serving-class.js";
+
+// The own-host vouch (models/local-model-servers.js) asks for a source OUTSIDE
+// crow.db before an own-host row may be forwarded or listed. This file's upstream
+// is a stub in this very process, so the fixture vouches its port the way Crow's
+// own native runtime does: a reservation in this instance's models/state.json.
+const home = mkdtempSync(join(tmpdir(), "crow-door-home-"));
+process.env.CROW_HOME = home;
 
 let up, upUrl, seen, srv, appUrl, acquired, remote = "127.0.0.1";
 
@@ -25,6 +36,9 @@ before(async () => {
   });
   await new Promise((r) => up.listen(0, "127.0.0.1", r));
   upUrl = `http://127.0.0.1:${up.address().port}/v1`;
+  mkdirSync(join(home, "models"), { recursive: true });
+  writeFileSync(join(home, "models", "state.json"), JSON.stringify({ reservations: { vouch: { port: up.address().port, owner: { crowHome: home, pid: process.pid } } } }));
+  resetLocalModelVouchCache();
   const providers = {
     "crow-chat": { baseUrl: upUrl, doorUrl: "http://100.64.9.1:3001/llm/p/crow-chat/v1", apiKey: "none", models: [{ id: "qwen3.6-35b-a3b" }], gpuPolicy: { runtime: "native", owner: "me", port: 1 } },
     "crow-voice": { baseUrl: upUrl, apiKey: "none", bundleId: "vllm-rocm-qwen35-4b", models: [{ id: "qwen3.5-4b" }] },

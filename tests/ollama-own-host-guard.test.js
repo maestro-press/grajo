@@ -45,6 +45,16 @@ import {
 } from "../servers/gateway/models/self-target.js";
 import { getEmbedding, invalidateConfigCache } from "../servers/gateway/ai/provider.js";
 
+/**
+ * The own-host VOUCH (`models/local-model-servers.js`) is exercised for real in
+ * `tests/local-model-allowlist.test.js`. The DECISION assertions below are about
+ * the path and the port allow-list, so the vouch is stubbed to "vouched"; the
+ * adapter/guardedFetch tests further down use the real predicate and pass it via
+ * the "socket owned by this process" rule (their listeners run in this test
+ * process, so /proc says the LISTEN socket is the gateway's own code).
+ */
+const vouched = async () => ({ local: true, reason: "vouched" });
+
 const OLLAMA_PORT = 11434;
 
 /** Own-host ports an Ollama may NOT be driven at. Under the old gateway-port
@@ -180,7 +190,7 @@ test("OLLAMA_OWN_HOST_PORTS is the port the Ollama bundle publishes (the compose
 
 test("judgeAdapterTarget: an own-host Ollama port is allowed at /api/chat and /api/embed, and at nothing else", async () => {
   for (const url of ["http://127.0.0.1:11434/api/chat", "http://localhost:11434/api/embed", `http://127.0.0.1:${OLLAMA_PORT}/api/embed`]) {
-    const d = await judgeAdapterTarget(url, { kind: "ollama" });
+    const d = await judgeAdapterTarget(url, { kind: "ollama", knownLocalTargetFn: vouched });
     assert.equal(d.mode, "own", `${url} must be usable (the store's Ollama bundle)`);
   }
   // the same host, the same kind, a path Ollama's reviewed list does not have

@@ -6,18 +6,24 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { connect } from "node:net";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import express from "express";
 import llmRouterRouter from "../servers/gateway/routes/llm-router.js";
 import { startEgressRelay } from "../scripts/pi-bots/pi_egress.mjs";
 import { containedClassifierBlock } from "../scripts/pi-bots/pi_contain_agent.mjs";
+import { resetLocalModelVouchCache } from "../servers/gateway/models/local-model-servers.js";
 
 const ROW = "classifier-row";
 const MODEL = "safety-small";
 let up, srv, relay, gwPort, upSeen = [];
 const scratch = mkdtempSync(join(tmpdir(), "classifier-e2e-"));
+
+// The row this test hands `containedClassifierBlock` is an own-host stub, so the
+// instance's home has to vouch its port the way a native runtime does (a
+// reservation in models/state.json) or doorRow refuses to build a door for it.
+process.env.CROW_HOME = join(scratch, "home");
 
 before(async () => {
   up = http.createServer((req, res) => {
@@ -30,7 +36,16 @@ before(async () => {
     });
   });
   await new Promise((r) => up.listen(0, "127.0.0.1", r));
-  const upUrl = `http://127.0.0.1:${up.address().port}/v1`;
+  const upPort = up.address().port;
+  // Both ports matter: 8011 is what the ROW declares (doorRow's own-host vouch),
+  // and upPort is where this stub actually listens (the door's forward vouch).
+  mkdirSync(join(process.env.CROW_HOME, "models"), { recursive: true });
+  writeFileSync(join(process.env.CROW_HOME, "models", "state.json"), JSON.stringify({ reservations: {
+    classifier: { port: upPort, owner: { pid: process.pid } },
+    row: { port: 8011, owner: { pid: process.pid } },
+  } }));
+  resetLocalModelVouchCache();
+  const upUrl = `http://127.0.0.1:${upPort}/v1`;
   const providers = { [ROW]: { baseUrl: upUrl, apiKey: "none", models: [{ id: MODEL }], gpuPolicy: { runtime: "native", owner: "me", port: 1 } } };
   // No remoteAddressFn: the door judges the REAL socket address, which is the relay's mark.
   const router = llmRouterRouter({

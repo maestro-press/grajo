@@ -47,6 +47,21 @@ mkdirSync(process.env.CROW_HOME, { recursive: true });
 mkdirSync(process.env.CROW_DATA_DIR, { recursive: true });
 const DOOR_ROW = "contain-sign-test-local";
 const DB_PATH = join(process.env.CROW_DATA_DIR, "crow.db");
+// The contain tier's agent dir is DOOR-ONLY, and `doorRow` (scripts/pi-bots/
+// pi_contain_agent.mjs) asks the cached own-host vouch before it writes a
+// models.json. This fixture's provider row is a LOOPBACK TEST UPSTREAM that no
+// container, bundle or pin publishes, so the fixture vouches its port the way a
+// native runtime does: a reservation in <CROW_HOME>/models/state.json naming a
+// live pid of our own uid (the same fixture shape tests/contain-classifier.test.js
+// uses). Without it the spawn refuses with "contain refused: provider … has no
+// door" — the row is bot-writable, so a port nobody vouches for is not a model
+// server.
+const DOOR_PORT = 18299;
+mkdirSync(join(process.env.CROW_HOME, "models"), { recursive: true });
+writeFileSync(
+  join(process.env.CROW_HOME, "models", "state.json"),
+  JSON.stringify({ reservations: { "contain-sign-test-door": { port: DOOR_PORT, owner: { pid: process.pid } } } }),
+);
 
 _resetPiSandboxForTest();
 const SANDBOX = probePiSandbox({ force: true });
@@ -69,7 +84,7 @@ before(async () => {
   const conn = new Database(DB_PATH);
   try {
     conn.prepare("INSERT OR REPLACE INTO providers (id, base_url, models, host, disabled, bundle_id) VALUES (?, ?, ?, 'local', 0, ?)")
-      .run(DOOR_ROW, "http://127.0.0.1:18299/v1", JSON.stringify([{ id: "m" }]), "contain-sign-test-bundle");
+      .run(DOOR_ROW, `http://127.0.0.1:${DOOR_PORT}/v1`, JSON.stringify([{ id: "m" }]), "contain-sign-test-bundle");
   } finally { conn.close(); }
 
   _resetActorKeyForTest();

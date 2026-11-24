@@ -53,6 +53,7 @@ import { basename, dirname, join } from "node:path";
 import { resolveCrowHome } from "../../servers/shared/crow-home.js";
 import { providerDoorUrl, cloudDoorUrl } from "../../servers/gateway/models/door.js";
 import { doorKindOf, isLocalClassTarget, isForbiddenTarget } from "../../servers/gateway/models/door-resolve.js";
+import { isKnownLocalModelTargetCached } from "../../servers/gateway/models/local-model-servers.js";
 import { cloudDoorEligible, consentVerdict } from "../../servers/shared/cloud-consent.js";
 import { DOOR_ID_PREFIX, doorEntryId, piCompatFor } from "../../servers/shared/pi-compat.js";
 import { AGENT_RO_SUBDIRS } from "./pi_contain.mjs";
@@ -163,6 +164,12 @@ export function doorRow(r) {
   if (!r || typeof r.baseUrl !== "string" || !r.baseUrl) return null;
   if (isForbiddenTarget(r.baseUrl) || !isLocalClassTarget(r.baseUrl)) return null;
   if (doorKindOf(r) === "unmanaged") return null;
+  // The row's OWN address must be one a model server vouches for, or /llm/p would
+  // refuse the spawn's every turn (a bot can write this row): an own-host port
+  // with no docker/compose/native/pin vouch is the "unverified-local" class, and
+  // a contained spawn is not offered it. The cached (vouch-only) predicate is the
+  // right one here — generating an agent dir must never dial anything.
+  if (!isKnownLocalModelTargetCached(r.baseUrl).local) return null;
   return r;
 }
 

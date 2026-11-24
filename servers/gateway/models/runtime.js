@@ -33,6 +33,7 @@ import { createHash } from "node:crypto";
 import { execFileSync as execFileSyncNode, spawn as spawnCb } from "node:child_process";
 import {
   chmodSync,
+  createReadStream as fsCreateReadStream,
   createWriteStream as fsCreateWriteStream,
   existsSync,
   mkdirSync,
@@ -626,6 +627,24 @@ export function sweepStaleRuntimeTmp(dir, opts = {}) {
 // ---------------------------------------------------------------------------
 
 /**
+ * The sha256 of a file on disk, streamed in chunks — a runtime binary is
+ * hundreds of MB, so it is never read whole. `createReadStream` is injectable
+ * for tests.
+ *
+ * @returns {Promise<string>} lowercase hex digest.
+ */
+async function sha256OfFile(path, { createReadStream = fsCreateReadStream } = {}) {
+  const hash = createHash("sha256");
+  await new Promise((resolvePromise, reject) => {
+    const rs = createReadStream(path);
+    rs.on("data", (chunk) => hash.update(chunk));
+    rs.on("end", resolvePromise);
+    rs.on("error", reject);
+  });
+  return hash.digest("hex");
+}
+
+/**
  * Ensure a working `llama-server` binary exists under
  * `<dir>/runtimes/llamacpp/<runtimeBlock.release>/` for this host, and
  * return its path. Idempotent: a prior successful install for the exact
@@ -654,7 +673,13 @@ export function sweepStaleRuntimeTmp(dir, opts = {}) {
  *      staging directory at this point (not into `releaseDir` yet) so it
  *      finalizes together with the binary in the next step — a reader
  *      can never observe a `releaseDir` with a binary but no manifest,
- *      or a manifest with no binary.
+ *      or a manifest with no binary. The manifest records TWO checksums:
+ *      `sha256` of the downloaded ARCHIVE (what `downloadRuntimeAsset`
+ *      verified) and `binSha256` of the extracted BINARY itself. The
+ *      second one exists so a later reader can identify the installed
+ *      binary BY CONTENT instead of by its path —
+ *      `models/local-model-servers.js`'s managed-binary fallback never
+ *      trusts a managed path without it.
  *   6. Finalize with a single `renameSync(stagingDir, releaseDir)` — an
  *      atomic swap on the same filesystem. Any stale `releaseDir` left
  *      by an old/corrupt manifest is cleared first (POSIX `rename` onto
@@ -711,6 +736,8 @@ export async function ensureRuntime(dir, runtimeBlock, probe, opts = {}) {
     sweepStaleTmp = sweepStaleRuntimeTmp,
     execFileSyncImpl = execFileSyncNode,
     collectLddOutputFn = collectLddOutput,
+    sha256Fn = sha256OfFile,
+    createReadStream = fsCreateReadStream,
   } = opts;
 
   try {
@@ -750,6 +777,20 @@ export async function ensureRuntime(dir, runtimeBlock, probe, opts = {}) {
         && candidateBinPath
         && fs.existsSync(candidateBinPath)
       ) {
+        // Backfill the binary's own checksum for an install made before it was
+        // recorded. `binSha256` is what lets a later reader identify this binary
+        // by content (models/local-model-servers.js), and a host that already has
+        // the runtime installed should not have to reinstall to get it. Best
+        // effort: a home that cannot be written simply leaves the install
+        // unrecognisable to that fallback, never an install failure here.
+        if (!manifest.binSha256) {
+          try {
+            const binSha256 = await sha256Fn(candidateBinPath);
+            fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, binSha256 }, null, 2));
+          } catch {
+            /* best effort — see above */
+          }
+        }
         return candidateBinPath; // already installed for this exact asset
       }
     } catch {
@@ -807,10 +848,14 @@ export async function ensureRuntime(dir, runtimeBlock, probe, opts = {}) {
   // Step 5: the ONLY chmod+x in this function, only after 2-4 succeeded.
   chmodFn(stagedBinPath, 0o755);
 
+  // The BINARY's own sha256 (the archive's is `resolved.sha256`): this is what a
+  // later reader compares the running executable's content against.
+  const binSha256 = await sha256Fn(stagedBinPath, { createReadStream });
+
   const relBinPath = relative(stagingDir, stagedBinPath);
   fs.writeFileSync(
     join(stagingDir, ".crow-runtime-installed.json"),
-    JSON.stringify({ key: resolved.key, sha256: resolved.sha256, relBinPath, installedAt: new Date().toISOString() }, null, 2),
+    JSON.stringify({ key: resolved.key, sha256: resolved.sha256, binSha256, relBinPath, installedAt: new Date().toISOString() }, null, 2),
   );
 
   // Step 6: atomic(-ish) finalize — a single rename swaps the

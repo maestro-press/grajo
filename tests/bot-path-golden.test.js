@@ -63,13 +63,22 @@
 // retired option and a keep-list naming the file change nothing, so it is not
 // only golden-derived.
 //
+// A FOURTH recorded exception (security review, H5): re-recorded once for the
+// `runtimes` reservation. The native runtime's install root
+// (`<data>/runtimes/llamacpp/<release>/…`) is now a RESERVED data-dir name, so
+// every case that binds a data dir gained exactly one `--tmpfs` + one
+// `--remount-ro` pair on `<data>/runtimes` — nothing else moved: same cases in
+// the same order, every other token identical, and the property itself is pinned
+// directly by tests/pi-contain-plan.test.js (which asserts `runtimes` is reserved,
+// masked and not a FILE-shaped name), so it is not only golden-derived.
+//
 // The count, so a reviewer knows the `--tmpfs` volume is the intended one and
-// not a leak: 32 masks per case that binds a data dir (34 reserved names minus
+// not a leak: 33 masks per case that binds a data dir (35 reserved names minus
 // the two FILE-shaped ones — `identity.json` and `instance-id` are never
-// created), 31 in the cases whose fixture keeps one (`projects`, re-exposed down
+// created), 32 in the cases whose fixture keeps one (`projects`, re-exposed down
 // to the bot's own workspace, and the C9 keep-list), and NOT ONE
 // installed-bundle-id mask, because none of these fixture instances records an
-// absent installed id. 1085 data-dir masks in total; nothing in the plan reads
+// absent installed id. 1119 data-dir masks in total; nothing in the plan reads
 // the repository's `registry/add-ons.json`. tests/pi-contain-plan.test.js (B11c)
 // asserts that source rule directly.
 import { test } from "node:test";

@@ -4,24 +4,49 @@
  * use were observed to send for a forced call: a vLLM server answers a NAMED choice
  * with tool_call deltas and finish_reason "stop", and "required" with finish_reason
  * "tool_calls"; a llama.cpp server accepts a named choice and ignores it (plain text).
+ *
+ * The backend is a REAL loopback listener in this process: an own-host model server
+ * is reached through the verified, unpooled transport (`guardedFetch` →
+ * `safeRequest` + `verifiedConnection`), never through `fetch`, and the own-host
+ * vouch accepts a listening socket THIS process holds (the same shape
+ * `tests/adapter-self-target-guard.test.js` uses). Nothing about the transport or
+ * the vouch is stubbed, so what is under test is only the request body.
  */
-import { test, afterEach } from "node:test";
+import { test } from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
 import createOpenAIAdapter from "../servers/gateway/ai/adapters/openai.js";
-
-const realFetch = globalThis.fetch;
-afterEach(() => { globalThis.fetch = realFetch; });
 
 const sse = (chunks) => new Response(chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("") + "data: [DONE]\n\n", { status: 200, headers: { "Content-Type": "text/event-stream" } });
 const TOOLS = [{ name: "crow_wm", description: "show", inputSchema: { type: "object", properties: { command: { type: "string" } } } }, { name: "crow_projects", description: "notes", inputSchema: { type: "object" } }];
 const MSGS = [{ role: "user", content: "show me a list" }];
+
+/** Serve ONE case over a real loopback listener and hand back the parsed body the
+ * adapter sent (`sent[0]`) plus every event it streamed. */
 async function run(options, respond, tools = TOOLS) {
   const sent = [];
-  globalThis.fetch = async (url, init) => { const body = JSON.parse(init.body); sent.push(body); return respond(body); };
-  const adapter = createOpenAIAdapter({ baseUrl: "http://127.0.0.1:9/v1", model: "m" });
-  const events = [];
-  for await (const ev of adapter.chatStream(MSGS, tools, options)) events.push(ev);
-  return { body: sent[0], events };
+  const server = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      let body;
+      try { body = JSON.parse(raw); } catch { res.writeHead(400); res.end(); return; }
+      sent.push(body);
+      const out = respond(body);
+      res.writeHead(out.status, Object.fromEntries(out.headers.entries()));
+      out.arrayBuffer().then((b) => res.end(Buffer.from(b)));
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const port = server.address().port;
+  try {
+    const adapter = createOpenAIAdapter({ baseUrl: `http://127.0.0.1:${port}/v1`, model: "m" });
+    const events = [];
+    for await (const ev of adapter.chatStream(MSGS, tools, options)) events.push(ev);
+    return { body: sent[0], events };
+  } finally {
+    await new Promise((r) => { server.closeAllConnections?.(); server.close(() => r()); });
+  }
 }
 const callChunks = (finish) => [
   { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "crow_wm", arguments: "" } }] } }] },

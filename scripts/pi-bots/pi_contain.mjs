@@ -297,6 +297,13 @@ export const BUNDLE_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 export const RESERVED_DATA_ENTRIES = Object.freeze([...new Set([
   ...RESERVED_DATA_NAMES,
   "pi-bots", "env", "identity.json", "orchestrator-refcounts.json", "deleted-projects", "history", "previews", "artifacts",
+  // The native runtime's install root (`<data>/runtimes/llamacpp/<release>/…`,
+  // models/runtime.js `ensureRuntime`). The data dir root is bound READ-WRITE
+  // (SQLite needs it), so without this a contained bot could create
+  // `<data>/runtimes` and plant a binary in a directory the host later trusts as
+  // the runtime's own: the managed-binary vouch (`local-model-servers.js`) reads
+  // the release manifest and the binary under this name.
+  "runtimes",
 ])]);
 
 /**

@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import { createDbClient } from "../servers/db.js";
 import { _resetProviderTaskCacheForTest } from "../servers/shared/provider-task.js";
 import { resolveDefaultProvider, embedText } from "../servers/memory/embeddings.js";
@@ -59,6 +60,32 @@ async function seed(rows, settings = {}) {
   } finally { db.close?.(); }
 }
 
+/**
+ * The own-host VOUCH (`models/local-model-servers.js`) is exercised for real in
+ * `tests/local-model-allowlist.test.js` and `tests/local-model-listener-vouch.test.js`.
+ * These two tests are about which MODEL a resolved row uses, and they stub the
+ * plain `fetch` against a loopback URL where no model server listens, so the
+ * vouch is stubbed to "vouched".
+ */
+const knownLocalTargetFn = async () => ({ local: true, reason: "vouched" });
+
+/**
+ * `guardedFetch` sends every OWN-HOST target through the VERIFIED transport
+ * (`requestFn` = `safeRequest`) and never through `fetch` (H1: fetch cannot verify
+ * the socket it got). These fixtures point at a loopback URL where nothing
+ * listens, so an own-host stub states its answer here.
+ */
+function ownHostRequest(payload, onCall = () => {}) {
+  return async (url, opts) => {
+    onCall(url, opts);
+    return {
+      status: 200,
+      headers: { "content-type": "application/json" },
+      stream: Readable.from([Buffer.from(JSON.stringify(payload))]),
+    };
+  };
+}
+
 beforeEach(() => {
   _resetProviderTaskCacheForTest();
   delete process.env.CROW_EMBED_PROVIDER;
@@ -96,20 +123,18 @@ test("rerank: 'score'-tagged row resolves; env override wins", async () => {
   assert.equal(await resolveDefaultRerankProvider(), "env-rerank");
 });
 
-test("rerank: a DB-only task-resolved provider IS called (stubbed fetch) and reorders", async () => {
+test("rerank: a DB-only task-resolved provider IS called (stubbed transport) and reorders", async () => {
   await seed([["db-rerank", "score", 0, "http://127.0.0.1:9/v1"]]);
-  const origFetch = globalThis.fetch;
   const seen = [];
-  globalThis.fetch = async (url, init) => {
-    seen.push(String(url));
-    return new Response(JSON.stringify({ results: [{ index: 2, relevance_score: 0.9 }, { index: 0, relevance_score: 0.5 }, { index: 1, relevance_score: 0.1 }] }), { status: 200, headers: { "content-type": "application/json" } });
-  };
-  try {
-    const out = await rerank("q", [{ id: 1, text: "a" }, { id: 2, text: "b" }, { id: 3, text: "c" }], { topK: 3 });
+  const payload = { results: [{ index: 2, relevance_score: 0.9 }, { index: 0, relevance_score: 0.5 }, { index: 1, relevance_score: 0.1 }] };
+  {
+    const out = await rerank("q", [{ id: 1, text: "a" }, { id: 2, text: "b" }, { id: 3, text: "c" }], {
+      topK: 3, guard: { knownLocalTargetFn, requestFn: ownHostRequest(payload, (url) => seen.push(String(url))) },
+    });
     assert.equal(seen.length, 1, "reranker endpoint must be called");
     assert.match(seen[0], /127\.0\.0\.1:9\/v1\/rerank$/);
     assert.equal(out[0].id, 3);
-  } finally { globalThis.fetch = origFetch; }
+  }
 });
 
 test("rerank: no provider -> candidates unreranked in original order", async () => {
@@ -120,30 +145,20 @@ test("rerank: no provider -> candidates unreranked in original order", async () 
 
 test("embed: provider lists a chat model first, embed-tagged model second -> the embed model is used, not models[0]", async () => {
   await seedRaw([["mixed-embed", [{ id: "chat-model" }, { id: "embed-model", task: "embed" }]]]);
-  const origFetch = globalThis.fetch;
   let seenBody;
-  globalThis.fetch = async (url, init) => {
-    seenBody = JSON.parse(init.body);
-    return new Response(JSON.stringify({ data: [{ embedding: [0.1, 0.2] }] }), { status: 200, headers: { "content-type": "application/json" } });
-  };
-  try {
-    await embedText("hello");
-    assert.equal(seenBody.model, "embed-model");
-  } finally { globalThis.fetch = origFetch; }
+  await embedText("hello", {
+    guard: { knownLocalTargetFn, requestFn: ownHostRequest({ data: [{ embedding: [0.1, 0.2] }] }, (_url, opts) => { seenBody = JSON.parse(opts.body); }) },
+  });
+  assert.equal(seenBody.model, "embed-model");
 });
 
 test("rerank: provider lists a chat model first, rerank-tagged model second -> the rerank model is used, not models[0]", async () => {
   await seedRaw([["mixed-rerank", [{ id: "chat-model" }, { id: "rerank-model", task: "rerank" }]]]);
-  const origFetch = globalThis.fetch;
   let seenBody;
-  globalThis.fetch = async (url, init) => {
-    seenBody = JSON.parse(init.body);
-    return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
-  };
-  try {
-    await rerank("q", [{ id: 1, text: "a" }]);
-    assert.equal(seenBody.model, "rerank-model");
-  } finally { globalThis.fetch = origFetch; }
+  await rerank("q", [{ id: 1, text: "a" }], {
+    guard: { knownLocalTargetFn, requestFn: ownHostRequest({ results: [] }, (_url, opts) => { seenBody = JSON.parse(opts.body); }) },
+  });
+  assert.equal(seenBody.model, "rerank-model");
 });
 
 test("embed: no provider configured -> explicit guard error", async () => {

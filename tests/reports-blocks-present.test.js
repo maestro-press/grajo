@@ -10,6 +10,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1186,14 +1187,28 @@ test("the block cannot start a model: no starter is imported or read, and the ca
   // Behavioural: the PRODUCTION completion path (no injected completion), with the global fetch replaced,
   // so a warm-up, a probe or any other request a start would make is recorded instead of reaching a model.
   const db = await freshDb();
+  // The endpoint IS this box, so the guard asks the LISTENER vouch
+  // (models/local-model-servers.js) before any dial: a listening socket THIS
+  // process owns is vouched (nothing a bot writes into crow.db can make the
+  // gateway open a listener). `fetch` is trapped below, and the listener records
+  // every request it gets — which is what an own-host completion now is, since the
+  // verified transport (`safeRequest`) does not go through `fetch` at all (H1).
+  const hits = [];
+  const vox = http.createServer((req, res) => {
+    hits.push({ url: req.url, method: req.method });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ choices: [{ message: { content: "A production commentary." } }] }));
+  });
+  await new Promise((resolve) => vox.listen(0, "127.0.0.1", resolve));
+  const voxHost = `127.0.0.1:${vox.address().port}`;
   await db.execute({
     sql: `INSERT OR REPLACE INTO providers (id, base_url, host, models, disabled)
-          VALUES ('trap-chat', 'http://127.0.0.1:8999/v1', 'local', ?, 0)`,
-    args: [JSON.stringify([{ id: "m1" }])],
+          VALUES ('trap-chat', ?, 'local', ?, 0)`,
+    args: [`http://${voxHost}/v1`, JSON.stringify([{ id: "m1" }])],
   });
   const { id } = await createReport(db, { projectId: PROJECT, owner: "owner", title: "Listings" });
   const report = await getReport(db, id);
-  const sealed = { providerId: "trap-chat", model: "m1", locality: "local", baseUrlHost: "127.0.0.1:8999" };
+  const sealed = { providerId: "trap-chat", model: "m1", locality: "local", baseUrlHost: voxHost };
   const traps = [];
   const trap = (name) => () => { traps.push(name); return true; };
   const deps = {
@@ -1235,12 +1250,14 @@ test("the block cannot start a model: no starter is imported or read, and the ca
     globalThis.fetch = realFetch;
     if (reservationPath === undefined) delete process.env.CROW_BOX_RESERVATION_PATH;
     else process.env.CROW_BOX_RESERVATION_PATH = reservationPath;
+    await new Promise((resolve) => { vox.closeAllConnections?.(); vox.close(() => resolve()); });
   }
   assert.deepEqual(traps, [], "no start-shaped seam was called");
   assert.deepEqual(out.sourceErrors, [], "the run finished");
-  assert.deepEqual(requests.map((entry) => entry.method), ["POST"],
+  assert.deepEqual(hits.map((entry) => entry.method), ["POST"],
     "one request, and it is the completion: nothing warmed or probed a model first");
-  assert.match(requests[0].url, /\/chat\/completions$/);
+  assert.match(hits[0].url, /\/chat\/completions$/);
+  assert.deepEqual(requests, [], "the own-host completion never went through plain fetch");
   assert.equal(out.sections.at(-1).markdown, "A production commentary.");
   assert.deepEqual(out.warnings, []);
 });

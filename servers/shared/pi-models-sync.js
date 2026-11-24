@@ -37,6 +37,7 @@ import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { resolveCrowHome } from "./crow-home.js";
 import { doorKindOf, isLocalClassTarget } from "../gateway/models/door-resolve.js";
+import { isUnverifiedLocalTarget } from "../gateway/models/local-model-servers.js";
 import { providerDoorUrl, cloudDoorUrl } from "../gateway/models/door.js";
 import { consentVerdict, cloudDoorEligible } from "./cloud-consent.js";
 import { piCompatFor, DOOR_ID_PREFIX, doorEntryId } from "./pi-compat.js";
@@ -196,6 +197,18 @@ export function buildManagedEntries(rows, {
       continue;
     }
     const cloud = !isLocalClassTarget(r.baseUrl) && !allow.has(r.id);
+    if (!cloud && r.baseUrl && !allow.has(r.id) && isUnverifiedLocalTarget(r.baseUrl)) {
+      // The "unverified-local" class: this machine's own address, and no model
+      // server Crow knows about (a docker/compose port, a live native reservation,
+      // an operator pin) vouches for that address and port. It is NEITHER local —
+      // never handed to pi as a local model, because a contained bot can write this
+      // row and point it at a listener of its own — NOR cloud (it is not a public
+      // address, so it is never cloud-consent eligible and never reaches the cloud
+      // door). The row is left out, in the same skipped-with-a-reason shape the
+      // key guards below use.
+      log(`[pi-models-sync] provider "${r.id}" skipped: its address is this machine, but no model server Crow knows about is listening there`);
+      continue;
+    }
     if (cloud) {
       if (!door || !r.baseUrl) continue;
       const models = chatModels(r.models);

@@ -14,7 +14,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -233,6 +233,14 @@ test("a row written with no change hook reaches pi's models.json after one poll"
   const fx = freshDb();
   const scratch = mkdtempSync(join(tmpdir(), "provider-watch-pi-"));
   try {
+    // `ROW` is an own-host row, and an own-host row is only offered to pi when a
+    // source outside crow.db vouches for its port (models/local-model-servers.js).
+    // The vouch here is the native runtime's own: a reservation in this instance's
+    // models/state.json.
+    mkdirSync(join(fx.dir, "models"), { recursive: true });
+    writeFileSync(join(fx.dir, "models", "state.json"), JSON.stringify({ reservations: { probe: { port: 18100, owner: { pid: process.pid } } } }));
+    const { resetLocalModelVouchCache } = await import("../servers/gateway/models/local-model-servers.js");
+    resetLocalModelVouchCache();
     const target = join(scratch, "models.json");
     let onChangeFired = 0;
     const watch = createProviderChangeWatch({

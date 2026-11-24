@@ -48,6 +48,8 @@ import {
   judgeAdapterTarget, guardedFetch, withoutCredentials, carriesCredentials,
   responseFromStream, selfTargetRefused, SELF_REFUSED_MESSAGE,
 } from "../servers/gateway/ai/adapter-guard.js";
+import { isKnownLocalModelTarget } from "../servers/gateway/models/local-model-servers.js";
+import { fakeProcRoot, loopbackLookup } from "./fixtures/vouch-proc.mjs";
 import { harness } from "./fixtures/voice-turn-harness.mjs";
 
 // Placeholder-safe addresses only (public hygiene): the box's own tailnet IP is
@@ -150,6 +152,15 @@ test("no chat-adapter model request opens its own socket: every request site is 
  * what matters — own tailnet IP on ports 8001-8014, loopback, a LAN peer, a
  * tailnet peer, and public cloud hosts.
  */
+/**
+ * The own-host VOUCH (`models/local-model-servers.js`) is exercised for real in
+ * `tests/local-model-allowlist.test.js` (fake /proc, fake vouch snapshot, real
+ * listeners). THIS file's decision table is about the ADDRESS and PATH rule, so
+ * the vouch is stubbed to "vouched": no model server listens on the fixture
+ * addresses below in a test sandbox.
+ */
+const vouched = async () => ({ local: true, reason: "vouched" });
+
 const FLEET_ROWS = [
   // [id, base_url, operation, own-host?]
   ["crow-chat", `http://${OWN_IP}:8003/v1`, "chat/completions", true],
@@ -186,7 +197,7 @@ test("every enabled provider row on the fleet passes the adapter guard, and only
   const lookupFn = (host, opts, cb) => cb(null, [{ address: PUBLIC, family: 4 }]);
   for (const [id, base, op, own] of FLEET_ROWS) {
     const url = `${base.replace(/\/+$/, "")}/${op}`;
-    const decision = await judgeAdapterTarget(url, { ownAddrs: OWN, lookupFn });
+    const decision = await judgeAdapterTarget(url, { ownAddrs: OWN, lookupFn, knownLocalTargetFn: vouched });
     assert.notEqual(decision.mode, "refused", `${id} (${url}) must stay usable`);
     if (own) {
       assert.equal(decision.mode, "own", `${id} (${url}) is this host`);
@@ -203,6 +214,57 @@ test("the guard's refusal is the existing fixed wording, never the bot-written U
   assert.equal(err.code, "SELF_TARGET_REFUSED");
   assert.equal(err.message, SELF_REFUSED_MESSAGE);
   assert.equal(err.message, "Crow will not contact that address");
+});
+
+// ---------------------------------------------------------------------------
+// The prod own-host SHAPES and the REAL vouch (models/local-model-servers.js):
+// a Docker-published port whose LISTEN socket docker-proxy holds as ROOT (uid 0)
+// is trusted without a pid lookup, which is what keeps a container-installed
+// model usable. Nothing here is dialled.
+// ---------------------------------------------------------------------------
+
+test("the prod own-host model shapes pass the real vouch (a docker-proxy uid-0 listener on a Docker-published port)", async () => {
+  const procRoot = fakeProcRoot({ rows: [
+    { address: "127.0.0.1", port: 8012, uid: 0 },     // crow-vision, a container
+    { address: "127.0.0.1", port: 11434, uid: 0 },    // the Ollama bundle (compose publishes 127.0.0.1:11434)
+    { address: "100.64.20.5", port: 8004, uid: 0 },   // crow-embed, a container on this box's tailnet address
+  ] });
+  const vouchDeps = {
+    crowHome: procRoot, procRoot, uid: 7100, selfPid: -1,
+    ownAddrs: new Set(["127.0.0.1", "100.64.20.5"]), lookupFn: loopbackLookup,
+    dockerEntries: [
+      { address: "127.0.0.1", port: 8012 },
+      { address: "127.0.0.1", port: 11434 },
+      { address: "100.64.20.5", port: 8004 },
+    ],
+  };
+  const knownLocalTargetFn = (url) => isKnownLocalModelTarget(url, vouchDeps);
+  // 100.64.20.5 is THIS box's tailnet address in these tests (the placeholder for
+  // the real one), so the judge is told it is own-host — the same seam the fleet
+  // table above uses.
+  const ownAddrs = vouchDeps.ownAddrs;
+  try {
+    const rows = [
+      ["http://127.0.0.1:8012/v1/chat/completions", "model"],
+      ["http://127.0.0.1:8012/v1/models", "probe"],
+      ["http://localhost:11434/api/chat", "ollama"],
+      ["http://localhost:11434/api/embed", "ollama"],
+      ["http://100.64.20.5:8004/v1/embeddings", "model"],
+    ];
+    for (const [url, kind] of rows) {
+      const d = await judgeAdapterTarget(url, { kind, knownLocalTargetFn, ownAddrs, lookupFn: loopbackLookup });
+      assert.equal(d.mode, "own", `${url} (${kind}) is a prod shape and must stay usable`);
+    }
+    // The SAME addresses with nothing vouching them: refused. A vouch is not a
+    // port number and not an address class (the vouch is what Docker supplies).
+    const unvouched = (url) => isKnownLocalModelTarget(url, { ...vouchDeps, dockerEntries: [] });
+    for (const [url, kind] of rows) {
+      const d = await judgeAdapterTarget(url, { kind, knownLocalTargetFn: unvouched, ownAddrs, lookupFn: loopbackLookup });
+      assert.equal(d.mode, "refused", `${url} with nothing vouching the port`);
+    }
+  } finally {
+    rmSync(procRoot, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

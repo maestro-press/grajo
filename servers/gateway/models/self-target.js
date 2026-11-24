@@ -5,11 +5,17 @@
  * The rules here are EVERY caller's, not only a relayed one: the operator's own
  * voice turn and a background job (`completeText`) read the same bot-writable
  * row, so `isAllowedSelfPath`/`isAllowedSelfForward` gate the door forward, the
- * voice path and `completeText` alike, and `pinnedTargetOf`/`pinnedLookup` pin a
- * rebindable NAME target on the voice path and in `completeText` for every
- * caller. Only the extra narrowing (a rebindable name refused outright, a name
- * that does not resolve, `/llm/v1` on our own port only, the peer relay's
- * name/query rule) is asked of a relayed caller.
+ * voice path and `completeText` alike, and `pinnedTargetOf` resolves a NAME target
+ * ONCE, reporting BOTH the answer a rebindable name must be pinned to (`pinned`)
+ * and the ordered answers an own-host name may be dialled at (`dialAnswers`). The
+ * own-host vouch judges those IN ORDER and names the ONE it accepted
+ * (`isKnownLocalModelTarget`'s `address`, carried by `dialAt`), and that literal is
+ * what the socket is opened to, on the door,
+ * the voice path, `completeText` and every adapter (`ai/adapter-guard.js`): a name
+ * is one address here, never two resolutions. Only the extra narrowing (a
+ * rebindable name refused outright, a name that does not resolve, `/llm/v1` on
+ * our own port only, the peer relay's name/query rule) is asked of a relayed
+ * caller.
  *
  * Two more rules live here because they are the same question, asked of the same
  * rows, and every caller needs them:
@@ -148,21 +154,23 @@ export function isOwnHostAddress(address, ownAddrs = ownAddresses()) {
 
 /**
  * Every address `host` names, as `[{address, family}]`, or [] when it cannot be
- * resolved. An IP literal needs no lookup; a localhost name is judged as
- * loopback (RFC 6761) and never asked of a resolver that could be rebound.
+ * resolved. An IP literal needs no lookup.
  *
  * THE 2 s CAP. A NAME target is resolved with a 2 s deadline (a resolver that
  * hangs must not stall a voice turn or a scheduled job), and every caller that
- * pins a connection reuses THIS ONE answer — see `pinnedTargetOf` — because a
- * second resolution of the same name is exactly the rebinding window this file
- * exists to close. A lookup that throws or answers nothing is [] (the caller's
+ * connects reuses THIS ONE answer — `pinnedTargetOf`'s `dial` — because a second
+ * resolution of the same name is exactly the rebinding window this file exists to
+ * close. A lookup that throws or answers nothing is [] (the caller's
  * `unresolved`), never a silent "not this host".
  */
-async function lookupAll(host, lookupFn) {
-  if (isIP(host)) return [{ address: host, family: isIP(host) }];
-  if (LOOPBACK_NAMES.has(host) || host.endsWith(".localhost")) {
-    return [{ address: "127.0.0.1", family: 4 }, { address: "::1", family: 6 }];
-  }
+/** Is this host a name that always means this host (RFC 6761)? */
+function isLoopbackName(host) {
+  return LOOPBACK_NAMES.has(host) || String(host || "").endsWith(".localhost");
+}
+
+/** Ask the resolver ONCE, with the 2 s cap: `[{address, family}]`, [] when it
+ * throws or answers nothing. */
+async function resolveOnce(host, lookupFn) {
   try {
     const answer = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => resolve(null), 2000);
@@ -180,9 +188,34 @@ async function lookupAll(host, lookupFn) {
   }
 }
 
+async function lookupAll(host, lookupFn) {
+  if (isIP(host)) return [{ address: host, family: isIP(host) }];
+  const answers = await resolveOnce(host, lookupFn);
+  if (!isLoopbackName(host)) return answers;
+  // A LOOPBACK NAME is loopback whatever the resolver says (RFC 6761: `localhost`
+  // is 127.0.0.1 and ::1). Only ITS loopback answers are kept — a host file that
+  // points the name elsewhere cannot move "this host" — and a resolver with no
+  // entry for it falls back to the RFC 6761 pair. It is asked at all because a
+  // caller connects to ONE literal (`pinnedTargetOf`'s `dial`), and which one it
+  // dials must be the one that was judged.
+  const loopback = answers.filter((a) => classifyIp(a.address).cls === "loopback");
+  if (loopback.length) return loopback;
+  return [{ address: "127.0.0.1", family: 4 }, { address: "::1", family: 6 }];
+}
+
 /** Every address `host` names, or [] when it cannot be resolved. */
 async function addressesOf(host, lookupFn) {
   return (await lookupAll(host, lookupFn)).map((x) => x.address);
+}
+
+/** Every address a target URL names — the list `ownTargetOf` judges — as
+ * `[{address, family}]`, or [] when the host cannot be resolved. Same resolver
+ * seam and the same 2 s cap; used by callers that must know WHICH address a name
+ * stood for (an address-and-port vouch, models/local-model-servers.js). */
+export async function targetAddresses(url, { lookupFn = dns.lookup } = {}) {
+  const host = targetHost(url);
+  if (!host) return [];
+  return (await lookupAll(host, lookupFn)).map((x) => ({ address: x.address, family: x.family ?? isIP(x.address) }));
 }
 
 /**
@@ -212,23 +245,33 @@ export async function ownTargetOf(url, { ports = gatewayListenPorts(), ownAddrs 
 }
 
 /**
- * Resolve a target ONCE and say where a connection may be pinned.
+ * Resolve a target ONCE and say where the socket must be opened.
  *
- * This is `ownTargetOf`'s judgement PLUS the statement a rebinding-safe forward
- * needs: `pinned`, the exact address the socket must be opened to. Two callers
- * use it — the voice path (`handleChat`) and `completeText` — because a DNS name
- * there is attacker-writable too (a `providers` row's base_url): judging the name
- * and then letting the fetch resolve it again is the rebinding window.
+ * This is `ownTargetOf`'s judgement PLUS the two statements a forward needs:
+ * `pinned` (a rebindable NAME's vetted answer) and `dial` (the ONE literal a NAME
+ * stands for). Four callers use it — the model door (`forwardDoor`), the voice
+ * path (`handleChat`), `completeText` and the adapter guard — because the target
+ * comes from a bot-writable row (`providers`), and judging a name and then letting
+ * the fetch resolve it again is the rebinding window.
  *
- *   - an IP literal or a loopback NAME cannot be rebound, so it is judged by
- *     `ownTargetOf` and never pinned (`pinned: null`);
- *   - a NAME is resolved once (2 s cap, `lookupAll`). If ANY answer is this host
- *     (`isOwnHostAddress`) the target is refused — a mixed answer is a rebinding
- *     attempt, not a destination — and if none is left dialable (link-local, cloud
- *     metadata, unspecified, multicast) `forbidden` says so;
- *   - otherwise `pinned` is the first vetting address, and the caller connects to
- *     it with `pinnedLookup` (the host name still rides the URL, so https keeps
- *     its SNI and certificate check).
+ *   - an IP LITERAL is already the address the socket opens to: no lookup, no
+ *     `dial` (the URL carries it), and `forbidden` says whether that class is off
+ *     limits (link-local / cloud metadata). Before this, a literal
+ *     `169.254.169.254` was simply "not this host" and the caller dialled it;
+ *   - a NAME (a loopback name included: `localhost` is 127.0.0.1 AND ::1) is
+ *     resolved once (2 s cap, `lookupAll`), and `dialAnswers` is EVERY answer in
+ *     resolver order. The caller hands that list to the own-host vouch, which judges
+ *     them in order and answers with the first one that is a known model server; it
+ *     then connects to THAT address with `pinnedLookup`, so no second resolution
+ *     happens and the address dialled is an address judged. `dial` stays the first
+ *     answer (the shape a caller with no vouch to ask uses); a loopback name's
+ *     answers are its loopback addresses;
+ *   - if ANY answer is this host (`isOwnHostAddress`) the target is own-host and
+ *     never pinned (`pinned: null`), and if none is left dialable (link-local,
+ *     cloud metadata, unspecified, multicast) `forbidden` says so;
+ *   - otherwise `pinned` is the first vetting address (with the whole vetted set
+ *     in `addresses`), and the host name still rides the URL, so https keeps its
+ *     SNI and certificate check.
  *
  * Never throws: an unparseable URL is not this gateway (the request fails on its
  * own), and a name nobody answers for is `unresolved`.
@@ -236,24 +279,48 @@ export async function ownTargetOf(url, { ports = gatewayListenPorts(), ownAddrs 
 export async function pinnedTargetOf(url, { ports = gatewayListenPorts(), ownAddrs = ownAddresses(), lookupFn = dns.lookup } = {}) {
   const host = targetHost(url);
   const port = targetPort(url);
-  if (!host || port == null) return { own: false, self: false, port, resolved: false, unresolved: false, pinned: null, forbidden: false };
-  if (isIP(host) || LOOPBACK_NAMES.has(host) || host.endsWith(".localhost")) {
-    // An IP LITERAL (or a localhost name) is a KNOWN address: `forbidden` says
-    // whether the address class itself is off limits (link-local / cloud
-    // metadata). Before this, a literal `169.254.169.254` was simply "not this
-    // host" and the caller dialled it.
-    return { ...(await ownTargetOf(url, { ports, ownAddrs, lookupFn })), pinned: null, forbidden: isForbiddenSelfTarget(url) };
+  if (!host || port == null) return { own: false, self: false, port, resolved: false, unresolved: false, pinned: null, forbidden: false, dial: null, dialAnswers: [] };
+  if (isIP(host)) {
+    // An IP LITERAL is the address itself: `forbidden` says whether the address
+    // class is off limits (link-local / cloud metadata) and there is nothing to
+    // resolve or to pin.
+    const own = isOwnHostAddress(host, ownAddrs);
+    const self = own && (ports == null ? true : ports.has(port));
+    return { own, self, port, resolved: true, unresolved: false, pinned: null, forbidden: isForbiddenSelfTarget(url), dial: null, dialAnswers: [] };
   }
   const answers = await lookupAll(host, lookupFn);
-  if (!answers.length) return { own: false, self: false, port, resolved: false, unresolved: true, pinned: null, forbidden: false };
+  if (!answers.length) return { own: false, self: false, port, resolved: false, unresolved: true, pinned: null, forbidden: false, dial: null, dialAnswers: [] };
   const own = answers.some((a) => isOwnHostAddress(a.address, ownAddrs));
   const self = own && (ports == null ? true : ports.has(port));
-  const dialable = own ? [] : answers.filter((a) => !addressRefused(a.address, { mode: "other", ownAddrs }));
+  // EVERY answer, in resolver order, with the family the socket needs: the caller
+  // judges them in order (the own-host vouch) and dials the first it accepted.
+  const listed = answers.map((a) => ({ address: a.address, family: a.family ?? isIP(a.address) }));
+  if (own) return { own, self, port, resolved: true, unresolved: false, pinned: null, forbidden: false, dial: { ...listed[0] }, dialAnswers: listed };
+  const dialable = answers.filter((a) => !addressRefused(a.address, { mode: "other", ownAddrs }));
   // The whole vetted set rides along: a dual-stack host must still be able to try
   // its other vetted address (Happy Eyeballs asks for `all`), and none of them is a
   // second resolution of the name.
   const pinned = dialable.length ? { ...dialable[0], addresses: dialable } : null;
-  return { own, self, port, resolved: true, unresolved: false, pinned, forbidden: !own && dialable.length === 0 };
+  return { own, self, port, resolved: true, unresolved: false, pinned, forbidden: dialable.length === 0, dial: pinned ? { address: pinned.address, family: pinned.family } : null, dialAnswers: [] };
+}
+
+/**
+ * WHERE THE SOCKET OPENS for a NAME target, once the own-host vouch has spoken.
+ *
+ * `pinnedTargetOf` hands over EVERY answer the name stood for (`dialAnswers`), but
+ * it cannot know which of them is a model server. The vouch can
+ * (`models/local-model-servers.js` `isKnownLocalModelTarget`): it judges them IN
+ * ORDER and answers with the ONE address that passed. That address — never the
+ * name's first answer by assumption — is what the transport is pinned to
+ * (`pinnedLookup`), so the judged address is the dialled one, and a dual-stack
+ * `localhost` whose ::1 has nothing listening still reaches a server bound to
+ * 127.0.0.1.
+ */
+export function dialAt(verdict, fallback = null) {
+  const address = verdict && typeof verdict.address === "string" && verdict.address ? verdict.address : null;
+  if (!address) return fallback || null;
+  const family = isIP(address);
+  return family ? { address, family } : { address };
 }
 
 /** A `lookup` for http.request that always answers the address(es) a target was

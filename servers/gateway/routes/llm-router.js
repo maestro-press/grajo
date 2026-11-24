@@ -92,7 +92,9 @@ import { classifyIp } from "../../shared/ip-classify.js";
 import { isForeignInstanceHost } from "../../shared/provider-host.js";
 import { getOrCreateLocalInstanceId, validateInstanceToken } from "../instance-registry.js";
 import { providerDoorUrl } from "../models/door.js";
-import { ownTargetOf, pinnedTargetOf, pinnedLookup, isAllowedSelfPath, isAllowedSelfForward, isRebindableHost, gatewayListenPorts, isForbiddenSelfTarget } from "../models/self-target.js";
+import { isIP } from "node:net";
+import { pinnedTargetOf, pinnedLookup, dialAt, isAllowedSelfPath, isAllowedSelfForward, isRebindableHost, gatewayListenPorts, isForbiddenSelfTarget, targetHost } from "../models/self-target.js";
+import { isKnownLocalModelTarget, describeTarget, logOwnHostTargetRefusal } from "../models/local-model-servers.js";
 import { safeRequest, readJson } from "../models/safe-upstream.js";
 import { createCloudDoor, CLOUD_DOOR_DEFAULTS } from "../models/cloud-door.js";
 import { validateLlmCloudToken } from "../local-token.js";
@@ -105,6 +107,23 @@ import { createSseEchoFilter, stripJsonEcho } from "../voice/sse-echo.js";
 import { resolveRole } from "../../shared/model-roles-store.js";
 import { resolveVoiceKeys, logRoleMiss, VOICE_RAW_KEYS } from "../../shared/voice-keys.js";
 import { isRoleRef } from "../../shared/model-roles.js";
+
+/**
+ * THE ADDRESSES A JUDGEMENT IS ABOUT. `pinnedTargetOf` resolves a NAME target ONCE
+ * and keeps every answer in resolver order (`dialAnswers`); that LIST is handed to
+ * the own-host vouch (`isKnownLocalModelTarget`), which judges each answer in order
+ * and answers with the one address that passed — and `dialAt` turns THAT address
+ * into the connection's pin (`pinnedLookup`). So exactly one address is dialled and
+ * it is one that was judged: a dual-stack `localhost` whose ::1 has nothing
+ * listening still reaches the model bound to 127.0.0.1. An IP literal needs
+ * neither: the URL already carries the exact address, so there is nothing to hand
+ * over and no second resolution is possible.
+ */
+function dialAddressesOf(target) {
+  if (!target) return undefined;
+  if (Array.isArray(target.dialAnswers) && target.dialAnswers.length) return target.dialAnswers.map((a) => a.address);
+  return target.dial ? [target.dial.address] : undefined;
+}
 
 // The raw fast/escalate keys are computed once, in servers/shared/voice-keys.js.
 const { fast: FAST_KEY, escalate: ESC_KEY } = VOICE_RAW_KEYS;
@@ -600,7 +619,7 @@ async function forwardDoor(req, res, target, op, deps) {
   // voice path (`handleChat`) and `completeText` use, so it is judged here and
   // not by the fetch's own lookup.
   const relayed = isRelayedSocket(req.socket);
-  const own = await ownTargetOf(url, { lookupFn: deps.lookupFn, ports: deps.listenPortsFn() });
+  const own = await pinnedTargetOf(url, { lookupFn: deps.lookupFn, ports: deps.listenPortsFn() });
   if (own.unresolved || (own.own && !isAllowedSelfForward(url, { relayed, self: own.self }))) {
     return res.status(403).json({ error: { code: "SELF_TARGET_REFUSED", message: `provider "${target.providerId}" points at this gateway${relayed ? "; a relayed caller may not use it as a forward" : ""}` } });
   }
@@ -615,6 +634,39 @@ async function forwardDoor(req, res, target, op, deps) {
   if (target.doorKind === "native-owned" || target.doorKind === "bundle") {
     await deps.acquireFn(target.providerId, { requester: requesterTag(req) });
   }
+  // THE OWN-HOST VOUCH (models/local-model-servers.js), AFTER the acquire and
+  // immediately before the fetch: the address class alone is not enough, because a
+  // contained bot shares the host network and can write this very row
+  // (`base_url: http://127.0.0.1:<free port>/v1`) and then listen there itself
+  // with a relay. It must be (1) a port some source OUTSIDE crow.db vouches for
+  // (a docker/compose publish, a live native reservation, an operator pin) AND
+  // (2) held by a listener that is not a bot. The acquire comes first on purpose:
+  // starting a cold native model is what makes its listener and its reservation
+  // exist. Refusal is this door's existing not-forwardable answer, logged once.
+  let known = null;
+  if (own.own) {
+    known = await deps.knownLocalTargetFn(url, dialAddressesOf(own));
+    if (!known.local) {
+      const { address, port } = describeTarget(url);
+      logOwnHostTargetRefusal({ address: known.address || address, port, providerId: target.providerId, reason: known.reason }, deps.logFn);
+      return res.status(400).json({ error: { code: "NOT_FORWARDABLE", message: `provider "${target.providerId}" is not on a loopback, private or tailnet address; the door never forwards to the internet` } });
+    }
+  }
+  // WHERE THE SOCKET OPENS. An own-host target whose host is a NAME (`localhost`, a
+  // tailnet name this box answers on) was resolved ONCE above, and the vouch judged
+  // every answer IN ORDER: the connection is opened to the address the vouch
+  // accepted (`known.address`, `dialAt`), through `pinnedLookup`, so nothing
+  // resolves the name a second time between the judgement and the connect and the
+  // address dialled is one that was judged. An IP-literal target already carries
+  // its address.
+  const dialTo = own.own && own.dial ? dialAt(known, own.dial) : null;
+  // AN OWN-HOST FORWARD ALWAYS GOES THROUGH `safeRequest` (H1), even for an IP
+  // literal: `fetch` cannot verify the socket it got, and the race (a same-uid bot
+  // opening a SO_REUSEPORT listener on the model's port between this check and the
+  // connect) is about exactly that socket. `verifiedConnection` opens the socket
+  // itself, verifies the ACCEPTED end before a request byte is written, and never
+  // pools it. A remote target keeps plain fetch / the pinned transport.
+  const verifiedAddress = own.own ? ((dialTo && dialTo.address) || targetHost(url) || null) : null;
   let upstream;
   try {
     const t = connectTimeout(LLM_CONNECT_TIMEOUT_MS);
@@ -622,21 +674,42 @@ async function forwardDoor(req, res, target, op, deps) {
     // either a misconfiguration or an attempt to move the forward somewhere the
     // own-host checks above never judged, and Node would follow it on a fresh
     // socket of its own.
-    upstream = t.disarm(await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: t.signal, redirect: "manual" }));
+    upstream = t.disarm(dialTo || verifiedAddress
+      ? await deps.requestFn(url, {
+        method: "POST", headers, body: JSON.stringify(body), signal: t.signal,
+        timeoutMs: LLM_CONNECT_TIMEOUT_MS, idleTimeoutMs: 0,
+        lookupFn: pinnedLookup(dialTo || { address: verifiedAddress, family: isIP(verifiedAddress) }), allowAddressFn: () => true,
+        verifiedConnection: verifiedAddress
+          ? { address: verifiedAddress, deps: deps.vouchDeps, log: deps.logFn, providerId: target.providerId }
+          : null,
+      })
+      : await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: t.signal, redirect: "manual" }));
   } catch (e) {
+    // A connection that is not one Crow accepts (a bot won the reuseport race):
+    // the door's existing not-forwardable refusal, with its own reason logged once
+    // by the transport (models/verified-connect.js) — never a 502, which would
+    // read like a broken model server.
+    if (e && e.code === "CONNECTION_NOT_TRUSTED") {
+      return res.status(400).json({ error: { code: "NOT_FORWARDABLE", message: `provider "${target.providerId}" is not on a loopback, private or tailnet address; the door never forwards to the internet` } });
+    }
     const msg = isTimeoutError(e) ? `upstream connect timeout after ${Math.round(LLM_CONNECT_TIMEOUT_MS / 1000)}s` : `upstream ${target.providerId} unreachable: ${e.message}`;
     return res.status(502).json({ error: { code: "UPSTREAM_UNREACHABLE", message: msg } });
   }
   if (upstream.status >= 300 && upstream.status < 400) {
-    try { upstream.body?.cancel?.()?.catch?.(() => {}); } catch { /* the body is irrelevant */ }
+    try {
+      if (dialTo || verifiedAddress) upstream.stream?.destroy?.();
+      else upstream.body?.cancel?.()?.catch?.(() => {});
+    } catch { /* the body is irrelevant */ }
     return res.status(502).json({ error: { code: "UPSTREAM_UNREACHABLE", message: `upstream ${target.providerId} unreachable: redirect ${upstream.status} not followed` } });
   }
   console.log(`[llm-router] door ${op} -> ${target.providerId}/${target.modelId} (${target.doorKind}) requester=${requesterTag(req)}`);
   res.status(upstream.status);
-  res.set("Content-Type", upstream.headers.get("content-type") || "application/json");
-  if (!upstream.body) return res.end();
+  res.set("Content-Type", (dialTo || verifiedAddress ? upstream.headers?.["content-type"] : upstream.headers.get("content-type")) || "application/json");
+  // fetch hands a web stream, safeRequest a Node one; both are piped the same below.
+  const nodeUpstream = (dialTo || verifiedAddress) ? upstream.stream : (upstream.body ? Readable.fromWeb(upstream.body) : null);
+  if (!nodeUpstream) return res.end();
   await new Promise((resolve) => {
-    const s = Readable.fromWeb(upstream.body);
+    const s = nodeUpstream;
     s.on("error", (e) => { console.error(`[llm-router] door stream error: ${e.message}`); if (!res.writableEnded) res.end(); resolve(); });
     // A client abort destroys the stream with "close", not "error", and res never
     // emits "finish": resolve on close too, or one promise leaks per aborted stream.
@@ -903,7 +976,11 @@ export const resolveVoiceKey = (key) => resolveKey(key);
  *      to a forward that lands on this box.
  *
  * `refusal` is `{ status, code, message }` (existing codes and messages only);
- * otherwise `{ own, pinned }` is what the caller forwards with.
+ * otherwise `{ own, pinned }` is what the caller forwards with — `own.dialAnswers` is
+ * every answer this judgement resolved a name to, in order (`own.dial` the first,
+ * for a caller with no vouch to ask), and the own-host vouch picks the ONE of them
+ * that is a model server (`dialAt`), which is the address the socket is opened to;
+ * `pinned` is the same for a rebindable name.
  */
 async function voiceTargetGuard(req, key, url, deps) {
   const relayed = isRelayedSocket(req.socket);
@@ -983,6 +1060,10 @@ export const probeVoiceReady = (baseUrl) => defaultProbeReady(baseUrl);
  * "box_reserved"), and it never sends to a provider whose kind loads models
  * lazily (ollama, llama-swap, lemonade and the like: "lazy_loader"); only a
  * direct, already-running llama-server-style endpoint is used.
+ * An own-host endpoint is additionally VOUCHED (`models/local-model-servers.js`
+ * `isKnownLocalModelTarget`) right before the fetch: the port must be one a
+ * source outside crow.db vouches for and its listener must not be a bot, or the
+ * job is refused like every other own-host forward (SELF_TARGET_REFUSED).
  * Thinking tags in the reply are stripped. Throws on any failure; the error
  * message never quotes the prompt or the reply.
  *
@@ -993,6 +1074,11 @@ export async function completeText({ model, prompt, maxTokens = 400, timeoutMs =
   resolveKeyFn = resolveDirectKey, fetchFn = fetch, requestFn = safeRequest, lookupFn = dns.lookup,
   recordUsageFn = (event) => recordUsageEvent(db(), event),
   ownInstanceIdFn = getOrCreateLocalInstanceId, reservationFn = () => readReservation(),
+  // The own-host VOUCH (models/local-model-servers.js) and where its one refusal
+  // line goes: the same seams the door's forward uses, so a test can furnish its
+  // own vouch snapshot exactly as it furnishes lookupFn/requestFn.
+  knownLocalTargetFn = (url, dialAddresses) => isKnownLocalModelTarget(url, dialAddresses ? { dialAddresses } : undefined),
+  logFn = (line) => console.log(line),
 } = {}) {
   if (!model || typeof prompt !== "string") throw new Error("completeText: model and prompt are required");
   // The box is spoken for (an operator window, a benchmark): a background
@@ -1059,15 +1145,53 @@ export async function completeText({ model, prompt, maxTokens = 400, timeoutMs =
   // "upstream status" error below instead of being followed on a new socket.
   const headers = { "Content-Type": "application/json", ...authHeaders(up.apiKey) };
   if (own.own) delete headers.Authorization;
+  // THE OWN-HOST VOUCH (models/local-model-servers.js), immediately before the
+  // fetch: loopback was never the question. A contained bot shares the host
+  // network and can write this very row (`base_url: http://127.0.0.1:<free
+  // port>/v1`) and then listen on the port itself with a relay to a cloud API, so
+  // the port must be vouched by a source OUTSIDE crow.db (a Docker/compose
+  // publish, a live native reservation, an operator pin, this gateway's own
+  // listen port, or a listening socket THIS process owns) AND the process holding
+  // the LISTEN socket must not be a bot. A scheduled job is not a privileged
+  // caller here either. Refusal is this path's existing SELF_TARGET_REFUSED, and
+  // the operator gets the one log line the door prints.
+  let known = null;
+  if (own.own) {
+    known = await knownLocalTargetFn(url, dialAddressesOf(own));
+    if (!known || !known.local) {
+      const { address, port } = describeTarget(url);
+      logOwnHostTargetRefusal({ address: (known && known.address) || address, port, providerId: splitKey(model)[0], reason: (known && known.reason) || "listener-not-trusted" }, logFn);
+      throw selfRefused();
+    }
+  }
+  // WHERE THE SOCKET OPENS: a rebindable NAME's vetted answer (`pinned`), or the
+  // address an own-host NAME's answers were judged on and one of them accepted
+  // (`dialAt(known)` — the first answer that passed, never the name's first answer
+  // by assumption). The judged address is the connected address; nothing resolves
+  // the name again after the vouch. An IP-literal target needs neither.
+  const dialTo = pinned || (own.own && own.dial ? dialAt(known, own.dial) : null);
+  // An OWN-HOST target is verified at the socket (H1), even as an IP literal: the
+  // reuseport race is about the connection, not the name.
+  const verifiedAddress = own.own ? ((dialTo && dialTo.address) || targetHost(url) || null) : null;
   let json;
-  if (pinned) {
-    // A rebindable name: safeRequest opens the socket to the EXACT address vetted
-    // above (pinnedLookup), never to a second answer for the name. allowAddressFn
-    // is safe here because `pinned` already passed the own-host/forbidden vetting.
-    const r = await requestFn(url, {
-      method: "POST", headers, body: JSON.stringify(body), timeoutMs,
-      lookupFn: pinnedLookup(pinned), allowAddressFn: () => true,
-    });
+  if (dialTo || verifiedAddress) {
+    // safeRequest opens the socket to the EXACT address judged above
+    // (pinnedLookup), never to a second answer for the name; the host name still
+    // rides the URL. allowAddressFn is safe here because the address already passed
+    // the own-host/forbidden vetting.
+    let r;
+    try {
+      r = await requestFn(url, {
+        method: "POST", headers, body: JSON.stringify(body), timeoutMs,
+        lookupFn: pinnedLookup(dialTo || { address: verifiedAddress, family: isIP(verifiedAddress) }), allowAddressFn: () => true,
+        verifiedConnection: verifiedAddress
+          ? { address: verifiedAddress, deps: { lookupFn }, log: logFn, providerId: splitKey(model)[0] }
+          : null,
+      });
+    } catch (e) {
+      if (e && e.code === "CONNECTION_NOT_TRUSTED") throw selfRefused();
+      throw e;
+    }
     if (r.status < 200 || r.status >= 300) {
       try { r.stream?.destroy?.(); } catch { /* the body is irrelevant */ }
       throw new Error(`completeText: upstream status ${r.status}`);
@@ -1240,11 +1364,33 @@ async function handleChat(req, res, deps) {
 
   // Forward to the chosen upstream, rewriting the model field to its real id.
   // The target was already judged by voiceTargetGuard (path rule + rebinding),
-  // before the acquire: `guard.own` is that judgement, `guard.pinned` is the
-  // address a rebindable name resolved to and the socket must be opened to.
+  // before the acquire: `guard.own` is that judgement, and `guard.pinned` /
+  // `guard.own.dial` are the addresses the socket may be opened to.
+  // The own-host VOUCH is judged here, AFTER the acquire (a cold native model is
+  // started by it) and immediately before the fetch: loopback is not enough when
+  // a contained bot shares the host network and can write this row and then
+  // listen on the port itself (models/local-model-servers.js).
+  let known = null;
+  if (guard.own.own) {
+    known = await deps.knownLocalTargetFn(`${up.baseUrl}/chat/completions`, dialAddressesOf(guard.own));
+    if (!known.local) {
+      const { address, port } = describeTarget(`${up.baseUrl}/chat/completions`);
+      logOwnHostTargetRefusal({ address: known.address || address, port, providerId, reason: known.reason }, deps.logFn);
+      return res.status(400).json({ error: { code: "NOT_FORWARDABLE", message: `the model key ${key} is not on a loopback, private or tailnet address; the door never forwards to the internet` } });
+    }
+  }
   body.model = up.model;
   const url = `${up.baseUrl}/chat/completions`;
-  const pinned = guard.pinned;
+  // The socket's address: a rebindable NAME's vetted answer (`guard.pinned`), or
+  // the address an OWN-HOST name's answers were judged on and one accepted
+  // (`dialAt(known)` — the first answer that passed, out of the ordered list —
+  // never the name's first answer by assumption). The judged address is the
+  // connected address, with no second resolution in between. An IP literal needs
+  // neither (the URL carries it).
+  const pinned = guard.pinned || (guard.own.own && guard.own.dial ? dialAt(known, guard.own.dial) : null);
+  // An own-host target is verified at the SOCKET (H1) even as an IP literal: the
+  // reuseport race is about the connection, never the name.
+  const verifiedAddress = guard.own.own ? ((pinned && pinned.address) || targetHost(url) || null) : null;
   const upHeaders = { "Content-Type": "application/json", Accept: "text/event-stream", ...authHeaders(up.apiKey) };
   if (guard.own.own) delete upHeaders.Authorization;
   const t0 = Date.now();
@@ -1255,15 +1401,18 @@ async function handleChat(req, res, deps) {
   try {
     const t = connectTimeout(LLM_CONNECT_TIMEOUT_MS);
     // NO REDIRECTS (see forwardDoor): a 3xx is a 502, never followed.
-    upstream = t.disarm(pinned
-      // A rebindable name: safeRequest opens the socket to the EXACT address
-      // vetted by voiceTargetGuard (pinnedLookup), never to a second answer for
-      // the same name. allowAddressFn is safe: `pinned` already passed the
+    upstream = t.disarm(pinned || verifiedAddress
+      // A rebindable name, or an own-host NAME: safeRequest opens the socket to the
+      // EXACT address judged above (pinnedLookup), never to a second answer for the
+      // same name. allowAddressFn is safe: the address already passed the
       // own-host/forbidden vetting.
       ? await deps.requestFn(url, {
         method: "POST", headers: upHeaders, body: JSON.stringify(body),
         signal: t.signal, timeoutMs: LLM_CONNECT_TIMEOUT_MS, idleTimeoutMs: 0,
-        lookupFn: pinnedLookup(pinned), allowAddressFn: () => true,
+        lookupFn: pinnedLookup(pinned || { address: verifiedAddress, family: isIP(verifiedAddress) }), allowAddressFn: () => true,
+        verifiedConnection: verifiedAddress
+          ? { address: verifiedAddress, deps: deps.vouchDeps, log: deps.logFn, providerId: key }
+          : null,
       })
       : await fetch(url, {
         method: "POST",
@@ -1273,18 +1422,19 @@ async function handleChat(req, res, deps) {
         redirect: "manual",
       }));
   } catch (e) {
+    if (e && e.code === "CONNECTION_NOT_TRUSTED") return selfRefused();
     const msg = isTimeoutError(e)
       ? `upstream connect timeout after ${Math.round(LLM_CONNECT_TIMEOUT_MS / 1000)}s`
       : `upstream ${url} unreachable: ${e.message}`;
     return res.status(502).json({ error: { message: msg } });
   }
   const upstreamStatus = upstream.status;
-  const upstreamType = pinned
+  const upstreamType = (pinned || verifiedAddress)
     ? (upstream.headers?.["content-type"] || "application/json")
     : (upstream.headers.get("content-type") || "application/json");
   if (upstreamStatus >= 300 && upstreamStatus < 400) {
     try {
-      if (pinned) upstream.stream?.destroy?.();
+      if (pinned || verifiedAddress) upstream.stream?.destroy?.();
       else upstream.body?.cancel?.()?.catch?.(() => {});
     } catch { /* the body is irrelevant */ }
     return res.status(502).json({ error: { code: "UPSTREAM_UNREACHABLE", message: `upstream ${url} unreachable: redirect ${upstreamStatus} not followed` } });
@@ -1294,7 +1444,7 @@ async function handleChat(req, res, deps) {
   res.status(upstreamStatus);
   res.set("Content-Type", upstreamType);
   // fetch hands a web stream, safeRequest a Node one; both are piped the same below.
-  const nodeUpstream = pinned ? upstream.stream : (upstream.body ? Readable.fromWeb(upstream.body) : null);
+  const nodeUpstream = (pinned || verifiedAddress) ? upstream.stream : (upstream.body ? Readable.fromWeb(upstream.body) : null);
   if (!nodeUpstream) return res.end();
   // Tap the pass-through to meter usage (voice/glasses). Bytes are forwarded
   // unchanged; we keep only a bounded tail because the OpenAI usage block rides
@@ -1407,6 +1557,11 @@ export default function llmRouterRouter(opts = {}) {
     // allowed only on OUR door and never a co-hosted sibling's.
     lookupFn: dns.lookup,
     requestFn: safeRequest,
+    // The own-host vouch (models/local-model-servers.js): the seam exists so a
+    // test can furnish its own vouch snapshot, exactly as lookupFn/requestFn do
+    // for the resolver and the transport. The default is the real predicate, told
+    // the ONE address that was resolved and will be dialled.
+    knownLocalTargetFn: (url, dialAddresses) => isKnownLocalModelTarget(url, dialAddresses ? { dialAddresses } : undefined),
     listenPortsFn: () => gatewayListenPorts(),
     recordUsageFn: (event) => recordUsageEvent(db(), event),
     // The voice keys per request (m6): a seam, so router tests never need the db() singleton.

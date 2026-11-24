@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 
 import { buildContainedAgentDir, containedCloudTokenPath } from "../scripts/pi-bots/pi_contain_agent.mjs";
+import { resetLocalModelVouchCache } from "../servers/gateway/models/local-model-servers.js";
 import { buildContainPlan, ContainRefused } from "../scripts/pi-bots/pi_contain.mjs";
 import { wrapPiSpawn } from "../scripts/pi-bots/pi_sandbox.mjs";
 import { llmCloudTokenPath } from "../servers/gateway/local-token.js";
@@ -33,6 +34,13 @@ const cloudTokenPath = join(crowHome, "llm-cloud-token");
 writeFileSync(cloudTokenPath, "cloud-door-token-value", { mode: 0o600 });
 const dataDir = mk(crowHome, "data");
 writeFileSync(join(dataDir, "crow.db"), "");
+// This instance's home, and the vouch a native runtime leaves there: doorRow only
+// offers an own-host row whose port a model server Crow knows about holds
+// (models/local-model-servers.js). The native-owned row below is 127.0.0.1:18100.
+process.env.CROW_HOME = crowHome;
+mk(crowHome, "models");
+writeFileSync(join(crowHome, "models", "state.json"), JSON.stringify({ reservations: { "native-owned": { port: 18100, owner: { crowHome, pid: process.pid } } } }));
+resetLocalModelVouchCache();
 const rolesFile = join(crowHome, "model-roles.json");
 writeFileSync(rolesFile, JSON.stringify({ roles: { everyday: "local-chat/m1" } }));
 

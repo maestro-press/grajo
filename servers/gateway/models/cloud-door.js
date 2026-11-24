@@ -67,6 +67,7 @@ import zlib from "node:zlib";
 import { StringDecoder } from "node:string_decoder";
 import { isLocalPeer } from "../../shared/peer-class.js";
 import { isLocalClassTarget, isForbiddenTarget, isDoorUrl } from "./door-resolve.js";
+import { isUnverifiedLocalTarget } from "./local-model-servers.js";
 import { consentVerdict, cloudDoorIneligibleReason } from "../../shared/cloud-consent.js";
 import { providerKeyState } from "../../shared/provider-row.js";
 import { parseStoredKey } from "../../shared/provider-key-shape.js";
@@ -100,7 +101,12 @@ const err = (status, code, message) => ({ kind: "error", status, code, message }
 
 /** A base URL the cloud door could dial: not loopback/LAN/tailnet, not a door. */
 export function isCloudTarget(url) {
-  return typeof url === "string" && !!url && !isLocalClassTarget(url) && !isDoorUrl(url);
+  if (typeof url !== "string" || !url) return false;
+  // "unverified-local" (this machine, no model server vouching for the port) is
+  // NOT a cloud target: it is not a public address at all, and a row is
+  // bot-writable, so it must never become a consented cloud provider either.
+  if (isUnverifiedLocalTarget(url)) return false;
+  return !isLocalClassTarget(url) && !isDoorUrl(url);
 }
 
 const authStyleOf = (row) => (String(row?.provider_type ?? row?.providerType ?? "").toLowerCase() === "anthropic" ? "anthropic" : "bearer");

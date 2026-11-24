@@ -29,6 +29,7 @@ import { normalizeBaseUrl } from "./provider-presets.js";
 import { providerRowToObject } from "./provider-row.js";
 import { parseStoredKey, providerKeyFp, sealedConsentFingerprint } from "./provider-key-shape.js";
 import { isLocalClassTarget, isForbiddenTarget, isDoorUrl } from "../gateway/models/door-resolve.js";
+import { isUnverifiedLocalTarget } from "../gateway/models/local-model-servers.js";
 import { DOOR_ID_PREFIX } from "./pi-compat.js";
 import { isIP } from "node:net";
 import { isPublicIp } from "./ip-classify.js";
@@ -260,7 +261,21 @@ export function consentVerdict(row, entry, { salt } = {}) {
 export function isCloudRow(row) {
   const url = row?.baseUrl ?? row?.base_url;
   if (typeof url !== "string" || !url) return false;
+  // The "unverified-local" class is NEITHER local nor cloud. It is not cloud
+  // because it is not a public address, which isCloudTarget/cloudDoorIneligibleReason
+  // below already say; this is the explicit half, so a future reordering here can
+  // never turn an own-host row a bot wrote (loopback, a listener of its own, no
+  // model server vouching for the port) into a cloud-consent candidate and so into
+  // a cloud-door forward carrying a key.
+  if (isUnverifiedLocal(url)) return false;
   return !isLocalClassTarget(url) && !isForbiddenTarget(url) && !isDoorUrl(url);
+}
+
+/** Is `url` the own-host address of no model server Crow knows about? (The vouch
+ * predicates live in models/local-model-servers.js; re-exported here as the ONE
+ * classification every surface asks.) */
+export function isUnverifiedLocal(url) {
+  return isUnverifiedLocalTarget(url);
 }
 
 const OPENAI_FAMILY = new Set([null, undefined, "", "openai-compat", "openai"]);
@@ -270,7 +285,9 @@ const OPENAI_FAMILY = new Set([null, undefined, "", "openai-compat", "openai"]);
  * aside). The one rule the providers-tab switch, grantCloudConsent, the pi
  * models.json door entries and the door's resolveCloudTarget share, checked
  * in this order:
- *   "disabled", "not_cloud" (`isCloudTarget`, default isCloudRow),
+ *   "disabled", "not_cloud" (`isCloudTarget`, default isCloudRow; the
+ *   "unverified-local" class is "not_cloud" whatever predicate is injected — a
+ *   seam may only narrow this rule, never re-admit a bot's loopback listener),
  *   "forbidden_target" (a scheme other than http(s), userinfo in the URL, or
  *   an IP literal that is not public: `isPublicIp`, the door's own check),
  *   "reserved_id" (crow-c-*, any case: the door entries' own namespace),
@@ -283,6 +300,12 @@ export function cloudDoorIneligibleReason(row, { isCloudTarget = (url) => isClou
   if (!row || typeof row !== "object" || row.disabled) return "disabled";
   const url = row.baseUrl ?? row.base_url;
   if (typeof url !== "string" || !url || !isCloudTarget(url)) return "not_cloud";
+  // An injected `isCloudTarget` may only NARROW this rule, never re-admit a row:
+  // the "unverified-local" class (this machine, no model server vouching for the
+  // port: models/local-model-servers.js) is NEVER cloud, whatever predicate a
+  // caller passes — otherwise a seam would be a way to forward an owner's
+  // content, and a key, to a bot's own loopback listener.
+  if (isUnverifiedLocal(url)) return "not_cloud";
   let u;
   try { u = new URL(url); } catch { return "forbidden_target"; }
   const host = u.hostname.replace(/^\[|\]$/g, "");

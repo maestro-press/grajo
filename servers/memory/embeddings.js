@@ -23,6 +23,9 @@ const EMBED_TASK_SET = new Set(EMBED_TASKS);
 // Per-request embed timeout. Default suits fast GPU endpoints; CPU/local
 // embedders (e.g. llamafile) need more for long documents — raise via env.
 const EMBED_TIMEOUT_MS = Number(process.env.CROW_EMBED_TIMEOUT_MS) || 10_000;
+// One retry for a transient transport failure. Never for a security refusal
+// (`SELF_TARGET_REFUSED`): that decision cannot change on a second attempt, and
+// a retry would print the guard's one refusal line twice for one call.
 const FETCH_RETRIES = 1;
 
 // Default embedding-provider resolution (spec 2026-09-24): CROW_EMBED_PROVIDER
@@ -160,6 +163,9 @@ export async function embedText(text, { providerName, guard } = {}) {
       const vecs = json.data.map((d) => Float32Array.from(d.embedding));
       return isArray ? vecs : vecs[0];
     } catch (err) {
+      // A SECURITY refusal is not a transient failure: retrying it would repeat a
+      // decision that cannot change (and print its one refusal line twice).
+      if (err && err.code === "SELF_TARGET_REFUSED") throw err;
       lastErr = err;
     }
   }
