@@ -813,9 +813,11 @@ const _jsonParser = express.json({ limit: "1mb" });
 // so the 1mb parser must not eat (or 413) the file first. The owner's Artifacts "Import file"
 // (`POST /api/artifacts/<id>/import`, bundles/artifacts/panel/routes.js) is here too: the viewer offers a
 // 4 MiB file, and the router's own json({limit:"60mb"}) parses it before its own 4 MiB text cap answers 413.
+// Crow Mail's local sync hook (`POST /mail/local/sync-now`, routes/mail-sync-hook.js) parses its own 8kb
+// body: a request over that is refused by that router's parser (413), never by the global one.
 // TWO LINES, always (a test reads this predicate out of this file with a two-line regex).
 const _hasOwnParser = (p) => p.toLowerCase().startsWith("/llm") || p.toLowerCase().startsWith("/api/workspace/live/v1/") || /^\/s\/[^/]+\/feedback$/.test(p) ||
-  /^\/dashboard\/perch-api\/interactive\/[^/]+\/(files|message)$/.test(p) || p.toLowerCase().startsWith("/dashboard/services/api/") || /^\/dashboard\/perch-api\/secret\/[^/]+\/?$/i.test(p) || /^\/dashboard\/perch-api\/staged\/[^/]+\/(send|edit|discard)\/?$/i.test(p) || /^\/dashboard\/mail\/api\//i.test(p) || /^\/dashboard\/messages\/api\//i.test(p) || /^\/dashboard\/bot-builder\/api\/sharing\//i.test(p) || p.toLowerCase().startsWith("/artifacts/upload/") || /^\/api\/artifacts\/[^/]+\/import\/?$/i.test(p);
+  /^\/dashboard\/perch-api\/interactive\/[^/]+\/(files|message)$/.test(p) || p.toLowerCase().startsWith("/dashboard/services/api/") || /^\/dashboard\/perch-api\/secret\/[^/]+\/?$/i.test(p) || /^\/dashboard\/perch-api\/staged\/[^/]+\/(send|edit|discard)\/?$/i.test(p) || /^\/dashboard\/mail\/api\//i.test(p) || /^\/dashboard\/messages\/api\//i.test(p) || /^\/dashboard\/bot-builder\/api\/sharing\//i.test(p) || p.toLowerCase().startsWith("/artifacts/upload/") || /^\/api\/artifacts\/[^/]+\/import\/?$/i.test(p) || /^\/mail\/local\/sync-now\/?$/i.test(p);
 app.use((req, res, next) => (_hasOwnParser(req.path) ? next() : _jsonParser(req, res, next)));
 
 // --- Static files (PWA manifest, service worker, icons) ---
@@ -858,6 +860,14 @@ app.use(audioProxyRouter({ createDbClient }));
 // routes' skipAuthForInstance turns that into full local-operator access.
 import { localTokenAuthMiddleware } from "./local-token.js";
 app.use(localTokenAuthMiddleware(createDbClient()));
+
+// Crow Mail's local sync hook (POST /mail/local/sync-now): the terminal `crow mail add` writes
+// crow.db itself, so it pings this route afterwards to have the already-running supervisor start the
+// new account. Mounted after instanceAuthMiddleware (so req.instanceAuth is authoritative for the
+// route's loopback check) and outside the dashboard: its own path-scoped MAIL_HOOK_TOKEN is the
+// whole auth, and the Funnel middleware above already refuses it (the path is not public).
+import mailSyncHookRouter from "./routes/mail-sync-hook.js";
+app.use(mailSyncHookRouter({ createDbClient }));
 
 // --- Instance enrollment (Phase 5-MVP peer pairing) ---
 // Off by default; set CROW_ENROLL_ENABLED=1 during the pairing ceremony.

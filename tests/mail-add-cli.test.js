@@ -34,7 +34,7 @@ const REPO = new URL("..", import.meta.url).pathname;
 const MASTER = join(root, "master", "crow.db");
 const CLI = join(REPO, "scripts", "cli", "mail-add.js");
 
-const { addMailAccount, readEnvFile, parseEnvValue, readLineFromStdin, MailCliError, EXIT } = await import("../scripts/cli/mail-add.js");
+const { addMailAccount, readEnvFile, parseEnvValue, readLineFromStdin, MailCliError, EXIT, _reportForTest } = await import("../scripts/cli/mail-add.js");
 const { createDbClient } = await import("../servers/db.js");
 const { createKeychainKey, keychainKeyPath } = await import("../servers/gateway/keychain/key.js");
 const { MailError } = await import("../servers/gateway/mail/errors.js");
@@ -714,4 +714,44 @@ test("a --password-key variable that is not in the env file is reported without 
   assert.match(r.err, /--password-key variable is not set in the env file/);
   assert.equal(r.all.includes(missing), false, "the variable name is not echoed");
   assert.equal(r.all.includes(PASSWORD), false, "nor the password");
+});
+
+/* --------------------------------------------- the closing line, and the hook */
+
+/** Run `report()` for one added outcome and return what it printed (stdout) plus its exit code. */
+function reportAdded(hook) {
+  const lines = [];
+  const original = console.log;
+  console.log = (...args) => { lines.push(args.join(" ")); };
+  try {
+    const code = _reportForTest({ outcome: "added", account: { id: "acc1", label: "Personal", address: ADDRESS } }, hook);
+    return { lines, out: lines.join("\n"), code };
+  } finally {
+    console.log = original;
+  }
+}
+
+const RESTART_LINE = "restart the gateway so the sync supervisor starts this account";
+const SYNCING_LINE = "The running gateway started syncing this account.";
+
+test("an added account whose hook notified the gateway says so, and does not ask for a restart", () => {
+  const r = reportAdded({ notified: true });
+
+  assert.equal(r.code, EXIT.ok);
+  assert.equal(r.lines[0], `added account acc1 (Personal, ${ADDRESS})`);
+  assert.equal(r.lines[1], SYNCING_LINE);
+  assert.equal(r.lines.length, 2, "the added account is two lines");
+  assert.equal(r.out.includes("restart the gateway"), false, "no restart sentence when the gateway is syncing");
+});
+
+test("an added account whose hook did not notify still asks for a restart, and never claims a sync", () => {
+  for (const hook of [{ notified: false }, undefined, {}]) {
+    const r = reportAdded(hook);
+
+    assert.equal(r.code, EXIT.ok);
+    assert.equal(r.lines[0], `added account acc1 (Personal, ${ADDRESS})`);
+    assert.equal(r.lines[1], RESTART_LINE);
+    assert.equal(r.lines.length, 2);
+    assert.equal(r.out.includes(SYNCING_LINE), false, "nothing started syncing, so nothing says it did");
+  }
 });

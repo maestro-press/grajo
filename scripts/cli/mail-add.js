@@ -80,9 +80,14 @@
  * The flag: with `CROW_MAIL` unset the gateway reaches no mail route at all, so this script refuses
  * too — but the flag usually lives in the gateway's unit, not in the operator's shell, so the refusal
  * says which of the two it can see. `--force-flag-off` adds the account anyway, and says plainly that
- * the gateway will not sync it. The sync supervisor loads accounts when it starts, so a successful
- * add ends by asking for a gateway restart — a running gateway will not pick the account up by
- * itself.
+ * the gateway will not sync it. The sync supervisor loads accounts when it starts, so after a
+ * successful add it first pings the running gateway's loopback sync hook
+ * (servers/gateway/routes/mail-sync-hook.js) with this boot's path-scoped `MAIL_HOOK_TOKEN`, which
+ * starts the new account without a restart when a gateway is up. The hook decides the closing line:
+ * when it reports `notified === true` the add ends with "The running gateway started syncing this
+ * account."; otherwise (no token file, no gateway, a refusal, a timeout, or a hook that throws) it
+ * ends by asking for a gateway restart, exactly as before. The hook is best effort in every case: the
+ * exit code is `0` either way.
  */
 // FIRST: the gateway's .env + instance-path gate, before any module below resolves a path.
 import "./lib/instance-env.js";
@@ -103,6 +108,9 @@ import { toMailError } from "../../servers/gateway/mail/errors.js";
 import { mailEnabled } from "../../servers/gateway/mail/flag.js";
 import { probeAccount } from "../../servers/gateway/mail/probe.js";
 import { createAccount, deleteAccount, listAccounts } from "../../servers/gateway/mail/store/accounts.js";
+import { MAIL_HOOK_TOKEN } from "../../servers/gateway/local-token.js";
+import { gatewayPort } from "../../servers/gateway/models/door.js";
+import { notifyMailSyncHook } from "./lib/mail-sync-hook-client.js";
 
 /** The exit codes the header documents, in one place so a caller never hard-codes a number. */
 export const EXIT = Object.freeze({
@@ -660,12 +668,19 @@ export async function addMailAccount({
 
 /* -------------------------------------------------------------------- main */
 
-/** Report one outcome the way the header documents: a line and an exit code, never a value. */
-function report(result) {
+/**
+ * Report one outcome the way the header documents: a line and an exit code, never a value.
+ *
+ * `hook` is the sync hook's outcome (`{ notified }`), which only changes the second line of the
+ * "added" case: a running gateway that started syncing this account needs no restart sentence.
+ */
+function report(result, hook = { notified: false }) {
   switch (result.outcome) {
     case "added":
       console.log(`added account ${result.account.id} (${result.account.label}, ${result.account.address})`);
-      console.log("restart the gateway so the sync supervisor starts this account");
+      console.log(hook?.notified === true
+        ? "The running gateway started syncing this account."
+        : "restart the gateway so the sync supervisor starts this account");
       return EXIT.ok;
     case "dry_run":
       console.log("dry run: the mail server accepted the sign-in and listed a folder; nothing was stored");
@@ -761,7 +776,24 @@ export async function main(argv = process.argv.slice(2)) {
 
     db = createDbClient(instance.dbPath);
     const result = await addMailAccount({ db, input, password, dryRun: args.dryRun === true });
-    return report(result);
+    // A successful add is worth telling the running gateway about: its supervisor loaded its accounts
+    // at boot, so it would otherwise leave this one alone until the next restart. Best effort in every
+    // direction — a hook that does not get through is never the add's failure, and only the closing
+    // line report() prints below depends on it; the exit code is the same either way.
+    let hook = { notified: false };
+    if (result.outcome === "added") {
+      try {
+        hook = await notifyMailSyncHook({
+          accountId: result.account.id,
+          tokenPath: MAIL_HOOK_TOKEN.path(),
+          port: gatewayPort(),
+        });
+      } catch {
+        // A hook failure is never the add's failure, and counts as not notified.
+        hook = { notified: false };
+      }
+    }
+    return report(result, hook);
   } catch (error) {
     if (error instanceof MailCliError) {
       console.error(error.message);
@@ -801,3 +833,6 @@ if (isMain()) {
 }
 
 export default main;
+
+/** The reporter itself, for tests: `main` owns it, and only the closing line depends on the hook. */
+export { report as _reportForTest };

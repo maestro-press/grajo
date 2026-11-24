@@ -22,7 +22,7 @@ import { mountMcpServer } from "../routes/mcp.js";
 import { enforcePeerExposure } from "../peer-exposure.js";
 import { connectedServers } from "../proxy.js";
 import { createBoardMcpServer } from "../board-mcp.js";
-import { ensureBoardToken, ensurePhoneToken, ensureModelsToken, ensureArtifactsToken, ensurePeerRelayToken, rotateLlmCloudToken, SERVICES_TOKEN, SATELLITE_TOOLS_TOKEN, SECRETS_TOKEN, SHARING_BOT_TOKEN, REPORTS_TOKEN } from "../local-token.js";
+import { ensureBoardToken, ensurePhoneToken, ensureModelsToken, ensureArtifactsToken, ensurePeerRelayToken, rotateLlmCloudToken, SERVICES_TOKEN, SATELLITE_TOOLS_TOKEN, SECRETS_TOKEN, SHARING_BOT_TOKEN, REPORTS_TOKEN, MAIL_HOOK_TOKEN } from "../local-token.js";
 import { peerRelayRouter } from "../routes/peer-relay.js";
 import { addonDoorsRouter } from "../routes/addon-doors.js";
 import { actorSignRouter } from "../routes/actor-sign.js";
@@ -97,7 +97,7 @@ export async function rotateCloudDoorTokenAtBoot({
  */
 export async function rotateFamilyTokensAtBoot({
   createDb = createDbClient, log = console,
-  tokens = [[SERVICES_TOKEN, "services-tools"], [SATELLITE_TOOLS_TOKEN, "satellite-tools"], [SECRETS_TOKEN, "secrets"], [SHARING_BOT_TOKEN, "sharing-bot"], [REPORTS_TOKEN, "reports"]],
+  tokens = [[SERVICES_TOKEN, "services-tools"], [SATELLITE_TOOLS_TOKEN, "satellite-tools"], [SECRETS_TOKEN, "secrets"], [SHARING_BOT_TOKEN, "sharing-bot"], [REPORTS_TOKEN, "reports"], [MAIL_HOOK_TOKEN, "mail-hook"]],
 } = {}) {
   for (const [tok, label] of tokens) {
     try {

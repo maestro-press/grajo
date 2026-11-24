@@ -62,6 +62,7 @@ export const SETTINGS_TOKEN_FAMILIES = Object.freeze([
   "mcp_secrets_token_hash",
   "mcp_sharing_bot_token_hash",
   "mcp_reports_token_hash",
+  "mcp_mail_hook_token_hash",
   "kiosk_announce_token_hash",
 ]);
 
@@ -97,6 +98,7 @@ export const ROTATED_AT_BOOT = Object.freeze([
   "mcp_secrets_token_hash",
   "mcp_sharing_bot_token_hash",
   "mcp_reports_token_hash",
+  "mcp_mail_hook_token_hash",
 ]);
 
 /** A pre-conversion stored verifier: the old code's `sha256hex(token)`. */

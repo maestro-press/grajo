@@ -142,6 +142,13 @@ export function clearMailApiRuntime() {
   runtime = { supervisor: null, adapterFactory: null };
 }
 
+/** The running supervisor boot published, or null. Read by the loopback sync hook
+ *  (routes/mail-sync-hook.js): with no supervisor there is nothing to start, so the hook answers
+ *  `503 mail_off` before scheduling any sync. */
+export function getMailSupervisor() {
+  return runtime.supervisor ?? null;
+}
+
 /* -------------------------------------------------------------- error shape */
 
 function messageFor(code) {

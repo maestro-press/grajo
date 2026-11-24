@@ -670,6 +670,17 @@ const SHARING_BOT_PATH_RE = /^\/sharing-bot\/(?:mcp|sse|messages)$/;
 export const REPORTS_TOKEN = pathScopedToken({ name: "reports", hashKey: "mcp_reports_token_hash", createdKey: "mcp_reports_token_created" });
 const REPORTS_PATH_RE = /^\/reports\/(?:mcp|sse|messages)$/;
 
+// Mail sync hook (Crow Mail, CLI add): the token the terminal's `crow mail add` presents to the
+// running gateway so its sync supervisor starts the account it just stored, instead of waiting for a
+// restart. Raw at <crowHome>/secrets/mail-hook-token (0600) in the 0700 secrets dir the pi sandbox
+// masks; rotated on EVERY boot. It authenticates ONLY the loopback mail sync hook
+// (routes/mail-sync-hook.js), which validates it itself: localTokenAuthMiddleware never consults it,
+// so it opens no MCP mount, and NO other validator consults this hash key. Because it rotates every
+// boot, a caller must READ THE FILE ON EACH CALL (as scripts/cli/lib/mail-sync-hook-client.js does)
+// and never copy the value into a config, a cron line or another host: a copy stops working at the
+// next restart, silently.
+export const MAIL_HOOK_TOKEN = pathScopedToken({ name: "mail-hook", hashKey: "mcp_mail_hook_token_hash", createdKey: "mcp_mail_hook_token_created" });
+
 /** The reports door's boot-mint entry point: the same rotation the family list runs, under the
  *  name the mount's callers use. A fresh value every call, so `minted` is always true. */
 export async function ensureReportsToken(db) {

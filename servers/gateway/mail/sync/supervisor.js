@@ -271,6 +271,9 @@ export function createMailSupervisor(options = {}) {
   /** accountId -> worker. A worker outlives a lost claim (the global tick restarts it). */
   const workers = new Map();
 
+  /** Workers whose poll was asked for before `start()`: `start()` arms theirs (see `armPoll`). */
+  const pollsBeforeStart = new Set();
+
   /** accountId -> {adapter, timer}: the short-lived adapter a `withAdapter` call borrows. */
   const actionAdapters = new Map();
 
@@ -1155,7 +1158,14 @@ export function createMailSupervisor(options = {}) {
   /* ---------------------------------------------------------------------- loops */
 
   function armPoll(worker) {
-    if (!running() || worker.pollTimer != null) return;
+    if (!live() || worker.pollTimer != null) return;
+    // `start()` has not run yet: a supervisor that was never started may never poll, so the worker is
+    // remembered and `start()` arms it. A stopped supervisor remembers nothing (live() is false).
+    if (!running()) {
+      pollsBeforeStart.add(worker);
+      return;
+    }
+    pollsBeforeStart.delete(worker);
     if (worker.claimed || worker.authFailed || !worker.syncable || notOurs(worker)) return;
     worker.pollTimer = arm(() => {
       worker.pollTimer = null;
@@ -1170,7 +1180,10 @@ export function createMailSupervisor(options = {}) {
    */
   async function pollTick(worker) {
     try {
-      if (!live() || worker.claimed || notOurs(worker) || removing(worker.accountId)) return;
+      // A worker left pending by a start whose claim read failed is not polling's to sync: its claim
+      // is still unread, and `claimCheck` reads an unreadable claim as "not claimed" (see
+      // `startAccount`). Only its short re-check may start it.
+      if (!live() || worker.claimed || worker.pendingStart || notOurs(worker) || removing(worker.accountId)) return;
       if (await claimCheck(worker)) return;
       if (!live() || worker.claimed || worker.authFailed || !worker.syncable) return;
       if (worker.backoffTimer != null || worker.inflight != null) return;
@@ -1408,21 +1421,36 @@ export function createMailSupervisor(options = {}) {
     stopped = false;
     armClaimTick();
     armRefreshTimer();
-    let accounts;
     try {
-      accounts = await listAccounts(db);
-    } catch (err) {
-      logError("accounts_failed", err);
-      return;
-    }
-    // Concurrently: one account whose server never answers must not hold up the others.
-    await Promise.allSettled(accounts.map(async (account) => {
+      let accounts;
       try {
-        await startAccount(account);
+        accounts = await listAccounts(db);
       } catch (err) {
-        logError("account_start_failed", err, { accountId: account.id });
+        logError("accounts_failed", err);
+        return;
       }
-    }));
+      // Concurrently: one account whose server never answers must not hold up the others.
+      await Promise.allSettled(accounts.map(async (account) => {
+        try {
+          await startAccount(account);
+        } catch (err) {
+          logError("account_start_failed", err, { accountId: account.id });
+        }
+      }));
+    } finally {
+      // A poll asked for before `start()` (a `syncNow` from a route, which arms the watch but could
+      // not poll yet) is armed only now, once this start's `startAccount` pass has settled for the
+      // workers it covers. Once: the set is emptied here, and `start()` never runs twice. A worker
+      // that pass left PENDING (its claim could not be read) is skipped: `claimCheck` reads an
+      // unreadable claim as "not claimed", so a poll on it could sync a loser's account. Its short
+      // re-check starts it on a claim it can read.
+      const waiting = [...pollsBeforeStart];
+      pollsBeforeStart.clear();
+      for (const worker of waiting) {
+        if (removing(worker.accountId) || notOurs(worker) || worker.pendingStart) continue;
+        armPoll(worker);
+      }
+    }
   }
 
   /* ----------------------------------------------------------------- actions */
@@ -1717,6 +1745,7 @@ export function createMailSupervisor(options = {}) {
    */
   async function retireWorker(worker, { keepRun = false } = {}) {
     worker.retired = true;
+    pollsBeforeStart.delete(worker);
     if (workers.get(worker.accountId) === worker) workers.delete(worker.accountId);
     supersede(worker);
     if (!keepRun) closeOutRun(worker);
@@ -1769,6 +1798,9 @@ export function createMailSupervisor(options = {}) {
     if (stopped) return;
     stopped = true;
     started = false;
+    // A stopped supervisor remembers nothing: a poll asked for before a `start()` that never ran (or
+    // that this `stop()` interrupted) must not be armed by the NEXT `start()`.
+    pollsBeforeStart.clear();
     claimTickTimer = disarm(claimTickTimer);
     refreshTimer = disarm(refreshTimer);
 
