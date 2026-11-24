@@ -1,5 +1,8 @@
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 // NOTE: botRuntimeActive -> readSetting -> getOrCreateLocalInstanceId() touches
 // the host's instance registry on import; that's fine here (tests run on a
 // configured Crow host with ~/.crow). The db stub below intercepts the actual
@@ -21,7 +24,9 @@ function dbWith(flagsValue) {
 }
 
 // Always restore a clean env after each test, even if an assertion throws.
+const scratchDirs = [];
 afterEach(() => {
+  for (const d of scratchDirs.splice(0)) rmSync(d, { recursive: true, force: true });
   delete process.env.CROW_HOME;
   delete process.env.CROW_DATA_DIR;
 });
@@ -31,7 +36,15 @@ test("explicit bot_runtime:true wins regardless of host", async () => {
 });
 
 test("explicit bot_runtime:false wins", async () => {
-  process.env.CROW_DATA_DIR = "/home/alex/.crow-mpa/data"; // would otherwise be true
+  // An MPA-shaped home under a scratch dir (it would otherwise auto-detect true).
+  // CROW_HOME is named explicitly and CROW_DATA_DIR is left unset: a raw
+  // `node --test` process refuses the IMPLICIT ~/.crow default
+  // (servers/shared/crow-home.js), and readSetting resolves the instance id
+  // first — which still mints a per-process id for a non-default home with no
+  // pinned data dir, so nothing is written anywhere real.
+  const scratch = mkdtempSync(join(tmpdir(), "bot-runtime-flag-"));
+  scratchDirs.push(scratch);
+  process.env.CROW_HOME = join(scratch, ".crow-mpa");
   assert.equal(await botRuntimeActive(dbWith(JSON.stringify({ bot_runtime: false }))), false);
 });
 

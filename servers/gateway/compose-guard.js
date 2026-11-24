@@ -26,6 +26,7 @@ import { execFileSync } from "node:child_process";
 // The escaping the shared refusal helper applies to an attacker-controlled name (shared, leaf
 // module: it imports nothing, so it can be read from both here and routes/bundles.js).
 import { refusalName } from "../shared/bundle-declared-paths.js";
+import { resolveCrowHome } from "../shared/crow-home.js";
 
 // A value Compose sees for a `${VAR:?}` the install left blank (a collection member,
 // finished later with Configure) so the REST of the model can still be checked. It must be a
@@ -33,7 +34,7 @@ import { refusalName } from "../shared/bundle-declared-paths.js";
 // which is never mountable read-write now, while Crow's media folder (library defaults) is
 // allowed for everyone — so nothing is widened by a compose that spells this path itself.
 export function unsetSentinel(crowHome) {
-  return join(crowHome || join(homedir(), ".crow"), "media", "crow-unset-value");
+  return join(crowHome || resolveCrowHome(), "media", "crow-unset-value");
 }
 
 /**

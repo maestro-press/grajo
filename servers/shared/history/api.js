@@ -134,8 +134,7 @@
  * `derived`), not a column of crow_context: it decides the FILING of a restored
  * section and is never part of the INSERT/UPDATE into the table itself.
  */
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { resolveCrowHome } from "../crow-home.js";
 import { BOT_DEFINITION_KEYS, COVERED, columnValueExpr, tableColumns } from "./covered.js";
 import { erasureKeys, findEraseRefusalSync } from "./erase.js";
 import { AUTHOR_KINDS, withWriteContext } from "./write-context.js";
@@ -467,7 +466,7 @@ async function artifactSeams(seams = {}) {
       if (m.design) {
         try {
           design = m.design.createDesign({
-            crowHome: process.env.CROW_HOME || join(homedir(), ".crow"),
+            crowHome: resolveCrowHome(),
             db: dbClient ?? db,
           });
         } catch {

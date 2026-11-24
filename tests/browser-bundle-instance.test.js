@@ -357,6 +357,8 @@ test("docker-compose.yml derives the project name from CROW_BROWSER_CONTAINER_NA
 // every instance; it must resolve the installed bundle under CROW_HOME.
 test("router.js resolves the installed media bundle under CROW_HOME", () => {
   const src = readFileSync(new URL("../servers/gateway/router.js", import.meta.url), "utf8");
-  assert.doesNotMatch(src, /homedir\(\),\s*"\.crow",\s*"bundles",\s*"media"/);
-  assert.match(src, /process\.env\.CROW_HOME \|\| join\(homedir\(\), "\.crow"\)/);
+  assert.doesNotMatch(src, /homedir\(\)|process\.env\.CROW_HOME/,
+    "the Crow home comes from the ONE resolver, never a local homedir()/env read (tests/crow-home-guard.test.js)");
+  assert.match(src, /const crowHome = resolveCrowHome\(\);/);
+  assert.match(src, /import \{ resolveCrowHome \} from "\.\.\/shared\/crow-home\.js";/);
 });

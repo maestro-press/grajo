@@ -16,8 +16,8 @@
 import { t } from "../shared/i18n.js";
 import { existsSync, readFileSync } from "fs";
 import { join, dirname } from "path";
-import { homedir } from "os";
 import { fileURLToPath } from "url";
+import { resolveCrowHome } from "../../../shared/crow-home.js";
 
 // ─── Visibility gate (B5, 2026-07-18) ───
 //
@@ -46,7 +46,7 @@ function federatedIds() {
 }
 
 export function hasFederatedBundleInstalled() {
-  const crowDir = process.env.CROW_HOME || join(homedir(), ".crow");
+  const crowDir = resolveCrowHome();
   const installedPath = join(crowDir, "installed.json");
   try {
     if (!existsSync(installedPath)) return false;

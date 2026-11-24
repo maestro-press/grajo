@@ -65,6 +65,7 @@ import { Router } from "express";
 import { existsSync, readFileSync, readdirSync, unlinkSync, lstatSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { resolveCrowHome } from "../../shared/crow-home.js";
 import { tasksDbPath } from "../../../scripts/pi-bots/instance-paths.mjs";
 import { createDbClient } from "../../db.js";
 import { activeProjectWhere } from "../../shared/shell-items.js";
@@ -113,7 +114,7 @@ import { defStatusLabel } from "../dashboard/panels/bot-board/data-queries.js";
 
 // Slice C: operator-approved promotion target (the PRIMARY skills dir both the
 // pi bridge and the glasses voice path search via skill_resolver).
-const CROW_USER_SKILLS = join(process.env.CROW_HOME || join(homedir(), ".crow"), "skills");
+const CROW_USER_SKILLS = join(resolveCrowHome(), "skills");
 
 const HOME = process.env.HOME || homedir();
 const TASKS_DB = tasksDbPath();

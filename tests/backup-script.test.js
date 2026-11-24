@@ -124,11 +124,20 @@ const quickCheck = (file) => {
  * The script env: its own HOME/CROW_HOME (so ~/.crow is scratch), its own
  * backup dir, a port of its own (never the host's real gateway port), and all
  * optional upload destinations off.
+ *
+ * CROW_HOME is set explicitly to <ctx.home>/.crow — the SAME path an unset
+ * CROW_HOME resolves to under HOME=<ctx.home>, so this stays the host-default
+ * instance (no backup tag, ~/.crow/backups still the legacy dir) while a child
+ * that reaches resolveCrowHome() never sees the implicit default. That default
+ * is refused under node --test (CROW_HOME_REQUIRED_IN_TESTS,
+ * servers/shared/crow-home.js), and the children here inherit
+ * NODE_TEST_CONTEXT from this process.
  */
 function envFor(ctx, extra = {}) {
   const env = {
     ...process.env,
     HOME: ctx.home,
+    CROW_HOME: join(ctx.home, ".crow"),
     CROW_DB_PATH: join(ctx.data, "crow.db"),
     CROW_BACKUP_DIR: ctx.backupDir,
     PORT: String(ctx.port),
@@ -142,8 +151,8 @@ function envFor(ctx, extra = {}) {
     CROW_BACKUP_GIT_REPO: "",
     ...extra,
   };
-  // Default instance (no tag) and no real instance paths leaked from the suite.
-  delete env.CROW_HOME;
+  // Default instance (no tag) and no real instance paths leaked from the suite
+  // (CROW_HOME above is this test's own scratch home, not the suite's).
   delete env.CROW_DATA_DIR;
   // `extra` wins over those deletes, so a test can describe a co-hosted
   // instance (its own CROW_HOME) without hand-building a whole env.

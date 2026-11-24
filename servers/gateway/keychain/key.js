@@ -15,9 +15,9 @@
  * caller decides, store.ensureWriteKey) and is then moved aside, never deleted.
  */
 import { existsSync, readFileSync, mkdirSync, chmodSync, openSync, writeSync, fsyncSync, closeSync, linkSync, unlinkSync, renameSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { randomBytes, createHash } from "node:crypto";
+import { resolveCrowHome } from "../../shared/crow-home.js";
 
 export class KeychainKeyInvalidError extends Error {
   constructor(path) {
@@ -27,7 +27,7 @@ export class KeychainKeyInvalidError extends Error {
   }
 }
 
-export function keychainKeyPath(crowHome = process.env.CROW_HOME || join(homedir(), ".crow")) {
+export function keychainKeyPath(crowHome = resolveCrowHome()) {
   return join(crowHome, "secrets", "keychain.key");
 }
 

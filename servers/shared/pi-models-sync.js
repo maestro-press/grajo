@@ -23,6 +23,7 @@
 import { readFileSync, writeFileSync, renameSync, chmodSync, mkdirSync, existsSync, lstatSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { resolveCrowHome } from "./crow-home.js";
 import { doorKindOf, isLocalClassTarget } from "../gateway/models/door-resolve.js";
 import { providerDoorUrl, cloudDoorUrl } from "../gateway/models/door.js";
 import { consentVerdict, cloudDoorEligible } from "./cloud-consent.js";
@@ -37,7 +38,7 @@ const OPENAI_TYPES = new Set([null, undefined, "", "openai-compat", "openai"]);
 const NON_CHAT = new Set([...EMBED_TASKS, ...RERANK_TASKS]);
 
 export function piModelsSyncPath({
-  env = process.env, crowHome = env.CROW_HOME || join(homedir(), ".crow"), home = env.HOME || homedir(),
+  env = process.env, crowHome = resolveCrowHome(env), home = env.HOME || homedir(),
   existsFn = existsSync, piCliFn = () => resolvePiCli({ env, crowHome }),
 } = {}) {
   if (env.CROW_PI_MODELS_SYNC === "0") return null;

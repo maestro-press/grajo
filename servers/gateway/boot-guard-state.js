@@ -26,6 +26,7 @@ import {
 } from "node:fs";
 import { homedir, uptime as osUptime } from "node:os";
 import { dirname, join } from "node:path";
+import { resolveCrowHome } from "../shared/crow-home.js";
 import { fileURLToPath } from "node:url";
 import {
   BOOT_GUARD_DIR, FULL_SHA_RE, LAUNCHER_FILE, LAUNCHER_VERSION, freshState, loadState, saveState,
@@ -50,7 +51,7 @@ export function _setBootGuardHomeForTest(dir) { _home = dir; }
 export function bootGuardHome(env = process.env) {
   if (_home) return _home;
   const raw = String(env?.CROW_HOME || "").trim();
-  return raw || join(homedir(), ".crow");
+  return raw || resolveCrowHome(env);
 }
 
 export function stateDirFor(env = process.env) {

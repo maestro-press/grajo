@@ -270,6 +270,13 @@ function instanceEnv(fakeHome, crowHome) {
     env.CROW_HOME = crowHome;
     env.CROW_DATA_DIR = join(crowHome, "data");
   } else {
+    // A CROW_HOME-unset instance resolves its home to <HOME>/.crow. Name it
+    // explicitly (same value): a child of the node test runner inherits
+    // NODE_TEST_CONTEXT, and the resolver refuses the IMPLICIT default there
+    // rather than reaching the operator's real ~/.crow (servers/shared/crow-home.js
+    // assertCrowHomeResolvable). The isDefaultCrowHome() answers are unchanged —
+    // this IS the host-default home for this fake HOME.
+    env.CROW_HOME = join(fakeHome, ".crow");
     env.CROW_DATA_DIR = join(fakeHome, ".crow", "data");
   }
   return env;

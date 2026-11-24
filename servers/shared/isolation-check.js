@@ -15,6 +15,7 @@
 import { closeSync, constants, openSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { resolveCrowHome } from "./crow-home.js";
 import { SECRET_NAME_RE } from "./bot-env.js";
 
 /** True when `path` (file or directory) can be opened read-only by this process. */
@@ -148,7 +149,7 @@ function looksLikeInstanceHome(p) {
 
 /** Default sensitive paths: the other ~/.crow* homes, ~/.ssh, ~/.gnupg, and the
  *  Google Cloud CLI's credential folder ~/.config/gcloud. */
-export function defaultSensitivePaths({ home = homedir(), crowHome = process.env.CROW_HOME || join(homedir(), ".crow") } = {}) {
+export function defaultSensitivePaths({ home = homedir(), crowHome = resolveCrowHome() } = {}) {
   const own = resolve(crowHome);
   const parent = dirname(own);
   const paths = [];

@@ -6,14 +6,13 @@
  * project, the one pi_bot_defs query appsForProject makes. The canManage
  * lookup runs only when an extra tile is registered.
  */
-import { join } from "node:path";
-import { homedir } from "node:os";
+import { resolveCrowHome } from "../../shared/crow-home.js";
 import { listApps, appsForProject } from "./catalog.js";
 import { launcherTiles, hasLauncherTiles, canManageProject } from "./extra-tiles.js";
 import { appIconSvg } from "../dashboard/shared/app-icons.js";
 
 export function defaultCrowHome() {
-  return process.env.CROW_HOME || join(homedir(), ".crow");
+  return resolveCrowHome();
 }
 
 /**

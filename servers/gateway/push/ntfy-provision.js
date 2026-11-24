@@ -12,7 +12,8 @@ import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import { join, sep } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
+import { resolveCrowHome } from "../../shared/crow-home.js";
 import {
   ntfyDataDir, ntfyConfigPath, readStoredNtfyConfig, writeStoredNtfyConfig, removeStoredNtfyConfig,
 } from "./ntfy-config.js";
@@ -101,7 +102,7 @@ export function parseAutowireTokens(text) {
 /** NTFY_PORT from this instance's installed ntfy bundle .env, or undefined. */
 export function bundleNtfyPort(env = process.env) {
   try {
-    const home = env.CROW_HOME || join(homedir(), ".crow");
+    const home = resolveCrowHome(env);
     const m = /^\s*NTFY_PORT\s*=\s*["']?(\d{1,5})["']?\s*$/m.exec(readFileSync(join(home, "bundles", "ntfy", ".env"), "utf8"));
     return m ? m[1] : undefined;
   } catch {
@@ -271,7 +272,7 @@ export async function deprovisionNtfy({ runner = defaultRunner, env = process.en
 /** Bundle ids in this instance's installed.json (array or object shape). Never throws. */
 export function installedBundleIds(env = process.env) {
   try {
-    const home = env.CROW_HOME || join(homedir(), ".crow");
+    const home = resolveCrowHome(env);
     const d = JSON.parse(readFileSync(join(home, "installed.json"), "utf8"));
     const arr = Array.isArray(d) ? d : Object.entries(d || {}).map(([k, v]) => ({ id: k, ...v }));
     return arr.map((e) => (typeof e === "string" ? e : e?.id)).filter(Boolean);

@@ -5,7 +5,7 @@
 
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
-import { homedir } from "os";
+import { resolveCrowHome } from "../../../shared/crow-home.js";
 import { emitOrQueue } from "../../../shared/sync-emit.js";
 
 /** @type {Map<string, object>} */
@@ -116,7 +116,7 @@ export async function dispatchAction(sectionsList, { req, res, db, action, lang 
 export async function loadAddonSettings() {
   // Resolved via CROW_HOME so co-hosted instances load their OWN add-on
   // settings sections, not the primary instance's.
-  const crowDir = process.env.CROW_HOME || join(homedir(), ".crow");
+  const crowDir = resolveCrowHome();
   const installedPath = join(crowDir, "installed.json");
 
   if (!existsSync(installedPath)) return;

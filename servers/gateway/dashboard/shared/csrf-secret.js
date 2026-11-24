@@ -32,13 +32,13 @@ import {
   linkSync, unlinkSync, renameSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
+import { resolveCrowHome } from "../../../shared/crow-home.js";
 
 const cache = new Map();
 
 /** `<CROW_HOME>/secrets/csrf.key` (CROW_HOME defaults to ~/.crow). */
-export function csrfSecretPath(crowHome = process.env.CROW_HOME || join(homedir(), ".crow")) {
+export function csrfSecretPath(crowHome = resolveCrowHome()) {
   return join(crowHome, "secrets", "csrf.key");
 }
 

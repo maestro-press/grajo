@@ -44,7 +44,7 @@ import { createProxyMiddleware, fixRequestBody } from "http-proxy-middleware";
 import { Router } from "express";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
-import { homedir } from "node:os";
+import { resolveCrowHome } from "../../shared/crow-home.js";
 import { sessionFromRequest } from "../dashboard/auth.js";
 import { isLocalPasswordSession } from "../dashboard/local-session.js";
 import { scopeProxySetCookieHeader, stripCrowCookiesForBackend, stripSetCookieFromHandshake } from "../proxy-cookie-filter.js";
@@ -58,7 +58,7 @@ export { rewriteProxySetCookie, setCookieName } from "../proxy-cookie-filter.js"
 // Respect CROW_HOME so a secondary instance (systemd unit with its own
 // CROW_HOME) proxies ITS extensions — not the primary's. Hardcoding ~/.crow
 // here made every co-hosted instance serve the primary's web UIs.
-const CROW_HOME = process.env.CROW_HOME || join(homedir(), ".crow");
+const CROW_HOME = resolveCrowHome();
 
 export function getManifest(bundleId, home = CROW_HOME) {
   const manifestPath = join(home, "bundles", bundleId, "manifest.json");

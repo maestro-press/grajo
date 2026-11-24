@@ -8,13 +8,13 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 
 import { resolveDataDir } from "../db.js";
+import { resolveCrowHome } from "../shared/crow-home.js";
 import { loadState, PORT_RANGE_START as NATIVE_MODEL_PORT_START, PORT_RANGE_END as NATIVE_MODEL_PORT_END } from "./models/state.js";
 
 const execFileP = promisify(execFile);
-const CROW_HOME = process.env.CROW_HOME || join(homedir(), ".crow");
+const CROW_HOME = resolveCrowHome();
 const BUNDLES_DIR = join(CROW_HOME, "bundles");
 const INSTALLED_PATH = join(CROW_HOME, "installed.json");
 

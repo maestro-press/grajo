@@ -7,8 +7,8 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
+import { resolveCrowHome } from "../../../../shared/crow-home.js";
 import { getPeerCreds } from "../../../../shared/peer-credentials.js";
 import { getOrCreateLocalInstanceId } from "../../../instance-registry.js";
 import { readSetting } from "../../settings/registry.js";
@@ -57,7 +57,7 @@ export async function getNestData(db, lang, opts = {}) {
   // Installed bundles — resolved via CROW_HOME so co-hosted instances (MPA,
   // alternate workspaces) render their OWN installed.json, not the primary's.
   let bundles = [];
-  const crowHome = process.env.CROW_HOME || join(homedir(), ".crow");
+  const crowHome = resolveCrowHome();
   const installedPath = join(crowHome, "installed.json");
   if (existsSync(installedPath)) {
     try {

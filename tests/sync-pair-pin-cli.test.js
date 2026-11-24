@@ -6,7 +6,7 @@
  */
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, statSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,7 +29,12 @@ async function setup() {
   dirs.push(dir);
   const db = await makeRealDb(dir);
   writeFileSync(join(dir, "instance-id"), LOCAL + "\n");
-  const tokens = join(dir, "peer-tokens.json");
+  // The store lives in <CROW_HOME>/secrets, as it does on a real instance: the
+  // CLI treats CROW_PEER_TOKENS_PATH=<CROW_HOME>/peer-tokens.json as the OLD
+  // default location and MOVES that file into secrets/ (peer-credentials.js
+  // activeOverride/reconcileLegacy), which would delete this fixture.
+  mkdirSync(join(dir, "secrets"), { recursive: true, mode: 0o700 });
+  const tokens = join(dir, "secrets", "peer-tokens.json");
   writeFileSync(tokens, JSON.stringify({
     [PEER]: { auth_token: "t1", signing_key: SK },
     [OTHER]: { auth_token: "t2", signing_key: SK2 },
@@ -40,7 +45,11 @@ async function setup() {
   for (const k of [`${SYNC_PB_KEY_PREFIX}${PEER}`, `${SYNC_PB_KEY_PREFIX}${OTHER}`, `tailnet_sync_cr:${PEER}`, `instance_hs_cb:abc`]) {
     await db.execute({ sql: "INSERT INTO dashboard_settings_overrides (key, instance_id, value) VALUES (?, ?, '1')", args: [k, LOCAL] });
   }
-  const env = { PATH: process.env.PATH, HOME: dir, CROW_DATA_DIR: dir, CROW_DB_PATH: join(dir, "crow.db"), CROW_PEER_TOKENS_PATH: tokens, CROW_DISABLE_NOSTR: "1" };
+  // CROW_HOME is the scratch dir too: the CLI (and the servers/ code it imports)
+  // resolves this instance's home with resolveCrowHome(), which refuses the
+  // implicit ~/.crow under node --test (CROW_HOME_REQUIRED_IN_TESTS). The data
+  // dir still comes from CROW_DATA_DIR, so every derived path is the same.
+  const env = { PATH: process.env.PATH, HOME: dir, CROW_HOME: dir, CROW_DATA_DIR: dir, CROW_DB_PATH: join(dir, "crow.db"), CROW_PEER_TOKENS_PATH: tokens, CROW_DISABLE_NOSTR: "1" };
   return { dir, db, env, tokens };
 }
 

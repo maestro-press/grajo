@@ -165,7 +165,10 @@ test("write path: explicit CROW_PEER_TOKENS_PATH — ensureDir creates THAT file
   const explicitPath = join(scratch, "deep", "nested", "tokens.json");
   assert.equal(existsSync(dirname(explicitPath)), false);
 
-  const mod = await freshModule({ home: makeFakeHome(), tokensPath: explicitPath });
+  // An instance home is named too: ensureDir resolves the instance before the
+  // override wins, and a raw `node --test` process refuses the implicit ~/.crow
+  // default (servers/shared/crow-home.js).
+  const mod = await freshModule({ home: makeFakeHome(), crowHome: makeTempDir("peer-creds-explicit-home-"), tokensPath: explicitPath });
   mod.setPeerCreds("crow:cccccccccc", {
     auth_token: "e".repeat(64),
     signing_key: "0".repeat(64),
@@ -174,11 +177,14 @@ test("write path: explicit CROW_PEER_TOKENS_PATH — ensureDir creates THAT file
   assert.equal(statSync(explicitPath).mode & 0o777, 0o600);
 });
 
-test("default (no vars): derives homedir()/.crow/peer-tokens.json — path derivation only", async () => {
+test("default home: derives homedir()/.crow/peer-tokens.json — path derivation only", async () => {
   // HOME points at a scratch dir, so homedir() is scratch — this asserts pure
-  // derivation without ever touching the operator's real home.
+  // derivation without ever touching the operator's real home. CROW_HOME names
+  // exactly what that default derives: a raw `node --test` process refuses the
+  // IMPLICIT ~/.crow default (servers/shared/crow-home.js), so the value is
+  // spelled out here and the assertion below is unchanged.
   const fakeHome = makeFakeHome();
-  const mod = await freshModule({ home: fakeHome });
+  const mod = await freshModule({ home: fakeHome, crowHome: join(fakeHome, ".crow") });
   assert.equal(homedir(), fakeHome, "safety net: homedir must be the scratch dir");
   assert.equal(
     mod.peerTokensPath(),

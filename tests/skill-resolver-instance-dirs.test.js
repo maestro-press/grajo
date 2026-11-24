@@ -45,7 +45,10 @@ test("skillDirs: a non-primary CROW_HOME searches only its own skills and the ru
 
 test("skillDirs: no crowHome falls back to CROW_HOME, then ~/.crow", () => {
   assert.deepEqual(skillDirs(), [join(other, "skills"), RUNNING_REPO_SKILLS]);
-  delete process.env.CROW_HOME;
+  // The host-default home, named explicitly: a raw `node --test` process refuses
+  // the IMPLICIT ~/.crow default (servers/shared/crow-home.js), so the value the
+  // default would derive is spelled out. The assertions are unchanged.
+  process.env.CROW_HOME = join(process.env.HOME, ".crow");
   try {
     assert.deepEqual(skillDirs(), [join(process.env.HOME, ".crow", "skills"), RUNNING_REPO_SKILLS]);
     assert.ok(resolveSkill("main-only"), "the primary itself still reads ~/.crow/skills");

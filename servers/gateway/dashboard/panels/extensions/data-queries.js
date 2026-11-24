@@ -9,8 +9,8 @@ import { addonLauncherStatus } from "../../../../shared/resolve-command.js";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { execFile, execFileSync } from "child_process";
 import { join, dirname } from "path";
-import { homedir } from "os";
 import { fileURLToPath } from "url";
+import { resolveCrowHome } from "../../../../shared/crow-home.js";
 import { loadCollections } from "./collections.js";
 // bundles-config.js ONLY — never routes/bundles.js, which would drag express
 // Router, db.js, peer-forward, cross-host-auth and the settings registry into the
@@ -24,7 +24,7 @@ import { composeEnv } from "../../../compose-guard.js";
 // Respect the instance's CROW_HOME (matches bundles.js / proxy.js resolveCrowHome).
 // Without this, an alternate instance (CROW_HOME=~/.crow-mpa, ~/.crow-finance) reads
 // the MAIN ~/.crow's installed.json/stores.json instead of its own.
-export const CROW_DIR = process.env.CROW_HOME || join(homedir(), ".crow");
+export const CROW_DIR = resolveCrowHome();
 export const INSTALLED_PATH = join(CROW_DIR, "installed.json");
 export const STORES_PATH = join(CROW_DIR, "stores.json");
 

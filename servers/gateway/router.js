@@ -22,6 +22,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { z } from "zod";
 import { jsonObject } from "../shared/tool-schema-types.js";
+import { resolveCrowHome } from "../shared/crow-home.js";
 
 import { createMemoryServer } from "../memory/server.js";
 import { createProjectServer } from "../research/server.js";
@@ -109,11 +110,10 @@ export function createRouterServer(options = {}) {
         const { existsSync } = await import("node:fs");
         const { join } = await import("node:path");
         const { pathToFileURL } = await import("node:url");
-        const { homedir } = await import("node:os");
         // Instance-scoped: an alternate instance (CROW_HOME=~/.crow-r4) must
         // load ITS installed media bundle, not the primary's. Read at call
         // time so a CROW_HOME set only in .env is honored.
-        const crowHome = process.env.CROW_HOME || join(homedir(), ".crow");
+        const crowHome = resolveCrowHome();
         const installed = join(crowHome, "bundles", "media", "server", "server.js");
         const repo = join(import.meta.dirname, "../../bundles/media/server/server.js");
         const serverPath = existsSync(installed) ? installed : repo;

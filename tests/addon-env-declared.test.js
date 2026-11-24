@@ -98,8 +98,11 @@ const APP_MODULES = {
     },
   },
   "servers/shared/crow-home.js": {
-    keys: ["CROW_HOME", "CROW_DATA_DIR", "CROW_DB_PATH", "CROW_ALLOW_SHARED_DATA_DIR"],
-    exempt: { CROW_ALLOW_SHARED_DATA_DIR: "the waiver for the boot-time instance-identity check; a child that does not see it never takes the waive path" },
+    keys: ["CROW_HOME", "CROW_DATA_DIR", "CROW_DB_PATH", "CROW_ALLOW_SHARED_DATA_DIR", "NODE_TEST_CONTEXT"],
+    exempt: {
+      CROW_ALLOW_SHARED_DATA_DIR: "the waiver for the boot-time instance-identity check; a child that does not see it never takes the waive path",
+      NODE_TEST_CONTEXT: "set only by the node test runner, to refuse the implicit ~/.crow under a raw `node --test`; a child that does not see it (every real gateway and add-on) keeps the ~/.crow default",
+    },
   },
   "servers/gateway/dashboard/auth.js": {
     keys: ["CROW_HOSTED", "CROW_HOSTING_API_URL", "CROW_HOSTING_AUTH_TOKEN", "CROW_ALLOWED_IPS", "CROW_DASHBOARD_PUBLIC", "NODE_ENV"],
@@ -137,7 +140,7 @@ const APP_MODULES = {
       CROW_PUSH_SEND_TIMEOUT_MS: "gateway-wide push timeout, defaulted; a no-op push never uses it",
     },
   },
-  "servers/gateway/dashboard/settings/registry.js": { keys: ["CROW_HOME"], exempt: {} },
+  "servers/gateway/dashboard/settings/registry.js": { keys: [], exempt: {} },
   "servers/shared/sqlite-datasets.js": { keys: ["CROW_DB_PATH", "PATH"], exempt: {} },
   "servers/shared/project-spaces.js": { keys: ["CROW_DB_PATH"], exempt: {} },
   "servers/shared/rate-limiter.js": { keys: [], exempt: {} },

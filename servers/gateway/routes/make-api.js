@@ -19,8 +19,7 @@
  */
 import express, { Router } from "express";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
+import { resolveCrowHome } from "../../shared/crow-home.js";
 import { jsonError } from "./_error.js";
 import { createDbClient } from "../../db.js";
 import { assertLiveProject, setItemCard, setItemProject } from "../../shared/shell-items.js";
@@ -88,7 +87,7 @@ export function makeApiRouter(dashboardAuth) {
           throw err;
         }
       }
-      const crowHome = process.env.CROW_HOME || join(homedir(), ".crow");
+      const crowHome = resolveCrowHome();
       let made;
       try {
         made = await createBlankWorkspaceFile({ crowHome, kind, title, projectSlug: slug });

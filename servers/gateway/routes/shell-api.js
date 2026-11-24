@@ -44,8 +44,7 @@
  * lands with the Workspace work in P4.
  */
 import { Router } from "express";
-import { join } from "node:path";
-import { homedir } from "node:os";
+import { resolveCrowHome } from "../../shared/crow-home.js";
 import { jsonError } from "./_error.js";
 import { createDbClient } from "../../db.js";
 import { ITEM_KINDS, setItemProject, setItemCard } from "../../shared/shell-items.js";
@@ -171,7 +170,7 @@ async function itemExists(db, kind, ref) {
     return exists(db, "SELECT 1 FROM artifacts WHERE id = ? AND deleted_at IS NULL LIMIT 1", [ref]);
   }
   // workspace_file: installed bundle only (existence check moves to P4).
-  const crowHome = process.env.CROW_HOME || join(homedir(), ".crow");
+  const crowHome = resolveCrowHome();
   return installedBundleIds(crowHome).includes("workspace");
 }
 

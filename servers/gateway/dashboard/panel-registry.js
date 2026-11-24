@@ -7,7 +7,7 @@
 
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
-import { homedir } from "os";
+import { resolveCrowHome } from "../../shared/crow-home.js";
 
 /** @type {Map<string, object>} */
 const panels = new Map();
@@ -37,7 +37,7 @@ export function registerPanel(manifest) {
  * Honors CROW_HOME so alternate instances (MPA) load their own panels.
  */
 export async function loadExternalPanels() {
-  const crowDir = process.env.CROW_HOME || join(homedir(), ".crow");
+  const crowDir = resolveCrowHome();
   const panelsDir = join(crowDir, "panels");
   const configPath = join(crowDir, "panels.json");
 

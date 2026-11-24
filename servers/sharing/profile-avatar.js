@@ -30,8 +30,8 @@ import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
 import bus from "../shared/event-bus.js";
+import { resolveCrowHome } from "../shared/crow-home.js";
 import { validateAvatar } from "./avatar.js";
 import { upsertSetting, deleteLocalSetting } from "../gateway/dashboard/settings/registry.js";
 import { broadcastProfile, readBroadcastPending } from "./peer-profile.js";
@@ -41,7 +41,7 @@ const __dir = dirname(fileURLToPath(import.meta.url));
 
 /** Same order as servers/gateway/boot/feature-mounts.js: installed copy, then the repo. */
 export function birdEngineCandidates() {
-  const crowHome = process.env.CROW_HOME || join(homedir(), ".crow");
+  const crowHome = resolveCrowHome();
   return [
     join(crowHome, "bundles", "ramble", "server", "bird-svg.cjs"),
     join(__dir, "..", "..", "bundles", "ramble", "server", "bird-svg.cjs"),

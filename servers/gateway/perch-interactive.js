@@ -148,9 +148,8 @@ import Database from "better-sqlite3";
 import { resolveDataDir } from "../db.js";
 import { randomUUID } from "node:crypto";
 import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { isAbsolute, join, sep } from "node:path";
-
+import { resolveCrowHome } from "../shared/crow-home.js";
 import { createDbClient } from "../db.js";
 import { offerableProjectConnections } from "./services/children.js";
 import { scopeRefFor } from "../../scripts/pi-bots/actor-sig.mjs";
@@ -691,7 +690,7 @@ function clearAsk(s) {
  */
 export function createInteractiveEngine({
   env = process.env,
-  crowHome = env.CROW_HOME || join(homedir(), ".crow"),
+  crowHome = resolveCrowHome(env),
   bridge = null,
   providerModels = null,
   now = Date.now,

@@ -15,6 +15,11 @@
  *                             → (non-default home) <CROW_HOME>/data
  *                             → ~/.crow/data
  *
+ * Under the Node test runner (`npm test`, which sets a scratch CROW_HOME) these
+ * resolvers behave as below; a RAW `node --test` with CROW_HOME unset throws
+ * CROW_HOME_REQUIRED_IN_TESTS instead of reaching the operator's ~/.crow
+ * (assertCrowHomeResolvable).
+ *
  * A non-default CROW_HOME never falls back to the host-default ~/.crow/data
  * (queue item 33, 2026-10-16): a second gateway that did reconciled the
  * primary's model state against its own DB and freed the primary's port
@@ -51,9 +56,39 @@ export const PINNED_PATH_ENV_KEYS = Object.freeze([
   "CROW_BOX_LEDGER_PATH", "CROW_HOST_TIMERS_DIR",
 ]);
 
+/**
+ * Refuse to reach the host-default ~/.crow from a process the Node test runner
+ * started without a scratch env.
+ *
+ * `npm test` runs scripts/run-suite.mjs, which always points CROW_HOME at a
+ * scratch dir. A RAW `node --test tests/<file>.test.js` does not, and a test
+ * that set only CROW_DATA_DIR/CROW_DB_PATH then resolved its Crow home to the
+ * operator's real ~/.crow and wrote token/csrf/keychain files there. Hundreds
+ * of test files set a DB path without CROW_HOME, so pinning each is not
+ * realistic — the default resolution itself refuses instead.
+ *
+ * The Node test runner sets NODE_TEST_CONTEXT in every process it starts for a
+ * test file (`node --test` forks one child per file; the value selects the
+ * reporter serializer, e.g. "child-v8"). It is absent in a normal process, so
+ * production is unaffected. Only the IMPLICIT default (no env argument, i.e.
+ * the real process environment) is refused: a test of the default resolution
+ * passes an explicit env object and keeps today's answer.
+ */
+export function assertCrowHomeResolvable(env = process.env) {
+  if (env.CROW_HOME) return;
+  if (env !== process.env || !process.env.NODE_TEST_CONTEXT) return;
+  const err = new Error(
+    "CROW_HOME is not set under node --test: run `npm test -- <files>` (scratch env) or set CROW_HOME to a temp dir",
+  );
+  err.code = "CROW_HOME_REQUIRED_IN_TESTS";
+  throw err;
+}
+
 /** This instance's home (bundles, installed.json, skills, tokens). */
 export function resolveCrowHome(env = process.env) {
-  return env.CROW_HOME || join(homedir(), ".crow");
+  if (env.CROW_HOME) return env.CROW_HOME;
+  assertCrowHomeResolvable(env);
+  return join(homedir(), ".crow");
 }
 
 /** True when this instance uses the host-default home (~/.crow). */
@@ -64,6 +99,11 @@ export function isDefaultCrowHome(env = process.env, homeDir = homedir()) {
 
 /** This instance's data dir for identity/state files (instance-id, refcounts, ntfy, model state). */
 export function resolveInstanceDataDir(env = process.env, homeDir = homedir()) {
+  // Same refusal as resolveCrowHome, and for the same reason: a raw
+  // `node --test` with CROW_HOME unset must not resolve THIS instance's state
+  // from the operator's real ~/.crow — even when CROW_DATA_DIR names a scratch
+  // dir, the answer would be a half-default instance (home ~/.crow, data tmp).
+  assertCrowHomeResolvable(env);
   if (env.CROW_DATA_DIR) return resolve(env.CROW_DATA_DIR);
   if (!isDefaultCrowHome(env, homeDir)) {
     return env.CROW_DB_PATH ? dirname(resolve(env.CROW_DB_PATH)) : resolve(env.CROW_HOME, "data");
