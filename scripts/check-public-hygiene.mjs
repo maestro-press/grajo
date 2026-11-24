@@ -56,9 +56,13 @@
  * violation reads `private host name #2 (host-shaped: ssh target)`, naming the
  * line in the denylist file and the shape that matched.
  *
- * Usage: node scripts/check-public-hygiene.mjs [--no-denylist] [--rev <commit>] [--messages <range>]
+ * Usage: node scripts/check-public-hygiene.mjs [--no-denylist] [--rev <commit>] [--messages <revisions>]
  *   --rev scans the committed tree of <commit> instead of the working tree;
- *   --messages also scans the commit messages in <range> (e.g. origin/main..HEAD).
+ *   --messages also scans the commit messages selected by <revisions>: one or
+ *   more git revision arguments separated by whitespace, each passed to
+ *   `git log` verbatim (e.g. origin/main..HEAD, or the exclusion form
+ *   HEAD ^origin/main ^refs/remotes/gitea/main that the pre-push hook uses to
+ *   leave main's already-public messages out of a merge's re-scan).
  *   Denylist file lines: <token> (substring match) or `host: <name>` (the
  *   host-shaped checks above).
  * Exit 0 clean, 1 on any violation.
@@ -402,7 +406,11 @@ export function scanRepo({ root = REPO_ROOT, denylist = [], hosts = [], rev = nu
     violations.push(...checkContent(path, buf.toString("utf8"), { allow, denylist, hosts }));
   }
   if (messages) {
-    const log = execFileSync("git", ["log", "--format=%H%n%B", messages], { cwd: root, maxBuffer: 64 * 1024 * 1024 }).toString("utf8");
+    // `messages` may hold several git revision arguments separated by
+    // whitespace (e.g. `<sha> ^<sha> ^refs/remotes/gitea/main`); a single range
+    // like `a..b` is one argument and works unchanged.
+    const revs = String(messages).split(/\s+/).filter(Boolean);
+    const log = execFileSync("git", ["log", "--format=%H%n%B", ...revs], { cwd: root, maxBuffer: 64 * 1024 * 1024 }).toString("utf8");
     violations.push(...checkContent(`commit messages ${messages}`, log, { allow, denylist, hosts }));
   }
   return { files: entries.length, violations };

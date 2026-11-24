@@ -16,9 +16,10 @@
 # Which messages a push publishes is measured from the pushed remote's own
 # main (refs/remotes/$1/main, falling back to origin/main) — never from a
 # possibly stale origin/main that reaches back over main's already-public
-# history. A fast-forward of branch-only commits scans the remote head..local.
-# When the remote head is already on main (a rebase or force push), it scans
-# from the merge-base with that main instead.
+# history. A fast-forward of branch-only commits scans the remote head..local,
+# excluding that main too, so a merge of main into the branch does not re-scan
+# main's messages. When the remote head is already on main (a rebase or force
+# push), it scans from the merge-base with that main instead.
 set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
 zero=0000000000000000000000000000000000000000
@@ -51,6 +52,12 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
      && git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
     if [ -n "$base" ] && git merge-base --is-ancestor "$remote_sha" "$base" 2>/dev/null; then
       range="$base..$local_sha"
+    elif [ -n "$main_ref" ]; then
+      # Several revision arguments, split by the hygiene script. Excluding the
+      # pushed remote's main as well as the remote head keeps a merge of main
+      # into the branch from re-scanning main's own, already public, messages.
+      # Still the full ref name for main (see the note below).
+      range="$local_sha ^$remote_sha ^$main_ref"
     else
       range="$remote_sha..$local_sha"
     fi

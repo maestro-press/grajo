@@ -205,6 +205,28 @@ test("--rev scans the committed tree and --messages the commit messages, not the
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("scanRepo's messages option takes several git revision arguments, not just one range", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hygiene-msgs-multi-"));
+  try {
+    const git = (...a) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.org", ...a], { cwd: dir, stdio: "pipe" }).toString().trim();
+    git("init", "-q");
+    writeFileSync(join(dir, "a.md"), "clean\n");
+    git("add", "a.md"); git("commit", "-q", "-m", "base");
+    const base = git("rev-parse", "HEAD");
+    writeFileSync(join(dir, "b.md"), "more\n"); git("add", "b.md");
+    git("commit", "-q", "-m", "add tokenone to the notes");
+    const leak = git("rev-parse", "HEAD");
+    writeFileSync(join(dir, "c.md"), "branch\n"); git("add", "c.md");
+    git("commit", "-q", "-m", "branch only");
+    const tip = git("rev-parse", "HEAD");
+    const rules = (messages) => scanRepo({ root: dir, messages, denylist: ["tokenone"] }).violations.map((v) => v.rule);
+    assert.deepEqual(rules(`${base}..HEAD`), ["denylisted token #1"], "a single range is one argument and still works");
+    assert.deepEqual(rules(`${tip} ^${leak}`), [], "the excluded commit's message is not scanned");
+    assert.deepEqual(rules(`${tip} ^${base}`), ["denylisted token #1"], "the leak is still found when only the base is excluded");
+    assert.deepEqual(rules(`${tip}   ^${base}`), ["denylisted token #1"], "repeated whitespace between arguments is dropped");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("scanRepo reads only tracked files; binaries are reduced to the text they carry", () => {
   const dir = mkdtempSync(join(tmpdir(), "hygiene-repo-"));
   try {

@@ -1,10 +1,10 @@
 // scripts/hooks/pre-push: which commit messages a push is checked for. A
-// fast-forward scans what is new since the remote head; a rebase or force push
-// scans only from where the branch leaves the pushed remote's own main (the
-// remote is the hook's $1, falling back to origin) — scanning remote..local, or
-// measuring from a stale origin/main, would re-check main's own, already public,
-// messages. Runs the real hook in a throwaway repo, with a stub hygiene script
-// that records its arguments.
+// fast-forward scans what is new since the remote head, always excluding the
+// pushed remote's own main; a rebase or force push scans only from where the
+// branch leaves that main (the remote is the hook's $1, falling back to origin)
+// — scanning remote..local, or measuring from a stale origin/main, would
+// re-check main's own, already public, messages. Runs the real hook in a
+// throwaway repo, with a stub hygiene script that records its arguments.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -65,7 +65,10 @@ test("a fast-forward push scans what is new since the remote head", () => {
     r.git("checkout", "-q", "-b", "b");
     const one = r.commit("branch 1");
     const two = r.commit("branch 2");
-    assert.equal(r.push(two, one), `${one}..${two}`);
+    assert.equal(r.push(two, one), `${two} ^${one} ^refs/remotes/origin/main`,
+      "remote head, with main excluded as well");
+    assert.deepEqual(r.git("log", "--format=%s", two, `^${one}`, "^refs/remotes/origin/main").split("\n"),
+      ["branch 2"], "the recorded arguments cover exactly the one new commit");
   } finally { r.cleanup(); }
 });
 
@@ -152,7 +155,7 @@ test("a force push whose old remote head is on main starts at the merge-base wit
   } finally { r.cleanup(); }
 });
 
-test("a fast-forward of branch-only commits still scans remote_sha..local", () => {
+test("a fast-forward of branch-only commits still scans only the branch's commits", () => {
   const r = makeRepo();
   try {
     const base = r.commit("main 1");
@@ -160,7 +163,30 @@ test("a fast-forward of branch-only commits still scans remote_sha..local", () =
     r.git("checkout", "-q", "-b", "b");
     const one = r.commit("branch 1");
     const two = r.commit("branch 2");
-    assert.equal(r.push(two, one, { remote: "gitea" }), `${one}..${two}`);
+    assert.equal(r.push(two, one, { remote: "gitea" }), `${two} ^${one} ^refs/remotes/gitea/main`);
+  } finally { r.cleanup(); }
+});
+
+test("a branch that merges main is pushed without re-scanning main's messages", () => {
+  const r = makeRepo();
+  try {
+    const m1 = r.commit("main 1");
+    r.git("update-ref", "refs/remotes/gitea/main", m1);
+    r.git("checkout", "-q", "-b", "b");
+    const b1 = r.commit("branch 1");               // what the remote holds
+    r.git("checkout", "-q", "main");
+    r.commit("MAIN-ONLY-MARKER main 2");            // already public once fetched
+    const m2 = r.git("rev-parse", "HEAD");
+    r.git("update-ref", "refs/remotes/gitea/main", m2);
+    r.git("checkout", "-q", "b");
+    r.git("merge", "--no-ff", "-m", "merge main", "main");
+    const b2 = r.commit("branch 2");
+    const recorded = r.push(b2, b1, { remote: "gitea" });
+    assert.equal(recorded, `${b2} ^${b1} ^refs/remotes/gitea/main`, "the remote head and main are both excluded");
+    const scanned = r.git("log", "--format=%s", ...recorded.split(/\s+/).filter(Boolean));
+    assert.ok(scanned.includes("branch 2"), "the branch's new commit is checked: " + scanned);
+    assert.ok(scanned.includes("merge main"), "the merge commit itself is checked: " + scanned);
+    assert.ok(!scanned.includes("MAIN-ONLY-MARKER"), "main's own message is not re-checked: " + scanned);
   } finally { r.cleanup(); }
 });
 
