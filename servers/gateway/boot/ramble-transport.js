@@ -53,9 +53,10 @@
  * counterpart ignores the copies.
  *
  * `local.`-prefixed settings keys are excluded from instance sync by
- * `shouldSyncRow`, which is exactly what we want for the per-boot session id
- * and the active area; `ramble_tombstones` is kept off the wire by simply not
- * being in instance-sync's SYNCED_TABLES allowlist.
+ * `shouldSyncRow`, which is exactly what we want for the per-boot session id,
+ * the active area and the PUBLIC persona author cache (`local.persona.*`) the
+ * Ramble stdio server reads; `ramble_tombstones` is kept off the wire by simply
+ * not being in instance-sync's SYNCED_TABLES allowlist.
  *
  * Nothing in here may throw out of a timer callback or out of `onEvent`; a relay
  * outage must never take the gateway down.
@@ -99,7 +100,7 @@ export async function startRambleTransport({
   autoStart = true,
 } = {}) {
   const load = (file) => import(pathToFileURL(join(bundleDir, file)).href);
-  const [{ initRambleTables }, { insertRemoteMark, expireMarks }, nostrMap, { resolvePersona, xOnly }, { makePublishGate }, { activeBird }, { feedAll }] = await Promise.all([
+  const [{ initRambleTables }, { insertRemoteMark, expireMarks }, nostrMap, personaModule, { makePublishGate }, { activeBird }, { feedAll }] = await Promise.all([
     load("init-tables.js"),
     load("marks.js"),
     load("nostr-map.js"),
@@ -109,6 +110,7 @@ export async function startRambleTransport({
     load("feed.js"),
   ]);
   const { MARK_KIND, CAW_KIND, markToEvent, eventToMark } = nostrMap;
+  const { resolvePersona, xOnly, personaCacheKey } = personaModule;
 
   // Phase 3 modules are loaded in their own guarded step: an installed bundle
   // copy that predates 0.4.0 (the refresh happens at boot, but a gateway
@@ -154,17 +156,68 @@ export async function startRambleTransport({
   await setSetting("local.session_id", sessionId);
 
   // --- Startup: our own personas, for own-echo suppression (C4) ---
+  // The same pass caches their PUBLIC authors for the Ramble stdio server
+  // (`ramble_settings`, `local.persona.*` — never key material, only the x-only
+  // pubkeys a mark/caw row needs). Inside a bot sandbox that server cannot read
+  // the identity file, and it never signs: this gateway re-derives the persona
+  // from the row's level and signs the event, so a stale or forged cache row
+  // buys nothing — but only for the PUBLIC marks and caws this drain selects
+  // (`visibility = 'public'`): those it re-signs and (where the author differs)
+  // rewrites at publish. A contacts/group/private row keeps its stored author
+  // locally — the delivery payload carries no author, and the receiver assigns
+  // it. Written EVERY boot (an upsert, so re-running is idempotent): a restart
+  // rotates the caw session id, and the caw row has to rotate with it.
+
+  // A bundle copy older than 0.26.3 has no `personaCacheKey` (the cache is the
+  // last thing its persona module learned). Same rule as the phase-3 modules
+  // above: a stale installed copy degrades — no cache rows, and the stdio
+  // server falls back to the identity, or says the gateway is missing — never
+  // "no ramble".
+  const canCachePersonas = typeof personaCacheKey === "function";
+  const cawCacheKey = canCachePersonas ? personaCacheKey({ level: "rotating", kind: "caw" }) : null;
+  // The companion key naming the boot the caw row belongs to (N4). A copy that
+  // predates it takes the literal, which is the same string it exports.
+  const cawSessionKey = personaModule.PERSONA_CAW_SESSION_KEY ?? "local.persona.caw_session";
+  if (!canCachePersonas) {
+    console.warn("[ramble] persona cache DISABLED: bundle copy predates 0.26.3 (no personaCacheKey) — restart this gateway after the bundle refresh");
+  }
+
   const ownAuthors = new Set();
+  const cachedAuthors = new Set();
   for (const opts of [
     { level: "real", kind: "mark" },
     { level: "pseudonym", kind: "mark" },
     { level: "rotating", kind: "mark" },
     { level: "rotating", kind: "caw" },
   ]) {
+    let author;
     try {
-      ownAuthors.add(resolvePersona(identity, seed, { ...opts, sessionId, _derive }).author);
+      author = resolvePersona(identity, seed, { ...opts, sessionId, _derive }).author;
     } catch (err) {
       console.warn(`[ramble] could not resolve ${opts.level}/${opts.kind} persona:`, err?.message ?? err);
+      continue;
+    }
+    ownAuthors.add(author);
+    if (!canCachePersonas) continue;
+    const cacheKey = personaCacheKey(opts);
+    // pseudonym/mark and rotating/mark resolve to the SAME world author, so
+    // one key is written once (three rows, not four).
+    if (!cacheKey || cachedAuthors.has(cacheKey)) continue;
+    cachedAuthors.add(cacheKey);
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await setSetting(cacheKey, author);
+      // `local.session_id` is written BEFORE this loop, so a caw derivation or
+      // write that failed leaves the PREVIOUS boot's caw row sitting beside a
+      // fresh session id. Stamp the session the row was really derived from (and
+      // only once the row itself landed), so the stdio side can tell a current
+      // caw from a stale one.
+      // eslint-disable-next-line no-await-in-loop
+      if (cacheKey === cawCacheKey) await setSetting(cawSessionKey, sessionId);
+    } catch (err) {
+      // A cache write must never take the transport down: the stdio server then
+      // falls back to the identity, or says the gateway is missing.
+      console.warn(`[ramble] could not cache the ${cacheKey} persona:`, err?.message ?? err);
     }
   }
 

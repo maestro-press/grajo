@@ -110,21 +110,25 @@ export function isIdentityFileName(n) {
  *    falls back to an inherited `S3_*`/`MINIO_*` endpoint: for a sandboxed bot
  *    that pointed at a localhost MinIO where nothing listens.
  *
- * The one bot-run server that still reads the identity is the `ramble` bundle
- * (`bundles/ramble/server/server.js` getIdentityState → loadOrCreateIdentity /
- * loadInstanceSeed): it needs the seed for its bot identity. Hidden, the file
- * parses as nothing, so its identity-backed tools fail on a bot turn; since
- * bundle 0.26.2 that failure is a plain sentence ("ramble: the instance
- * identity is not available to bots …") instead of pi's JSON error, and the
- * tool still cannot run there. Its public-persona cache (the gateway writes the
- * authors to ramble_settings and this server reads them) is the follow-up, and
- * it is the last entry on the seed-import guard's TEMPORARY allow-list
- * (tests/bot-seed-import-guard.test.js).
+ * The one bot-run server that still REACHES the identity is the `ramble` bundle
+ * (`bundles/ramble/server/server.js` getIdentityState → loadIdentityIfPresent /
+ * loadInstanceSeed). It needs the seed for its bot identity, and hidden, the
+ * file parses as nothing — so that path fails as a plain sentence since bundle
+ * 0.26.2 ("ramble: the instance identity is not available to bots …") instead
+ * of pi's JSON error. A bot turn only takes it as a FALLBACK: since 0.26.3 the
+ * gateway writes the PUBLIC persona authors to `ramble_settings` at boot
+ * (`local.persona.real/.world/.caw`) and the stdio server authors its marks and
+ * caws from those rows, so it needs no seed while a gateway runs (the gateway
+ * signs). With no cache rows and no identity it answers "Ramble needs the Crow
+ * gateway (with sharing on) to have run." — and it never mints an identity
+ * (loadIdentityIfPresent, never loadOrCreateIdentity). It stays the last entry on
+ * the seed-import guard's allow-list (tests/bot-seed-import-guard.test.js) for
+ * that fallback alone.
  *
  * None of this is an escape: masking the seed is the point, and no bot
  * definition can opt out of it.
  */
-export const IDENTITY_HIDDEN_LIMITATION = "storage-using bot servers (crow-storage, studio, sunvox-studio, data-dashboard, artifacts) get their storage settings from the host over the fd pipe — storage is off on a file-delivery turn and for an add-on that is not a reviewed storage consumer; ramble's bot server has no identity-backed features until its follow-up";
+export const IDENTITY_HIDDEN_LIMITATION = "storage-using bot servers (crow-storage, studio, sunvox-studio, data-dashboard, artifacts) get their storage settings from the host over the fd pipe — storage is off on a file-delivery turn and for an add-on that is not a reviewed storage consumer; ramble's bot server takes its public persona authors from the gateway's cache in ramble_settings, so it has no identity-backed gap while a gateway runs, never mints an identity, and answers 'Ramble needs the Crow gateway (with sharing on) to have run.' when nothing has cached one";
 
 /** A `.env` name: `.env` or `.env.<anything>` (a .env.bak-2026... copy too). */
 export const BUNDLE_ENV_NAME_RE = /^\.env(\..*)?$/;

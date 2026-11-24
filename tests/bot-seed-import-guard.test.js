@@ -2,10 +2,10 @@
  * The seed never enters a bot — a CI guard over bot-reachable code.
  *
  * One exception, stated here so nobody reads this header as a claim the code does not keep:
- * Ramble's stdio server (bundles/ramble/server/server.js) still derives the PUBLIC persona
- * authors from the instance identity, so it is on the TEMPORARY allow-list below until its
- * public-persona cache PR lands. Everywhere else — and Ramble too, once that PR is in — the
- * seed never enters a bot.
+ * Ramble's stdio server (bundles/ramble/server/server.js) still reaches the identity as its LAST
+ * fallback, for a db no gateway has ever written a public-persona cache to, so it stays on the
+ * allow-list below — and when its tools take that fallback they mint nothing.
+ * Everywhere else the seed never enters a bot.
  *
  * The bot-run extensions need CREDENTIALS, never the instance seed: storage needs the opened
  * Shared Storage settings (piped over the fd by scripts/pi-bots/mcp_writer.mjs), and Ramble
@@ -126,10 +126,12 @@ export const ALLOWED_HOST_SIDE = Object.freeze({
     "because servers/shared/project-lifecycle.js imports the gateway proxy, and never calls " +
     "that function (lazy, literal import).",
   "bundles/ramble/server/server.js":
-    "TEMPORARY, and the last one: Ramble's stdio server still derives the PUBLIC persona " +
-    "authors from the identity (it never signs there). The public-persona cache — the gateway " +
-    "writes the authors to ramble_settings and this server reads them — replaces it; when that " +
-    "lands this entry must be deleted.",
+    "Ramble's stdio server takes its PUBLIC persona authors from the gateway's cache in " +
+    "ramble_settings (local.persona.real/.world/.caw, written at boot) and reaches the identity " +
+    "only as the fallback for a db no gateway has written one to — a fallback that reads and " +
+    "never mints (loadIdentityIfPresent, never loadOrCreateIdentity) and whose own tests pin " +
+    "that. A bot turn on a running gateway never gets there; with no cache and no readable " +
+    "identity it answers 'Ramble needs the Crow gateway (with sharing on) to have run.' instead.",
 });
 
 /**

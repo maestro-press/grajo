@@ -6362,7 +6362,7 @@
     {
       "id": "ramble",
       "name": "Ramble",
-      "version": "0.26.2",
+      "version": "0.26.3",
       "type": "mcp-server",
       "author": "Crow",
       "category": "social",

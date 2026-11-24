@@ -18,7 +18,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mkdtempSync, cpSync, rmSync } from "node:fs";
+import { mkdtempSync, cpSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createClient } from "@libsql/client";
 import { generateSecretKey, getPublicKey, finalizeEvent } from "nostr-tools/pure";
@@ -830,6 +830,58 @@ test("phase 3: a bundle copy without the phase-3 modules still runs the public d
     assert.equal(result.delivered, 0, "contacts delivery is disabled");
 
     await assert.doesNotReject(transport.onEnvelope({ crowId: "crow:one", pubkey: PK, payload: { type: "ramble.egg", v: 1, egg: { egg_id: "x", warmth: 1 } }, eventId: "s-1" }));
+
+    transport.stop();
+  } finally {
+    rmSync(stale, { recursive: true, force: true });
+  }
+});
+
+test("review N1: a bundle copy whose persona module lacks personaCacheKey/resolveAuthor still runs, skipping only the cache writes", async () => {
+  // An installed copy older than 0.26.3 has a persona.js with neither export (the
+  // cache and its key rule were the last additions). Un-guarded, the boot pass
+  // threw `personaCacheKey is not a function` out of startRambleTransport, and
+  // Ramble had no transport at all — the same fault the phase-3 guard above
+  // exists for, so the same rule: degrade, never "no ramble".
+  const stale = mkdtempSync(join(tmpdir(), "ramble-stale-persona-"));
+  cpSync(BUNDLE_DIR, stale, { recursive: true });
+  const personaPath = join(stale, "persona.js");
+  const src = readFileSync(personaPath, "utf8");
+  const stripped = src
+    .replace(/export function personaCacheKey\(opts\) \{\n  return PERSONA_CACHE_KEYS\[personaCacheSlot\(opts\)\];\n\}\n/, "")
+    .replace(/export function resolveAuthor\([\s\S]*?\n\}\n/, "");
+  assert.ok(!stripped.includes("personaCacheKey") && !stripped.includes("resolveAuthor"),
+    "the fixture really is a persona module from before the cache");
+  writeFileSync(personaPath, stripped);
+  try {
+    const db = createClient({ url: "file::memory:" });
+    const transport = await startRambleTransport({
+      db,
+      nostrManager: {
+        relays: new Map([["wss://fake", { connected: true, connect: async () => {}, subscribe: () => ({ close: () => {} }) }]]),
+        connectRelays: async () => [],
+        publishRendezvousEvent: async () => ["wss://fake"],
+      },
+      identity, seed: SEED, bus: new EventEmitter(), bundleDir: stale, _derive: fakeDerive, autoStart: false,
+    });
+
+    // The transport booted, and it still knows its own authors: only the CACHE
+    // WRITES are skipped (own-echo suppression works exactly as before).
+    assert.equal(transport.ownAuthors.size, 3, "real, world and per-session caw are still resolved");
+    const { rows: cached } = await db.execute({
+      sql: "SELECT key FROM ramble_settings WHERE key LIKE 'local.persona.%'",
+    });
+    assert.deepEqual(cached, [], "no cache row is written from a copy that has no cache rule");
+    const { rows: session } = await db.execute({
+      sql: "SELECT value FROM ramble_settings WHERE key = 'local.session_id'", args: [],
+    });
+    assert.equal(session[0]?.value, transport.sessionId, "the session id row is still minted");
+
+    await setMaster(db, true);
+    await setCell(db, "public", "geo", true);
+    await seedPublicMark(db, "public on an old persona module");
+    const result = await transport.drainOnce();
+    assert.equal(result.published, 1, "the public drain still signs and publishes");
 
     transport.stop();
   } finally {

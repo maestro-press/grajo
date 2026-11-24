@@ -99,7 +99,7 @@ test("secretFilesFor: the sharing identity and every copy of it, at THIS home's 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("IDENTITY_HIDDEN_LIMITATION: storage arrives over the fd pipe, and ramble is the one bot server still without identity-backed features", () => {
+test("IDENTITY_HIDDEN_LIMITATION: storage arrives over the fd pipe, and ramble's authors come from the gateway's cache", () => {
   // The storage-using bot servers, DERIVED: the registry grants the core `crow-storage` the opened
   // settings (`needs: ["shared-storage"]`, scripts/server-registry.js) and these four are the
   // reviewed, code-held bundle consumers (servers/gateway/addon-env.js: STORAGE_ENV_CONSUMERS).
@@ -121,8 +121,13 @@ test("IDENTITY_HIDDEN_LIMITATION: storage arrives over the fd pipe, and ramble i
   assert.deepEqual(readers, ["ramble"], "ramble is the last bot-run server that reads the identity");
   for (const id of readers) {
     assert.ok(IDENTITY_HIDDEN_LIMITATION.includes(id), id + " is named in: " + IDENTITY_HIDDEN_LIMITATION);
-    assert.match(IDENTITY_HIDDEN_LIMITATION, new RegExp(id + "[^;]*identity-backed"),
-      id + " is named as the one losing identity-backed features: " + IDENTITY_HIDDEN_LIMITATION);
+    // The sentence says WHY the reach is only a fallback: the gateway's cache is where the authors
+    // come from, and this server never mints an identity. (It used to be worded as a missing
+    // feature, which is exactly the stale claim this assertion now pins.)
+    assert.match(IDENTITY_HIDDEN_LIMITATION, new RegExp(id + "[^;]*gateway's cache"),
+      id + " is named as taking its authors from the gateway's cache: " + IDENTITY_HIDDEN_LIMITATION);
+    assert.match(IDENTITY_HIDDEN_LIMITATION, new RegExp(id + "[^;]*never mints"),
+      id + " is named as never minting an identity: " + IDENTITY_HIDDEN_LIMITATION);
   }
 
   // Neither claim is words only. Ramble's bot server really reaches the identity and really says
@@ -130,6 +135,13 @@ test("IDENTITY_HIDDEN_LIMITATION: storage arrives over the fd pipe, and ramble i
   const ramble = readFileSync(join(import.meta.dirname, "..", "bundles", "ramble", "server", "server.js"), "utf8");
   assert.match(ramble, /appImport\("servers\/sharing\/identity\.js"\)/, "ramble's bot server opens the instance identity");
   assert.match(ramble, /the instance identity is not available to bots/, "and says so when it is hidden");
+  // Its no-gateway sentence is the owner-approved wording, byte for byte, and the limitation
+  // above quotes that same sentence rather than a paraphrase of an older one.
+  const gatewayError = "Ramble needs the Crow gateway (with sharing on) to have run.";
+  assert.ok(ramble.includes(`const NO_GATEWAY_ERROR = "${gatewayError}"`),
+    "the no-gateway sentence is the approved one: " + gatewayError);
+  assert.ok(IDENTITY_HIDDEN_LIMITATION.includes(`'${gatewayError}'`),
+    "and the limitation quotes it: " + IDENTITY_HIDDEN_LIMITATION);
   // ... and data-dashboard (the newest storage user) really takes the host's settings instead.
   const src = readFileSync(join(import.meta.dirname, "..", "bundles", "data-dashboard", "server", "server.js"), "utf8");
   assert.match(src, /adoptHostStorage\(/, "data-dashboard takes the settings the host piped over the fd");

@@ -102,7 +102,9 @@
  *    need it: the host opens this instance's Shared Storage settings and pipes
  *    them over the fd pipe (storage is off on a file-delivery turn and for an
  *    add-on that is not a reviewed storage consumer), and ramble's bot server
- *    has no identity-backed features until its follow-up — see
+ *    takes its public persona authors from the gateway's cache in
+ *    ramble_settings (`local.persona.*`), so it needs no seed while a gateway
+ *    runs and never mints one — see
  *    IDENTITY_HIDDEN_LIMITATION in hidden_files.mjs.
  *
  * Without bubblewrap (e.g. the cloud VM), the fallback is

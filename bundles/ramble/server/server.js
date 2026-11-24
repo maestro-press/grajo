@@ -17,15 +17,23 @@
  *
  * Identity seam (review round 3, D8): options.identity/seed/_derive are
  * injectable (tests inject all three so no identity files are generated).
- * When absent, resolved lazily on first tool call from
- * servers/sharing/identity.js so the factory itself stays synchronous.
+ * When absent, the persona authors come from the GATEWAY's public-persona
+ * cache in `ramble_settings` (`local.persona.real/.world/.caw`, written by
+ * servers/gateway/boot/ramble-transport.js at boot); only when those rows are
+ * absent — or, for the boot-scoped caw row, left over from an earlier boot
+ * (`local.persona.caw_session` ≠ `local.session_id`) — does this fall back to
+ * the instance identity, and only
+ * `loadIdentityIfPresent` — this bundle's server NEVER mints an identity (a
+ * sandbox with an absent seed file and a writable data dir would otherwise
+ * create a SECOND identity that no gateway signs for). The import is lazy so
+ * the factory itself stays synchronous.
  */
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { appImport } from "./app-root.js";
 import { resolveDataDir } from "./db.js";
-import { resolvePersona } from "./persona.js";
+import { resolvePersona, resolveAuthor, PERSONA_CACHE_KEYS, PERSONA_CAW_SESSION_KEY } from "./persona.js";
 import { createMark, listMarks, unlockMark, blockPersona, unblockPersona } from "./marks.js";
 import { encodeGeohash } from "./anchors.js";
 import { getGrid } from "./grid.js";
@@ -47,6 +55,9 @@ import { streakState, awardStreakHeart } from "./moves/streak.js";
 import { learningFlows } from "./moves/learning.js";
 import { stepsState } from "./steps.js";
 
+/** The `ramble_settings` key holding the per-boot session id the gateway signs caws with (R11). */
+const SESSION_ID_KEY = "local.session_id";
+
 const text = (t) => ({ content: [{ type: "text", text: t }] });
 const errorText = (t) => ({ content: [{ type: "text", text: t }], isError: true });
 
@@ -65,6 +76,14 @@ export function createRambleServer(db, options = {}) {
     { capabilities: { tools: {} }, instructions: options.instructions },
   );
 
+  // The two sentences this tool answers when it has no author at all. They are
+  // different faults, so they are different messages: a MASKED identity file
+  // (a bot sandbox: the file is there and reads empty) keeps the sentence the
+  // sandbox note documents; no identity file at all means no gateway has run
+  // here, so nothing was cached and there is nobody to sign for this mark.
+  const MASKED_IDENTITY_ERROR = "ramble: the instance identity is not available to bots (this Crow's identity file is hidden inside the bot sandbox); run this from the dashboard, not a bot turn";
+  const NO_GATEWAY_ERROR = "Ramble needs the Crow gateway (with sharing on) to have run.";
+
   // Identity seam: resolved lazily (once) on first tool call so the factory
   // stays synchronous and tests that inject identity/seed/_derive never
   // touch real identity files. Memoize the IN-FLIGHT PROMISE, not the
@@ -74,21 +93,32 @@ export function createRambleServer(db, options = {}) {
   // that race — the second caller awaits the first caller's in-flight
   // promise instead of starting its own. Reset to null on rejection so a
   // transient failure (e.g. identity file not yet written) can retry.
+  //
+  // This is the FALLBACK path only: personaFor() asks the gateway's cache
+  // first, so a bot turn normally never reaches it (and therefore never loads
+  // the seed).
   let identityPromise = null;
   function getIdentityState() {
     identityPromise ??= (async () => {
       let { identity, seed, _derive } = options;
       if (!identity || !seed || !_derive) {
         const mod = await appImport("servers/sharing/identity.js");
-        // A bot sandbox masks the instance identity on purpose (it holds the
-        // master seed every bot key derives from), so these loaders see an empty
-        // file and would fail with pi's JSON parse error. Say what is actually
-        // wrong instead: this tool needs the gateway, not a bot turn.
+        if (!identity) {
+          // loadIdentityIfPresent, never loadOrCreateIdentity: an absent seed
+          // file with a writable data dir must never become a second identity.
+          // It returns null for a missing file and throws for an unreadable one
+          // (the sandbox masks it to an empty file), which are different faults.
+          try {
+            identity = mod.loadIdentityIfPresent();
+          } catch {
+            throw new Error(MASKED_IDENTITY_ERROR);
+          }
+          if (!identity) throw new Error(NO_GATEWAY_ERROR);
+        }
         try {
-          if (!identity) identity = mod.loadOrCreateIdentity();
           if (!seed) seed = mod.loadInstanceSeed(resolveDataDir());
         } catch {
-          throw new Error("ramble: the instance identity is not available to bots (this Crow's identity file is hidden inside the bot sandbox); run this from the dashboard, not a bot turn");
+          throw new Error(MASKED_IDENTITY_ERROR);
         }
         if (!_derive) _derive = mod.deriveBotIdentity;
       }
@@ -124,8 +154,8 @@ export function createRambleServer(db, options = {}) {
   async function storedSessionId() {
     try {
       const { rows } = await db.execute({
-        sql: "SELECT value FROM ramble_settings WHERE key = 'local.session_id'",
-        args: [],
+        sql: "SELECT value FROM ramble_settings WHERE key = ?",
+        args: [SESSION_ID_KEY],
       });
       return rows[0]?.value ?? null;
     } catch {
@@ -133,9 +163,58 @@ export function createRambleServer(db, options = {}) {
     }
   }
 
+  /**
+   * The gateway's public-persona cache: the x-only authors it derives at boot
+   * and writes to `ramble_settings` (`local.persona.real/.world/.caw`). Read
+   * FRESH per call, never memoized — a gateway restart rotates the caw session
+   * id and rewrites the caw row in the same boot, so a pinned author would sign
+   * caws with a key the gateway has already rotated away from. Returns null
+   * when the table is not there yet (no gateway has ever run on this db).
+   *
+   * The caw slot is BOOT-scoped, and that is what `local.persona.caw_session`
+   * is for: the gateway writes `local.session_id` before it derives the caw
+   * persona, so a caw derivation (or its write) that failed leaves the PREVIOUS
+   * boot's caw row behind, next to a fresh session id. Unless the two agree the
+   * caw slot reads as MISSING, and personaFor() takes its normal fallback
+   * instead of reporting an author the gateway has already rotated away from.
+   */
+  async function personaCache() {
+    try {
+      const { rows } = await db.execute({
+        sql: "SELECT key, value FROM ramble_settings WHERE key IN (?, ?, ?, ?, ?)",
+        args: [PERSONA_CACHE_KEYS.real, PERSONA_CACHE_KEYS.world, PERSONA_CACHE_KEYS.caw,
+          PERSONA_CAW_SESSION_KEY, SESSION_ID_KEY],
+      });
+      const byKey = new Map(rows.map((r) => [r.key, r.value]));
+      const sessionId = byKey.get(SESSION_ID_KEY) ?? null;
+      const cawSession = byKey.get(PERSONA_CAW_SESSION_KEY) ?? null;
+      return {
+        real: byKey.get(PERSONA_CACHE_KEYS.real) ?? null,
+        world: byKey.get(PERSONA_CACHE_KEYS.world) ?? null,
+        caw: sessionId && cawSession === sessionId ? (byKey.get(PERSONA_CACHE_KEYS.caw) ?? null) : null,
+        cawSession,
+      };
+    } catch {
+      return null; // table not there yet
+    }
+  }
+
   async function personaFor(kind) {
-    const { identity, seed, _derive, sessionId } = await getIdentityState();
     const level = await getPublicIdentityLevel();
+    // 1. The gateway's cache — the only path a bot turn takes. No seed, no
+    //    identity file, no key material: just the author row the gateway will
+    //    sign with. For a PUBLIC mark or caw the gateway re-derives the persona
+    //    from the row's level and rewrites a mismatched author when it
+    //    publishes, so there the cached author is the one that really signs. A
+    //    contacts/group/private row keeps its stored author locally: the
+    //    delivery payload carries no author, and the receiver assigns it.
+    const cached = resolveAuthor(await personaCache(), level, kind);
+    if (cached) return cached;
+    // 2. No gateway has cached anything: fall back to the instance identity
+    //    (never minting one). Either this throws with the message the fault
+    //    deserves — "the gateway is not running" or "the identity is masked
+    //    in a bot sandbox" — and the tool answers that sentence.
+    const { identity, seed, _derive, sessionId } = await getIdentityState();
     // The session id is the ONLY input that changes under this long-lived
     // stdio process: a gateway restart mints a new one. Memoizing it would pin
     // caws to a session key the gateway has already rotated away from, so read
