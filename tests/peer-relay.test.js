@@ -27,6 +27,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { createDbClient } from "../servers/db.js";
 import { peerRelayRouter } from "../servers/gateway/routes/peer-relay.js";
+import { pinPeerOrigin, setPeerCreds } from "../servers/shared/peer-credentials.js";
 import { ensurePeerRelayToken, validatePeerRelayToken } from "../servers/gateway/local-token.js";
 import { initGatewayActorKey, signPeerRelayActor, signArtifactsActor } from "../scripts/pi-bots/actor-sig.mjs";
 import { verifyRemoteActor, REMOTE_ACTOR_HEADER, REMOTE_ACTOR_SIG_HEADER, _resetRemoteActorNonces } from "../servers/shared/remote-actor.js";
@@ -40,6 +41,9 @@ const ECHO = "inst-echo-0005"; // a trusted peer the bot did NOT select
 // stubs fetchImpl), for the relayed-caller control below.
 const ROMEO = "inst-romeo-0006";
 const PEER_TOKENS = { [BRAVO]: "bravo-peer-bearer-" + randomBytes(6).toString("hex"), [CHARLIE]: "charlie-peer-bearer-" + randomBytes(6).toString("hex"), [ECHO]: "echo-peer-bearer-x", [ROMEO]: "romeo-peer-bearer-x" };
+// Each peer's stored gateway_url, filled in before() (BRAVO/CHARLIE/ECHO point at
+// the local fake upstream; ROMEO at a documentation address never dialled here).
+const PEER_URLS = [];
 const PAIR_KEYS = { [BRAVO]: randomBytes(32).toString("hex") }; // charlie has no pair key (S-P2)
 // B6: the relay signature binds the bot session; the ids are filled in before().
 let ACTOR = { botId: "hank", sessionId: null, threadId: "discord:42", gatewayType: "discord" };
@@ -83,11 +87,14 @@ before(async () => {
   upstreamPort = await listen(upstream);
   const d = new Database(dbPath);
   const ins = d.prepare("INSERT INTO crow_instances (id, name, crow_id, gateway_url, status, trusted) VALUES (?, ?, ?, ?, 'active', 1)");
-  ins.run(BRAVO, "bravo", BRAVO, `http://127.0.0.1:${upstreamPort}/`);
-  ins.run(CHARLIE, "charlie", CHARLIE, `http://127.0.0.1:${upstreamPort}/charlie`);
-  ins.run(ECHO, "echo", ECHO, `http://127.0.0.1:${upstreamPort}/echo`);
   // Remote, never dialled by the real relay app; a stub fetch proves forwarding.
-  ins.run(ROMEO, "romeo", ROMEO, "http://192.0.2.10:3001/");
+  const peerRows = [
+    [BRAVO, "bravo", BRAVO, `http://127.0.0.1:${upstreamPort}/`],
+    [CHARLIE, "charlie", CHARLIE, `http://127.0.0.1:${upstreamPort}/charlie`],
+    [ECHO, "echo", ECHO, `http://127.0.0.1:${upstreamPort}/echo`],
+    [ROMEO, "romeo", ROMEO, "http://192.0.2.10:3001/"],
+  ];
+  for (const [id, name, crowId, url] of peerRows) { ins.run(id, name, crowId, url); PEER_URLS.push([id, url]); }
   const def = { tools: { remote_mcp: [`${BRAVO}::crow-memory`, `${CHARLIE}::crow-memory`, `${DELTA}::crow-memory`, `${BRAVO}::crow-blog`, `${ROMEO}::crow-memory`] } };
   d.prepare("INSERT INTO pi_bot_defs (bot_id, display_name, definition) VALUES (?, ?, ?)").run("hank", "Hank Bot", JSON.stringify(def));
   d.prepare("INSERT INTO pi_bot_defs (bot_id, display_name, definition, enabled) VALUES (?, ?, ?, 0)").run("dora", "Dora Bot", JSON.stringify(def));
@@ -107,6 +114,15 @@ before(async () => {
   const tdb = createDbClient(dbPath);
   try { await ensurePeerRelayToken(tdb); } finally { tdb.close(); }
   relayToken = readFileSync(join(process.env.CROW_HOME, "secrets", "peer-relay-token"), "utf8").trim();
+  // The relay also asks the credential store whether the bearer may go to the
+  // peer's address at all (peerUrlAllowed: the gateway ORIGIN pinned at
+  // pairing — the row alone never authorizes a destination). So these peers are
+  // paired for real: an entry holding the bearer the fake upstream expects, with
+  // that peer's stored address as its pinned origin.
+  for (const [id, url] of PEER_URLS) {
+    setPeerCreds(id, { auth_token: PEER_TOKENS[id], signing_key: PAIR_KEYS[id] || "0".repeat(64) });
+    assert.equal(pinPeerOrigin(id, url), true, `pinned ${id}`);
+  }
   initGatewayActorKey();
 
   app = express();
@@ -328,14 +344,19 @@ test("an unreachable peer → 502 JSON-RPC error", async () => {
   const d = new Database(dbPath);
   d.prepare("UPDATE crow_instances SET gateway_url = ? WHERE id = ?").run("http://127.0.0.1:9", BRAVO);
   d.close();
+  // The operator's own re-pin (a peer that MOVED): the relay gets past the
+  // paired-origin gate and fails on the dial instead.
+  assert.equal(pinPeerOrigin(BRAVO, "http://127.0.0.1:9"), true);
   try {
     const r = await post(`/peer-relay/${BRAVO}/memory/mcp`, { headers: good() });
     assert.equal(r.status, 502, r.text);
     assert.equal(r.json.jsonrpc, "2.0");
+    assert.match(r.json.error.message, /unreachable/);
   } finally {
     const d2 = new Database(dbPath);
     d2.prepare("UPDATE crow_instances SET gateway_url = ? WHERE id = ?").run(`http://127.0.0.1:${upstreamPort}/`, BRAVO);
     d2.close();
+    assert.equal(pinPeerOrigin(BRAVO, `http://127.0.0.1:${upstreamPort}/`), true);
   }
 });
 
@@ -632,6 +653,10 @@ async function relayWithStub() {
       keyLookup: () => null,
       getCreds: (id) => (PEER_TOKENS[id] ? { auth_token: PEER_TOKENS[id], signing_key: null } : null),
       localId: () => LOCAL,
+      // These tests judge the NAME/query rule on rows they point anywhere; the
+      // paired-origin pin is its own rule, tested above and in
+      // tests/peer-pinned-origin.test.js, so it is stubbed open here.
+      urlAllowed: () => ({ ok: true }),
       lookupFn: (host, options, cb) => {
         if (host === "peer.example.test" || host === "peer.example.ts.net") {
           const all = typeof options === "object" && options && options.all;
@@ -747,6 +772,28 @@ test("refused: a gateway_url whose final url is not the mount's own path (a quer
     srv.closeAllConnections?.();
     await new Promise((r) => srv.close(() => r()));
   }
+});
+
+test("the pin and the final-path rule COMPOSE: a row AT the paired origin carrying ?x=1 passes the pin and is still refused", async () => {
+  const { peerUrlAllowed } = await import("../servers/shared/peer-credentials.js");
+  // BRAVO's row is at the origin pinned for it; adding a query does not move
+  // the origin, so the paired-origin gate (REAL here, not stubbed) allows it.
+  const pinnedRow = `http://127.0.0.1:${upstreamPort}/?x=1`;
+  assert.deepEqual(peerUrlAllowed(BRAVO, pinnedRow), { ok: true }, "the ORIGIN is the paired one");
+  await withPeerUrl(BRAVO, pinnedRow, async () => {
+    // …and it is refused anyway: `${row}${mount}/mcp` would be a query on the
+    // peer's ROOT, not this mount's own path, so the peer bearer is never dialled.
+    const r = await post(`/peer-relay/${BRAVO}/memory/mcp`, { headers: good() });
+    assert.equal(r.status, 404, r.text);
+    assert.equal(r.json?.jsonrpc, "2.0", r.text);
+    assert.match(r.json.error.message, /peer/);
+    assert.equal(seen.length, 0, "nothing was dialled, so the pin was never even needed to refuse");
+  });
+  // Positive control on the same harness: the clean row relays, with the bearer.
+  const ok = await post(`/peer-relay/${BRAVO}/memory/mcp`, { headers: good() });
+  assert.equal(ok.status, 200, ok.text);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].headers.authorization, `Bearer ${PEER_TOKENS[BRAVO]}`);
 });
 
 test("a RELAYED caller still forwards to an IP literal and to a *.ts.net peer (the allowed shapes)", async () => {

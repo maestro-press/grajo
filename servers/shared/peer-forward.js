@@ -9,6 +9,9 @@
  *   1. Target must be registered in crow_instances.
  *   2. crow_instances.trusted must equal 1.
  *   3. peer-tokens.json must contain creds for the target.
+ *   4. The target's gateway_url must normalize to the origin pinned for that
+ *      pair at pairing (peerUrlAllowed) — the row alone never decides where a
+ *      credential goes, because a contained bot can write it.
  *   Any failure → structured error, caller decides whether to surface.
  *
  * Manifest trust boundary (for `host: <instance-id>` in bundle manifests)
@@ -22,7 +25,7 @@
  */
 
 import { peerTrust } from "./peer-trust.js";
-import { getPeerCreds } from "./peer-credentials.js";
+import { getPeerCreds, peerUrlAllowed } from "./peer-credentials.js";
 import { signRequest, auditCrossHostCall } from "./cross-host-auth.js";
 
 /**
@@ -125,6 +128,19 @@ export async function forwardSignedRequest({
     return { ok: false, status: 0, error };
   }
 
+  // 2b. The destination must be the origin pinned for this pair at pairing.
+  // `crow_instances.gateway_url` is bot-writable (a contained bot has crow.db
+  // bound read-write, and instance sync writes it), so a rewritten row would
+  // otherwise carry both the peer bearer and a pair-key signature to whatever
+  // server the bot named. Refused before the request is built — no fetch, no
+  // headers, and the audit row names the reason, never the URL.
+  const allowed = peerUrlAllowed(targetInstanceId, instance.gateway_url);
+  if (!allowed.ok) {
+    const error = "target_not_at_paired_origin";
+    await auditCrossHostCall(db, { ...audit, error });
+    return { ok: false, status: 0, error, reason: allowed.reason };
+  }
+
   // 3. Build path + query, signed body, URL
   let queryStr = "";
   if (query && typeof query === "object") {
@@ -160,7 +176,19 @@ export async function forwardSignedRequest({
 
   const url = String(instance.gateway_url).replace(/\/+$/, "") + signedPath;
 
-  // 4. Fire + size-capped read
+  // 3b. The FINAL url is what gets dialled: the pin is re-checked against it, so
+  // a path that (through a `//host` form, an absolute URL or a fragment) would
+  // move the request off the paired origin is refused before it is built.
+  const finalAllowed = peerUrlAllowed(targetInstanceId, url);
+  if (!finalAllowed.ok) {
+    const error = "target_not_at_paired_origin";
+    await auditCrossHostCall(db, { ...audit, error });
+    return { ok: false, status: 0, error, reason: finalAllowed.reason };
+  }
+
+  // 4. Fire + size-capped read. NO REDIRECTS: a 3xx is never followed (a peer
+  // that answers 307 would otherwise move this signed request — bearer and
+  // pair-key signature included — to a host none of the checks above judged).
   let res;
   try {
     res = await fetch(url, {
@@ -168,11 +196,18 @@ export async function forwardSignedRequest({
       headers,
       body: requestBody || undefined,
       signal: AbortSignal.timeout(timeoutMs),
+      redirect: "manual",
     });
   } catch (err) {
     const error = err.name === "TimeoutError" ? "timeout" : String(err.message || err);
     await auditCrossHostCall(db, { ...audit, error });
     return { ok: false, status: 0, error };
+  }
+  if (res.status >= 300 && res.status < 400) {
+    try { await res.body?.cancel?.(); } catch { /* irrelevant */ }
+    const error = "redirect_refused";
+    await auditCrossHostCall(db, { ...audit, httpStatus: res.status, error });
+    return { ok: false, status: res.status, error };
   }
 
   const raw = await readBodyWithCap(res, maxResponseBytes);

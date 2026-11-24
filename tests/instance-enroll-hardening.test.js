@@ -171,6 +171,7 @@ test("two-instance pairing through the real CLI: OTC mandatory, single-use, re-p
       // Happy path.
       const ok = await cli(S, ["--peer-url", peer.url, "--otc", otc1]);
       assert.equal(ok.code, 0, ok.out);
+      assert.doesNotMatch(ok.out, /is pinned to .* but its stored gateway_url points elsewhere/, "a pin and a row that agree warn about nothing");
       await assertMutuallyPaired(P, S);
       const firstHash = (await P.row(S.id)).auth_token_hash;
 
@@ -495,6 +496,149 @@ test("a known-but-uncredentialed row (operator-registered) enrolls without an al
     assert.equal(acceptableAdvertisedUrl("http://127.0.0.1:3001"), null);
     assert.equal(acceptableAdvertisedUrl("http://203.0.113.4:3001"), null);
   } finally { restore(); P.cleanup(); }
+});
+
+test("the enroll pin comes only from the ceremony: a pre-poisoned row's address is written to the row but is never what gets pinned", async () => {
+  const restore = snapshotEnv();
+  const P = await makeSide("instP", "100.64.0.1");
+  try {
+    // A bare row this instance already knows (operator-registered / learned by
+    // sync) that already holds an address a bot could have written.
+    const ATTACKER = "http://100.64.66.66:3001";
+    await P.db.execute({
+      sql: "INSERT INTO crow_instances (id, name, crow_id, gateway_url, status, trusted) VALUES ('bareX', 'bareX', 'bareX', ?, 'active', 0)",
+      args: [ATTACKER],
+    });
+    const code = generateEnrollOtc();
+    const peer = await startPeer(P, { otc: code });
+    const warns = [];
+    const origWarn = console.warn;
+    console.warn = (...a) => { warns.push(a.join(" ")); };
+    try {
+      // The source advertises an address this host refuses and no tailnet IP, so
+      // THIS ceremony supplied no usable address — only the row's value exists.
+      const r = await post(peer.port, baseBody("bareX", {
+        otc: code, source_gateway_url: "https://evil.example.com:8444", source_tailscale_ip: null, source_sync_port: null,
+      }));
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+    } finally { console.warn = origWarn; await peer.close(); }
+    const row = await P.row("bareX");
+    assert.equal(row.gateway_url, ATTACKER, "the row keeps today's logic (the address it already had)");
+    assert.equal(Number(row.trusted), 1);
+    assert.equal(P.tokens().bareX.pinned_origin, undefined, "the row's address is NEVER the pin");
+    const { peerUrlAllowed } = await import("../servers/shared/peer-credentials.js");
+    assert.equal(peerUrlAllowed("bareX", `${ATTACKER}/`).reason, "no-pin", "unpinned until the operator re-pins");
+    assert.ok(warns.some((l) => l.includes("[peer-pin] bareX left unpinned: run node scripts/cli/peer-pin.js bareX <url>")), warns.join("\n"));
+
+    // Positive control: a NEW peer with a ceremony address IS pinned to it.
+    const code2 = generateEnrollOtc();
+    const peer2 = await startPeer(P, { otc: code2 });
+    try {
+      const r = await post(peer2.port, baseBody("fresh2", {
+        otc: code2, source_gateway_url: "http://100.64.9.9:3001", source_tailscale_ip: "100.64.9.9", source_sync_port: 3001,
+      }));
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+    } finally { await peer2.close(); }
+    assert.equal(P.tokens().fresh2.pinned_origin, "http://100.64.9.9:3001", "the advertised ceremony address is the pin");
+    assert.deepEqual(peerUrlAllowed("fresh2", "http://100.64.9.9:3001/x"), { ok: true });
+  } finally { restore(); P.cleanup(); }
+});
+
+test("the enroll route: a re-pair with no ceremony address KEEPS the entry's previous pin and says so", async () => {
+  const restore = snapshotEnv();
+  const P = await makeSide("instP", "100.64.0.1");
+  try {
+    const KEPT = "http://100.64.7.7:3001";
+    await P.db.execute({
+      sql: "INSERT INTO crow_instances (id, name, crow_id, gateway_url, status, trusted, auth_token_hash) VALUES ('pinnedY', 'pinnedY', 'pinnedY', ?, 'active', 1, ?)",
+      args: [KEPT, sha("v".repeat(64))],
+    });
+    // Paired earlier: the entry holds credentials AND the origin pinned then.
+    writeFileSync(P.tokensPath, JSON.stringify({
+      pinnedY: { auth_token: "v".repeat(64), signing_key: "w".repeat(64), pinned_origin: KEPT },
+    }), { mode: 0o600 });
+    // Re-pairing a known, credentialed peer needs the operator's allowance here
+    // (this request carries no current-credential proof).
+    await writeRepairAllowance(P.db, P.id, "pinnedY");
+    const code = generateEnrollOtc();
+    const peer = await startPeer(P, { otc: code });
+    const warns = [];
+    const origWarn = console.warn;
+    console.warn = (...a) => { warns.push(a.join(" ")); };
+    try {
+      // The source advertises an address this host refuses and no tailnet IP, so
+      // THIS ceremony supplies no pin of its own.
+      const r = await post(peer.port, baseBody("pinnedY", {
+        otc: code, source_gateway_url: "https://evil.example.com:8444", source_tailscale_ip: null, source_sync_port: null,
+      }));
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+    } finally { console.warn = origWarn; await peer.close(); }
+    assert.equal(P.tokens().pinnedY.pinned_origin, KEPT, "the previous pin is kept, never dropped");
+    assert.ok(warns.some((l) => l.includes("[peer-pin] pinnedY kept its previous pin")), warns.join("\n"));
+    assert.ok(!warns.some((l) => l.includes("pinnedY left unpinned")), warns.join("\n"));
+    Object.assign(process.env, P.env);
+    const { peerUrlAllowed } = await import("../servers/shared/peer-credentials.js");
+    assert.deepEqual(peerUrlAllowed("pinnedY", `${KEPT}/x`), { ok: true }, "and it still authorizes exactly that origin");
+  } finally { restore(); P.cleanup(); }
+});
+
+test("CLI side: a pre-poisoned row is never the pin — the operator's --peer-url origin is", async () => {
+  const restore = snapshotEnv();
+  const S = await makeSide("instS", "100.64.0.2");
+  let answer = null;
+  const fake = createServer((req, res) => {
+    let b = "";
+    req.on("data", (c) => { b += c; });
+    req.on("end", () => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(answer)); });
+  });
+  await new Promise((r) => fake.listen(0, "127.0.0.1", r));
+  const fakeUrl = `http://127.0.0.1:${fake.address().port}`;
+  const ATTACKER = "http://100.64.66.66:3001";
+  try {
+    // A bare row already at a dialable address a bot could have written.
+    await S.db.execute({
+      sql: "INSERT INTO crow_instances (id, name, crow_id, gateway_url, tailscale_ip, status, trusted) VALUES ('poisoned', 'PZ', 'poisoned', ?, '100.64.66.66', 'active', 0)",
+      args: [ATTACKER],
+    });
+    answer = {
+      peer_instance_id: "poisoned", peer_crow_id: "poisoned", peer_name: "PZ", peer_outbound_bearer: "z".repeat(64),
+      // This ceremony supplied no usable address of its own.
+      peer_gateway_url: "https://evil.example.com:8444", peer_tailscale_ip: "8.8.8.8", peer_sync_port: 3001,
+    };
+    const otc = generateEnrollOtc();
+    const r = await cli(S, ["--peer-url", fakeUrl, "--otc", otc, "--peer-id", "poisoned"]);
+    assert.equal(r.code, 0, r.out);
+    assert.equal((await S.row("poisoned")).gateway_url, ATTACKER, "the row keeps today's logic");
+    assert.equal(S.tokens().poisoned.pinned_origin.replace(/\/$/, ""), fakeUrl, "the pin is the origin the operator typed");
+    // The pin and the stored row now name DIFFERENT origins, so every sender will
+    // refuse this peer. Neither value is silently changed: the CLI says so and
+    // names the PIN it took from this ceremony — but never the row's address,
+    // and never a ready-to-run command that would pin the row (a bot can write
+    // that row, so a copy-paste command built from it is pin poisoning).
+    assert.ok(r.out.includes(`WARNING: [peer-pin] poisoned is pinned to ${fakeUrl} (from this pairing)`), r.out);
+    assert.ok(r.out.includes("its stored gateway_url points elsewhere"), r.out);
+    assert.ok(r.out.includes("may have been written by a bot"), r.out);
+    assert.ok(r.out.includes("node scripts/cli/peer-pin.js poisoned <the address you confirmed>"), r.out);
+    // The row's origin is absent from the whole output...
+    assert.ok(!r.out.includes(ATTACKER), `the row origin must not be echoed: ${r.out}`);
+    assert.ok(!r.out.includes("100.64.66.66"), `the row's tailnet ip must not be echoed: ${r.out}`);
+    // ...and no runnable peer-pin command carries it (only the `<the address you
+    // confirmed>` placeholder form is offered).
+    for (const line of r.out.split("\n")) {
+      if (!line.includes("node scripts/cli/peer-pin.js")) continue;
+      assert.ok(line.includes("<the address you confirmed>"), `no ready-to-run pin command may name a stored address: ${line}`);
+    }
+    assert.ok(!/node scripts\/cli\/peer-pin\.js\s+poisoned\s+http/.test(r.out), `no pin command may carry a URL: ${r.out}`);
+    // Read the CLI's store as the CLI saw it (its own CROW_HOME / store path).
+    Object.assign(process.env, S.env);
+    const { peerUrlAllowed } = await import("../servers/shared/peer-credentials.js");
+    assert.deepEqual(peerUrlAllowed("poisoned", `${fakeUrl}/x`), { ok: true });
+    assert.deepEqual(peerUrlAllowed("poisoned", `${ATTACKER}/x`), { ok: false, reason: "mismatch" }, "the row's address is not authorized");
+  } finally {
+    await new Promise((r) => { fake.close(r); fake.closeAllConnections(); });
+    restore();
+    S.cleanup();
+  }
 });
 
 test("time box: an OTC expires CROW_ENROLL_WINDOW_MINUTES after the gateway first saw it", async () => {

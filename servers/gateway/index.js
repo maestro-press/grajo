@@ -319,6 +319,21 @@ try { await (await import("../shared/history/ensure.js")).ensureHistoryTriggersA
 // restore). See boot/storage-service-guard.js.
 await runStorageServiceGuard();
 
+// Peer gateway-origin pins (security stopgap): a peer credential may only be
+// sent to the origin recorded in <CROW_HOME>/secrets/peer-tokens.json at
+// pairing, never to whatever crow_instances.gateway_url says today (a contained
+// bot can write that row). Pairs made before the pin existed are pinned here,
+// ONCE, from their current trusted row — before any route can serve, so the row
+// is still the operator's. Marker-gated in the store, so a later rewrite can
+// never be backfilled; fail-soft (a failure never costs the boot).
+// See boot/peer-origin-backfill.js.
+try {
+  const { runPeerOriginBackfill } = await import("./boot/peer-origin-backfill.js");
+  await runPeerOriginBackfill({ createDbClient });
+} catch (err) {
+  console.warn(`[peer-pin] backfill crashed: ${err?.message || err}`);
+}
+
 // Record the sha this process booted on, for convergence. Captured once, here,
 // so every later comparison is against the code actually running rather than
 // whatever the shared checkout has since moved to. A null value makes

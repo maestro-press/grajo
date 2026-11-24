@@ -1690,23 +1690,15 @@ export async function pushAudioStream(deviceId, { url, codec, sampleRate, channe
         return refuseStream(err.code);
       }
     } else if (typeof auth === "string" && auth.startsWith("crow-peer:")) {
-      // A paired instance's stream proxy. The peer's bearer goes only to that peer's REGISTERED
-      // gateway host, and a redirect is never followed with or without it.
+      // A paired instance's stream proxy. The peer's bearer goes only to that peer's PAIRED gateway
+      // origin (pinned host-side at pairing, in the credential store a bot cannot read), and a
+      // redirect is never followed with or without it. The row's `gateway_url` alone never
+      // authorizes the destination: a contained bot can rewrite it.
       const instId = auth.slice("crow-peer:".length);
       let bearer = null;
       try {
-        let gwHost = null;
-        const dbc = (await loadDb()).createDbClient();
-        try {
-          const { rows } = await dbc.execute({ sql: "SELECT gateway_url FROM crow_instances WHERE id = ?", args: [instId] });
-          if (rows[0]?.gateway_url) gwHost = new URL(rows[0].gateway_url).host;
-        } finally { try { dbc.close(); } catch {} }
-        let targetHost = null;
-        try { targetHost = new URL(url).host; } catch {}
-        if (gwHost && targetHost && gwHost === targetHost) {
-          const { getPeerCreds } = await import(pathToFileURL(join(gatewayDir, "..", "shared", "peer-credentials.js")).href);
-          bearer = getPeerCreds(instId)?.auth_token || null;
-        }
+        const { getPeerCreds, peerUrlAllowed } = await import(pathToFileURL(join(gatewayDir, "..", "shared", "peer-credentials.js")).href);
+        if (peerUrlAllowed(instId, url).ok) bearer = getPeerCreds(instId)?.auth_token || null;
       } catch (err) {
         console.warn(`[meta-glasses] crow-peer auth resolve failed for ${instId}: ${err.message}`);
       }

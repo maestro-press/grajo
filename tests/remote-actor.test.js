@@ -259,7 +259,9 @@ test("signingFetch signs tools/call POSTs, passes the rest through", async () =>
   assert.equal(verify(h2, { keyLookup: () => KEY }).reason, "bad_sig");
   assert.equal(verify(h2, { keyLookup: () => KEY_C }).ok, true);
 
-  // pass-through, byte-identical init objects
+  // pass-through: the caller's init is untouched apart from the no-redirect
+  // hardening (a signed call must never follow a 3xx), and no actor headers
+  // are invented for anything that is not a tools/call.
   const passes = [
     { method: "POST", body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }) },
     { method: "POST", body: JSON.stringify({ ...BODY, method: "tools/list" }) },
@@ -271,7 +273,11 @@ test("signingFetch signs tools/call POSTs, passes the rest through", async () =>
   for (const init of passes) {
     const before = seen.length;
     await f("http://x/router/mcp", init);
-    assert.equal(seen[before].init, init);
+    const got = seen[before].init;
+    assert.equal(got.redirect, "manual", "a signed call never follows a redirect");
+    const { redirect: _redirect, ...rest } = got;
+    assert.deepEqual(rest, init ?? {}, "the caller's init is passed through");
+    assert.equal(new Headers(got.headers || {}).get(REMOTE_ACTOR_HEADER), null, "no actor header is invented");
   }
   assert.equal(unsigned, 0);
 
@@ -369,11 +375,14 @@ test("unsigned path strips caller-supplied actor headers, keeps the rest", async
     assert.equal(h.get(REMOTE_ACTOR_SIG_HEADER), null);
     assert.equal(h.get("x-keep"), "1");
   }
-  // an init with no actor headers is passed through untouched
+  // an init with no actor headers is passed through apart from the redirect
+  // hardening
   const plain = { method: "POST", body: notCall, headers: { a: "b" } };
   seen.length = 0;
   await withKey("u", plain);
-  assert.equal(seen[0], plain);
+  const { redirect: _r, ...plainRest } = seen[0];
+  assert.deepEqual(plainRest, plain);
+  assert.equal(seen[0].redirect, "manual");
 });
 
 // Adversarial review M1: the review's sequence. A header 60 s ahead of the

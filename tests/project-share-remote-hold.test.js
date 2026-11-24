@@ -144,6 +144,15 @@ before(async () => {
   });
   upstreamPort = await listen(upstream);
   sql((c) => c.prepare("UPDATE crow_instances SET gateway_url = ? WHERE id = ?").run(`http://127.0.0.1:${upstreamPort}/`, PEER));
+  // A pair the relay will forward to: the credential entry carries the bearer the
+  // fake upstream expects, and the paired-origin pin is the address this test
+  // stores for the peer (peerUrlAllowed — the row alone never authorizes a
+  // destination, which is the point of the pin).
+  {
+    const { setPeerCreds, pinPeerOrigin } = await import("../servers/shared/peer-credentials.js");
+    setPeerCreds(PEER, { auth_token: "peer-bearer", signing_key: "0".repeat(64) });
+    assert.equal(pinPeerOrigin(PEER, `http://127.0.0.1:${upstreamPort}/`), true);
+  }
 
   ({ peerRelayRouter } = await import("../servers/gateway/routes/peer-relay.js"));
   ({ createDbClient } = await import("../servers/db.js"));

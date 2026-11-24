@@ -48,7 +48,7 @@ import {
   createDeviceTrust,
   DEVICE_TRUST_TTL,
 } from "./totp.js";
-import { getPeerCreds } from "../../shared/peer-credentials.js";
+import { getPeerCreds, peerUrlAllowed } from "../../shared/peer-credentials.js";
 import { peerTrust, rowIsTrusted } from "../../shared/peer-trust.js";
 import { signTicket, verifyTicket, isSafeDestPath } from "../../shared/sso-ticket.js";
 import { auditCrossHostCall } from "../../shared/cross-host-auth.js";
@@ -1191,12 +1191,29 @@ export default function dashboardRouter(mcpAuthMiddleware, { renderLayout: rende
       const row = rows[0];
       const base = row?.gateway_url ? String(row.gateway_url).replace(/\/+$/, "") : null;
       const ssoOn = (await readSetting(db, "sso_enabled")) === "true";
-      const eligible = ssoOn && row && rowIsTrusted(row) && base; // PT-1: trusted AND active/offline
+      // PT-1: trusted AND active/offline. The ticket is signed with the pair key,
+      // so the address it rides to must be the PAIRED origin (pinned host-side at
+      // pairing): crow_instances.gateway_url is bot-writable, and a rewritten row
+      // would otherwise carry that signature to a host of the bot's choosing.
+      // Not pinned/not matching ⇒ no ticket, and the direct link below sends no
+      // credential at all.
+      const atPinnedOrigin = Boolean(base) && peerUrlAllowed(target, base).ok;
+      const eligible = ssoOn && row && rowIsTrusted(row) && atPinnedOrigin;
       const creds = eligible ? getPeerCreds(target) : null;
 
       if (!eligible || !creds || !creds.signing_key) {
-        // Not SSO-eligible — fall back to a direct link (prompts for password)
-        // if we at least have a gateway URL; otherwise back to the local home.
+        // Not at the paired origin: never send the browser to `${base}${dest}`.
+        // `base` comes from crow_instances.gateway_url, which a contained bot can
+        // rewrite, so that redirect would land the owner on a host the bot chose
+        // (phishing / a look-alike login page). Refuse loudly and point at the
+        // local page where the pair's address is fixed.
+        if (!atPinnedOrigin) {
+          const reason = base ? peerUrlAllowed(target, base).reason : "no-row";
+          console.warn(`[sso] refused launch to ${target}: not at the paired gateway origin (${reason}); open Settings → Paired Instances`);
+          return res.redirect(302, "/dashboard/settings?section=paired-instances");
+        }
+        // SSO is off / the row is not trusted, but the address IS the paired one:
+        // fall back to a direct link (prompts for password) when we have one.
         if (base) return res.redirect(302, `${base}${dest}`);
         return res.redirect(302, "/dashboard");
       }
@@ -1207,6 +1224,14 @@ export default function dashboardRouter(mcpAuthMiddleware, { renderLayout: rende
       url.searchParams.set("src", localId);
       url.searchParams.set("t", payloadB64);
       url.searchParams.set("sig", sig);
+      // The FINAL url is what the browser is sent to: re-check the pin against
+      // it, so a path or gateway_url form that would carry the ticket off the
+      // paired origin never reaches the user's address bar.
+      const finalAllowed = peerUrlAllowed(target, url.toString());
+      if (!finalAllowed.ok) {
+        console.warn(`[sso] refused launch to ${target}: not at the paired gateway origin (${finalAllowed.reason}); open Settings → Paired Instances`);
+        return res.redirect(302, "/dashboard/settings?section=paired-instances");
+      }
       return res.redirect(302, url.toString());
     } catch (err) {
       console.warn("[sso] launch failed:", err.message);

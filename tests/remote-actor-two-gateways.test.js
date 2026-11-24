@@ -28,7 +28,7 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { Named, installWorkspace, pairInto, until, sha, settingsRevoke, hasMarker, REPO } from "./fixtures/peer-pair.mjs";
+import { Named, installWorkspace, pairInto, repinCode, until, sha, settingsRevoke, hasMarker, REPO } from "./fixtures/peer-pair.mjs";
 import { startFakeNextcloud } from "./helpers/workspace-fake-nextcloud.js";
 import { idSuffix } from "../servers/shared/peer-label.js";
 import { signRemoteActor } from "../servers/shared/remote-actor.js";
@@ -130,6 +130,7 @@ async function voiceComment(from, to, bot, file) {
   const code = `
     const { buildRemoteVoiceContext } = await import(${mod("servers/gateway/ai/remote-voice-tools.js")});
     const { createDbClient } = await import(${mod("servers/db.js")});
+    ${repinCode(to.id, url)}
     const db = createDbClient();
     const ctx = await buildRemoteVoiceContext(db, { bot_id: ${JSON.stringify(bot.id)}, display_name: ${JSON.stringify(bot.name)}, tools: { remote_mcp: [${JSON.stringify(`${to.id}::workspace`)}] } }, {
       readSettingFn: async () => JSON.stringify({ remote_invocation: true }),
@@ -221,6 +222,7 @@ test("E-P1: A's pi bot reaches B through A's relay (real router, writer and prox
     const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
     initGatewayActorKey();
     const STORED = ${JSON.stringify(stored)}, REAL = ${JSON.stringify(real)};
+    ${repinCode(B.id, stored)}
     const fetchImpl = (url, init) => globalThis.fetch(String(url).startsWith(STORED) ? REAL + String(url).slice(STORED.length) : url, init);
     const app = express();
     app.use(express.json());

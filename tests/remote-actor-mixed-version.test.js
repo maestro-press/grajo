@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { Named, installWorkspace, pairInto, until, sha } from "./fixtures/peer-pair.mjs";
+import { Named, installWorkspace, pairInto, repinCode, until, sha } from "./fixtures/peer-pair.mjs";
 import { oldTree } from "./fixtures/old-tree.mjs";
 import { startFakeNextcloud } from "./helpers/workspace-fake-nextcloud.js";
 
@@ -71,6 +71,7 @@ test("E-M1: a new gateway's signed voice call to a pre-PR-A receiver runs and re
     const { buildRemoteVoiceContext } = await import(${mod("servers/gateway/ai/remote-voice-tools.js")});
     const { createDbClient } = await import(${mod("servers/db.js")});
     const { defaultPairKey } = await import(${mod("servers/shared/sync-pair-binding.js")});
+    ${repinCode(B.id, url)}
     const db = createDbClient();
     const ctx = await buildRemoteVoiceContext(db, { bot_id: "hank", display_name: "Hank", tools: { remote_mcp: [${JSON.stringify(`${B.id}::workspace`)}] } }, {
       readSettingFn: async () => JSON.stringify({ remote_invocation: true }),

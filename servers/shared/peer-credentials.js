@@ -18,9 +18,26 @@
  *                                            //   existing instanceAuthMiddleware which
  *                                            //   hashes against crow_instances.auth_token_hash)
  *       "created_at":    "ISO-8601",
- *       "rotated_at":    "ISO-8601 | null"
+ *       "rotated_at":    "ISO-8601 | null",
+ *       "pinned_origin": "http://host:port"  // the peer's gateway ORIGIN, recorded
+ *                                            //   here at pairing (optional: absent
+ *                                            //   on pairs made before the pin)
  *     }
  *   }
+ *
+ * The one-time pin-backfill marker is NOT a key in this file: it lives in its
+ * own <CROW_HOME>/secrets/peer-pin-backfill.json (see peerPinBackfillPath),
+ * because every top-level key here is an instance id — a marker key would be
+ * an entry the trust sweeper deletes and any store writer could clobber. A
+ * legacy top-level "pin_backfill_done_at" string is migrated out on first read.
+ *
+ *
+ * Why pinned_origin lives HERE and not in crow_instances: that row is
+ * bot-writable (a contained bot has crow.db bound read-write, and instance
+ * sync writes it too), so a URL read from it can never decide where a peer
+ * bearer or a pair-key signature goes. This file is under <CROW_HOME>/secrets,
+ * which the pi sandbox hides from bots. Every credential sender asks
+ * peerUrlAllowed() before attaching anything.
  *
  * Security notes:
  *   - File is verified 0600 at load time; loudly warns and refuses to use
@@ -64,6 +81,17 @@ function peerTokensFile() {
 function legacyPeerTokensFile() {
   if (activeOverride()) return null;
   return resolve(resolveCrowHome(), "peer-tokens.json");
+}
+
+/** The legacy top-level store key that used to hold the pin-backfill marker. */
+export const PIN_BACKFILL_KEY = "pin_backfill_done_at";
+
+/** Top-level keys that MAY be store metadata (a legacy marker), never a peer entry. */
+const STORE_META_KEYS = new Set([PIN_BACKFILL_KEY]);
+
+/** A real peer entry: a plain object. A string under a metadata key is not one. */
+function isPeerEntry(v) {
+  return Boolean(v) && typeof v === "object" && !Array.isArray(v);
 }
 
 /** A path with its existing ancestors' symlinks resolved (the file itself may not exist). */
@@ -160,11 +188,38 @@ export function loadPeerCreds() {
   if (!checkPermissions(p)) return {};
   try {
     if (!existsSync(p)) return {};
-    return JSON.parse(readFileSync(p, "utf-8"));
+    const parsed = JSON.parse(readFileSync(p, "utf-8"));
+    // A legacy store-metadata value (the old one-time pin backfill marker) is
+    // never a peer entry: callers iterate this object as "peers", and an
+    // orphan-key report that named the marker would be noise the operator
+    // cannot act on. An OBJECT under that same key is a real peer with that id
+    // (its marker lives in its own file now), so it is left alone.
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const k of STORE_META_KEYS) {
+        if (Object.prototype.hasOwnProperty.call(parsed, k) && !isPeerEntry(parsed[k])) delete parsed[k];
+      }
+    }
+    return parsed;
   } catch (err) {
     console.warn(`[peer-credentials] Failed to parse ${p}: ${err.message}`);
     return {};
   }
+}
+
+/** The store exactly as written (metadata included), or {} when unreadable. */
+function readStoreRaw() {
+  let p = peerTokensFile();
+  const legacy = legacyPeerTokensFile();
+  if (legacy && existsSync(legacy)) {
+    try { reconcileLegacyIfDue(); } catch { /* read the file where it is */ }
+    if (!existsSync(p) && !existsSync(p + MIGRATED_SUFFIX) && existsSync(legacy)) p = legacy;
+  }
+  if (!checkPermissions(p)) return {};
+  try {
+    if (!existsSync(p)) return {};
+    const o = JSON.parse(readFileSync(p, "utf-8"));
+    return o && typeof o === "object" && !Array.isArray(o) ? o : {};
+  } catch { return {}; }
 }
 
 const _warned = new Set();
@@ -535,7 +590,10 @@ export function getPeerCreds(instanceId) {
 
 /**
  * Upsert credentials for a peer. Preserves any existing fields not in
- * `patch`. Sets created_at on first write, rotated_at on subsequent writes.
+ * `patch` — including `pinned_origin`, so a token rotation or a re-enroll that
+ * reuses this entry never drops the paired gateway origin (a pairing that
+ * WANTS to move the pin calls pinPeerOrigin explicitly). Sets created_at on
+ * first write, rotated_at on subsequent writes.
  */
 export function setPeerCreds(instanceId, patch) {
   return updatePeerCreds((all) => {
@@ -561,6 +619,197 @@ export function deletePeerCreds(instanceId) {
     delete all[instanceId];
     return { deleted: true };
   }).deleted;
+}
+
+// ---------------------------------------------------------------------------
+// The paired gateway ORIGIN (security stopgap).
+//
+// Every sender of a peer credential used to take its destination straight from
+// crow_instances.gateway_url — a row a contained bot can write. A bot rewrote
+// it to its own server and collected the peer bearer on the owner's next call.
+// So the peer's gateway ORIGIN is recorded in THIS store (which bots cannot
+// read) at pairing, and a credential may only go to a URL whose origin is that
+// recorded origin. The owner re-pins deliberately when a peer legitimately
+// moves (scripts/cli/peer-pin.js) — nothing a bot writes can re-pin.
+// ---------------------------------------------------------------------------
+
+/**
+ * The origin form of a gateway URL: `protocol//host:port`, lower-case, with the
+ * default port made explicit (http 80, https 443). Null for anything that is
+ * not an http(s) URL with a host and without userinfo. Path, query and fragment
+ * are ignored (an install's gateway URL may carry a base path); no DNS is done,
+ * so a name stays exactly the name written and an IPv6 literal keeps its
+ * brackets.
+ */
+export function normalizeGatewayOrigin(url) {
+  if (typeof url !== "string") return null;
+  const s = url.trim();
+  if (!s) return null;
+  let u;
+  try { u = new URL(s); } catch { return null; }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+  if (u.username || u.password) return null;
+  const host = u.hostname; // URL already lower-cases it and keeps [..] for IPv6
+  if (!host) return null;
+  const port = u.port || (u.protocol === "http:" ? "80" : "443");
+  return `${u.protocol}//${host}:${port}`;
+}
+
+/**
+ * Record (or replace) the gateway origin pinned to a paired peer. Returns false
+ * — and writes nothing — when the URL does not normalize or the peer has no
+ * entry (a pin never invents a peer). Synchronous, under the store lock.
+ */
+export function pinPeerOrigin(instanceId, url) {
+  const origin = normalizeGatewayOrigin(url);
+  if (!origin || typeof instanceId !== "string" || !instanceId) return false;
+  try {
+    const r = updatePeerCreds((all) => {
+      const entry = all[instanceId];
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return { write: false, pinned: false };
+      entry.pinned_origin = origin;
+      return { pinned: true };
+    });
+    return !!(r && r.pinned);
+  } catch { return false; }
+}
+
+/**
+ * May a peer credential be sent to `url` for `instanceId`? Pure and synchronous
+ * (no locking beyond the store read); never throws, never logs the URL.
+ *
+ * `{ ok: true }` only when there is a credential entry, it carries a
+ * `pinned_origin`, and this URL normalizes to exactly that origin.
+ * Otherwise `{ ok: false, reason }` with one of:
+ *   bad-url   the URL is not a usable http(s) origin
+ *   no-creds  the peer is not paired (no entry in the store)
+ *   no-pin    paired before the pin existed and never backfilled/re-pinned
+ *   mismatch  the URL's origin is not the paired one
+ */
+export function peerUrlAllowed(instanceId, url) {
+  const want = normalizeGatewayOrigin(url);
+  if (!want) return { ok: false, reason: "bad-url" };
+  let entry = null;
+  try { entry = getPeerCreds(instanceId); } catch { entry = null; }
+  if (!entry || typeof entry !== "object") return { ok: false, reason: "no-creds" };
+  const pinned = typeof entry.pinned_origin === "string" ? entry.pinned_origin : "";
+  if (!pinned) return { ok: false, reason: "no-pin" };
+  if (pinned !== want) return { ok: false, reason: "mismatch" };
+  return { ok: true };
+}
+
+/**
+ * The one-time pin-backfill marker FILE. Not a key in the credential store:
+ * every top-level store key is an instance id, so a marker there was an entry
+ * (the trust sweeper deleted it, and `setPeerCreds`/`deletePeerCreds` on that
+ * id clobbered it — after which a later boot backfilled again from rows a bot
+ * can write). It sits beside the credential store, so it follows the same
+ * CROW_HOME / CROW_PEER_TOKENS_PATH scoping and the same 0700 dir.
+ * CROW_PEER_PIN_BACKFILL_PATH names it explicitly (tests, odd layouts).
+ */
+export function peerPinBackfillPath() {
+  const o = process.env.CROW_PEER_PIN_BACKFILL_PATH;
+  if (o) return resolve(o);
+  return resolve(dirname(peerTokensFile()), "peer-pin-backfill.json");
+}
+
+/** The marker file's value (ISO-8601), or null when it is absent/unusable. */
+function readPinBackfillFile() {
+  const p = peerPinBackfillPath();
+  if (!checkPermissions(p)) return null;
+  try {
+    if (!existsSync(p)) return null;
+    const o = JSON.parse(readFileSync(p, "utf-8"));
+    const v = typeof o === "string" ? o : o?.done_at;
+    return typeof v === "string" && v ? v : null;
+  } catch { return null; }
+}
+
+/** Write the marker durably (0600, tmp + rename + fsync), inside the secrets dir. */
+function writePinBackfillFile(at) {
+  const p = peerPinBackfillPath();
+  ensureSecretsDir(dirname(p));
+  writeDurable(p, `${JSON.stringify({ done_at: at }, null, 2)}\n`);
+}
+
+/**
+ * Move a legacy top-level marker STRING out of the store into its own file and
+ * drop the key. Only ever touches a string value: an object under the same key
+ * is a peer whose id happens to be that name, and is left alone.
+ */
+function migrateLegacyPinMarker() {
+  let raw;
+  try { raw = readStoreRaw(); } catch { return; }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+  if (!Object.prototype.hasOwnProperty.call(raw, PIN_BACKFILL_KEY)) return;
+  const v = raw[PIN_BACKFILL_KEY];
+  if (typeof v !== "string" || !v) return;
+  if (!readPinBackfillFile()) {
+    try { writePinBackfillFile(v); } catch (err) {
+      // The old key still gates the backfill; leave it in place.
+      warnOnce(`pin-migrate:${peerTokensFile()}`, `[peer-credentials] could not move the pin-backfill marker into ${peerPinBackfillPath()}: ${err.message}`);
+      return;
+    }
+  }
+  try {
+    updatePeerCreds((all) => {
+      if (!Object.prototype.hasOwnProperty.call(all, PIN_BACKFILL_KEY)) return { write: false };
+      if (isPeerEntry(all[PIN_BACKFILL_KEY])) return { write: false };
+      delete all[PIN_BACKFILL_KEY];
+      return {};
+    });
+  } catch { /* the file is authoritative: the next boot reads only it */ }
+}
+
+/** The one-time gateway-origin backfill marker (ISO-8601), or null. */
+export function pinBackfillDoneAt() {
+  const file = readPinBackfillFile();
+  if (file) return file;
+  // A store written by a version that kept the marker as a key still counts:
+  // move it to its own file (and drop the key) on first read.
+  try { migrateLegacyPinMarker(); } catch { /* read-only view */ }
+  const migrated = readPinBackfillFile();
+  if (migrated) return migrated;
+  try {
+    const v = readStoreRaw()[PIN_BACKFILL_KEY];
+    return typeof v === "string" && v ? v : null;
+  } catch { return null; }
+}
+
+/**
+ * Record the one-time backfill marker. True when it was written; false when the
+ * marker file could not be written (the caller then leaves the backfill to
+ * retry). Never writes the credential store.
+ */
+export function markPinBackfillDone(at = new Date().toISOString()) {
+  try {
+    writePinBackfillFile(at);
+  } catch { return false; }
+  try { migrateLegacyPinMarker(); } catch { /* the file is authoritative now */ }
+  return true;
+}
+
+/**
+ * A fetch that NEVER follows a redirect: `redirect: "manual"`, and any 3xx is
+ * thrown as an error instead of being handed back. A peer that answers 307
+ * would otherwise move a peer bearer (or a pair-key signature) to a host none
+ * of the origin checks judged, on a fresh socket of Node's own choosing.
+ *
+ * The error is a FIXED message: no status, and never the redirect target or its
+ * origin. Such a message reaches logs, error reports and an operator's terminal,
+ * and the target is exactly the address a hostile peer chose — naming it hands
+ * that choice a louder audience than the peer itself had.
+ */
+export function noRedirectFetch(fetchImpl = globalThis.fetch) {
+  if (typeof fetchImpl !== "function") throw new TypeError("noRedirectFetch needs a fetch function");
+  return async (url, init = {}) => {
+    const res = await fetchImpl(url, { ...init, redirect: "manual" });
+    if (res && res.status >= 300 && res.status < 400) {
+      try { res.body?.cancel?.()?.catch?.(() => {}); } catch { /* irrelevant */ }
+      throw new Error("peer redirect refused");
+    }
+    return res;
+  };
 }
 
 /**

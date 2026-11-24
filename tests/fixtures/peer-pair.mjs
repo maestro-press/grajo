@@ -599,6 +599,21 @@ export function installWorkspace(inst, fake, { exposed = ["workspace"] } = {}) {
 const mod = (p) => JSON.stringify(new URL(`../../${p}`, import.meta.url).href);
 
 /**
+ * The operator's re-pin, as code for a child, for a test that reaches a peer
+ * through a different ORIGIN than the stored row (this fixture's Serve relay).
+ * A peer credential only ever goes to a peer's PAIRED gateway origin
+ * (servers/shared/peer-credentials.js: peerUrlAllowed), so a fixture that dials
+ * a relay has to pin that relay — exactly what `scripts/cli/peer-pin.js` does.
+ * Run it inside a child whose env is the instance that will send.
+ */
+export function repinCode(peerId, url) {
+  return `const { pinPeerOrigin } = await import(${mod("servers/shared/peer-credentials.js")});
+    // Best effort: a peer we hold no credential entry for has nothing to pin —
+    // and nothing to send — so the call fails the way the test expects.
+    if (!pinPeerOrigin(${JSON.stringify(peerId)}, ${JSON.stringify(url)})) console.error("repin: no credential entry for ${peerId}");`;
+}
+
+/**
  * A signed call from `from` to `to` through the real forwardSignedRequest, in
  * a signer child with `from`'s env. The target row's gateway_url is mapped to
  * `to`'s relay for this call only (the stored URL is tailnet-shaped and not
@@ -610,6 +625,7 @@ export async function signedCall(from, to, method, path, body) {
   const code = `
     const { forwardSignedRequest } = await import(${mod("servers/shared/peer-forward.js")});
     const { createDbClient } = await import(${mod("servers/db.js")});
+    ${repinCode(to.id, url)}
     const real = createDbClient();
     const db = {
       async execute(st) {

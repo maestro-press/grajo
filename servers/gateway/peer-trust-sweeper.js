@@ -45,6 +45,11 @@ import bus from "../shared/event-bus.js";
 
 export const SWEEP_INTERVAL_MS = 10_000;
 
+/** A real store entry: a plain object. A legacy metadata string is not one. */
+function isStoreEntry(v) {
+  return Boolean(v) && typeof v === "object" && !Array.isArray(v);
+}
+
 /** SQLite datetime('now') text (UTC, no zone) → epoch ms. */
 export function sqliteUtcMs(ts) {
   if (!ts) return NaN;
@@ -135,7 +140,12 @@ export async function reconcilePeerCreds(db, { localInstanceId = null, fixItStor
       let changed = false;
       for (const r of revoked) {
         const entry = all[r.id];
-        if (!entry) continue;
+        // Only a real entry is ever deleted: a legacy store-metadata value (the
+        // old `pin_backfill_done_at` string) is not a peer entry — `entryMintMs`
+        // of a string is -Infinity, which used to make the sweeper delete the
+        // one-time backfill marker and let a later boot re-pin from bot rows.
+        // (The marker is its own file now; this stays as a defence in depth.)
+        if (!isStoreEntry(entry)) continue;
         const R = sqliteUtcMs(r.updated_at);
         const M = entryMintMs(entry);
         if (!Number.isFinite(R)) continue; // no revoke time: never guess

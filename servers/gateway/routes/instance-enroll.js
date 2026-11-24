@@ -66,6 +66,8 @@ import {
   getPeerCreds,
   loadPeerCreds,
   updatePeerCreds,
+  pinPeerOrigin,
+  normalizeGatewayOrigin,
   generateSecret,
 } from "../../shared/peer-credentials.js";
 import { fenceStatements } from "../../shared/repair-fence.js";
@@ -274,6 +276,17 @@ export function instanceEnrollRouter(db, { execFileSyncImpl, now = () => Date.no
         gatewayUrl = existing.gateway_url || gatewayUrl;
         if (existing.tailscale_ip) tailscaleIp = null;
       }
+      // The PIN may only come from a URL this ceremony itself supplied: the
+      // source's accepted advertised address, or the request-derived tailnet
+      // address above (both vetted in this request). `gatewayUrl` may instead
+      // be the EXISTING row's address — a bare row the operator registered, or
+      // a dialable address this request must not downgrade — and
+      // crow_instances is bot-writable, so that value never pins. A pair with
+      // no ceremony address is stored UNPINNED (senders refuse with `no-pin`)
+      // until the operator runs scripts/cli/peer-pin.js, rather than pinning
+      // whatever a poisoned row already held.
+      const ceremonyOrigin = srcUrl ? normalizeGatewayOrigin(srcUrl) : null;
+      const pinUrl = ceremonyOrigin && ceremonyOrigin === normalizeGatewayOrigin(gatewayUrl) ? gatewayUrl : null;
       const name = typeof source_name === "string" && source_name.trim() ? source_name.trim().slice(0, 128) : null;
 
       const stmts = [
@@ -330,6 +343,24 @@ export function instanceEnrollRouter(db, { execFileSyncImpl, now = () => Date.no
       const hadPrev = Object.prototype.hasOwnProperty.call(prevAll, source_instance_id);
       const prevCreds = prevAll[source_instance_id];
       setPeerCreds(source_instance_id, { auth_token: peerOutboundBearer, signing_key: shared_signing_key });
+      // Pin the gateway ORIGIN this request itself vetted and wrote to
+      // crow_instances.gateway_url (the local `pinUrl` above) — never a later
+      // re-read of that row, and never a value kept from it. A credential for
+      // this peer will only ever go to that origin; a pair with no
+      // ceremony-supplied address stays unpinned (senders then refuse with
+      // `no-pin` until the operator re-pins).
+      if (!pinUrl || !pinPeerOrigin(source_instance_id, pinUrl)) {
+        // No ceremony address to take a pin from. setPeerCreds() above MERGES,
+        // so a pin recorded at an earlier pairing is still in place: it stays,
+        // and "left unpinned" would be wrong (and would send the operator to
+        // re-pin a peer that is already pinned).
+        const keptPin = getPeerCreds(source_instance_id)?.pinned_origin;
+        if (typeof keptPin === "string" && keptPin) {
+          console.warn(`[peer-pin] ${source_instance_id} kept its previous pin (${keptPin}): this pairing had no ceremony address to take a new one from`);
+        } else {
+          console.warn(`[peer-pin] ${source_instance_id} left unpinned: run node scripts/cli/peer-pin.js ${source_instance_id} <url>`);
+        }
+      }
       try {
         await db.batch(stmts);
       } catch (err) {

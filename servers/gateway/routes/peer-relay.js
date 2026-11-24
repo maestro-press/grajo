@@ -42,6 +42,9 @@
  *      and a peer bearer                                             else 502
  *      and, for EVERY caller, the FINAL url `${base}${mount}/mcp` is that
  *      mount's own path with no query and no fragment             else 404/403
+ *      and that row's URL at the PAIRED gateway origin (pinned
+ *      host-side at pairing: the row itself is bot-writable, so it
+ *      never decides where the bearer goes)                         else 502
  *   7. a JSON-RPC batch                                              -32600
  *   8. one forward, `redirect: "manual"` — a 3xx is answered as the same 502
  *      "the peer is unreachable" and never followed (a redirect would move the
@@ -63,7 +66,7 @@ import { isRelayedSocket } from "../../shared/bot-doors.js";
 import { ownTargetOf, isRebindableHost } from "../models/self-target.js";
 import dns from "node:dns";
 import { defaultPairKey } from "../../shared/sync-pair-binding.js";
-import { getPeerCreds } from "../../shared/peer-credentials.js";
+import { getPeerCreds, peerUrlAllowed } from "../../shared/peer-credentials.js";
 import { readSetting } from "../dashboard/settings/registry.js";
 import { verifyPeerRelayActorSig } from "../../../scripts/pi-bots/actor-sig.mjs";
 import { resolveSignedSession, sessionMatchesTuple } from "../../shared/signed-session.js";
@@ -109,6 +112,9 @@ const header = (req, name) => {
  * @param {Function} [o.deps.fetchImpl]   upstream fetch (default globalThis.fetch)
  * @param {Function} [o.deps.keyLookup]   peerId -> pair signing key hex | null
  * @param {Function} [o.deps.getCreds]    peerId -> { auth_token } | null
+ * @param {Function} [o.deps.urlAllowed]  (peerId, url) -> { ok, reason? }: may this
+ *                                        peer's credential go to this URL? Defaults to
+ *                                        peerUrlAllowed (the paired-origin pin).
  * @param {Function|string} [o.deps.localId]  this instance's id (or a function returning it)
  * @param {Function} [o.deps.now]         ms clock for the remote-actor timestamp
  */
@@ -120,6 +126,7 @@ export function peerRelayRouter({ createDbClient, deps = {} } = {}) {
   const lookupFn = deps.lookupFn || dns.lookup;
   const keyLookup = deps.keyLookup || defaultPairKey;
   const getCreds = deps.getCreds || getPeerCreds;
+  const urlAllowed = deps.urlAllowed || peerUrlAllowed;
   const localIdFn = typeof deps.localId === "function" ? deps.localId
     : typeof deps.localId === "string" ? () => deps.localId
       : getOrCreateLocalInstanceId;
@@ -233,6 +240,9 @@ export function peerRelayRouter({ createDbClient, deps = {} } = {}) {
       // the row may carry no query or fragment (`${gateway_url}${mount}/mcp`
       // would otherwise turn into another route on the peer). Judged on the string
       // alone, before any lookup, with the same refusal shape as below.
+      //
+      // (The paired-origin pin below is the complement: it refuses any address this
+      // host did not pair with, whatever a bot writes into the row.)
       const raw = String(peer.gateway_url);
       if (isRelayedSocket(req.socket)) {
         // The RAW string first: `${gateway_url}${mount}/mcp` turns a row carrying
@@ -276,6 +286,17 @@ export function peerRelayRouter({ createDbClient, deps = {} } = {}) {
       let creds = null;
       try { creds = await getCreds(instanceId); } catch { creds = null; }
       if (!creds || typeof creds.auth_token !== "string" || !creds.auth_token) return refuse(res, 502, "no credentials for this peer", { id });
+      // The address the bearer is about to go to must be the one this host
+      // pinned for the pair. `crow_instances.gateway_url` is bot-writable, so it
+      // alone can never authorize a destination: a rewritten row would hand this
+      // gateway's peer bearer to whatever server the bot named. Refused BEFORE
+      // any dial, with the reason in the log only (never the URL).
+      const allowed = urlAllowed(instanceId, peer.gateway_url);
+      if (!allowed || !allowed.ok) {
+        const reason = (allowed && allowed.reason) || "no-pin";
+        console.error(`[peer-relay] refused ${instanceId} for bot ${bot}: gateway origin is not the paired one (${reason})`);
+        return refuse(res, 502, "the peer is not at its paired address", { id });
+      }
 
       // 7. Batches are never relayed (the receiver verifies single objects only).
       if (Array.isArray(req.body)) return refuse(res, 400, "batch requests are not relayed", { code: -32600 });
@@ -303,6 +324,15 @@ export function peerRelayRouter({ createDbClient, deps = {} } = {}) {
       db = null;
 
       const url = `${peerBase}${mount}/mcp`;
+      // The FINAL url is what gets dialled: re-check the pin against it (a
+      // gateway_url form that would move the bearer off the paired origin is
+      // refused here too, not only on the row value).
+      const finalAllowed = urlAllowed(instanceId, url);
+      if (!finalAllowed || !finalAllowed.ok) {
+        const reason = (finalAllowed && finalAllowed.reason) || "no-pin";
+        console.error(`[peer-relay] refused ${instanceId} for bot ${bot}: gateway origin is not the paired one (${reason})`);
+        return refuse(res, 502, "the peer is not at its paired address", { id });
+      }
       const ac = new AbortController();
       res.on("close", () => { if (!res.writableEnded) ac.abort(); });
       let upstream;

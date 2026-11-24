@@ -19,7 +19,7 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { Named, installWorkspace, pairInto, until, sha } from "./fixtures/peer-pair.mjs";
+import { Named, installWorkspace, pairInto, repinCode, until, sha } from "./fixtures/peer-pair.mjs";
 import { startFakeNextcloud } from "./helpers/workspace-fake-nextcloud.js";
 import { idSuffix } from "../servers/shared/peer-label.js";
 
@@ -50,6 +50,7 @@ async function voiceComment(from, path, content) {
   const code = `
     const { buildRemoteVoiceContext } = await import(${mod("servers/gateway/ai/remote-voice-tools.js")});
     const { createDbClient } = await import(${mod("servers/db.js")});
+    ${repinCode(B.id, url)}
     const db = createDbClient();
     const ctx = await buildRemoteVoiceContext(db, { bot_id: "hank", display_name: "Hank", tools: { remote_mcp: [${JSON.stringify(`${B.id}::workspace`)}] } }, {
       readSettingFn: async () => JSON.stringify({ remote_invocation: true }),

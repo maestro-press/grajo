@@ -24,6 +24,8 @@
  */
 
 import { createDbClient, resolveDataDir } from "../../servers/db.js";
+import { fileURLToPath } from "node:url";
+import { realpathSync } from "node:fs";
 import { resolve as resolvePath } from "path";
 import { createHash } from "crypto";
 import {
@@ -40,6 +42,8 @@ import {
 } from "../../servers/shared/self-dial-address.js";
 import {
   setPeerCreds,
+  pinPeerOrigin,
+  normalizeGatewayOrigin,
   generateSecret,
   peerTokensPath,
 } from "../../servers/shared/peer-credentials.js";
@@ -275,13 +279,37 @@ async function vetPeerAnswer(db, peerPayload, { peerUrl, expectPeerId, localId }
 /** The gateway_url to store for the peer: its answer only when it passes the
  * route's acceptance rule (and does not downgrade a dialable row), else the
  * existing dialable address, else the origin the operator typed. Never a URL
- * with userinfo. */
+ * with userinfo. This is the ROW only — crow_instances.gateway_url is
+ * bot-writable, so it never decides the pin (see peerPinCandidateForCeremony). */
 function vetPeerGatewayUrl(answerUrl, { row, peerUrl, ownTailnet }) {
   const ok = acceptableAdvertisedUrl(answerUrl, { ownTailnet });
   const existing = row?.gateway_url && isDialableGatewayUrl(row.gateway_url) ? row.gateway_url : null;
   if (ok && (isDialableGatewayUrl(ok) || !existing)) return ok;
   if (existing) return existing;
   try { return new URL(String(peerUrl)).origin; } catch { return null; }
+}
+
+/**
+ * The gateway ORIGIN this pairing may pin, or null (store the credentials
+ * unpinned). ONLY a URL that came from the authenticated ceremony itself:
+ *   - the peer's ADVERTISED gateway_url, when this host accepts it; else
+ *   - the origin the operator typed as --peer-url (the address this ceremony
+ *     actually reached the peer on).
+ * NEVER a value read from crow_instances: that row is bot-writable, so a
+ * pre-poisoned row would otherwise become the pin the bot needs.
+ */
+function peerPinCandidateForCeremony(answerUrl, { peerUrl, ownTailnet }) {
+  return acceptableAdvertisedUrl(answerUrl, { ownTailnet }) || operatorOrigin(peerUrl);
+}
+
+/** The http(s) ORIGIN of the URL the operator typed, or null. */
+function operatorOrigin(peerUrl) {
+  try {
+    const u = new URL(String(peerUrl));
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    if (u.username || u.password) return null;
+    return u.origin;
+  } catch { return null; }
 }
 
 async function networkPair(db, { peerUrl, peerName, peerId: expectPeerId, otc: otcArg }) {
@@ -338,6 +366,9 @@ async function networkPair(db, { peerUrl, peerName, peerId: expectPeerId, otc: o
     peerId,
     peerName: peerName || answerName || knownRow?.name || peerId,
     peerGatewayUrl: vetPeerGatewayUrl(peerPayload.peer_gateway_url, { row: knownRow, peerUrl, ownTailnet }),
+    // The pin comes ONLY from this ceremony: the peer's advertised address when
+    // acceptable, else the --peer-url origin the operator typed. Never the row.
+    pinOrigin: peerPinCandidateForCeremony(peerPayload.peer_gateway_url, { peerUrl, ownTailnet }),
     peerTailscaleIp: peerPayload.peer_tailscale_ip,
     peerSyncPort: peerPayload.peer_sync_port,
     peerCrowId: peerId,
@@ -403,6 +434,12 @@ async function manualPair(db, { peerId, peerName, peerUrl }) {
     peerId: answeredId,
     peerName,
     peerGatewayUrl: pickPeerGatewayUrl(peerPayload.peer_gateway_url, peerUrl),
+    // Same rule as the network ceremony: the advertised address if acceptable,
+    // else the --peer-url origin the operator typed — never a stored row.
+    pinOrigin: peerPinCandidateForCeremony(peerPayload.peer_gateway_url, {
+      peerUrl,
+      ownTailnet: tailnetSuffix(gatewayUrlHost(self.gateway_url)) || ownTailnetSuffix(),
+    }),
     peerTailscaleIp: peerPayload.peer_tailscale_ip,
     peerSyncPort: peerPayload.peer_sync_port,
     peerCrowId: peerPayload.peer_crow_id || peerId,
@@ -415,11 +452,17 @@ async function manualPair(db, { peerId, peerName, peerUrl }) {
   console.log(`  Credentials stored: ${peerTokensPath()}`);
 }
 
-async function storePeerCredsLocally(db, {
+/**
+ * The write half of a pairing: the row, the credentials, and the pin. Exported
+ * for the tests that must prove what it does (and what it logs) when a ceremony
+ * supplies no pin of its own.
+ */
+export async function storePeerCredsLocally(db, {
   allowReactivate = false,
   peerId,
   peerName,
   peerGatewayUrl,
+  pinOrigin,
   peerTailscaleIp,
   peerSyncPort,
   peerCrowId,
@@ -458,6 +501,41 @@ async function storePeerCredsLocally(db, {
   await forgetPeerHandshakeState(db, getOrCreateLocalInstanceId(), peerId);
 
   setPeerCreds(peerId, { auth_token, signing_key });
+  // Pin only an ORIGIN this ceremony itself supplied (the peer's accepted
+  // advertised address, else the --peer-url the operator typed). The row above
+  // is bot-writable, so an address read from it (or kept from an older row) is
+  // never pinned: such a pair is stored UNPINNED and every sender refuses with
+  // `no-pin` until the operator re-pins (scripts/cli/peer-pin.js), rather than
+  // pinning whatever a bot wrote into crow_instances.gateway_url.
+  //
+  // A pin and the row it authorizes must be the SAME origin, because every
+  // sender compares its target against the pin. A pin taken from the peer's
+  // accepted advertised address while the row keeps a different dial address is
+  // a pair nothing can reach; neither value is changed here (the row follows the
+  // stored pairing, the pin follows the ceremony), so say so plainly.
+  //
+  // The stored row origin is NOT printed: crow_instances is bot-writable, so
+  // echoing it back — and worse, printing a ready-to-run `peer-pin.js <id>
+  // <row origin>` — would turn operator guidance into a pin-poisoning rail. The
+  // operator is told to confirm the peer's real address themselves and paste
+  // THAT, never a value this CLI read out of the row.
+  const pinOriginNorm = normalizeGatewayOrigin(pinOrigin);
+  const rowOriginNorm = normalizeGatewayOrigin(peerGatewayUrl);
+  if (pinOriginNorm && rowOriginNorm && pinOriginNorm !== rowOriginNorm) {
+    console.warn(`WARNING: [peer-pin] ${peerId} is pinned to ${pinOriginNorm} (from this pairing) but its stored gateway_url points elsewhere; senders will refuse this peer until they agree. The stored address may have been written by a bot: confirm the peer's real gateway address yourself, then run: node scripts/cli/peer-pin.js ${peerId} <the address you confirmed>`);
+  }
+  if (!pinOrigin || !pinPeerOrigin(peerId, pinOrigin)) {
+    // No ceremony address to take a pin from. setPeerCreds() merges, so a pin
+    // recorded at an earlier pairing is still in place — it stays, and saying
+    // "left unpinned" would be wrong (and would send the operator to re-pin a
+    // peer that is already pinned).
+    const keptPin = loadPeerCreds()[peerId]?.pinned_origin;
+    if (typeof keptPin === "string" && keptPin) {
+      console.warn(`[peer-pin] ${peerId} kept its previous pin (${keptPin}): this pairing had no ceremony address to take a new one from`);
+    } else {
+      console.warn(`[peer-pin] ${peerId} left unpinned: run node scripts/cli/peer-pin.js ${peerId} <url>`);
+    }
+  }
 }
 
 async function main() {
@@ -482,7 +560,23 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(`FAIL: ${err.message}`);
-  process.exit(1);
-});
+/**
+ * Is this file the process's entry point? Compared on the RESOLVED paths, so a
+ * relative invocation (`node scripts/cli/instance-pair.js`, how the installer
+ * and the tests run it) and a symlinked checkout both still count. The tests
+ * import storePeerCredsLocally() from here, and importing must never pair.
+ */
+function isEntryPoint() {
+  const arg = process.argv[1];
+  if (!arg) return false;
+  try {
+    return realpathSync(arg) === realpathSync(fileURLToPath(import.meta.url));
+  } catch { return false; }
+}
+
+if (isEntryPoint()) {
+  main().catch((err) => {
+    console.error(`FAIL: ${err.message}`);
+    process.exit(1);
+  });
+}

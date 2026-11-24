@@ -165,22 +165,27 @@ function stripActorHeaders(init) {
 /**
  * A fetch that signs tools/call POSTs. The key is looked up on every call and
  * never held in the closure; without one the request goes out unsigned.
+ * Every request is issued with `redirect: "manual"`: a caller that installs
+ * this fetch on a peer transport must never have the actor signature follow a
+ * 3xx to a host its own origin check never judged (senders also wrap it in
+ * noRedirectFetch, which turns the 3xx into an error).
  */
 export function signingFetch({ keyLookup, src, aud, mount, bot, name, fetchImpl = globalThis.fetch, onUnsigned } = {}) {
   return async (url, init) => {
+    const base = { ...(init || {}), redirect: "manual" };
     let body = null;
     if (init && String(init.method || "").toUpperCase() === "POST" && typeof init.body === "string") {
       try { body = JSON.parse(init.body); } catch { body = null; }
     }
-    if (!isToolCall(body)) return fetchImpl(url, stripActorHeaders(init));
+    if (!isToolCall(body)) return fetchImpl(url, stripActorHeaders(base));
     let key = null;
     try { key = keyLookup(aud); } catch { key = null; }
     const signed = key ? signRemoteActor({ signingKeyHex: key, bot, name, src, aud, mount, body }) : null;
     if (!signed) {
       try { onUnsigned?.(); } catch { /* never affects the call */ }
-      return fetchImpl(url, stripActorHeaders(init));
+      return fetchImpl(url, stripActorHeaders(base));
     }
-    return fetchImpl(url, { ...init, headers: withHeaders(init.headers, signed) });
+    return fetchImpl(url, { ...base, headers: withHeaders(base.headers, signed) });
   };
 }
 

@@ -59,7 +59,9 @@ const verifyReq = (c, over = {}) => verifyRemoteActor({
 beforeEach(() => {
   captured.length = 0;
   _resetRemoteActorNonces(); _resetRemoteVoiceCacheForTests(); _resetVoiceUnsignedLogForTests();
-  writeStore({ [PEER]: { auth_token: TOKEN, signing_key: KEY } });
+  // The paired gateway ORIGIN travels with the credentials (pinned at pairing):
+  // the voice client refuses to send the peer bearer anywhere else.
+  writeStore({ [PEER]: { auth_token: TOKEN, signing_key: KEY, pinned_origin: URL_BASE } });
 });
 
 function captureErr(fn) {
@@ -92,7 +94,7 @@ test("S-V1 a bound bot's tool call is signed; discovery and handshake carry no a
 });
 
 test("S-V2 no pair key: the call still succeeds unsigned and one line is logged, never a secret", async () => {
-  writeStore({ [PEER]: { auth_token: TOKEN } });
+  writeStore({ [PEER]: { auth_token: TOKEN, pinned_origin: URL_BASE } });
   const ctx = await buildRemoteVoiceContext(null, botDef, deps());
   const lines = await captureErr(async () => {
     const r1 = await ctx.callRemote("fw_search", { q: "x" });

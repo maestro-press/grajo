@@ -1597,13 +1597,35 @@ export async function loadRemoteInstances() {
 /**
  * Create a proper MCP client connected to a remote Crow instance's gateway.
  * Uses the SDK's StreamableHTTPClientTransport for session-aware communication.
+ *
+ * Exported for tests (the paired-origin refusal is asserted directly).
  */
-async function createRemoteInstanceClient(instance) {
+export async function createRemoteInstanceClient(instance) {
   const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
-  const { getPeerCreds } = await import("../shared/peer-credentials.js");
+  const { getPeerCreds, peerUrlAllowed, noRedirectFetch } = await import("../shared/peer-credentials.js");
+
+  // A peer credential goes only to the origin pinned for the pair at pairing
+  // time (host-side, in <CROW_HOME>/secrets/peer-tokens.json). The destination
+  // here comes from crow_instances.gateway_url, which a contained bot can write
+  // (and instance sync writes), so a rewritten row must not carry the bearer
+  // anywhere: refuse BEFORE the transport is built (no connection is opened at
+  // all), and log the reason — never the URL.
+  const allowed = peerUrlAllowed(instance.id, instance.gateway_url);
+  if (!allowed.ok) {
+    console.log(`  [proxy] refused federation to ${instance.name}: gateway origin is not the paired one (${allowed.reason})`);
+    throw new Error(`federation refused: gateway origin is not the paired one (${allowed.reason})`);
+  }
 
   const baseUrl = instance.gateway_url.replace(/\/$/, "");
   const mcpUrl = new URL(`${baseUrl}/memory/mcp`);
+  // The FINAL url is what is dialled: re-check the pin against it, so a path or
+  // a gateway_url form that would move the bearer off the paired origin is
+  // refused before a connection is opened.
+  const finalAllowed = peerUrlAllowed(instance.id, mcpUrl.toString());
+  if (!finalAllowed.ok) {
+    console.log(`  [proxy] refused federation to ${instance.name}: gateway origin is not the paired one (${finalAllowed.reason})`);
+    throw new Error(`federation refused: gateway origin is not the paired one (${finalAllowed.reason})`);
+  }
 
   // Attach the pre-shared peer bearer token so the remote gateway's
   // instanceAuthMiddleware (servers/gateway/instance-registry.js:427)
@@ -1618,7 +1640,13 @@ async function createRemoteInstanceClient(instance) {
     ? { headers: { Authorization: `Bearer ${creds.auth_token}` } }
     : undefined;
 
-  const transport = new StreamableHTTPClientTransport(mcpUrl, requestInit ? { requestInit } : undefined);
+  // NO REDIRECTS on any request this transport makes (a 3xx would move the peer
+  // bearer to a host the pin above never judged); noRedirectFetch turns one
+  // into an error instead.
+  const transport = new StreamableHTTPClientTransport(mcpUrl, {
+    ...(requestInit ? { requestInit } : {}),
+    fetch: noRedirectFetch(),
+  });
 
   const client = new Client({
     name: `crow-federation-${instance.id}`,

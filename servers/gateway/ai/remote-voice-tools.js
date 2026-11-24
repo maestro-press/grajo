@@ -194,26 +194,44 @@ function noteUnsigned(botId, instanceId) {
 export async function createRemoteRouterClient({ instanceId, gatewayUrl, actor, getLocalId }) {
   const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
   const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
-  const { getPeerCreds } = await import("../../shared/peer-credentials.js");
+  const { getPeerCreds, peerUrlAllowed, noRedirectFetch } = await import("../../shared/peer-credentials.js");
 
   const baseUrl = String(gatewayUrl).replace(/\/+$/, "");
+  // Only the origin pinned for this pair at pairing may receive the peer
+  // bearer: gatewayUrl comes from crow_instances.gateway_url, which a contained
+  // bot can write, so a rewritten row is refused before anything is dialled
+  // (the reason is logged, the URL never is).
+  const allowed = peerUrlAllowed(instanceId, baseUrl);
+  if (!allowed.ok) {
+    console.error(`[voice-remote] refused ${instanceId}: gateway origin is not the paired one (${allowed.reason})`);
+    throw new Error(`remote peer refused: gateway origin is not the paired one (${allowed.reason})`);
+  }
   const url = new URL(`${baseUrl}/router/mcp`);
+  const finalAllowed = peerUrlAllowed(instanceId, url.toString());
+  if (!finalAllowed.ok) {
+    console.error(`[voice-remote] refused ${instanceId}: gateway origin is not the paired one (${finalAllowed.reason})`);
+    throw new Error(`remote peer refused: gateway origin is not the paired one (${finalAllowed.reason})`);
+  }
   const creds = getPeerCreds(instanceId);
   const requestInit = creds?.auth_token
     ? { headers: { Authorization: `Bearer ${creds.auth_token}` } }
     : undefined;
 
-  const opts = requestInit ? { requestInit } : {};
+  // No redirects on ANY request this transport makes (see noRedirectFetch): a
+  // 3xx would move the peer bearer or the actor signature to a host the pin
+  // above never judged.
+  const opts = { fetch: noRedirectFetch() };
+  if (requestInit) opts.requestInit = requestInit;
   if (actor && typeof actor.botId === "string" && BOT_ID_RE.test(actor.botId)) {
     const localId = getLocalId
       ? getLocalId()
       : (await import("../instance-registry.js")).getOrCreateLocalInstanceId();
-    opts.fetch = signingFetch({
+    opts.fetch = noRedirectFetch(signingFetch({
       keyLookup: defaultPairKey, src: localId, aud: instanceId, mount: "/router",
       bot: actor.botId, name: actor.name, onUnsigned: () => noteUnsigned(actor.botId, instanceId),
-    });
+    }));
   }
-  const transport = new StreamableHTTPClientTransport(url, Object.keys(opts).length ? opts : undefined);
+  const transport = new StreamableHTTPClientTransport(url, opts);
   const client = new Client({ name: `crow-voice-remote-${instanceId}`, version: "0.1.0" });
   await Promise.race([
     client.connect(transport),
