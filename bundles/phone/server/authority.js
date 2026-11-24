@@ -1,35 +1,23 @@
-import { appImport } from "./app-root.js";
-
-/** Only the owner's own turn may approve calls: the gateway's isLocalPasswordSessionOn
- *  (servers/gateway/dashboard/local-session.js). A peer-instance SSO session
- *  ('dashboard sso'), a session minted by a login from this machine ('dashboard onhost'),
- *  a signed peer call, and any request from this machine itself are all refused.
- *  Takes the request (not the raw session) so the origin rule applies; anything else -> false. */
-export async function isLocalDashboardSession(db, req) {
-  if (!req || typeof req !== "object") return false;
-  try {
-    const { isLocalPasswordSessionOn } = await appImport("servers/gateway/dashboard/local-session.js");
-    return await isLocalPasswordSessionOn(db, req);
-  } catch {
-    return false;
-  }
-}
-
-async function defaultDeps() {
-  const t = await appImport("servers/gateway/dashboard/totp.js");
-  return { is2faEnabled: t.is2faEnabled, getTotpSecret: t.getTotpSecret, verifyTotp: t.verifyTotp };
-}
-
-export async function stepUpOk(code, deps) {
-  const d = deps || (await defaultDeps());
-  if (!(await d.is2faEnabled())) return true;
-  if (!code || !/^\d{6}$/.test(String(code))) return false;
-  const secret = await d.getTotpSecret();
-  return !!secret && d.verifyTotp(String(code), secret);
-}
-
-/** Whether an approval needs a 2FA code right now (drives the card's 2FA field). */
-export async function totpRequired(deps) {
-  const d = deps || (await defaultDeps());
-  return !!(await d.is2faEnabled());
-}
+/**
+ * MOVED — this module now lives at bundles/phone/panel/authority.js.
+ *
+ * Why: everything under a bundle's server/ tree is BOT-REACHABLE (a bot MCP
+ * child loads it), and these checks read the gateway's owner rule
+ * (servers/gateway/dashboard/local-session.js -> servers/gateway/token-store.js,
+ * whose verifiers are minted under servers/shared/token-mac.js's host-only HMAC
+ * key) plus the gateway's 2FA module. Only panel/ code — which runs inside the
+ * gateway — may do that. Nothing under server/ ever imported this module: only
+ * panel/routes.js did, and it now resolves it from panel/ through the bundle's
+ * app root.
+ *
+ * THIS STUB MUST STAY. Do not delete it as "a leftover": a bundle refresh copies
+ * the repo's server/ tree into ~/.crow/bundles/<id>/server/ ADDITIVELY — the top-level
+ * directories go through copyBundleRefreshItem with its default prune:false (only a
+ * manifest-declared refresh root is pruned), so a file the repo no longer ships is never
+ * removed from an installed copy. Deleting this stub would leave the OLD,
+ * session-checking authority.js in place for every install made before the move, at the
+ * same manifest version — exactly the file this stub replaced. A zero-export stub is the
+ * only way to make the refresh overwrite it.
+ * tests/bundle-server-no-gateway-auth.test.js enforces the rule.
+ */
+export {};

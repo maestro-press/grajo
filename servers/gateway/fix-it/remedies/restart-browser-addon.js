@@ -59,10 +59,17 @@
  * already-restarting sentence from the dashboard's flash table.
  */
 import { join } from "node:path";
-import { isLocalPasswordSessionOn } from "../../dashboard/local-session.js";
 import { CROW_HOME } from "../../bundles-config.js";
 import { dockerRunner } from "../../bundle-core.js";
 import { restartWouldDowngrade, runningBrowserContainerIds } from "../browser-chromium-guard.js";
+// The gateway's owner rule, STATIC. A remedy runs only inside the gateway process (the fix-it
+// route is the owner's own click), so this is the host side by construction; the bot-reachable
+// chain that used to reach this file (servers/research/server.js ->
+// servers/shared/project-lifecycle.js -> servers/gateway/proxy.js -> fix-it) is CUT at its
+// source: the research server checks ownership through servers/shared/project-ownership.js and
+// never loads the lifecycle's delete machinery. tests/bot-seed-import-guard.test.js pins the
+// chain's absence.
+import { isLocalPasswordSessionOn } from "../../dashboard/local-session.js";
 import { ALREADY_RESTARTING_FLASH, OWNER_ONLY_FLASH, OWNER_ONLY_MESSAGE } from "./restore-bundle-compose.js";
 
 export const ACTION_ID = "restart-browser-addon";

@@ -50,6 +50,10 @@ const appImport = (rel) => import(pathToFileURL(join(APP_ROOT, rel)).href);
 // the app root's shared servers/ tree) — resolve through APP_ROOT +
 // bundles/maker-lab/server/, mirroring panel/routes.js's bundleImport().
 const bundleImport = (rel) => import(pathToFileURL(join(APP_ROOT, "bundles", "maker-lab", "server", rel)).href);
+// The device-binding helpers (incl. the admin-session check) live in panel/,
+// never server/: a bundle's server/ tree is bot-reachable and those helpers
+// read the gateway's own session rule. See panel/device-binding.js.
+const bundlePanelImport = (rel) => import(pathToFileURL(join(APP_ROOT, "bundles", "maker-lab", "panel", rel)).href);
 
 const { createProjectSpace, updateProjectSpaceMeta } = await appImport("servers/shared/project-spaces.js");
 
@@ -101,7 +105,7 @@ function readInstalledBundleIds() {
 }
 
 async function loadDeviceBinding() {
-  return bundleImport("device-binding.js");
+  return bundlePanelImport("device-binding.js");
 }
 
 export default {

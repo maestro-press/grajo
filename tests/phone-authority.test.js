@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { createDbClient } from "../servers/db.js";
-import { isLocalDashboardSession, stepUpOk, totpRequired } from "../bundles/phone/server/authority.js";
+import { isLocalDashboardSession, stepUpOk, totpRequired } from "../bundles/phone/panel/authority.js";
 import { readRunnerSecret } from "../bundles/phone/server/secrets.js";
 import { fromLaptop } from "./helpers/off-box.js";
 

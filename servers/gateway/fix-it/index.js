@@ -61,7 +61,7 @@ import { createNotification } from "../../shared/notifications.js";
 import { getInstance } from "../instance-registry.js";
 import { escapeHtml } from "../dashboard/shared/components.js";
 import { t } from "../dashboard/shared/i18n.js";
-import { csrfInput } from "../dashboard/shared/csrf.js";
+import { csrfInput } from "../dashboard/shared/csrf-input.js";
 
 let wired = false;
 export function wireFixIt() {

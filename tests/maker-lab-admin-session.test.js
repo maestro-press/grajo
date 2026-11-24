@@ -62,7 +62,7 @@ before(async () => {
   execFileSync(process.execPath, ["scripts/init-db.js"], { env: { ...process.env }, stdio: "pipe", cwd: REPO });
   // Imported AFTER the scratch env is in place: the bundle resolves the app root
   // and the dashboard modules when this module loads (its own appImport contract).
-  ({ hasAdminSession } = await import("../bundles/maker-lab/server/device-binding.js"));
+  ({ hasAdminSession } = await import("../bundles/maker-lab/panel/device-binding.js"));
   ({ _setNowFn } = await import("../servers/gateway/dashboard/auth.js"));
 });
 

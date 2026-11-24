@@ -1260,7 +1260,7 @@ test("KB isLanRequest keeps today's meaning: local and RFC1918 only, never the t
 });
 
 test("maker-lab isLoopback: only a bare local peer, never Serve", async () => {
-  const { isLoopback } = await import("../bundles/maker-lab/server/device-binding.js");
+  const { isLoopback } = await import("../bundles/maker-lab/panel/device-binding.js");
   procWithClientUid(0);
   try {
     assert.equal(isLoopback(mkReq({ ip: "127.0.0.1" })), true);

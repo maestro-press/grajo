@@ -54,14 +54,33 @@
  *
  * A non-literal specifier (`import(name)`, a template literal, `require(prefix + name)`,
  * `appImport(dynamic)`) cannot be followed by any static check, so a bot-reachable file that
- * uses one FAILS unless it is in ALLOWED_DYNAMIC_IMPORT with a reason.
+ * uses one FAILS unless it is in ALLOWED_DYNAMIC_IMPORT with a reason. This is checked over
+ * the WHOLE WALKED SET — the starting trees AND every file the walk reaches through imports —
+ * not just the starting trees. A file that is reached by an import is bot-reachable in exactly
+ * the same sense as one that starts there, so a computed specifier in it hides its target just
+ * as well: `servers/gateway/fix-it/owner-rule.js` was such a file (a lazy `import(new
+ * URL(…).href)` of the owner rule, used to keep the gateway's session checks off the walk's
+ * radar), and it was a guard EVASION, not a fix. The real fix was to cut the chain at its
+ * source: the ownership helpers a bot-reachable server needs live in
+ * servers/shared/project-ownership.js, so servers/research/server.js never loads the
+ * lifecycle's delete machinery (servers/gateway/proxy.js → fix-it → the session checks).
  *
  * REMAINING LIMIT, stated plainly: this is static analysis of the source. It follows only
- * specifiers written as string literals in this repo's bot-reachable trees. Code reached
- * through a node_modules package's own internals, through a computed specifier in a file that
- * is allow-listed with a reason, or through a file this walk cannot resolve (a missing
- * extension-less path, a symlink target outside the repo) is NOT covered — the allow-list
- * entries and the review of each non-literal import are the human half of the check.
+ * specifiers written as string literals in this repo's bot-reachable trees, and it only looks
+ * at the FILES this repo's own import graph reaches. Code reached through a node_modules
+ * package's own internals, through a computed specifier in a file that is allow-listed with a
+ * reason, or through a file this walk cannot resolve (a missing extension-less path, a symlink
+ * target outside the repo) is NOT covered — the allow-list entries and the review of each
+ * non-literal import are the human half of the check.
+ *
+ * TWO MORE LIMITS, both about where the walk STOPS. (a) The non-literal-import review runs over
+ * `walked`, which is the starting trees plus everything the walk reached — and the walk stops at
+ * every ALLOWED_HOST_SIDE entry (that file IS the host side), so a file reachable only BEYOND
+ * one of those entries is never scanned for a computed specifier either. (b) Neither check says
+ * anything about the gateway's session checks for such a file. Those are covered — with NO stop
+ * set at all — by tests/bundle-server-no-gateway-auth.test.js, which walks the same bot-loadable
+ * trees and fails if any chain reaches servers/gateway/dashboard/auth.js, local-session.js or
+ * servers/gateway/token-store.js.
  *
  * ALLOWED_HOST_SIDE lists the files that legitimately touch the seed, each with the reason.
  * Every entry is one of two shapes: the bridge's HOST-SIDE hydration (it opens the value and
@@ -124,20 +143,6 @@ export const ALLOWED_HOST_SIDE = Object.freeze({
     "Crow Messages' HOST-SIDE adapter (the pibot-gateways process, never a bot child): it reads " +
     "the instance identity to address this instance on its own relay, which is the same " +
     "authority the gateway has.",
-  "servers/gateway/token-store.js":
-    "the gateway's oauth_tokens store layer: the ONE place a session, OAuth access or OAuth " +
-    "refresh verifier is minted and checked (design §8 PR 2), so it imports the token-mac key " +
-    "module. NO bot child loads it today: the walk reaches it through exactly TWO chains, and " +
-    "both are imported only from that bundle's panel/ code, which runs in the GATEWAY. " +
-    "Chain 1: bundles/maker-lab/server/device-binding.js -> servers/gateway/dashboard/auth.js " +
-    "(for sessionFromRequest), imported only from bundles/maker-lab/panel/routes.js and " +
-    "panel/maker-lab.js. Chain 2: bundles/phone/server/authority.js -> " +
-    "servers/gateway/dashboard/local-session.js, imported only from " +
-    "bundles/phone/panel/routes.js. In the nnp/none sandbox tiers the key file is readable by " +
-    "the gateway's own user anyway, so neither chain adds a capability a bot lacks there; in " +
-    "the bwrap tiers <CROW_HOME>/secrets is masked and every mint/verify fails closed with " +
-    "key-missing. This entry stays until a follow-up moves those two server/ files out of a " +
-    "bot-reachable tree.",
   "servers/sharing/instance-sync.js":
     "instance sync's signing (identity.js's sign/verify) is reached only from emitChange and " +
     "the feed paths, which run in the GATEWAY process that owns the feeds; a bot's server " +
@@ -149,11 +154,6 @@ export const ALLOWED_HOST_SIDE = Object.freeze({
     "reaches it through a LAZY import inside the peer-announce path only; a bot child that loads " +
     "erase.js for its DDL/tombstone tables never calls eraseEventsFor, so no manager (and no " +
     "identity) is loaded on that path.",
-  "servers/gateway/keychain/store.js":
-    "the keychain seals under its OWN key (keychain/key.js), never the instance seed; " +
-    "secret-box is only its AES-GCM helper and this module never reads identity.json. " +
-    "Bot-reachable code reaches it through servers/shared/addon-secrets.js's sync reader, " +
-    "which reads an add-on's own listed env keys — the intended door.",
   "servers/shared/addon-secrets.js":
     "the add-on keychain seam — a REVIEWED door between bot-reachable code and " +
     "servers/gateway/keychain/key.js (now on the guarded list). It reasons only about an " +
@@ -171,19 +171,6 @@ export const ALLOWED_HOST_SIDE = Object.freeze({
     "reaches it through the app root). It returns two PATHS and never opens either; the key " +
     "module it imports is the same one servers/shared/addon-secrets.js is allowed to reach, and " +
     "a bot that holds the path still cannot read <CROW_HOME>/secrets in the walled tiers.",
-  "servers/shared/secret-values-collect.js":
-    "the DISPLAY set's collector, not host-side: it collects the secret values the surface " +
-    "masks (so a saved key never appears in a card, a panel or an audit line). It reaches " +
-    "keychain/key.js only to OPEN a keychain row for that masking set; the opened values are " +
-    "masked and never returned to a caller as usable credentials. It does NOT import the " +
-    "provider-key box (round 1, L2): the host processes that can open a sealed provider key " +
-    "(this engine, and the gateway at boot) install that part through " +
-    "servers/gateway/keychain/provider-key-values.js and its seam (setProviderKeyValuesSource).",
-  "servers/gateway/routes/bundles.js":
-    "the gateway's add-on routes: its identity read is inside injectSharedStorage, an async " +
-    "bundle-INSTALL path that only the gateway runs. A bot child loads this module only " +
-    "because servers/shared/project-lifecycle.js imports the gateway proxy, and never calls " +
-    "that function (lazy, literal import).",
   "bundles/ramble/server/server.js":
     "Ramble's stdio server takes its PUBLIC persona authors from the gateway's cache in " +
     "ramble_settings (local.persona.real/.world/.caw, written at boot) and reaches the identity " +
@@ -218,6 +205,16 @@ export const ALLOWED_DYNAMIC_IMPORT = Object.freeze({
   "bundles/studio/server/render.js":
     "require(join(ENGINE_DIR, \"resample.js\")): a fixed file name inside the bundle's own engine " +
     "directory, not a caller-controlled path.",
+  "servers/gateway/dashboard/settings/registry.js":
+    "loadAddonSettings() imports the settings-section.js of each INSTALLED add-on " +
+    "(join(CROW_HOME, 'bundles', id, 'settings-section.js')). Every id is checked against the " +
+    "gateway's bundle-id rule (isValidBundleId, servers/gateway/skills-catalog.js) BEFORE the " +
+    "join, and a record whose id fails it is skipped with a warning, so the file name and the " +
+    "directory are both fixed: the target is always one add-on's own settings section — the " +
+    "settings door of the install mechanism itself. It cannot be a literal specifier: the " +
+    "set of add-ons is the operator's, not the repo's. The gateway calls this at boot; " +
+    "bot-reachable code reaches the module only for readSetting/writeSetting (never GROUPS, " +
+    "never loadAddonSettings).",
 });
 
 /** File extensions the guard reads (the trees it scans are JS/ESM). */
@@ -243,16 +240,40 @@ export function botReachableFiles({ root = ROOT } = {}) {
   const files = [];
   const seen = new Set();
   const add = (list) => { for (const f of list) if (!seen.has(f)) { seen.add(f); files.push(f); } };
+  add(coreBotServerFiles({ root }));
+  add(bundleServerFiles({ root }));
+  add(walk(resolve(root, "scripts", "pi-bots")));
+  return files;
+}
+
+/**
+ * Every code file under the directory of each stdio server the bot catalog can emit
+ * (CORE_SERVERS + CONDITIONAL_SERVERS), walked whole. The seed's own home is skipped: those
+ * modules ARE the guarded thing (see the header), and servers/sharing is never a bot entry
+ * (the catalog emits `crow-sharing` only for the OWNER's combined spawn).
+ *
+ * Exported because tests/bundle-server-no-gateway-auth.test.js scans the SAME core server
+ * trees for the gateway's session checks — one derivation, so the two guards cannot drift
+ * apart on which trees are bot-reachable.
+ */
+export function coreBotServerFiles({ root = ROOT } = {}) {
+  const files = [];
+  const seen = new Set();
   const seedHome = resolve(root, "servers", "sharing");
   for (const spec of [...CORE_SERVERS, ...CONDITIONAL_SERVERS]) {
     const entry = Array.isArray(spec.args) ? spec.args[0] : null;
     if (typeof entry !== "string" || !entry) continue;
     const dir = resolve(root, dirname(entry));
-    // The seed's own home: the definition modules live there and every file in that tree
-    // reads them. The guard is about code that must never reach for them (see the header).
     if (dir === seedHome || dir.startsWith(seedHome + sep)) continue;
-    add(walk(dir));
+    for (const f of walk(dir)) if (!seen.has(f)) { seen.add(f); files.push(f); }
   }
+  return files;
+}
+
+/** Every code file under every `bundles/<id>/server/` (any add-on can be enabled for a bot). */
+export function bundleServerFiles({ root = ROOT } = {}) {
+  const files = [];
+  const seen = new Set();
   let bundles = [];
   try { bundles = readdirSync(resolve(root, "bundles"), { withFileTypes: true }); } catch { bundles = []; }
   for (const b of bundles) {
@@ -260,9 +281,9 @@ export function botReachableFiles({ root = ROOT } = {}) {
     const serverDir = resolve(root, "bundles", b.name, "server");
     let st = null;
     try { st = statSync(serverDir); } catch { st = null; }
-    if (st && st.isDirectory()) add(walk(serverDir));
+    if (!(st && st.isDirectory())) continue;
+    for (const f of walk(serverDir)) if (!seen.has(f)) { seen.add(f); files.push(f); }
   }
-  add(walk(resolve(root, "scripts", "pi-bots")));
   return files;
 }
 
@@ -329,7 +350,11 @@ export function resolveImportTarget(spec, file, { root = ROOT } = {}) {
  * files are reported back in `reachedAllowed` so the list itself cannot rot.
  *
  * @returns {{violations: Array<{file: string, spec: string, line: number, chain: string[]}>,
- *            reachedAllowed: Set<string>}} repo-relative paths throughout
+ *            reachedAllowed: Set<string>,
+ *            walked: string[]}} repo-relative paths throughout; `walked` is EVERY file the
+ *            walk read (abs paths) — the whole bot-reachable set, not just the seeds. The
+ *            non-literal-import check runs over it, because a file reached by an import is
+ *            as bot-reachable as one that starts the walk.
  */
 export function walkSeedImports(files, { root = ROOT, allow = ALLOWED_HOST_SIDE } = {}) {
   const relOf = (f) => relative(root, f).split(sep).join("/");
@@ -359,7 +384,7 @@ export function walkSeedImports(files, { root = ROOT, allow = ALLOWED_HOST_SIDE 
       queue.push({ file: target, chain: [...chain, relOf(target)] });
     }
   }
-  return { violations, reachedAllowed };
+  return { violations, reachedAllowed, walked: [...visited] };
 }
 
 /** The 1-based line a specifier sits on, for the failure message (0 when it cannot be found). */
@@ -476,7 +501,15 @@ test("no bot-reachable file — transitively — imports the seed, the seal help
 });
 
 test("no bot-reachable file uses a non-literal import specifier (a reviewed list only)", () => {
-  const offenders = nonLiteralImportViolations(botReachableFiles());
+  // The SEED trees AND everything the walk reaches from them: a computed specifier in a
+  // file that is reached by an import is just as unreadable to this guard as one in a
+  // starting tree, so the review covers the whole set (see the header on owner-rule.js).
+  const { walked } = walkSeedImports(botReachableFiles());
+  // Non-vacuous: the walk really follows the graph (the starting trees plus the gateway modules a
+  // bundle's server/ imports — ~765 files at the time of writing). A collapsed walk would make
+  // this review meaningless.
+  assert.ok(walked.length > 500, "the walk covers the real graph, not just the starting trees: " + walked.length);
+  const offenders = nonLiteralImportViolations(walked);
   assert.deepEqual(
     offenders,
     [],
@@ -504,6 +537,26 @@ test("the keychain key and the provider-key box are guarded too, and only a revi
   const { violations } = walkSeedImports(botReachableFiles());
   assert.equal(violations.some((v) => v.spec.includes("keychain/key")), false,
     "no bot-reachable chain imports the keychain key module");
+});
+
+test("the walk from servers/research/server.js reaches neither the gateway proxy nor the token-mac key", () => {
+  // The chain this pins: servers/research/server.js -> servers/shared/project-lifecycle.js ->
+  // servers/gateway/proxy.js -> fix-it/index.js -> every remedy -> the owner rule -> token-store.
+  // A bot MCP child runs servers/research/server.js, so none of that may be on its load path.
+  // The ownership helpers it needs live in servers/shared/project-ownership.js.
+  const entry = resolve(ROOT, "servers", "research", "server.js");
+  const { walked, violations } = walkSeedImports([entry]);
+  const rels = walked.map((f) => relative(ROOT, f).split(sep).join("/"));
+  assert.ok(rels.includes("servers/research/server.js"), "the walk really started at the research server");
+  assert.ok(rels.includes("servers/shared/project-ownership.js"),
+    "the research server takes the owner rule from project-ownership.js");
+  for (const forbidden of ["servers/gateway/proxy.js", "servers/shared/token-mac.js"]) {
+    assert.equal(rels.includes(forbidden), false,
+      "servers/research/server.js is bot-reachable, so the walk from it must not reach " + forbidden +
+      " (do not re-route the owner rule through servers/shared/project-lifecycle.js, and do not " +
+      "wrap the import in a computed specifier — that is a guard evasion, not a fix)");
+  }
+  assert.deepEqual(violations, [], "and no guarded module is reached another way either");
 });
 
 test("the token-mac key module is guarded like the seed, and no bot entry reaches it", () => {
@@ -553,7 +606,12 @@ test("the exclusion of the combined crow-core server still holds (the catalog ne
 });
 
 test("every ALLOWED_HOST_SIDE entry exists, still reaches the seed, and is still on a real chain", () => {
-  const { reachedAllowed } = walkSeedImports(botReachableFiles());
+  const { reachedAllowed, walked } = walkSeedImports(botReachableFiles());
+  // The whole bot-reachable set — the starting trees AND everything the walk reaches — because
+  // a reached file is as bot-reachable as a starting one (that is what ALLOWED_DYNAMIC_IMPORT
+  // covers now; servers/gateway/dashboard/settings/registry.js is reached, not a starting file).
+  const allFiles = new Set([...botReachableFiles(), ...walked]);
+  const allRels = [...allFiles].map((f) => relative(ROOT, f).split(sep).join("/"));
   for (const [rel, reason] of Object.entries(ALLOWED_HOST_SIDE)) {
     const file = resolve(ROOT, rel);
     assert.ok(reason.length > 40, rel + ": the allow-list entry carries a reason");
@@ -570,7 +628,7 @@ test("every ALLOWED_HOST_SIDE entry exists, still reaches the seed, and is still
   for (const [rel, reason] of Object.entries(ALLOWED_DYNAMIC_IMPORT)) {
     assert.ok(reason.length > 20, rel + ": the non-literal-import entry carries a reason");
     assert.ok(
-      botReachableFiles().some((f) => allowListHas({ [rel]: reason }, relative(ROOT, f).split(sep).join("/"))),
+      allRels.some((f) => allowListHas({ [rel]: reason }, f)),
       rel + " is allow-listed for a non-literal import but no bot-reachable file matches it",
     );
   }

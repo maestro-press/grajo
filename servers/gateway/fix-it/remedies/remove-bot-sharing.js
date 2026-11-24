@@ -21,9 +21,13 @@
  *    owner's; this re-proves the owner's own local password session (the same gate
  *    remove-retired-bundle.js uses) so a peer SSO session or a session-less call changes nothing.
  */
-import { isLocalPasswordSessionOn } from "../../dashboard/local-session.js";
 import { t as i18nT } from "../../dashboard/shared/i18n.js";
 import { BOT_ID_RE } from "../../../../scripts/pi-bots/bot-workspace-env.mjs";
+// The gateway's owner rule, STATIC: a remedy runs only inside the gateway process. The
+// bot-reachable chain that used to reach this file is cut at its source (the research server
+// checks ownership through servers/shared/project-ownership.js). See
+// tests/bot-seed-import-guard.test.js.
+import { isLocalPasswordSessionOn } from "../../dashboard/local-session.js";
 import { OWNER_ONLY_FLASH, OWNER_ONLY_MESSAGE } from "./restore-bundle-compose.js";
 
 export const ACTION_ID = "bot-sharing-remove";

@@ -46,7 +46,6 @@
 
 import { createHmac } from "node:crypto";
 import { sessionTokenFromRequest } from "../auth.js";
-import { escapeHtml } from "./components.js";
 import { csrfSecret } from "./csrf-secret.js";
 
 const HEADER_NAME = "x-crow-csrf";
@@ -184,16 +183,9 @@ export function csrfTokenMatches(req, presented) {
   return safeEqual(presented, expected);
 }
 
-/**
- * Emit a hidden input carrying the CSRF token. For classic `<form>` submits
- * that don't go through Turbo's auto-header-attach path.
- */
-export function csrfInput(req) {
-  const token = req && req.csrfToken ? String(req.csrfToken) : "";
-  return `<input type="hidden" name="_csrf" value="${escapeHtml(token)}">`;
-}
-
-/** The bytes for the `<meta name="crow-csrf">` tag a page renders (layout.js). */
-export function csrfMetaTag(token) {
-  return `<meta name="crow-csrf" content="${escapeHtml(typeof token === "string" ? token : "")}">`;
-}
+// The form-render helpers (a hidden `_csrf` input, the `<meta name="crow-csrf">` tag) live in
+// csrf-input.js: they carry no session lookup, so code that only DRAWS a form (the Fix-it
+// registry — reachable from bot-reachable code through servers/gateway/proxy.js) can import
+// them without dragging this module's session reader (auth.js -> token-store.js -> the token-mac
+// key) along.
+export { csrfInput, csrfMetaTag } from "./csrf-input.js";

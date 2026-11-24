@@ -12,6 +12,16 @@ function serverDir() {
   return join(process.env.CROW_APP_ROOT || join(homedir(), "crow"), "bundles", "phone", "server");
 }
 const bundleImport = (f) => import(pathToFileURL(join(serverDir(), f)).href);
+/** The panel-side half of the bundle (panel/), resolved the same way: an installed
+ *  copy first, else the app checkout. The approval-authority checks live there,
+ *  never in server/: a bundle's server/ tree is bot-reachable and those checks
+ *  read the gateway's own owner rule. See panel/authority.js. */
+function panelDir() {
+  const installed = join(CROW_HOME(), "bundles", "phone", "panel");
+  if (existsSync(join(installed, "authority.js"))) return installed;
+  return join(process.env.CROW_APP_ROOT || join(homedir(), "crow"), "bundles", "phone", "panel");
+}
+const panelImport = (f) => import(pathToFileURL(join(panelDir(), f)).href);
 const appImport = (rel) => import(pathToFileURL(join(process.env.CROW_APP_ROOT || join(homedir(), "crow"), rel)).href);
 const eqSecret = (a, b) => { const x = createHash("sha256").update(String(a)).digest(), y = createHash("sha256").update(String(b)).digest(); return timingSafeEqual(x, y); };
 
@@ -161,8 +171,9 @@ export default function phoneRouter(authMiddleware, seams = {}) {
 
   async function init() {
     seams.onInit?.();
-    const [store, plan, auth, secrets, deliver, rc, disp, card] = await Promise.all(
-      ["store.js", "plan.js", "authority.js", "secrets.js", "deliver.js", "runner-client.js", "dispatcher.js", "card.js"].map(bundleImport));
+    const [store, plan, secrets, deliver, rc, disp, card, auth] = await Promise.all([
+      ...["store.js", "plan.js", "secrets.js", "deliver.js", "runner-client.js", "dispatcher.js", "card.js"].map(bundleImport),
+      panelImport("authority.js")]);
     if (!db) { const { createDbClient } = await appImport("servers/db.js"); db = createDbClient(); }
     const { initPhoneTables } = await bundleImport("init-tables.js"); await initPhoneTables(db);
     const secret = secrets.readRunnerSecret();

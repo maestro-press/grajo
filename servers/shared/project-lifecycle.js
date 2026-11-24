@@ -4,7 +4,8 @@
 // `archived_at` has only ever meant "deleted"; archive and restore NEVER write it, because the
 // bot runtime treats archived_at as gone. See docs/guide/projects.md.
 
-import { AclError, appendAudit } from "./project-acl.js";
+import { appendAudit } from "./project-acl.js";
+import { canOwnProject, canOwnDeletedProject } from "./project-ownership.js";
 import { clearApprovalNonce } from "./data-backend-approval-key.js";
 import { existsSync, lstatSync, mkdirSync, realpathSync, renameSync } from "node:fs";
 import { join, resolve, relative, isAbsolute } from "node:path";
@@ -130,52 +131,13 @@ async function eraseProjectCardHistory(project, { tasksDbPath, ids = null } = {}
   }
 }
 
-/**
- * canManageProject's rule (live row, local owner member, not revoked, role owner), except that
- * status='archived' is allowed. archived_at set and learner_profile rows are always false.
- */
-export async function canOwnProject(db, projectId) {
-  return ownsProject(db, projectId, { allowDeleted: false });
-}
-
-/**
- * The SAME owner rule with the tombstone allowed (archived_at NOT NULL). Only finishing a delete
- * that stopped partway uses it: the row it addresses is by definition already deleted, so the
- * ordinary rule could never pass. Everything else keeps using canOwnProject.
- */
-export async function canOwnDeletedProject(db, projectId) {
-  return ownsProject(db, projectId, { allowDeleted: true });
-}
-
-async function ownsProject(db, projectId, { allowDeleted }) {
-  if (projectId == null || !Number.isFinite(Number(projectId))) return false;
-  try {
-    const { rows } = await db.execute({
-      sql: `SELECT m.role FROM project_spaces ps
-              JOIN project_members m ON m.project_id = ps.id AND m.contact_id IS NULL AND m.revoked_at IS NULL
-             WHERE ps.id = ?${allowDeleted ? "" : " AND ps.archived_at IS NULL"} AND (ps.type IS NULL OR ps.type != 'learner_profile')
-             LIMIT 1`,
-      args: [Number(projectId)],
-    });
-    return !!rows[0] && rows[0].role === "owner";
-  } catch (err) {
-    console.warn("[project-lifecycle] owner lookup failed:", err.message);
-    return false;
-  }
-}
-
-/**
- * A status change is allowed only to the project's owner. Archiving is a soft delete (it hides
- * the project), so it takes delete's rule: `canOwnProject`, which already allows an archived
- * row but never a tombstone, a visited/clone-shared project, or a missing one. Throws
- * AclError('not_owner') so every caller answers it the way it answers a refused delete, and
- * callers run it BEFORE the write.
- */
-export async function assertCanChangeStatus(db, projectId) {
-  if (!(await canOwnProject(db, projectId))) {
-    throw new AclError(`Only the owner can change project #${projectId}'s status`, "not_owner");
-  }
-}
+// The owner rule lives in servers/shared/project-ownership.js and is RE-EXPORTED here, so
+// every existing importer keeps working. It is split out because this module is NOT
+// bot-reachable-safe: its delete path lazy-imports servers/gateway/proxy.js (which reaches
+// fix-it and the gateway's session checks), and a bot MCP child does run
+// servers/research/server.js. Anything bot-reachable that only needs the owner rule imports
+// project-ownership.js instead — see that file's header.
+export { canOwnProject, canOwnDeletedProject, assertCanChangeStatus } from "./project-ownership.js";
 
 async function statusOf(db, projectId) {
   const { rows } = await db.execute({ sql: "SELECT status FROM project_spaces WHERE id = ?", args: [Number(projectId)] });

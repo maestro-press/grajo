@@ -104,21 +104,6 @@ const APP_MODULES = {
       NODE_TEST_CONTEXT: "set only by the node test runner, to refuse the implicit ~/.crow under a raw `node --test`; a child that does not see it (every real gateway and add-on) keeps the ~/.crow default",
     },
   },
-  "servers/gateway/dashboard/auth.js": {
-    keys: ["CROW_HOSTED", "CROW_HOSTING_API_URL", "CROW_HOSTING_AUTH_TOKEN", "CROW_ALLOWED_IPS", "CROW_DASHBOARD_PUBLIC", "NODE_ENV"],
-    exempt: {
-      CROW_HOSTED: "set only on the hosted control plane; unset means the gateway is self-hosted, which is what the child must assume",
-      CROW_HOSTING_API_URL: "read only inside the CROW_HOSTED branch, which a child never enters",
-      CROW_HOSTING_AUTH_TOKEN: "the hosting control plane's own credential, read only inside the CROW_HOSTED branch a child never enters",
-      CROW_ALLOWED_IPS: "the gateway's own client allowlist; a bundle server judges no network peers",
-      CROW_DASHBOARD_PUBLIC: "the gateway's own exposure switch; a bundle server judges no network peers",
-    },
-  },
-  "servers/gateway/dashboard/totp.js": {
-    keys: ["CROW_HOSTED"],
-    exempt: { CROW_HOSTED: "set only on the hosted control plane; a self-hosted child keeps the local-password path" },
-  },
-  "servers/gateway/dashboard/local-session.js": { keys: [], exempt: {} },
   "servers/gateway/for-you/flag.js": {
     keys: ["CROW_FOR_YOU"],
     exempt: { CROW_FOR_YOU: "gateway feature flag (=== \"1\"); a child that does not see it keeps the feature off, which is the default" },
@@ -153,10 +138,6 @@ const APP_MODULES = {
   "servers/shared/sqlite-lock.js": { keys: [], exempt: {} },
   "servers/shared/artifact-trust.js": { keys: [], exempt: {} },
   "servers/shared/project-acl.js": { keys: [], exempt: {} },
-  "servers/shared/peer-class.js": {
-    keys: ["CROW_SERVE_PEER_UIDS"],
-    exempt: { CROW_SERVE_PEER_UIDS: "the gateway's Tailscale Serve identity policy; a child that does not see it trusts no Serve headers, the conservative direction" },
-  },
   "servers/shared/addon-secrets.js": {
     keys: ["CROW_ADDON_HOST"],
     exempt: {},

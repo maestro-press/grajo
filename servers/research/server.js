@@ -24,7 +24,12 @@ import {
 import { slugify } from "../shared/slugify.js";
 import { newRowUuid } from "../shared/row-uuid.js";
 import { createProjectSpace, updateProjectSpaceMeta } from "../shared/project-spaces.js";
-import { assertCanChangeStatus } from "../shared/project-lifecycle.js";
+// From project-ownership.js, NOT project-lifecycle.js: this file is bot-reachable (a bot MCP
+// child is spawned on servers/research/index.js) and the lifecycle's delete path reaches
+// servers/gateway/proxy.js -> fix-it -> the gateway's session checks -> the host-only
+// token-mac key. The owner rule is all this file needs. tests/bot-seed-import-guard.test.js
+// pins that the walk from here reaches neither proxy.js nor token-mac.js.
+import { assertCanChangeStatus } from "../shared/project-ownership.js";
 import { parseLaunchSpec, canonicalSpecText, PENDING_STATUS } from "../shared/data-backend-approval.js";
 import { clearApprovalNonce } from "../shared/data-backend-approval-key.js";
 import { resolveDatasetPath } from "../shared/sqlite-datasets.js";

@@ -259,15 +259,17 @@ describe("maker-lab location independence (BH-4 phase 2)", () => {
 
   test("class-regression: no import (static or dynamic) escaping the panel dir remains anywhere under panel/*.js", () => {
     // Widened from a narrow db.js/retention-sweep.js-only net (this follow-up's
-    // first pass) to a blanket net now that ALL nine pre-existing lazy
-    // `../server/*` sites (routes.js: device-binding.js x2, sessions.js,
-    // hint-pipeline.js x2, resolve-llm-endpoint.js; maker-lab.js:
-    // device-binding.js, sessions.js, lesson-validator.js) have been converted
-    // through the file-local `bundleImport(rel)` helper (routes.js has its
-    // own; maker-lab.js gained an equivalent one alongside its existing
-    // `appImport`). Every panel/*.js file is copied ALONE into
-    // ~/.crow/panels/ on install/refresh, so ANY import escaping the panel
-    // dir via `../` (static `from "../..."` or dynamic
+    // first pass) to a blanket net now that ALL the pre-existing lazy
+    // `../server/*` sites (routes.js: sessions.js, hint-pipeline.js x2,
+    // resolve-llm-endpoint.js; maker-lab.js: sessions.js, lesson-validator.js)
+    // have been converted through the file-local `bundleImport(rel)` helper
+    // (routes.js has its own; maker-lab.js gained an equivalent one alongside
+    // its existing `appImport`). device-binding.js started in server/ and is
+    // now panel/device-binding.js (it reads the gateway's session rule, which
+    // no bot-reachable server/ file may reach), so it is resolved through a
+    // `bundlePanelImport` helper with the same shape. Every panel/*.js file is
+    // copied ALONE into ~/.crow/panels/ on install/refresh, so ANY import
+    // escaping the panel dir via `../` (static `from "../..."` or dynamic
     // `import("../...")` / `import(pathToFileURL(resolve(__dirname,
     // "../...")))`) is location-dependent and will 500/crash once installed.
     // Same-dir `./` imports and node builtins/package imports (bare

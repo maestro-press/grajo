@@ -39,6 +39,13 @@ const APP_ROOT = looksLikeAppRoot(process.env.CROW_APP_ROOT) ? process.env.CROW_
 // which is always present on an installed instance (CROW_APP_ROOT points at
 // the repo checkout).
 const bundleImport = (rel) => import(pathToFileURL(join(APP_ROOT, "bundles", "maker-lab", "server", rel)).href);
+// The SESSION-checking half of the bundle lives in panel/, never server/:
+// everything under a bundle's server/ tree is bot-reachable (a bot MCP child
+// loads it), and these modules read the gateway's own session rule, whose
+// token store is sealed by the host-only token-mac key. panel/ code runs only
+// inside the gateway. See panel/device-binding.js and
+// tests/bundle-server-no-gateway-auth.test.js.
+const bundlePanelImport = (rel) => import(pathToFileURL(join(APP_ROOT, "bundles", "maker-lab", "panel", rel)).href);
 
 // Lazy DB
 let createDbClient;
@@ -268,7 +275,7 @@ export default function makerLabKioskRouter(/* dashboardAuth */) {
       return noSessionResponse(res);
     }
 
-    const deviceBinding = await bundleImport("device-binding.js");
+    const deviceBinding = await bundlePanelImport("device-binding.js");
     const sessionsMod = await bundleImport("sessions.js");
 
     const fp = fingerprint(req);
@@ -615,7 +622,7 @@ export default function makerLabKioskRouter(/* dashboardAuth */) {
   // AND thus shares the host's loopback) can reach it.
 
   router.post("/maker-lab/api/hint-internal", express_json(), async (req, res) => {
-    const deviceBinding = await bundleImport("device-binding.js");
+    const deviceBinding = await bundlePanelImport("device-binding.js");
     if (!deviceBinding.isLoopback(req)) {
       return res.status(403).json({ error: "loopback_only" });
     }

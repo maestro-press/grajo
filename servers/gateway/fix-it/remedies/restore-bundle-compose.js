@@ -45,6 +45,12 @@ import {
 } from "../../bundle-compose-state.js";
 import { missingRequiredComposeVars, parseDotEnv } from "../../compose-guard.js";
 import { BUNDLE_ID_RE } from "../../satellites/installs.js";
+// The gateway's owner rule, STATIC: a card action only ever runs in the gateway process. The
+// bot-reachable chain that used to reach this file (servers/research/server.js ->
+// servers/shared/project-lifecycle.js -> servers/gateway/proxy.js -> fix-it/index.js -> here)
+// is cut at its source: the research server takes the owner rule from
+// servers/shared/project-ownership.js and never loads the lifecycle's delete machinery.
+// tests/bot-seed-import-guard.test.js pins that no bot-reachable chain reaches proxy.js.
 import { isLocalPasswordSessionOn } from "../../dashboard/local-session.js";
 import { fill, t } from "../../dashboard/shared/i18n.js";
 

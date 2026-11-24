@@ -17,7 +17,7 @@ import { z } from "zod";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SRC = join(ROOT, "bundles", "phone", "server");
-const MODULES = ["mcp.js", "init-tables.js", "store.js", "plan.js", "deliver.js", "dispatcher.js", "runner-client.js", "authority.js", "secrets.js", "card.js"];
+const MODULES = ["mcp.js", "init-tables.js", "store.js", "plan.js", "deliver.js", "dispatcher.js", "runner-client.js", "secrets.js", "card.js"];
 const saved = process.env.CROW_APP_ROOT;
 let tmp, dir;
 
@@ -50,10 +50,10 @@ test("installed mcp.js builds a server with the injected McpServer and z", async
   assert.ok(server instanceof McpServer);
 });
 
-test("bundle version 0.2.10 (call approvals use the gateway's owner check, so a request or a login from this machine is refused) — the manifest and the MCP server agree", async () => {
+test("bundle version 0.2.11 (call approvals use the gateway's owner check, so a request or a login from this machine is refused — the check lives in panel/authority.js, out of this bot-reachable tree) — the manifest and the MCP server agree", async () => {
   const { readFileSync } = await import("node:fs");
   const manifest = JSON.parse(readFileSync(join(ROOT, "bundles", "phone", "manifest.json"), "utf8"));
-  assert.equal(manifest.version, "0.2.10");
+  assert.equal(manifest.version, "0.2.11");
   const mcpSrc = readFileSync(join(SRC, "mcp.js"), "utf8");
-  assert.match(mcpSrc, /new McpServer\(\{ name: "crow-phone", version: "0\.2\.10" \}\)/);
+  assert.match(mcpSrc, /new McpServer\(\{ name: "crow-phone", version: "0\.2\.11" \}\)/);
 });

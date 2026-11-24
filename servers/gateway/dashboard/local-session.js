@@ -2,7 +2,7 @@
  * Is this request the owner at THIS machine's own dashboard? A local password-login
  * session only: a signed peer request (crossHostAuth) never is, and neither is a session a
  * peer sign-in minted (mintSsoSession: scopes 'dashboard sso'). The phone bundle's call
- * approvals use this same check (bundles/phone/server/authority.js).
+ * approvals use this same check (bundles/phone/panel/authority.js).
  *
  * Nor is a request that comes from this machine itself (servers/shared/self-origin.js): its
  * own console, the shared browser container on host networking, a local script or a bot with

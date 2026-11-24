@@ -7,6 +7,7 @@ import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { resolveCrowHome } from "../../../shared/crow-home.js";
 import { emitOrQueue } from "../../../shared/sync-emit.js";
+import { isValidBundleId } from "../../skills-catalog.js";
 
 /** @type {Map<string, object>} */
 const sections = new Map();
@@ -132,6 +133,15 @@ export async function loadAddonSettings() {
   for (const addon of installed) {
     const id = typeof addon === "string" ? addon : addon?.id;
     if (!id) continue;
+
+    // installed.json is operator-writable and `id` becomes a PATH SEGMENT below, imported as
+    // code. Only the gateway's bundle-id shape may get there (isValidBundleId, the rule every
+    // install path enforces), so a hand-edited record can never name a directory outside this
+    // instance's bundles/ — and the import stays "one add-on's own settings section".
+    if (!isValidBundleId(id)) {
+      console.warn(`[settings] Skipping add-on settings: not a valid bundle id: ${JSON.stringify(id)}`);
+      continue;
+    }
 
     const sectionPath = join(crowDir, "bundles", id, "settings-section.js");
     if (!existsSync(sectionPath)) continue;
