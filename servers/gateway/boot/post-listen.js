@@ -839,50 +839,38 @@ export async function runPostListenSetup(server, app, deps) {
   }
 
   // Existing installs get their app's own admin login created by Crow, and then the API
-  // token that app mints for Crow. Once per boot, after the add-ons have settled, in ONE
-  // chain and in this order (a token needs the admin to exist first):
+  // token that app mints for Crow. Once per boot, after the add-ons have settled, as ONE
+  // PIPELINE PER ADD-ON (bundle-boot-catchups.js), each in this order (a token needs that
+  // add-on's admin first):
   //   1. bundle-first-admin-catchup.js: every installed bundle whose app can be given its
   //      admin by a setup script Crow may run, and that has no login/keychain entry yet —
   //      the install path ran the step only from the version that shipped it, so an install
   //      made before it (or one whose app was not up yet) never got one.
   //   2. bundle-api-token.js: every bundle whose own admin setup succeeded for THIS install
   //      and whose token env is still empty.
-  // Both run behind the same settle gate as the walls above, take the per-bundle first-admin
-  // lock, and reconnect the add-on themselves when they write its MCP entry. Fire-and-forget:
-  // neither delays listen nor throws, and each is caught on its own so a failure in the first
-  // never costs the second. Skipped on a --no-auth gateway, which is nobody's dashboard.
+  // The pipelines run concurrently under a small cap. That matters because the first-admin
+  // pass' recreate seam WAITS (up to ten minutes) while that add-on has a start or recreate in
+  // flight: one chain over the whole list would make one busy add-on hold up every other
+  // add-on's catch-up — and then every token catch-up after it. Per add-on, that wait holds
+  // only its own add-on. Each pipeline is caught on its own, so a failure in one add-on (or in
+  // its first-admin step) never costs another; both passes stay behind the same settle gate as
+  // the walls above, take the per-bundle first-admin lock, and reconnect the add-on themselves
+  // when they write its MCP entry. Fire-and-forget: nothing on the listen path awaits it, and
+  // it never throws. Skipped on a --no-auth gateway, which is nobody's dashboard.
   if (!noAuth) {
-    (async () => {
-      const settled = async () => {
-        const proxy = await import("../proxy.js");
-        await Promise.race([
-          proxy.addonsSettled(),
-          new Promise((r) => setTimeout(r, 10 * 60 * 1000).unref()),
-        ]);
-      };
-      try {
-        await settled();
-        // The catch-up's own real seams: one copy of the wiring, so boot and the module
-        // cannot drift apart.
-        const { runFirstAdminCatchUp, firstAdminCatchUpDeps } = await import("../bundle-first-admin-catchup.js");
-        const admin = await runFirstAdminCatchUp({ deps: await firstAdminCatchUpDeps() });
-        // Ids and result words only — never anything the run handled.
-        if (admin.ran.length) {
-          console.log(`[first-admin] catch-up: ${admin.ran.map((r) => `${r.id} ${r.result}`).join(", ")}`);
-        }
-      } catch (err) {
-        console.warn("[first-admin] catch-up skipped:", err?.message || err);
-      }
-      try {
-        const { runApiTokenCatchUp, apiTokenCatchUpDeps } = await import("../bundle-api-token.js");
-        const summary = await runApiTokenCatchUp({ deps: await apiTokenCatchUpDeps() });
-        if (summary.ran.length) {
-          console.log(`[api-token] catch-up: ${summary.ran.map((r) => `${r.id} ${r.result}`).join(", ")}`);
-        }
-      } catch (err) {
-        console.warn("[api-token] catch-up skipped:", err?.message || err);
-      }
-    })();
+    import("../bundle-boot-catchups.js")
+      .then(({ runBootCatchUps }) => runBootCatchUps({
+        settled: async () => {
+          const proxy = await import("../proxy.js");
+          await Promise.race([
+            proxy.addonsSettled(),
+            new Promise((r) => setTimeout(r, 10 * 60 * 1000).unref()),
+          ]);
+        },
+      }))
+      // Belt and braces: runBootCatchUps catches every step itself; only the import itself (or
+      // the settle seam, which it also catches) could land here.
+      .catch((err) => console.warn("[first-admin] catch-up skipped:", err?.message || err));
   }
 
   // Bring up alwaysResident vLLM bundles (embed, etc.) via gpu-orchestrator.

@@ -18,9 +18,11 @@
  *
  * Every seam is injected: no database, no docker, no app. What this file pins down is the
  * gating, "one run under the lock, released always", the reconnect on mcpEnvUpdated, the
- * after-step parity with the card's route, that one bundle cannot stop the others, and that NO
- * password can reach a log line. The last test runs the REAL runFirstAdminSetup through the
- * catch-up with a sentinel password.
+ * after-step parity with the card's route, that one bundle cannot stop the others, that an
+ * add-on reinstalled (or removed) while its after-step was about to write — or while its
+ * recreate waited — is dropped with one console line and NO bell naming the old install, and
+ * that NO password can reach a log line.
+ * The last test runs the REAL runFirstAdminSetup through the catch-up with a sentinel password.
  */
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
@@ -384,6 +386,120 @@ test("a bell that cannot be written leaves the run's own answer alone", async ()
   assert.deepEqual(summary.ran, [{ id: ID, result: "ok" }], "a notification failure never undoes anything");
 });
 
+// ── a reinstall during the wait owns its own setup ────────────────────────────
+
+/**
+ * A manifest whose after-step recreates: the step the recreate seam is passed to, and the one
+ * that can WAIT for a start of the same add-on in flight.
+ */
+const AFTER_MANIFEST = {
+  ...MANIFEST,
+  env_vars: [...MANIFEST.env_vars, { name: "FRIGATE_SIGNUPS", default: "true" }],
+  firstAdmin: {
+    ...MANIFEST.firstAdmin,
+    setup: { ...MANIFEST.firstAdmin.setup, after: { env: { FRIGATE_SIGNUPS: "false" }, recreate: true } },
+  },
+};
+
+/** listInstalled that answers these entries in order, then repeats the last for every re-read. */
+const readingAs = (...answers) => {
+  let reads = 0;
+  return () => {
+    const at = Math.min(reads, answers.length - 1);
+    reads += 1;
+    return answers[at];
+  };
+};
+
+/** listInstalled that answers the original entry first and `later` for every re-read. */
+const readingTwice = (later) => readingAs([{ id: ID, installedAt: INSTALL }], later);
+
+test("an add-on reinstalled while the after-step waited rings nothing and names no install", async () => {
+  const { deps, state } = harness({
+    overrides: {
+      manifest: AFTER_MANIFEST,
+      // A failed after-step WOULD ring the one bell: the reinstall check comes first.
+      afterAnswer: { ok: false, applied: false, outcome: "recreate-failed: reinstalled", line: 'after: "x"', reason: "reinstalled" },
+    },
+  });
+  // Reads: the pass's own list, the check before the after-step's write (same install), then
+  // the check after the wait, where the install is the new one.
+  deps.listInstalled = readingAs([{ id: ID, installedAt: INSTALL }], [{ id: ID, installedAt: INSTALL }], [{ id: ID, installedAt: REINSTALL }]);
+
+  const summary = await runFirstAdminCatchUp({ deps });
+
+  assert.deepEqual(summary.ran, [], "the run is dropped, not reported as this install's answer");
+  assert.deepEqual(state.calls.notify, [], "no after-failure bell naming the OLD install");
+  assert.deepEqual(state.calls.changed, [], "and no 'Crow set the admin password' bell either");
+  assert.equal(state.calls.warned.length, 1, "exactly one line");
+  assert.match(state.calls.warned[0], /was reinstalled or removed while it waited/);
+  assert.match(state.calls.warned[0], /the new install runs its own setup/);
+  assert.equal(JSON.stringify(state.calls.warned).includes("Frigate"), false, "nothing named but the id");
+  assert.deepEqual(state.calls.ended, [ID], "the lock is released either way");
+});
+
+test("a reinstall during the run leaves the NEW install's .env alone: the follow-up step is never written", async () => {
+  const { deps, state } = harness({ overrides: { manifest: AFTER_MANIFEST } });
+  // Reads: the pass's own list, then the check right before the after-step writes — already the
+  // new install, so the write must never happen.
+  deps.listInstalled = readingTwice([{ id: ID, installedAt: REINSTALL }]);
+
+  const summary = await runFirstAdminCatchUp({ deps });
+
+  assert.deepEqual(summary.ran, []);
+  assert.equal(state.calls.after.length, 0, "the after-env was never written into the newer install");
+  assert.deepEqual(state.calls.notify, [], "no bell naming the OLD install's follow-up step");
+  assert.deepEqual(state.calls.changed, [], "and no 'Crow set the admin password' bell");
+  assert.equal(state.calls.warned.length, 1, "exactly one line");
+  assert.match(state.calls.warned[0], /was reinstalled or removed while it waited/);
+  assert.match(state.calls.warned[0], /the new install runs its own setup/);
+  assert.deepEqual(state.calls.ended, [ID], "the lock is released either way");
+});
+
+test("an add-on REMOVED while the after-step waited rings nothing either", async () => {
+  const { deps, state } = harness({ overrides: { manifest: AFTER_MANIFEST } });
+  deps.listInstalled = readingTwice([]);
+
+  const summary = await runFirstAdminCatchUp({ deps });
+
+  assert.deepEqual(summary.ran, []);
+  assert.deepEqual(state.calls.after, [], "nothing is written into an install that is gone");
+  assert.deepEqual(state.calls.notify, []);
+  assert.deepEqual(state.calls.changed, [], "nothing to announce for an install that is gone");
+  assert.equal(state.calls.warned.length, 1);
+  assert.match(state.calls.warned[0], /was reinstalled or removed while it waited/);
+});
+
+test("the after-step's recreate is bound to THIS install: it is handed { installStamp } where it waits", async () => {
+  const recreateCalls = [];
+  const { deps, state } = harness({ overrides: { manifest: AFTER_MANIFEST } });
+  deps.recreate = async (id, opts) => { recreateCalls.push({ id, opts }); return { ok: true, recreated: true }; };
+  // The REAL after-step always calls the recreate when the plan asks for one: do the same, so
+  // the call the catch-up bound is the call observed.
+  deps.applyAfter = async (o) => {
+    await o.recreate(o.bundleId);
+    return { ok: true, applied: true, outcome: "applied", line: 'after: "applied"', reason: null };
+  };
+
+  const summary = await runFirstAdminCatchUp({ deps });
+
+  assert.deepEqual(summary.ran, [{ id: ID, result: "ok" }], "the install is unchanged, so the run stands");
+  assert.deepEqual(recreateCalls, [{ id: ID, opts: { installStamp: INSTALL } }], "the guarded recreate is told which install it serves");
+  assert.deepEqual(state.calls.notify, []);
+});
+
+test("a reinstall during a run with NO after-step still suppresses the password bell", async () => {
+  const { deps, state } = harness();
+  deps.listInstalled = readingTwice([{ id: ID, installedAt: REINSTALL }]);
+
+  const summary = await runFirstAdminCatchUp({ deps });
+
+  assert.deepEqual(summary.ran, []);
+  assert.deepEqual(state.calls.changed, [], "the new install says its own thing about its own password");
+  assert.equal(state.calls.warned.length, 1);
+  assert.match(state.calls.warned[0], /was reinstalled or removed while it waited/);
+});
+
 // ── it never throws, and never leaks ────────────────────────────────────────────
 
 test("one bundle's broken seam does not stop the next bundle", async () => {
@@ -511,24 +627,30 @@ test("no password reaches a log line: the REAL run, with a sentinel", async (t) 
   assert.equal(JSON.stringify(markers).includes(SENTINEL), false);
 });
 
-// ── the boot wiring: first-admin FIRST, then the API token ──────────────────────
+// ── the boot wiring: one pipeline per add-on, first-admin first, then the token ──
 
-test("post-listen runs the first-admin catch-up before the API-token one, behind one settle gate", () => {
+test("post-listen hands the catch-ups to the per-add-on pipelines, behind one settle gate", () => {
   const src = readFileSync(join(REPO, "servers", "gateway", "boot", "post-listen.js"), "utf8");
-  const admin = src.indexOf("runFirstAdminCatchUp");
-  const token = src.indexOf("runApiTokenCatchUp");
-  assert.ok(admin > -1, "post-listen runs the first-admin catch-up");
-  assert.ok(token > -1, "and still runs the API-token catch-up");
-  assert.ok(admin < token, "the admin login first: a token needs the admin to exist");
+  const call = src.indexOf("runBootCatchUps");
+  assert.ok(call > -1, "post-listen starts the boot catch-ups");
 
-  // Both inside the SAME chain: the --no-auth skip and the settle race open it, and no new IIFE
-  // starts between the two calls.
-  const gate = src.lastIndexOf("if (!noAuth)", admin);
+  // Inside the --no-auth skip, behind the add-ons' settle gate (the same 10-minute cap), and
+  // fire-and-forget: nothing on the listen path awaits the import or the call.
+  const gate = src.lastIndexOf("if (!noAuth)", call);
   assert.ok(gate > -1, "behind the --no-auth skip");
-  const block = src.slice(gate, token);
+  const block = src.slice(gate, call + 600);
   assert.match(block, /addonsSettled\(\)/, "behind the add-ons' settle gate");
   assert.match(block, /10 \* 60 \* 1000/, "with the same 10-minute cap");
-  assert.match(block, /firstAdminCatchUpDeps\(\)/, "wired with the module's own real seams");
-  assert.equal(block.match(/\(async \(\) => \{/g).length, 1, "one chain, not a second fire-and-forget block");
-  assert.match(src.slice(admin, token + 400), /\[first-admin\] catch-up:/, "one line per run, ids and result words");
+  assert.doesNotMatch(block, /await import\("\.\.\/bundle-boot-catchups\.js"\)/, "never awaited on the listen path");
+  assert.equal(block.match(/\(async \(\) => \{/g), null, "a promise chain, not a blocking chain");
+
+  // The per-add-on order (that add-on's admin, THEN its token) lives in the pipelines module.
+  const pipelines = readFileSync(join(REPO, "servers", "gateway", "bundle-boot-catchups.js"), "utf8");
+  const admin = pipelines.indexOf("firstAdmin({ onlyId: id })");
+  const token = pipelines.indexOf("apiToken({ onlyId: id })");
+  assert.ok(admin > -1, "a pipeline runs the first-admin catch-up");
+  assert.ok(token > -1, "and its API-token catch-up");
+  assert.ok(admin < token, "the admin login first: a token needs the admin to exist");
+  assert.match(pipelines, /\[first-admin\] catch-up:/, "one line per run, ids and result words");
+  assert.match(pipelines, /\[api-token\] catch-up:/, "the token pass' own line too");
 });

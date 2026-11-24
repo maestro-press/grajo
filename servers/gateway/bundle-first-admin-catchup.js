@@ -37,7 +37,11 @@
  * (applyFirstAdminAfter with the guarded recreate, which needs no request); a failure rings
  * the same one bell the route rings, because the card itself is already hidden by the login
  * the run just saved. A follow-up step that a caller cannot perform (no recreate seam) is
- * left to the card instead of being half-applied.
+ * left to the card instead of being half-applied. That recreate WAITS for a start of the same
+ * add-on in flight, so it can outlive the install it started for: when the owner uninstalled
+ * and reinstalled the add-on meanwhile, this pass drops the run (no bell, nothing named) — the
+ * new install runs its own setup — with one line on the console. The same check runs BEFORE the
+ * after-step writes its env into the bundle's .env, so that write never lands in a newer install.
  *
  * A run that wrote the bundle's mcp-addons.json entry (mcpEnvUpdated) reconnects that add-on
  * the way the API-token catch-up does after it saves a token, so its MCP child picks the new
@@ -78,6 +82,25 @@ function parseMarker(raw) {
 /** The one line this pass may write about a bundle it deliberately did not finish. */
 const afterStepSkippedLine = (id) =>
   `[first-admin] ${id}: the follow-up step needs a container restart this run cannot do; the Extensions card can do it`;
+
+/** The one line for a run whose install was replaced under it (before or after the wait). */
+const reinstallLine = (id) =>
+  `[first-admin] catch-up: ${id} was reinstalled or removed while it waited; the new install runs its own setup`;
+
+/**
+ * Whether this run's install is STILL the installed one: the entry exists and carries the same
+ * install stamp (`installStampOf`). A throw answers false — nothing here may be attributed to
+ * an install it cannot read.
+ */
+async function stillSameInstall(id, installAt, seam) {
+  try {
+    const installed = await (await seam("listInstalled"))();
+    const entry = (Array.isArray(installed) ? installed : []).find((i) => i && i.id === id);
+    return !!entry && installStampOf(entry) === installAt;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * The catch-up's real seams. Built lazily and memoised by the caller: a test that injects
@@ -155,9 +178,17 @@ export async function firstAdminCatchUpDeps() {
     applyAfter: (o) => applyFirstAdminAfter(o),
     // The same guarded recreate the card route's after-step uses: it needs no request (it is
     // the path the shared-storage re-apply also uses), so it is safe from the boot pass.
-    recreate: async (id) => {
+    // WAIT, not refuse: this pass runs once per boot and has NO retry, so a recreate skipped
+    // because a start of the same add-on was in flight would leave the app's sign-ups open
+    // until the next boot. It queues behind that run instead (bounded: a timeout comes back
+    // as ok:false, which rings the existing after-failure bell). The wait holds only THIS
+    // add-on: boot runs one catch-up pipeline per add-on (bundle-boot-catchups.js), so a
+    // busy add-on's queue never delays another add-on's catch-up.
+    // opts is the caller's per-run binding (catchUpOne passes `{ installStamp }`: the install
+    // this run started for). The wait policy is ours and always applied.
+    recreate: async (id, opts = {}) => {
       const { recreateBundleGuarded } = await import("./routes/bundles.js");
-      return recreateBundleGuarded(id);
+      return recreateBundleGuarded(id, { ...opts, onBusy: "wait" });
     },
     reconnect: async (id) => {
       const proxy = await import("./proxy.js");
@@ -266,30 +297,55 @@ async function catchUpOne(id, entry, seam) {
   // account. Its own failure rings the same one bell the route rings — the card is already
   // hidden by the login the run saved, so a bell is the only way the operator hears it.
   const afterPlan = result === "ok" ? firstAdminAfterPlan(manifest) : null;
+  let after = null;
   if (afterPlan) {
     const recreate = await seam("recreate");
     if (afterPlan.recreate && typeof recreate !== "function") {
       try { (await seam("warn"))(afterStepSkippedLine(id)); } catch { /* console gone */ }
     } else {
-      let after = null;
+      // The follow-up step WRITES the manifest's after-env into this bundle's .env, and its
+      // recreate waits: checked BEFORE that write, so a reinstall meanwhile leaves the NEW
+      // install's .env alone. The run belonged to an install that is gone; the new one runs
+      // its own setup. (Only the after-step writes: the post-wait check below is unchanged.)
+      if (!(await stillSameInstall(id, installAt, seam))) {
+        try { (await seam("warn"))(reinstallLine(id)); } catch { /* console gone */ }
+        return null;
+      }
       try {
-        after = await (await seam("applyAfter"))({ bundleId: id, manifest, destDir, recreate: typeof recreate === "function" ? recreate : null });
+        after = await (await seam("applyAfter"))({
+          bundleId: id,
+          manifest,
+          destDir,
+          // Bound to THIS install: a recreate that queued behind a start must not restart an
+          // install the owner made meanwhile (recreateBundleGuarded answers code "reinstalled").
+          recreate: typeof recreate === "function" ? (bid) => recreate(bid, { installStamp: installAt }) : null,
+        });
       } catch {
         after = null;
       }
-      if (after && after.ok === false) {
-        try {
-          await (await seam("reportAfterFailure"))({
-            bundleId: id,
-            manifest,
-            bundleName: (typeof manifest.name === "string" && manifest.name) || id,
-            installId: installAt,
-            autoResult: result,
-            afterResult: { ok: after.ok, outcome: after.outcome },
-          });
-        } catch { /* a bell that cannot be written never undoes anything */ }
-      }
     }
+  }
+
+  // The recreate above can WAIT minutes for a start of this add-on in flight. If the owner
+  // uninstalled and reinstalled the add-on within that wait, this run belongs to an install
+  // that no longer exists: the new install runs its own setup, and neither the after-failure
+  // bell nor "Crow set the admin password" may name the old one. One line, then nothing.
+  if (!(await stillSameInstall(id, installAt, seam))) {
+    try { (await seam("warn"))(reinstallLine(id)); } catch { /* console gone */ }
+    return null;
+  }
+
+  if (after && after.ok === false) {
+    try {
+      await (await seam("reportAfterFailure"))({
+        bundleId: id,
+        manifest,
+        bundleName: (typeof manifest.name === "string" && manifest.name) || id,
+        installId: installAt,
+        autoResult: result,
+        afterResult: { ok: after.ok, outcome: after.outcome },
+      });
+    } catch { /* a bell that cannot be written never undoes anything */ }
   }
 
   // A run that really created the login replaces whatever the operator (or an app, or a phone
@@ -322,9 +378,14 @@ async function catchUpOne(id, entry, seam) {
  *                          hasAdminSaved, appRunning, tryBegin, end, runSetup, applyAfter,
  *                          recreate, reconnect, reportAfterFailure, reportChanged, warn,
  *                          appBundles, bundlesDir, crowHome, setupDeps, close
+ * @param {string} [o.onlyId] process exactly this installed entry (the boot wiring runs one
+ *                          such pass per add-on, so a wait in one add-on's step — the
+ *                          recreate seam waits for a start in flight — holds only that
+ *                          add-on). Every other entry is left to its own pass.
  * @returns {Promise<{checked: number, ran: Array<{id: string, result: string}>}>}
  */
-export async function runFirstAdminCatchUp({ deps = {} } = {}) {
+export async function runFirstAdminCatchUp({ deps = {}, onlyId = null } = {}) {
+  const only = typeof onlyId === "string" && onlyId ? onlyId : null;
   const injected = deps && typeof deps === "object" ? deps : {};
   let real = null;
   const seam = async (name) => {
@@ -339,6 +400,7 @@ export async function runFirstAdminCatchUp({ deps = {} } = {}) {
     for (const entry of Array.isArray(installed) ? installed : []) {
       const id = entry && typeof entry.id === "string" ? entry.id : "";
       if (!id) continue;
+      if (only && id !== only) continue;
       summary.checked += 1;
       try {
         const result = await catchUpOne(id, entry, seam);

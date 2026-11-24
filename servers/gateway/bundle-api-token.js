@@ -1031,9 +1031,13 @@ async function catchUpHasValue(id, env, seam) {
  * @param {object} [o.deps] seams: listInstalled, getManifest, readSetting, writeSetting,
  *                          mcpValue, mcpTransport, hasKeychainRow, tryBegin, end, runApiToken,
  *                          reconnect, notify, now, appBundles, bundlesDir, crowHome, tokenDeps, close
+ * @param {string} [o.onlyId] process exactly this installed entry (the boot wiring runs one
+ *                          pass per add-on, right after that add-on's first-admin pass, so
+ *                          one busy add-on never delays another's token)
  * @returns {Promise<{checked: number, ran: Array<{id: string, result: string}>}>}
  */
-export async function runApiTokenCatchUp({ deps = {} } = {}) {
+export async function runApiTokenCatchUp({ deps = {}, onlyId = null } = {}) {
+  const only = typeof onlyId === "string" && onlyId ? onlyId : null;
   const injected = deps && typeof deps === "object" ? deps : {};
   let real = null;
   const seam = async (name) => {
@@ -1048,6 +1052,7 @@ export async function runApiTokenCatchUp({ deps = {} } = {}) {
     for (const entry of Array.isArray(installed) ? installed : []) {
       const id = entry && typeof entry.id === "string" ? entry.id : "";
       if (!id) continue;
+      if (only && id !== only) continue;
       summary.checked += 1;
       try {
         const result = await catchUpOne(id, entry, seam);

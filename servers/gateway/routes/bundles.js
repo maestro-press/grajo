@@ -2523,35 +2523,196 @@ function startConsent(bundleId, { crossHost = false } = {}) {
 
 export { startConsent as _startConsentForTest, consentRecord as _consentRecordForTest };
 
+// bundleId -> { jobId, done, release } of the local `compose up` in flight for it. ONE map
+// for every local run: a Start, a Restart and a recreate of the same add-on are the same
+// collision (two `up`s against one compose project), so they share one guard, not one each.
+const runsInFlight = new Map();
+
+/** How long an `onBusy: "wait"` recreate may wait for the run in front of it. */
+const DEFAULT_RECREATE_WAIT_MS = 10 * 60 * 1000;
+
 /**
- * Recreate one installed bundle's containers through the same guards a Start runs — the ONE
- * path every non-interactive recreate uses (the shared-storage re-apply and the first-admin
- * "after" step). It never throws: the caller gets a plain reason and reports it.
+ * Take the per-bundle in-flight guard, or null when another run holds it. Taken
+ * SYNCHRONOUSLY (no await before the map write), so two overlapping callers cannot both get
+ * past the check. `release()` removes only THIS entry — never a successor's — and settles
+ * `done`, which is how an `onBusy: "wait"` caller learns the run in front of it finished.
+ *
+ * @param {string} bundleId
+ * @returns {{jobId: string, done: Promise<void>, release: () => void} | null}
+ */
+function claimBundleRun(bundleId) {
+  if (runsInFlight.has(bundleId)) return null;
+  const jobId = randomUUID();
+  let settle;
+  const done = new Promise((resolve) => { settle = resolve; });
+  const entry = {
+    jobId,
+    done,
+    release() {
+      if (runsInFlight.get(bundleId) === entry) runsInFlight.delete(bundleId);
+      settle();
+    },
+  };
+  runsInFlight.set(bundleId, entry);
+  return entry;
+}
+
+/** The jobId of the run in flight for this bundle, or null when the bundle is free. */
+function bundleRunInFlightJobId(bundleId) {
+  const entry = runsInFlight.get(bundleId);
+  return entry ? entry.jobId : null;
+}
+
+/** `promise`, or "timeout" once ms elapses — the timer is cleared either way. */
+function settleWithin(promise, ms) {
+  let timer;
+  return Promise.race([
+    promise.then(() => "settled"),
+    new Promise((resolve) => { timer = setTimeout(() => resolve("timeout"), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Take the guard for a run that WAITS its turn instead of refusing: wait on the in-flight
+ * run's `done`, then claim again — another run may have taken the guard meanwhile, so the
+ * claim is retried within the same deadline.
+ *
+ * @returns {Promise<{jobId: string, done: Promise<void>, release: () => void} | null>} null
+ *   when the deadline passed with a run still in flight.
+ */
+async function claimBundleRunWaiting(bundleId, waitMs) {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const claim = claimBundleRun(bundleId);
+    if (claim) return claim;
+    const current = runsInFlight.get(bundleId);
+    if (!current) continue; // released between the two reads: just try again
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return null;
+    await settleWithin(current.done, remaining);
+  }
+}
+
+/** "10" for ten minutes, "0.5" for the half-minute a test waits. */
+function minutesLabel(ms) {
+  const minutes = ms / 60000;
+  return Number.isInteger(minutes) ? String(minutes) : String(Math.round(minutes * 100) / 100);
+}
+
+/**
+ * The refusals a recreate answers without taking (or keeping) the guard: the bundle must be
+ * installed, must be local (never a satellite, whose containers run on another instance's
+ * host) and must not be refused by the orchestration switch. Shared by the pre-claim check
+ * and the re-check a waiting caller runs once it owns the guard.
+ *
+ * @param {string} bundleId
+ * @returns {{code: string, reason: string} | null} null when the recreate may proceed
+ */
+function recreateRefusal(bundleId) {
+  if (!bundleId || !isValidBundleId(bundleId)) return { code: "invalid_bundle", reason: "That is not a valid bundle id." };
+  const entry = getInstalled().find((i) => i && i.id === bundleId);
+  if (!entry) return { code: "not_installed", reason: `Bundle '${bundleId}' is not installed` };
+  if (isSatelliteEntry(entry)) {
+    return { code: "satellite", reason: `Bundle '${bundleId}' runs on another instance, so this one cannot restart it` };
+  }
+  const orchRefusal = bundleOrchestrationRefusal(bundleId);
+  if (orchRefusal) return { code: orchRefusal.code || "orchestration_refused", reason: orchRefusal.error };
+  return null;
+}
+
+/**
+ * Recreate one installed bundle's containers through the same guards a Start runs. This is
+ * the guarded recreate path for everything except TWO paths that deliberately stay outside
+ * this guard:
+ *
+ *   1. the browser add-on's door (routes/addon-doors.js): the browser itself asks for its
+ *      own `up -d --force-recreate`, with its own door token (Bearer, per spawn, for that
+ *      one method and path) and its own `busy` flag. That is a different trust boundary —
+ *      an add-on calling the gateway, not a gateway caller restarting an add-on — and it is
+ *      out of scope here; the two guards do not know about each other.
+ *   2. the FIRST `up` inside runInstallJob: an install creates the containers it just
+ *      installed, which is before any start of that bundle can exist, so there is nothing
+ *      for it to collide with. What the install path runs under this guard is its LATER
+ *      after-step (`firstAdmin.setup.after`), which runs after that `up`.
+ *
+ * Every other recreate — the shared-storage re-apply (owner click), the first-admin after
+ * step of the card route (owner click), the install job's after-step and the boot catch-up
+ * (background) — comes through here, and the Extensions Restart (startBundleLocal with
+ * `recreate: true`) takes the same guard directly. It never throws: the caller gets a plain
+ * reason and reports it.
  *
  * The order is Start's: ownership (never another install's containers), the consent + compose
  * safety check on what Compose will apply NOW (textCheck: false — an operator's override is
  * part of that model, and the installed bundle was consented to at install), then
- * `up -d --force-recreate` so the container really takes the new environment.
+ * `up -d --force-recreate` so the container really takes the new environment. The whole of
+ * that runs under the SAME per-add-on in-flight guard as startBundleLocal: a recreate and a
+ * start of one bundle must never run two `up`s against one compose project. An
+ * `onBusy: "wait"` caller re-runs the pre-claim checks once it owns the guard, because it
+ * may have queued for minutes.
  *
- * It is never called for a peer request (no request reaches it: both callers are local) and
+ * Who asks for which policy, and why:
+ *   - shared-storage Apply (owner click) and the first-admin card (owner click) pass
+ *     `onBusy: "refuse"` (the default): the owner is at the dashboard, gets the existing
+ *     already-running answer, and can press Restart when the run in flight is done.
+ *   - the install job's after-step and the boot first-admin catch-up pass
+ *     `onBusy: "wait"`: they are background steps with no owner watching, and the catch-up
+ *     has no retry — dropping the after-step would leave the app's sign-ups open until the
+ *     next boot. Waiting a bounded while is the only answer that finishes the job.
+ *
+ * It is never called for a peer request (no request reaches it: every caller is local) and
  * never for a satellite (that bundle's containers run on another instance's host).
  *
  * @param {string} bundleId
- * @returns {Promise<{ok: true, recreated: boolean} | {ok: false, code: string, reason: string}>}
+ * @param {{onBusy?: "refuse"|"wait", waitMs?: number, installStamp?: string|null}} [opts]
+ *   onBusy defaults to "refuse"; waitMs (default 10 minutes) bounds the "wait" policy;
+ *   installStamp (optional) binds the run to ONE install: when it is given (including an
+ *   explicit null for an entry with no stamp), the post-wait re-check also compares it with
+ *   the installed entry's `installStampOf`, so a caller that queued behind a start while the
+ *   owner uninstalled and reinstalled the add-on does not recreate the NEW install and does
+ *   not report against the OLD one. Callers that leave it undefined behave exactly as before.
+ * @returns {Promise<{ok: true, recreated: boolean} | {ok: false, code: string, reason: string, jobId?: string}>}
+ *   `already_running` (refuse) carries the in-flight run's `jobId`;
+ *   `already_running_timeout` (wait) means a run was still going at the deadline; the
+ *   stale-state codes (`not_installed`, `satellite`, `orchestration_refused`, `reinstalled`)
+ *   are what a waiting caller gets when the bundle stopped being recreatable while it queued.
  */
-async function recreateBundleGuarded(bundleId) {
-  if (!bundleId || !isValidBundleId(bundleId)) return { ok: false, code: "invalid_bundle", reason: "That is not a valid bundle id." };
-  const entry = getInstalled().find((i) => i && i.id === bundleId);
-  if (!entry) return { ok: false, code: "not_installed", reason: `Bundle '${bundleId}' is not installed` };
-  if (isSatelliteEntry(entry)) {
-    return { ok: false, code: "satellite", reason: `Bundle '${bundleId}' runs on another instance, so this one cannot restart it` };
-  }
-  const orchRefusal = bundleOrchestrationRefusal(bundleId);
-  if (orchRefusal) return { ok: false, code: orchRefusal.code || "orchestration_refused", reason: orchRefusal.error };
+async function recreateBundleGuarded(bundleId, opts = {}) {
+  const refusal = recreateRefusal(bundleId);
+  if (refusal) return { ok: false, ...refusal };
   const bundleDir = join(BUNDLES_DIR, bundleId);
   // No compose file: an MCP-server or skill-only bundle has no containers to recreate.
   if (!existsSync(join(bundleDir, "docker-compose.yml"))) return { ok: true, recreated: false };
+  const onBusy = (opts || {}).onBusy === "wait" ? "wait" : "refuse";
+  const waitMs = Number.isFinite((opts || {}).waitMs) && (opts || {}).waitMs >= 0 ? opts.waitMs : DEFAULT_RECREATE_WAIT_MS;
+  // Taken BEFORE the first await (a "wait" claim resolves only once the run in front of it
+  // has released), so the ownership check, the consent check and the compose run all sit
+  // under the guard and a start of this add-on cannot slip in between them.
+  const claim = onBusy === "wait" ? await claimBundleRunWaiting(bundleId, waitMs) : claimBundleRun(bundleId);
+  if (!claim) {
+    if (onBusy === "wait") {
+      const reason = `a start of this add-on was still running after ${minutesLabel(waitMs)} minutes`;
+      console.warn(`[bundles] ${bundleId} recreate: gave up waiting — ${reason}`);
+      return { ok: false, code: "already_running_timeout", reason };
+    }
+    return { ok: false, code: "already_running", reason: "already_running", jobId: bundleRunInFlightJobId(bundleId) };
+  }
   try {
+    // The guard is ours, but a waiting caller may have queued for minutes behind the run in
+    // front of it: the bundle can have been uninstalled, turned into a satellite, or the
+    // orchestration switch flipped while it waited. Re-run the same checks (same codes), so a
+    // stale request never recreates containers the owner no longer has installed.
+    const stale = recreateRefusal(bundleId);
+    if (stale) return { ok: false, ...stale };
+    // A caller bound to ONE install (the boot catch-up, whose recreate can queue for minutes)
+    // re-checks the install stamp: an uninstall + reinstall while it waited makes this a
+    // different install, whose own setup runs separately. Recreating it here would apply the
+    // OLD install's step to the new one, and the caller's bell would name the old install.
+    if ((opts || {}).installStamp !== undefined) {
+      const entry = getInstalled().find((i) => i && i.id === bundleId);
+      if (installStampOf(entry) !== (opts || {}).installStamp) {
+        return { ok: false, code: "reinstalled", reason: "the add-on was reinstalled while this run waited" };
+      }
+    }
     const own = await composeOwnership(bundleId, bundleDir, getInstalledFirstManifest(bundleId));
     if (own.refusal) return { ok: false, code: "compose_project_foreign", reason: own.refusal };
     if (own.warning) console.warn(`[bundles] ${bundleId} recreate: ${own.warning}`);
@@ -2562,6 +2723,9 @@ async function recreateBundleGuarded(bundleId) {
     return { ok: true, recreated: true };
   } catch (err) {
     return { ok: false, code: "compose_failed", reason: String((err && (err.stderr || err.message)) || "docker compose up failed").trim() };
+  } finally {
+    // Success, refusal, rejection and throw all release — and only this run's own entry.
+    claim.release();
   }
 }
 export { recreateBundleGuarded as _recreateBundleGuardedForTest };
@@ -2569,9 +2733,6 @@ export { recreateBundleGuarded as _recreateBundleGuardedForTest };
 // boot first-admin catch-up's `firstAdmin.setup.after` step (bundle-first-admin-catchup.js).
 // It needs no request, so the boot pass may run it exactly as the card's route does.
 export { recreateBundleGuarded };
-
-// bundleId -> jobId of the start/restart currently in flight for it.
-const startsInFlight = new Map();
 
 /**
  * The LOCAL start of one installed bundle: everything POST /bundles/api/start does once it
@@ -2583,9 +2744,15 @@ const startsInFlight = new Map();
  * The route maps the result to the status/body it always answered with; the Fix-it card's
  * restart (restartBundleInProcess) calls this directly.
  *
- * Only one start per bundle id may be in flight: the exported wrapper holds a module-level
- * map keyed by bundle id until the compose runner's promise settles (success, rejection or
- * throw — a caller-side timeout does not release it), and a second call for that id answers
+ * Only one local run per bundle id may be in flight — and a RECREATE shares that guard
+ * (recreateBundleGuarded, or this function itself with `recreate: true`), so a start and a
+ * recreate of one add-on can never run two `up`s against one compose project. The two
+ * recreates that do not come through either are deliberate: the browser add-on's own door
+ * (routes/addon-doors.js, a different trust boundary with its own token and its own `busy`
+ * flag) and an install's first `up` (the install precedes any start). The
+ * exported wrapper holds a module-level entry keyed by bundle id until the compose runner's
+ * promise settles (success, rejection or throw — a caller-side timeout does not release it),
+ * and a second call for that id answers
  * `{ ok: false, status: 409, code: "already_running", error: "already_running", jobId }`
  * without running anything, naming the in-flight run; a successful start's own result
  * carries that same `jobId`.
@@ -2599,19 +2766,23 @@ const startsInFlight = new Map();
 export async function startBundleLocal(bundleId, opts = {}) {
   // Only a real id is guarded: an invalid/absent one must reach the existing refusals.
   if (typeof bundleId !== "string" || bundleId === "") return startBundleLocalInner(bundleId, opts);
-  if (startsInFlight.has(bundleId)) {
-    const inFlightJobId = startsInFlight.get(bundleId);
-    return { ok: false, status: 409, code: "already_running", error: "already_running", jobId: inFlightJobId };
+  // Taken BEFORE any await, so overlapping callers cannot both get past the check; the
+  // release (only this run's own entry, never a successor's) is the guard helper's.
+  const claim = claimBundleRun(bundleId);
+  if (!claim) {
+    return {
+      ok: false,
+      status: 409,
+      code: "already_running",
+      error: "already_running",
+      jobId: bundleRunInFlightJobId(bundleId),
+    };
   }
-  // Taken BEFORE any await, so overlapping callers cannot both get past the check.
-  const jobId = randomUUID();
-  startsInFlight.set(bundleId, jobId);
   try {
     const out = await startBundleLocalInner(bundleId, opts);
-    return out.ok ? { ...out, jobId } : out;
+    return out.ok ? { ...out, jobId: claim.jobId } : out;
   } finally {
-    // Only this run's entry: never release a successor's guard.
-    if (startsInFlight.get(bundleId) === jobId) startsInFlight.delete(bundleId);
+    claim.release();
   }
 }
 
@@ -4570,7 +4741,10 @@ export async function runInstallJob(bundleId, envVars, { job, installedSnapshot,
             bundleId,
             manifest: reviewed,
             destDir: join(BUNDLES_DIR, bundleId),
-            recreate: recreateBundleGuarded,
+            // WAIT: a background install job with no owner watching must not drop the
+            // after-step (the app would keep accepting sign-ups), so it queues behind a
+            // start/recreate of the same add-on instead of refusing.
+            recreate: (id) => recreateBundleGuarded(id, { onBusy: "wait" }),
           });
           if (after.line) appendLog(job, after.line);
           firstAdminAfter = { ok: after.ok, outcome: after.outcome };
@@ -5310,6 +5484,9 @@ export default function bundlesRouter() {
         bundleId,
         manifest,
         destDir: join(BUNDLES_DIR, bundleId),
+        // Refuse (the default): this is the owner's click on the card, and the failure
+        // sentence already tells them to press Restart on the Extensions card, which runs
+        // the same guard. Waiting here would hold a 15-minute HTTP request.
         recreate: recreateBundleGuarded,
       });
       if (step.line) log.push(step.line);
@@ -6406,6 +6583,16 @@ export default function bundlesRouter() {
     const orchRefusal = bundleOrchestrationRefusal(bundleId);
     if (orchRefusal) return res.status(orchRefusal.status).json({ error: orchRefusal.error, code: orchRefusal.code });
 
+    // An OWNER CLICK: refuse a start/restart/recreate already in flight for this add-on,
+    // exactly as the Start route answers, instead of queueing a second `up` behind it. The
+    // check comes first so the .env rewrite below does not happen either — the run that is
+    // already going reads what is on disk when its own recreate comes. The page turns this
+    // 409 into the existing "already restarting" sentence.
+    const busyJobId = bundleRunInFlightJobId(bundleId);
+    if (busyJobId) {
+      return res.status(409).json({ error: "already_running", code: "already_running", job_id: busyJobId });
+    }
+
     const manifest = getManifest(bundleId);
     if (!manifest?.storage?.translator) {
       return res.status(400).json({ error: `Bundle '${bundleId}' does not declare manifest.storage.translator` });
@@ -6428,10 +6615,15 @@ export default function bundlesRouter() {
       if (injected === null) {
         return res.status(400).json({ error: "No shared-storage config in DB. Enter MinIO endpoint + credentials in Settings → Shared Storage first." });
       }
-      // Force-recreate so the affected containers pick up the new env: the same guarded path
-      // every non-interactive recreate uses (consent + compose safety check + ownership).
+      // Force-recreate so the affected containers pick up the new env: the guarded recreate
+      // path (consent + compose safety check + ownership) and the same guard Start holds.
+      // Refuse (the default) — an owner is here to read it, and a
+      // run which started between the check above and here is the same collision.
       const rec = await recreateBundleGuarded(bundleId);
       if (!rec.ok) {
+        if (rec.code === "already_running") {
+          return res.status(409).json({ error: "already_running", code: "already_running", job_id: rec.jobId });
+        }
         const status = rec.code === "compose_project_foreign" ? 409 : rec.code === "compose_security_check" ? 403 : 500;
         return res.status(status).json({ error: rec.reason, ...(rec.code ? { code: rec.code } : {}) });
       }

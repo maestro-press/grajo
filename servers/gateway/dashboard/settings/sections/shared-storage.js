@@ -14,6 +14,7 @@
  */
 
 import { escapeHtml } from "../../shared/components.js";
+import { tJs } from "../../shared/i18n.js";
 import * as Minio from "minio";
 import { readSetting, readSettings, writeSetting } from "../registry.js";
 import { isSealed, openSecret, sealSecret } from "../../../../sharing/secret-box.js";
@@ -72,7 +73,7 @@ export default {
     }
   },
 
-  async render({ db }) {
+  async render({ db, lang }) {
     const cfg = await _readAll(db);
     const maskedAccess = cfg.accessSealed ? "••••••••" : "";
     const maskedSecret = cfg.secretSealed ? "••••••••" : "";
@@ -230,8 +231,16 @@ export default {
                 btn.disabled = true;
                 btn.textContent = 'Applying…';
                 const r = await fetch('/dashboard/bundles/api/shared-storage/apply/' + encodeURIComponent(b.id), { method: 'POST', credentials: 'same-origin' });
-                if (r.ok) loadBundles();
-                else { btn.disabled = false; btn.textContent = 'Apply (failed)'; }
+                if (r.ok) { loadBundles(); return; }
+                // A start/restart/recreate of this add-on is already in flight: the existing
+                // "already restarting" sentence (the same one the Extensions card shows), never
+                // a failure line. Any other refusal keeps the old answer.
+                let d = null;
+                try { d = await r.json(); } catch { d = null; }
+                btn.disabled = false;
+                btn.textContent = (d && d.code === 'already_running')
+                  ? '${tJs("fixit.flash.alreadyRestarting", lang)}'
+                  : 'Apply (failed)';
               });
               right.appendChild(btn);
             }
