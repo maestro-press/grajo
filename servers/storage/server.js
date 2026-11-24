@@ -24,6 +24,7 @@ import {
   getPresignedUploadUrl,
   deleteObject,
   getBucketStats,
+  defaultBucket,
   isAllowedMimeType,
 } from "./s3-client.js";
 import { actorFromEnv, resolveCallActor, auditActor } from "../research/actor.js";
@@ -103,6 +104,22 @@ const STORAGE_QUOTA_MB = parseInt(process.env.STORAGE_QUOTA_MB || "5120", 10); /
 const BOT_URL_TTL_SECONDS = 300;
 const BUCKET_OVERRIDE_MESSAGE = "A bot cannot choose a storage bucket.";
 
+/**
+ * The key prefix a BOT's project-less upload lands under, or null for any other caller.
+ *
+ * A bot's storage key is path-scoped (projects/*, bots/*, studio/*, sunvox-studio/* of the files
+ * bucket — scripts/ops/minio-bot-storage.sh), so a bot with no project prefix must never write
+ * at the bucket root: the object would be refused, and an owner-keyed layout would mix a bot's
+ * files into the instance's own namespace. `<bot id>` is the actor id the MCP server already
+ * resolved and the share gate already decided with. An unverified bot (no id) gets "unknown": it
+ * is refused by the gate before it can name a project, and a segment is safer than the root.
+ */
+function botKeyPrefix(actor) {
+  if (!actor || actor.kind !== "bot") return null;
+  const id = typeof actor.id === "string" && actor.id ? actor.id.replace(/[^A-Za-z0-9._@:-]/g, "_") : "unknown";
+  return `bots/${id}/`;
+}
+
 function notConfiguredError() {
   return {
     content: [{
@@ -151,7 +168,7 @@ export function createStorageServer(dbPath, options = {}) {
   // The S3 calls this server makes, with a test seam: `options.s3` overrides any of them, so a test
   // drives a fake backend and never touches the network. Everything else is the real client.
   const s3 = {
-    isAvailable, uploadObject, getPresignedUrl, getPresignedUploadUrl, deleteObject, getBucketStats,
+    isAvailable, uploadObject, getPresignedUrl, getPresignedUploadUrl, deleteObject, getBucketStats, defaultBucket,
     ...Object.fromEntries(
       Object.entries(options.s3 || {}).filter(([, fn]) => typeof fn === "function")
     ),
@@ -255,8 +272,14 @@ export function createStorageServer(dbPath, options = {}) {
         }
       }
 
+      // The bucket this upload actually lands in. `bucket` is only ever set by a caller the bot
+      // rules do not bind (a bot's override is refused above), so a bot always writes to the
+      // configured files bucket (`<prefix>-files`). The row must record THAT bucket: a presigned
+      // URL and every by-id gate later resolve the object through the row's own bucket.
+      const bucketUsed = bucket || s3.defaultBucket();
+
       // Check quota
-      const stats = await s3.getBucketStats(bucket);
+      const stats = await s3.getBucketStats(bucketUsed);
       const quotaBytes = STORAGE_QUOTA_MB * 1024 * 1024;
       if (stats.totalSizeBytes >= quotaBytes) {
         return {
@@ -267,9 +290,15 @@ export function createStorageServer(dbPath, options = {}) {
 
       const timestamp = Date.now();
       const sanitizedName = file_name.replace(/[^a-zA-Z0-9._-]/g, "_");
+      // A project upload goes under the project's own prefix, an owner's project-less upload at the
+      // bucket root (as it always has), and a BOT's project-less upload under `bots/<bot id>/` —
+      // the only place inside the root a bot's scoped key is allowed to write.
+      const botPrefix = storagePrefix ? null : botKeyPrefix(gate.actor);
       const s3Key = storagePrefix
         ? `${storagePrefix}${timestamp}-${sanitizedName}`
-        : `${timestamp}-${sanitizedName}`;
+        : botPrefix
+          ? `${botPrefix}${timestamp}-${sanitizedName}`
+          : `${timestamp}-${sanitizedName}`;
 
       if (data_base64) {
         // Direct base64 upload (small files only)
@@ -281,18 +310,18 @@ export function createStorageServer(dbPath, options = {}) {
           };
         }
 
-        await s3.uploadObject(s3Key, buffer, { bucket, contentType: mime_type });
+        await s3.uploadObject(s3Key, buffer, { bucket: bucketUsed, contentType: mime_type });
 
         try {
           // Record in database
           await db.execute({
             sql: `INSERT INTO storage_files (s3_key, original_name, mime_type, size_bytes, bucket, reference_type, reference_id, project_id)
                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-            args: [s3Key, file_name, mime_type || null, buffer.length, bucket || "crow-files", reference_type || null, reference_id || null, targetProjectId ?? null],
+            args: [s3Key, file_name, mime_type || null, buffer.length, bucketUsed, reference_type || null, reference_id || null, targetProjectId ?? null],
           });
         } catch (err) {
           // Don't leave an untracked orphan object behind
-          try { await s3.deleteObject(s3Key, bucket || "crow-files"); } catch {}
+          try { await s3.deleteObject(s3Key, bucketUsed); } catch {}
           throw err;
         }
 
@@ -304,19 +333,19 @@ export function createStorageServer(dbPath, options = {}) {
           });
         }
 
-        const url = await s3.getPresignedUrl(s3Key, bound ? { bucket, expiry: BOT_URL_TTL_SECONDS } : { bucket });
+        const url = await s3.getPresignedUrl(s3Key, bound ? { bucket: bucketUsed, expiry: BOT_URL_TTL_SECONDS } : { bucket: bucketUsed });
         return {
           content: [{ type: "text", text: `Uploaded "${file_name}" (${(buffer.length / 1024).toFixed(1)}KB)${targetProjectId != null ? ` to project #${targetProjectId}` : ""}\nKey: ${s3Key}\nDownload URL (${bound ? "5 min" : "1hr"}): ${url}` }],
         };
       } else {
         // Return presigned upload URL for larger files
-        const uploadUrl = await s3.getPresignedUploadUrl(s3Key, bound ? { bucket, expiry: BOT_URL_TTL_SECONDS } : { bucket });
+        const uploadUrl = await s3.getPresignedUploadUrl(s3Key, bound ? { bucket: bucketUsed, expiry: BOT_URL_TTL_SECONDS } : { bucket: bucketUsed });
 
         // Pre-register in database (size will be updated after upload)
         await db.execute({
           sql: `INSERT INTO storage_files (s3_key, original_name, mime_type, size_bytes, bucket, reference_type, reference_id, project_id)
                 VALUES (?, ?, ?, 0, ?, ?, ?, ?)`,
-          args: [s3Key, file_name, mime_type || null, bucket || "crow-files", reference_type || null, reference_id || null, targetProjectId ?? null],
+          args: [s3Key, file_name, mime_type || null, bucketUsed, reference_type || null, reference_id || null, targetProjectId ?? null],
         });
 
         if (targetProjectId != null) {

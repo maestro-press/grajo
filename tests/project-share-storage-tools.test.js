@@ -614,6 +614,40 @@ test("the URLs crow_upload_file returns are capped at 300 s for a bot, and a buc
   } finally { await s.close(); }
 });
 
+test("a bot's project-less upload lands under bots/<bot id>/ in the bucket actually used; the owner keeps the root", async () => {
+  // A bot whose home project carries NO storage_prefix: the share gate resolves the project, the
+  // key builder finds no prefix, and the bot storage key is scoped to projects/*, bots/*,
+  // studio/*, sunvox-studio/* — so the object goes under bots/<bot id>/ and never the bucket root.
+  const home = await mkProject();
+  const bot = await mkBot({ home });
+  await db.execute({ sql: "UPDATE project_spaces SET storage_prefix = NULL WHERE id = ?", args: [Number(home)] });
+  const s3 = fakeS3({ defaultBucket: () => "fixture-files" });
+  const s = await open({ actor: { kind: "bot", id: bot }, s3 });
+  const ownerS3 = fakeS3({ defaultBucket: () => "fixture-files" });
+  const owner = await open({ actor: OWNER, s3: ownerS3 });
+  try {
+    const r = await s.call("crow_upload_file", { file_name: "loose.txt", mime_type: "text/plain", data_base64: base64("loose") });
+    assert.equal(r.isError, false, r.text);
+    const key = /Key: (\S+)/.exec(r.text)[1];
+    assert.ok(key.startsWith(`bots/${bot}/`), `${key} sits under bots/${bot}/`);
+    // The row records the bucket the object really went to — the configured files bucket, not the
+    // legacy "crow-files" constant (the bug: the object was in <prefix>-files, the row said
+    // crow-files, and every by-id gate and presigned URL then pointed at the wrong bucket).
+    const row = await fileRow(key);
+    assert.equal(row.bucket, "fixture-files");
+    assert.equal(s3.calls.upload.at(-1).opts.bucket, "fixture-files");
+    assert.equal(s3.calls.presign.at(-1).opts.bucket, "fixture-files");
+    assert.equal(s3.calls.stats.at(-1).bucket, "fixture-files", "the quota is read from the bucket used");
+
+    // The same call for the owner: the bucket root, exactly as before.
+    const owned = await owner.call("crow_upload_file", { file_name: "mine.txt", mime_type: "text/plain", data_base64: base64("mine") });
+    assert.equal(owned.isError, false, owned.text);
+    const ownerKey = /Key: (\S+)/.exec(owned.text)[1];
+    assert.match(ownerKey, /^\d+-mine\.txt$/, "an owner's project-less upload keeps the bucket root");
+    assert.equal((await fileRow(ownerKey)).bucket, "fixture-files");
+  } finally { await s.close(); await owner.close(); }
+});
+
 test("the owner's upload keeps its 1-hour URLs and may choose a bucket", async () => {
   const A = await mkProject();
   const s3 = fakeS3();

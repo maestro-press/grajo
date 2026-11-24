@@ -26,6 +26,21 @@ export const defaultQuotaBytes = () => envInt("STORAGE_QUOTA_MB", 5120) * 1024 *
 
 export const URL_EXPIRY_S = 3600;
 
+/** A bot's presigned URL lasts at most this long — the same 300 s cap crow-storage applies to a
+ *  bot (servers/storage/server.js BOT_URL_TTL_SECONDS): a revoked share or a removed bot must
+ *  stop working quickly, and a link a bot hands out is never an hour-long capability. */
+export const BOT_URL_EXPIRY_S = 300;
+
+/**
+ * Is this process a BOT turn? The bot engine puts the storage marker on every bot child's block
+ * (`CROW_STORAGE_FROM_HOST`, `1` hydrated or `0` off), and an OWNER's own spawn has no marker at
+ * all — the same signal servers/storage/s3-client.js's adoptHostStorage decides its storage with.
+ * Read from the env so a bundled child decides it the same way it decides its storage.
+ */
+export function isBotTurn(env = process.env) {
+  return !!env && Object.prototype.hasOwnProperty.call(env, "CROW_STORAGE_FROM_HOST");
+}
+
 const MIME = Object.freeze({ wav: "audio/wav", mp3: "audio/mpeg", ogg: "audio/ogg", sunvox: "application/octet-stream" });
 export const mimeFor = (ext) => MIME[String(ext).toLowerCase()] || "application/octet-stream";
 
@@ -48,7 +63,7 @@ export function storageMode(requested, available) {
 export async function saveToStorage({
   s3, db, buf, fileName, mimeType, kind, referenceType = null, referenceId = null,
   maxBytes = defaultMaxBytes(), quotaBytes = defaultQuotaBytes(), now = Date.now(),
-  rand = () => randomBytes(16).toString("hex"),
+  rand = () => randomBytes(16).toString("hex"), botBound = isBotTurn(),
 }) {
   if (referenceType != null && !REFERENCE_TYPES.includes(referenceType)) {
     throw new Error(`reference_type must be one of ${REFERENCE_TYPES.join(", ")}`);
@@ -77,9 +92,10 @@ export async function saveToStorage({
     try { await s3.deleteObject(key, bucket); } catch { /* best effort, as crow_upload_file */ }
     throw err;
   }
+  const expiryS = botBound ? Math.min(URL_EXPIRY_S, BOT_URL_EXPIRY_S) : URL_EXPIRY_S;
   let url = null;
-  try { url = await s3.getPresignedUrl(key, { bucket, expiry: URL_EXPIRY_S }); } catch { url = null; }
-  const out = { storage_key: key, bucket, size_bytes: buf.length, url, url_expires_in_s: url ? URL_EXPIRY_S : null };
+  try { url = await s3.getPresignedUrl(key, { bucket, expiry: expiryS }); } catch { url = null; }
+  const out = { storage_key: key, bucket, size_bytes: buf.length, url, url_expires_in_s: url ? expiryS : null };
   if (referenceType === "blog_post") out.media_path = `/blog/media/${key}`;
   else out.gateway_path = `/storage/file/${key}`;
   return out;

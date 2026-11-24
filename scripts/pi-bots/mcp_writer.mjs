@@ -59,20 +59,16 @@ import { AddonKeysUnavailableError, ADDON_SECRET_SHARES, keychainEnvNames, readA
 // the bot engine's values collector does, so a plantable path is never followed.
 import { anchoredPath } from "../../servers/shared/secret-values.js";
 // Shared Storage over the fd pipe. This process IS the host side (the bridge, the gateway, a
-// CLI): it may read the identity, open the instance's sealed storage credentials and pipe only
-// the OPENED config into a child's block. The identity is read here and nowhere else on the bot
-// path — servers/storage/s3-client.js's adoptHostStorage is what a hydrated child does instead.
-// The status reader (not the null-returning loader) is used so "nothing is configured" and
-// "the settings could not be read" become two different lines for the operator.
+// CLI): it reads the instance's BOT storage key — a separate, operator-provisioned, path-scoped
+// credential kept in <CROW_HOME>/secrets (never crow.db, which a bot can write) — and pipes only
+// the OPENED values into a child's block. The instance's own `storage.shared.*` settings are
+// NEVER opened for a bot: those are the instance-wide credential. The identity is not read here
+// at all; servers/storage/s3-client.js's adoptHostStorage is what a hydrated child does instead.
 import {
-  readSharedStorageSettingsSync,
-  storageHydrationEnv,
   STORAGE_FROM_HOST_ENV,
   STORAGE_SETTING_ENV_NAMES,
-  SHARED_STORAGE_NO_SETTINGS,
-  SHARED_STORAGE_UNREADABLE,
 } from "../../servers/storage/s3-client.js";
-import { loadIdentityIfPresent } from "../../servers/sharing/identity.js";
+import { BOT_STORAGE_KEY_MISSING, botStorageEnv, readBotStorageKey } from "../../servers/shared/bot-storage-key.js";
 // A service add-on's derived env (Render's AUTH_HEADER) must be rendered from the values the
 // child will actually get — the unsealed ones — not from the stripped plaintext (Task 2.1).
 import { addonDerivedEnv } from "../../servers/gateway/services/legacy-sources.js";
@@ -714,11 +710,21 @@ export const WARN_ADDON_KEYS_UNREADABLE = (id) =>
 // ---- shared storage: the same rule as a sealed add-on ----------------------
 //
 // A block that declares `needs: ["shared-storage"]` runs as a child that CANNOT read this
-// instance's identity file, so for a GRANTED block the bridge opens the settings here, in the
-// host process, and pipes exactly what the child would have held in memory anyway: endpoint,
-// region, prefix, access key, secret key. Never the seed, never the "crow-secret-box-v1"
-// sub-key. The child sees CROW_STORAGE_FROM_HOST=1 and skips identity.js entirely
-// (servers/storage/s3-client.js adoptHostStorage).
+// instance's identity file, and it must not hold this instance's storage credential either. So
+// for a GRANTED block the bridge reads the instance's BOT storage key — a separate, scoped key
+// provisioned by the operator at <CROW_HOME>/secrets/bot-storage.json
+// (scripts/ops/minio-bot-storage.sh) — and pipes exactly the opened values: endpoint, region,
+// prefix, access key, secret key. Never the shared `storage.shared.*` settings (the
+// instance-wide credential), never the seed, never the "crow-secret-box-v1" sub-key. The child
+// sees CROW_STORAGE_FROM_HOST=1 and skips identity.js entirely (servers/storage/s3-client.js
+// adoptHostStorage).
+//
+// NO BOT BLOCK OPENS `storage.shared.*` ANY MORE, in any mode: the key file is outside crow.db
+// because crow.db is bot-writable and a sealed value there is not bound to its setting name.
+// With no key file the block is storage-OFF with one warning
+// (WARN_SHARED_STORAGE_NO_BOT_KEY), and an unreadable/unsafe file is storage-OFF with a
+// DIFFERENT warning naming the reason (WARN_SHARED_STORAGE_BOT_KEY_UNREADABLE) — a fault the
+// operator has to see, never a silent fallback.
 //
 // THE GRANT HAS TWO HALVES. The core crow-storage server is granted by its registry entry
 // (code in this repo). A BUNDLE is granted only when BOTH hold: its installed manifest declares
@@ -726,13 +732,13 @@ export const WARN_ADDON_KEYS_UNREADABLE = (id) =>
 // (isStorageEnvConsumer — STORAGE_ENV_CONSUMERS in servers/gateway/addon-env.js, today studio,
 // sunvox-studio, data-dashboard, artifacts). A declaration alone grants NOTHING: the installed
 // manifest is operator-writable and a store add-on is not reviewed code, so honouring it by
-// itself would hand this instance's storage credentials to any add-on that asked. A bundle
+// itself would hand a bot storage key to any add-on that asked. A bundle
 // that declares the need and is not on the list is storage-OFF (marker 0, no credentials) with
 // ONE warning naming it (WARN_SHARED_STORAGE_NOT_REVIEWED) — silence would read as a working
 // storage block to its author.
 //
 // `addonKeys: "hydrate"` is the switch for both kinds of value (a sealed add-on's keys and the
-// instance's opened storage settings): both travel on the fd the bridge pipes to pi, and both
+// bot storage key): both travel on the fd the bridge pipes to pi, and both
 // are refused for a file write. A FILE-MODE turn cannot carry them, so the block gets the
 // marker with no settings and one warning: the child then runs with no shared storage at all,
 // never with a silent fallback to whatever env it inherited (for a sandboxed bot that is
@@ -740,29 +746,32 @@ export const WARN_ADDON_KEYS_UNREADABLE = (id) =>
 //
 // The marker is on EVERY active stdio block: `1` on the ones whose declaration was hydrated, and
 // `0` on every other one (see the marker-0 pass below). A block that does not declare
-// shared-storage never receives settings, so a child that imports servers/storage/s3-client.js
+// shared-storage never receives the key, so a child that imports servers/storage/s3-client.js
 // anyway — a bundle from before its `needs` bump, one that has no declaration at all — is OFF
 // with no identity read, instead of quietly taking the OWNER path inside a bot.
 //
 // THE INSTANCE'S ENVIRONMENT IS NOT A FALLBACK FOR A BOT: on a MinIO install the S3_* and
-// MINIO_* names are the operator's root credential, so a bot turn with no Shared Storage
-// settings is simply OFF (one warning). And every block's storage credential names are
+// MINIO_* names are the operator's root credential, so a bot turn with no bot storage key is
+// simply OFF (one warning). And every block's storage credential names are
 // stripped before this section runs — see withoutStorageCredentials /
 // WARN_STORAGE_CREDENTIALS_STRIPPED.
 
 /** The one warning a file-delivery turn shows for a storage-using block. Fixed sentence. */
 export const WARN_SHARED_STORAGE_FILE_MODE = (id) =>
   `${id}: shared storage needs fd delivery — this turn's MCP config is a file, so ${id} has no shared storage`;
-/** The same, when the instance simply has no Shared Storage settings to send. Fixed sentence. */
-export const WARN_SHARED_STORAGE_NO_SETTINGS = (id) =>
-  `${id}: Shared Storage is not configured on this instance, so ${id} has no shared storage`;
 /**
- * The same, when the instance HAS settings that could not be read (an unreadable croW.db, a
- * sealed value that would not open). A different sentence from "not configured", because it
- * is a fault: the operator has to see that storage is broken, not merely absent.
+ * The same, when this instance has no bot storage key at all (the normal state of an instance
+ * whose operator has not run scripts/ops/minio-bot-storage.sh). Fixed sentence.
  */
-export const WARN_SHARED_STORAGE_UNREADABLE = (id) =>
-  `${id}: this instance's Shared Storage settings could not be read, so ${id} has no shared storage`;
+export const WARN_SHARED_STORAGE_NO_BOT_KEY = (id) =>
+  `${id}: this instance has no bot storage key, so ${id} has no shared storage`;
+/**
+ * The same, when the key FILE exists and cannot be used (group/world readable, a symlink, too
+ * large, not JSON, a missing field). A different sentence from "no key", because it is a fault
+ * the operator has to see. Carries the reason sentence, never a value.
+ */
+export const WARN_SHARED_STORAGE_BOT_KEY_UNREADABLE = (id, reason) =>
+  `${id}: the bot storage key file could not be read (${reason}), so ${id} has no shared storage`;
 /**
  * The one warning a bundle gets when its manifest ASKS for shared storage and its id is not on
  * the reviewed allow-list. Fixed sentence, no value: the declaration is not a grant.
@@ -775,8 +784,8 @@ export const WARN_SHARED_STORAGE_NOT_REVIEWED = (id) =>
  * instance's environment, whatever its source: the core registry's ``mcpEnv`` template (which
  * resolves MINIO_* and S3_* out of the repo .env), a bundle's ``mcp-addons.json`` env, or a
  * canonical copy of a third-party server. On a MinIO install those values ARE the instance's
- * root credential, and a bot's only storage credential is the scoped Shared Storage config
- * the engine opens and pipes for THIS turn (CROW_STORAGE_FROM_HOST=1).
+ * root credential, and a bot's only storage credential is the scoped bot storage key
+ * the engine pipes for THIS turn (CROW_STORAGE_FROM_HOST=1).
  *
  * All MINIO_* names are credentials by class; the S3_* side is the six names the hydration
  * itself uses (STORAGE_SETTING_ENV_NAMES in servers/storage/s3-client.js), so the two can
@@ -807,17 +816,19 @@ export function withoutStorageCredentials(env) {
 
 /** The one warning shown when a block arrived carrying storage credentials. No values. */
 export const WARN_STORAGE_CREDENTIALS_STRIPPED = (id) =>
-  `${id}: its MCP env carried storage credentials from this instance's environment; a bot only ever gets the scoped Shared Storage settings the engine pipes, so they were left out`;
+  `${id}: its MCP env carried storage credentials from this instance's environment; a bot only ever gets the scoped bot storage key the engine pipes, so they were left out`;
 
 /**
  * The per-bot spawn-log note (the boot line): one sentence, in the same place the
  * `[containment]` line goes, so an operator sees a degraded feature instead of a silent
- * localhost fallback. Exactly the three states a bot turn can be in.
+ * localhost fallback. Exactly the states a bot turn can be in.
  */
 export const SHARED_STORAGE_NOTE_OVER_FD = "shared storage: over fd";
 export const SHARED_STORAGE_NOTE_OFF_FILE = "shared storage: off (file delivery)";
-export const SHARED_STORAGE_NOTE_OFF_NO_SETTINGS = "shared storage: off (no Shared Storage settings on this instance)";
-export const SHARED_STORAGE_NOTE_OFF_UNREADABLE = "shared storage: off (the Shared Storage settings could not be read)";
+export const SHARED_STORAGE_NOTE_OFF_NO_BOT_KEY = "shared storage: off (no bot storage key on this instance)";
+/** The key file exists but cannot be used; the reason sentence is appended (never a value). */
+export const SHARED_STORAGE_NOTE_OFF_KEY_UNREADABLE = (reason) =>
+  `shared storage: off (the bot storage key file could not be read: ${reason})`;
 /** A validate-only turn built no config for a spawn: nothing was piped, nothing was decided. */
 export const SHARED_STORAGE_NOTE_DEFERRED = "shared storage: not piped in this turn";
 
@@ -854,40 +865,24 @@ export function addonUnsealInstanceMatches(crowHome, env = process.env) {
 }
 
 /**
- * This instance's Shared Storage settings, opened HOST-SIDE for a bot turn.
+ * This instance's BOT storage key, read HOST-SIDE for a bot turn.
  *
- * The six storage.shared.* rows are read and the sealed credentials opened with the instance
- * identity, which is zeroed straight away and never handed on. Returns the opened config, or
- * WHY there is none — "nothing configured" or "could not be read" — so the caller shows the
- * operator two different sentences.
+ * The key lives OUTSIDE crow.db on purpose: crow.db is bot-writable, and a sealed value there is
+ * not bound to its setting name, so a bot that could write the row could point its own child at
+ * any credential. <CROW_HOME>/secrets/bot-storage.json is in the directory a bot sandbox is
+ * never bound, is written 0600 by scripts/ops/minio-bot-storage.sh, and is refused (with the
+ * reason) when the secrets DIRECTORY is a symlink, another user's or not exactly 0700, when the
+ * file is a symlink, not a regular file, not this user's or readable by group/other, and when it
+ * is too large, not JSON, or missing a required field (servers/shared/bot-storage-key.js).
  *
- * THERE IS NO ENV FALLBACK FOR A BOT, deliberately: the operator's own S3_* and MINIO_*
- * environment is the operator's credential (on a MinIO install, the root credential), and it
- * is never piped to a bot. An env-only install therefore simply has no bot shared storage ("not
- * configured", one warning), which is visible instead of a silent grant.
- *
- * Refuses when `crowHome` is not this process's instance, the same rule the add-on hydrate
- * step applies: never another instance's settings.
- * @returns {{ok: true, config: object} | {ok: false, reason: "no-settings"|"unreadable"}}
+ * THERE IS NO ENV FALLBACK FOR A BOT, and the shared `storage.shared.*` settings are NOT
+ * consulted, deliberately: both are this instance's credential (on a MinIO install, the root
+ * credential) and neither is ever piped to a bot. An instance without the file therefore
+ * simply has no bot storage (one warning), which is visible instead of a silent grant.
+ * @returns {{config: object|null, reason: string|null}} see readBotStorageKey
  */
-function openInstanceSharedStorage(crowHome) {
-  if (!addonUnsealInstanceMatches(crowHome)) return { ok: false, reason: SHARED_STORAGE_UNREADABLE };
-  let identity = null;
-  try {
-    identity = loadIdentityIfPresent();
-  } catch {
-    // The identity file is there but cannot be opened (a permissions error, corrupt JSON, an
-    // encrypted seed this host holds no passphrase for). That is NOT "nothing configured": the
-    // settings may well exist and the operator has to see storage is broken, so it is the
-    // unreadable fault. Only a null (no identity.json at all) means there is no identity.
-    return { ok: false, reason: SHARED_STORAGE_UNREADABLE };
-  }
-  if (!identity) return { ok: false, reason: SHARED_STORAGE_NO_SETTINGS };
-  try {
-    return readSharedStorageSettingsSync(botsDbPath(), identity);
-  } finally {
-    for (const v of Object.values(identity)) if (v instanceof Uint8Array) v.fill(0);
-  }
+function openBotStorageKey(crowHome) {
+  return readBotStorageKey({ crowHome });
 }
 
 /**
@@ -1154,21 +1149,29 @@ export function writeBotMcp(def, opts = {}) {
       // stays exactly as built, and the caller is told what a spawn would need piped.
       sharedStorage = { servers: [...sharedStorageIds], note: SHARED_STORAGE_NOTE_DEFERRED };
     } else {
-      const opened = openInstanceSharedStorage(crowHome);
-      if (opened.ok) {
+      // The bot's OWN key, from <CROW_HOME>/secrets/bot-storage.json. The instance's shared
+      // `storage.shared.*` rows are never read for a bot block (see openBotStorageKey).
+      const key = openBotStorageKey(crowHome);
+      if (key.config) {
+        const env = botStorageEnv(key.config);
         for (const id of sharedStorageIds) {
           const block = built.json.mcpServers[id];
-          block.env = { ...block.env, ...storageHydrationEnv(opened.config) };
+          block.env = { ...block.env, ...env };
         }
         sharedStorage = { servers: [...sharedStorageIds], note: SHARED_STORAGE_NOTE_OVER_FD };
-      } else if (opened.reason === SHARED_STORAGE_UNREADABLE) {
-        // Settings exist but could not be opened/read: a different sentence from "not
-        // configured", because this is a fault the operator has to see.
-        for (const id of sharedStorageIds) sharedStorageOff(id, WARN_SHARED_STORAGE_UNREADABLE(id));
-        sharedStorage = { servers: [...sharedStorageIds], note: SHARED_STORAGE_NOTE_OFF_UNREADABLE };
+      } else if (key.reason === BOT_STORAGE_KEY_MISSING) {
+        // No key file: the normal state of an instance that has not provisioned one. Storage is
+        // OFF — never the shared settings, never the operator's environment.
+        for (const id of sharedStorageIds) sharedStorageOff(id, WARN_SHARED_STORAGE_NO_BOT_KEY(id));
+        sharedStorage = { servers: [...sharedStorageIds], note: SHARED_STORAGE_NOTE_OFF_NO_BOT_KEY };
       } else {
-        for (const id of sharedStorageIds) sharedStorageOff(id, WARN_SHARED_STORAGE_NO_SETTINGS(id));
-        sharedStorage = { servers: [...sharedStorageIds], note: SHARED_STORAGE_NOTE_OFF_NO_SETTINGS };
+        // The file exists and cannot be used (unsafe mode, a symlink, not JSON, a missing
+        // field): a fault with its own sentence, so the operator sees a broken key rather than
+        // an absent one.
+        for (const id of sharedStorageIds) {
+          sharedStorageOff(id, WARN_SHARED_STORAGE_BOT_KEY_UNREADABLE(id, key.reason));
+        }
+        sharedStorage = { servers: [...sharedStorageIds], note: SHARED_STORAGE_NOTE_OFF_KEY_UNREADABLE(key.reason) };
       }
     }
   }

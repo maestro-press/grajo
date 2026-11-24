@@ -70,18 +70,61 @@ Presigned URLs default to 1-hour expiry. The expiry is configurable per request.
 
 ## Who opens the settings (and who never does)
 
-The S3 credentials live in `dashboard_settings` as `storage.shared.*`, with the access key and
-secret sealed by `secret-box` — opening them needs the instance identity file. Two paths, one
-decision, taken by `adoptHostStorage()` in `s3-client.js` off the env var
-`CROW_STORAGE_FROM_HOST`:
+The INSTANCE's S3 credentials live in `dashboard_settings` as `storage.shared.*`, with the access
+key and secret sealed by `secret-box` — opening them needs the instance identity file. A bot
+gets none of that: its storage credential is its own key at
+`<CROW_HOME>/secrets/bot-storage.json` (see "The credential a bot gets is NOT the instance's"
+below), which is why a bot's child never opens the DB rows at all. One decision, taken by
+`adoptHostStorage()` in `s3-client.js` off the env var `CROW_STORAGE_FROM_HOST`:
 
 | Process | `CROW_STORAGE_FROM_HOST` | What it does |
 |---|---|---|
 | The gateway | — | `initStorage({ db, identity })` in-process |
 | An owner's own stdio server (the generated `~/.pi/agent` config) | absent | reads the identity (`loadIdentityIfPresent`), opens the config, keeps only that |
-| A bot's MCP child | `1` | uses the OPENED settings the bot engine piped into its block (`S3_ENDPOINT`, `S3_USE_SSL`, `S3_REGION`, `S3_BUCKET_PREFIX`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`); never reads the identity |
+| A bot's MCP child | `1` | uses the BOT storage key the bot engine piped into its block (`S3_ENDPOINT`, `S3_USE_SSL`, `S3_REGION`, `S3_BUCKET_PREFIX`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`); never reads the identity and never opens `storage.shared.*` |
 | A bot's MCP child on a file-delivery turn | `0` | NO shared storage at all — a file cannot carry credentials, so the child refuses instead of falling back to an inherited endpoint |
-| A bot's MCP child whose block declares no shared storage | `0` | NO shared storage and no identity read: such a child never receives settings, so marker-less (the owner path) must never reach it |
+| A bot's MCP child whose block declares no shared storage | `0` | NO shared storage and no identity read: such a child never receives a key, so marker-less (the owner path) must never reach it |
+
+**The credential a bot gets is NOT the instance's.** `storage.shared.*` is the instance-wide
+credential (on a MinIO install, a root-level key), and a sibling process in a bot's sandbox can
+read a child's `/proc/<pid>/environ`. So a bot's storage key is its own: an operator provisions
+`<CROW_HOME>/secrets/bot-storage.json` with `scripts/ops/minio-bot-storage.sh apply <mc-alias>
+<crow-home> [prefix]`, which creates the per-instance `<prefix>-bot-<tag>` user and its
+`<prefix>-bot-<tag>-policy` policy — the tag is the first 12 hex of
+`sha256("<hostname>:<realpath of the crow home>")`, so two instances on one host (every default
+install is `~/.crow`) do not collide — then writes the file 0600. The policy grants
+GetObject/PutObject/DeleteObject, AbortMultipartUpload and ListMultipartUploadParts on
+`projects/*`, `bots/*`, `studio/*` and `sunvox-studio/*` of `<prefix>-files`, ListBucket limited to
+those prefixes, ListBucketMultipartUploads on `<prefix>-files` with NO condition, and
+GetBucketLocation — nothing else. The multipart listing is unconditioned because MinIO will not
+accept the policy otherwise: it rejects `s3:prefix` on that action, and minio-js needs the action
+for an upload over 64 MiB. The cost is bounded: a bot's key can list the NAMES of in-progress
+(incomplete) multipart uploads anywhere in `<prefix>-files` — never a completed object, never an
+object's contents — while every read, write and delete still needs one of the four granted
+prefixes. The file lives outside `crow.db` on purpose: `crow.db` is bot-writable, and a sealed value there is not
+bound to its setting name. `servers/shared/bot-storage-key.js` refuses a secrets DIRECTORY that is
+a symlink, another user's, or not exactly mode 0700, and a file that is a symlink, not a regular
+file, not this user's, group/world readable, oversized, not JSON or missing a field; with no file a
+bot has no storage at all (`shared storage: off (no bot storage key on this instance)`).
+
+A hydrated child therefore makes only the calls that policy grants. Availability is NOT a
+`bucketExists`: MinIO evaluates HeadBucket as `s3:ListBucket` with NO prefix, so the policy's
+`s3:prefix` condition fails and a healthy backend answers AccessDenied. The probe is a
+non-recursive list of one key under `bots/` instead (an empty answer is available), `ensureBucket`
+is a no-op (the operator provisions the bucket; nothing is ever created), `getBucketStats` lists
+only the four granted prefixes and sums them — the empty prefix a whole-bucket listing would use is
+refused — and an S3 AccessDenied reads `storage refused this location` — not "storage
+unavailable", which would hide a policy gap. A bot's project-less `crow_upload_file` writes under
+`bots/<bot id>/` (its key may not touch the bucket root), and a `storage_files` row records the
+bucket actually written (`<prefix>-files`).
+
+Two buckets are deliberately OUTSIDE that policy, and this is a known limitation rather than an
+oversight: the blog figures bucket (`CROW_BLOG_FIGURES_BUCKET`, default `blog-figures`;
+`servers/blog/figures-bucket.js`) and `<prefix>-artifacts` (the artifacts blob store). A bot's
+data-dashboard figure publish is therefore REFUSED under the scoped key — it needs the instance's
+own credential — while artifacts are not affected, because bots reach that store only through the
+gateway's `/artifacts` mount, which runs with the instance's credential. Widen the policy
+deliberately if a bot should publish figures itself.
 
 Who declares the need, and who is actually granted it. The core `crow-storage` server is
 GRANTED by its registry entry (`needs: ["shared-storage"]` in `scripts/server-registry.js`) —
@@ -95,11 +138,11 @@ credentials to any add-on that typed `"needs": ["shared-storage"]`. A bundle tha
 need and is not on the list is storage-**OFF** — the marker `0` and no credentials, like any
 other block — plus one warning naming it (`<id>: its manifest declares shared storage, but <id>
 is not a reviewed storage consumer, so <id> has no shared storage`). The bot engine's
-owner-side hydration is in `scripts/pi-bots/mcp_writer.mjs` (`sharedStorageUnreviewed` carries
-the refused ids out of the catalog); it pipes only the opened config, never the seed or the seal
-key, and it says so in the spawn log — `shared storage: over fd`, `shared storage: off (file
-delivery)`, `shared storage: off (no Shared Storage settings on this instance)` or
-`shared storage: off (the Shared Storage settings could not be read)`.
+hydration is in `scripts/pi-bots/mcp_writer.mjs` (`sharedStorageUnreviewed` carries
+the refused ids out of the catalog); it pipes only the opened BOT storage key (see below), never
+the seed or the seal key, and it says so in the spawn log — `shared storage: over fd`,
+`shared storage: off (file delivery)`, `shared storage: off (no bot storage key on this
+instance)` or `shared storage: off (the bot storage key file could not be read: <reason>)`.
 
 Two rules make "only the six S3_* names" true rather than aspirational:
 
@@ -108,12 +151,12 @@ Two rules make "only the six S3_* names" true rather than aspirational:
   canonical copy) — every `MINIO_*` name and the six `S3_*` names are stripped. The core
   registry's `mcpEnv` template resolves those out of the repo `.env`, where on a MinIO install
   they are the instance's ROOT credential; a bot's only storage credentials are the scoped
-  settings the engine opens and pipes for that turn.
-- **There is no env fallback for a bot.** No Shared Storage settings (an env-only install, no
-  identity) means storage is OFF with one warning; settings that exist but cannot be read (an
-  unopenable crow.db, a sealed value that would not open, an identity file that will not open)
-  are OFF with a different warning and boot line, because that is a fault rather than a normal
-  state.
+  bot key the engine reads and pipes for that turn.
+- **There is no env fallback for a bot.** No bot storage key on the instance means storage is
+  OFF with one warning; a key file that exists but cannot be used (its secrets directory is a
+  symlink, another user's or not exactly 0700; the file is group/world readable, a symlink, too
+  large, not JSON, a missing field) is OFF with its own warning and the reason — a fault rather
+  than a normal state.
 - **Every active bot stdio block carries the marker.** `1` on the blocks the engine hydrated,
   `0` on every other one — including a bundle that imports `s3-client` without declaring
   `needs`, an installed copy from before its declaration, and a bundle that declared `needs`
@@ -121,10 +164,11 @@ Two rules make "only the six S3_* names" true rather than aspirational:
   leaving one unmarked would let such a child open the instance identity inside a bot. A
   `{url, headers}` block spawns no child and is left alone.
 
-Tests: `tests/pibot-shared-storage-hydrate.test.js` (the writer, each child, and a planted
-repo-style `.env` full of MINIO_*/S3_* credentials in both modes) and
-`tests/pi-contain-shared-storage.test.js` (a real bubblewrap sandbox: the identity reads empty
-while the child is configured from the pipe). `tests/bot-seed-import-guard.test.js` walks the
+Tests: `tests/bot-storage-key.test.js` (the key file's checks, the writer's four outcomes, the
+hydrated child's scoped behaviour and the bot key layout), `tests/pibot-shared-storage-hydrate.test.js`
+(the writer, each child, and a planted repo-style `.env` full of MINIO_*/S3_* credentials in both
+modes) and `tests/pi-contain-shared-storage.test.js` (a real bubblewrap sandbox: the identity reads
+empty while the child is configured from the pipe). `tests/bot-seed-import-guard.test.js` walks the
 static import graph TRANSITIVELY from every bot entry and fails on any chain that reaches
 `servers/sharing/identity.js` or `secret-box.js` (reporting the chain), plus any bot-reachable
 file with a non-literal import specifier unless a reviewed entry says why it cannot reach the

@@ -119,13 +119,10 @@ export const ALLOWED_HOST_SIDE = Object.freeze({
   "servers/storage/s3-client.js":
     "the storage client. Its openers (loadSharedStorageFromDb/Sync, useDbStorageConfig, " +
     "useDbStorageConfigFromInstance, initStorageFromInstance) open storage.shared.* for the " +
-    "OWNER's path and for the bot engine's hydrate step; a hydrated bot turn goes through " +
-    "adoptHostStorage and never reaches them, and a file-delivery bot turn is explicitly off " +
-    "(tests/pibot-shared-storage-hydrate.test.js pins both).",
-  "scripts/pi-bots/mcp_writer.mjs":
-    "the bot engine's host-side hydration: it reads the identity, opens the storage settings " +
-    "and pipes ONLY the opened config (CROW_STORAGE_FROM_HOST=1 + S3_*) into the in-memory " +
-    "config; the seed and the seal key never enter the config.",
+    "OWNER's path (the gateway, an owner's own spawn); a hydrated bot turn goes through " +
+    "adoptHostStorage with its own scoped bot storage key and never reaches them, and a " +
+    "file-delivery bot turn is explicitly off (tests/pibot-shared-storage-hydrate.test.js and " +
+    "tests/bot-storage-key.test.js pin both).",
   "scripts/pi-bots/bridge.mjs":
     "the bot ENGINE — the host process that spawns pi; a bot never loads it. Its one seed import " +
     "is identity.js's identityDataDir, used only as the ANCHOR of the directory whose " +

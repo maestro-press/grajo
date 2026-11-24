@@ -40,14 +40,22 @@ A surface is "declared" by the presence of its key. Each declared surface is val
 
 **`needs`: what the spawner must hydrate into your MCP block.** A bundle's `server/` runs as a
 stdio MCP child that can NOT read Crow's identity file, so anything it needs *opened* on its
-behalf is declared here. `["shared-storage"]` means the instance's Shared Storage settings
-(endpoint, region, bucket prefix, access/secret key): the bot engine opens them in its own
-process and pipes them into the block's env as `S3_*` with `CROW_STORAGE_FROM_HOST=1`, and your
-child calls `adoptHostStorage()` from the app's `servers/storage/s3-client.js` instead of
-reading the identity. A file-delivery turn cannot carry them: the child gets
-`CROW_STORAGE_FROM_HOST=0` and NO credentials (one warning names it), so treat storage as
-optional and say so when it is missing. An owner's own stdio spawn has no marker and keeps the
-old path (the s3-client opens the settings from the DB itself).
+behalf is declared here. `["shared-storage"]` means Crow's **bot storage key** — a separate,
+operator-provisioned, path-scoped S3 credential (`<CROW_HOME>/secrets/bot-storage.json`, made by
+`scripts/ops/minio-bot-storage.sh`; endpoint, region, bucket prefix, access/secret key): the bot
+engine reads it in its own process and pipes it into the block's env as `S3_*` with
+`CROW_STORAGE_FROM_HOST=1`, and your child calls `adoptHostStorage()` from the app's
+`servers/storage/s3-client.js` instead of reading the identity. The key may only touch
+`projects/*`, `bots/*`, `studio/*` and `sunvox-studio/*` of `<prefix>-files`: it cannot list
+buckets, cannot create one, cannot ask whether one exists (`bucketExists` sends HeadBucket, which
+MinIO reads as `s3:ListBucket` with no prefix — refused) and cannot list the bucket root, so list
+under one of those four prefixes (`isAvailable` and `getBucketStats` in the same module already
+do) — and a refusal reads `storage refused this location`. Without a
+provisioned key the child gets `CROW_STORAGE_FROM_HOST=0` and NO credentials (one warning names
+it) — never the instance's shared settings and never its environment — so treat storage as
+optional and say so when it is missing. A file-delivery turn cannot carry them either. An
+owner's own stdio spawn has no marker and keeps the old path (the s3-client opens the settings
+from the DB itself).
 
 **The declaration is a request, not a grant.** The installed manifest is operator-writable and
 an add-on from the store is not reviewed code, so a bot turn grants shared storage only when

@@ -6,14 +6,18 @@
  * endpoint.
  *
  * Configuration precedence (hydrated > DB > env):
- *   0. A bot's MCP child is HYDRATED: the bot engine opened this instance's
- *      Shared Storage settings (in its own process, which may read the
- *      identity) and piped only the opened config into the block's env, under
- *      CROW_STORAGE_FROM_HOST=1 (see STORAGE_FROM_HOST_ENV / adoptHostStorage).
- *      Such a child never reads identity.json and never falls back to the
- *      environment, so a bot whose sandbox masks the identity file still has
- *      storage. A file-delivery bot turn gets the marker with no settings: no
- *      shared storage at all, with one line saying so.
+ *   0. A bot's MCP child is HYDRATED: the bot engine read this instance's BOT storage key — a
+ *      separate, operator-provisioned, path-scoped credential kept outside crow.db
+ *      (<CROW_HOME>/secrets/bot-storage.json; servers/shared/bot-storage-key.js) — and piped
+ *      only the opened values into the block's env, under CROW_STORAGE_FROM_HOST=1 (see
+ *      STORAGE_FROM_HOST_ENV / adoptHostStorage). Such a child never reads identity.json,
+ *      never opens the instance's storage.shared.* settings and never falls back to the
+ *      environment, so a bot whose sandbox masks the identity file still has its OWN scoped
+ *      storage. That key cannot list buckets, cannot ask about the bucket (HeadBucket is
+ *      s3:ListBucket with no prefix, which the policy's s3:prefix condition refuses), cannot
+ *      create one and cannot list the bucket root — see isAvailable / ensureBucket /
+ *      getBucketStats for the calls it is granted instead. A file-delivery bot turn gets the
+ *      marker with no settings: no shared storage at all, with one line saying so.
  *   1. If initStorage({db, identity}) has been called and the DB has
  *      storage.shared.* keys, use those (sealed secrets opened with identity).
  *      The gateway, the stdio storage server and bundle MCP children all do.
@@ -30,13 +34,13 @@
  * OWNER PATH vs BOT PATH: an owner's own stdio server (the generated
  * ~/.pi/agent config, the combined crow-core server) has no
  * CROW_STORAGE_FROM_HOST in its env and runs rule 1 then rule 2 exactly as
- * before. A bot's child ALWAYS has the marker: `1` (the settings above were
- * piped) or `0` (a file-delivery turn, which cannot carry them, or a block
+ * before. A bot's child ALWAYS has the marker: `1` (a bot storage key was
+ * piped) or `0` (a file-delivery turn, which cannot carry one, or a block
  * that does not declare `needs: ["shared-storage"]` at all) — see
  * adoptHostStorage. Rule 1 is the only code here that touches the identity or
- * the seal helpers, and it is host-side: the bot engine, the gateway, and an
- * owner's own spawn; useDbStorageConfigFromInstance reads the marker itself,
- * so even a child that skipped adoptHostStorage cannot reach it inside a bot.
+ * the seal helpers, and it is host-side: the gateway and an owner's own spawn;
+ * useDbStorageConfigFromInstance reads the marker itself, so even a child that
+ * skipped adoptHostStorage cannot reach it inside a bot.
  */
 
 import * as Minio from "minio";
@@ -61,6 +65,27 @@ let _cachedDbConfig = null; // parsed + opened plaintext, or null if DB has no f
 // fallback to the env, which for a sandboxed bot points at a localhost:9000
 // where nothing listens.
 let _offReason = null;
+// True when THIS process was hydrated by the bot engine with a BOT storage key: a path-scoped
+// credential that may not list buckets, may not ask about or create the bucket, and may not list
+// the bucket root. Set only by adoptHostStorage (marker "1" with a usable config), cleared by
+// every other wiring path.
+let _hydrated = false;
+
+/**
+ * The four object prefixes a bot's scoped key is granted on `<prefix>-files` (the matching MinIO
+ * policy is written by scripts/ops/minio-bot-storage.sh). `getBucketStats` sums exactly these on
+ * a hydrated path, because anything wider — an empty prefix, i.e. the bucket root — is refused.
+ */
+export const BOT_STORAGE_PREFIXES = Object.freeze([
+  "projects/",
+  "bots/",
+  "studio/",
+  "sunvox-studio/",
+]);
+
+/** The prefix the hydrated availability probe lists ONE key of: a bot's own project-less uploads
+ *  land under `bots/<bot id>/`, so the prefix is always in the policy. */
+const HYDRATED_PROBE_PREFIX = "bots/";
 
 /**
  * The env var a hydrated bot block carries (see adoptHostStorage).
@@ -93,6 +118,7 @@ export async function initStorage({ db, identity }) {
   _boot.db = db || null;
   _boot.identity = identity || null;
   _offReason = null;
+  _hydrated = false;
   clientInstance = null;
   await _reloadCachedConfig();
 }
@@ -130,6 +156,7 @@ export function useStorageConfig(cfg) {
   _boot = { db: null, identity: null };
   _cachedDbConfig = cfg || null;
   _offReason = null;
+  _hydrated = false;
   clientInstance = null;
 }
 
@@ -144,9 +171,16 @@ export function useNoStorage(reason = STORAGE_OFF_NO_SETTINGS) {
   _boot = { db: null, identity: null };
   _cachedDbConfig = null;
   _offReason = text;
+  _hydrated = false;
   clientInstance = null;
   if (first) console.error(`[storage] ${text}`);
   return false;
+}
+
+/** Is this process a HYDRATED bot child (a scoped bot storage key: no bucket listing, no
+ *  bucket creation, and a refusal reads as "storage refused this location")? */
+export function isHydratedBotStorage() {
+  return _hydrated;
 }
 
 /** Why this process has no storage (`null` when it may have one). */
@@ -188,8 +222,9 @@ export function storageHydrationEnv(cfg) {
  * initStorageFromInstance; studio, sunvox-studio and data-dashboard, at their storage
  * bootstrap).
  *
- *   "hydrated" — the bridge piped this instance's opened settings (marker "1"): use them,
- *                and never read identity.json or the env fallback.
+ *   "hydrated" — the bridge piped this instance's BOT storage key (marker "1"): use those
+ *                values, never read identity.json, never read storage.shared.*, never the env
+ *                fallback.
  *   "off"      — a bot turn: NO shared storage at all. A file-delivery config cannot carry
  *                the credentials, so the child refuses instead of falling back to whatever
  *                env it inherited (for a sandboxed bot that is localhost:9000, where nothing
@@ -204,6 +239,9 @@ export function adoptHostStorage(env = process.env) {
     const cfg = envStorageConfig(env);
     if (cfg && cfg.secretKey) {
       useStorageConfig(cfg);
+      // A hydrated child holds a BOT storage key: path-scoped, no bucket listing, no bucket
+      // creation (isAvailable / ensureBucket / the AccessDenied mapping below read this).
+      _hydrated = true;
       return "hydrated";
     }
     // A hydrated block with no usable endpoint is a bridge bug: fail closed rather than fall
@@ -303,11 +341,14 @@ export const SHARED_STORAGE_NO_SETTINGS = "no-settings";
 export const SHARED_STORAGE_UNREADABLE = "unreadable";
 
 /**
- * The same read through a SYNCHRONOUS read-only sqlite handle, for the bot engine's hydrate
- * step: it builds an in-memory MCP config in one synchronous pass (the same shape as
- * readAddonSecretsSync), so it cannot await a driver. `dbPath` is this instance's crow.db
- * (botsDbPath() in the bot engine); the handle is opened read-only, closed here, and never
- * touches the identity file itself — the caller hands the identity in.
+ * The same read through a SYNCHRONOUS read-only sqlite handle, for a host-side reader that
+ * must not await a driver: it builds its answer in one synchronous pass (the same shape as
+ * readAddonSecretsSync). `dbPath` is this instance's crow.db (botsDbPath() in the bot engine);
+ * the handle is opened read-only, closed here, and never touches the identity file itself —
+ * the caller hands the identity in.
+ *
+ * A BOT turn never reaches this (a bot's storage comes from its own scoped key file, piped as
+ * env: servers/shared/bot-storage-key.js); this is the OWNER/gateway side of the same rows.
  *
  * Answers WHY there is no config (see SHARED_STORAGE_NO_SETTINGS / SHARED_STORAGE_UNREADABLE):
  * a caller that must tell "nothing configured" from "could not read it" needs the difference.
@@ -511,12 +552,59 @@ export function getClient() {
   return clientInstance;
 }
 
+/** A bot's scoped storage key may not do what it asked for AT THAT LOCATION (an S3 AccessDenied
+ *  / a 403). One fixed sentence: the operator has to see a policy gap, not a dead backend. A
+ *  files bucket that is really missing is a policy gap from a bot's side too — its key can
+ *  neither check for nor create the bucket, so the first allowed call is refused. */
+export const STORAGE_REFUSED_LOCATION = "storage refused this location";
+
+/** True for an S3 refusal (AccessDenied / Forbidden / a 403), whatever the client spells it. */
+function isAccessDenied(err) {
+  const name = String((err && (err.code || err.name)) || "");
+  const status = Number((err && (err.statusCode || err.status)) || 0);
+  if (name === "AccessDenied" || name === "Forbidden" || name === "AccessDeniedError") return true;
+  if (status === 403) return true;
+  return /access ?denied|forbidden/i.test(String((err && err.message) || ""));
+}
+
+/** The error a HYDRATED child answers when the backend refuses the call it made (an S3
+ *  AccessDenied / 403): one fixed sentence, with the client's own error kept as `cause`. */
+function refusedLocationError(cause) {
+  const refused = new Error(STORAGE_REFUSED_LOCATION);
+  refused.code = "STORAGE_REFUSED_LOCATION";
+  refused.cause = cause;
+  return refused;
+}
+
+/** Run one S3 call. A HYDRATED bot child maps a refusal to STORAGE_REFUSED_LOCATION; the owner's
+ *  own path keeps the client's error exactly as it was. */
+async function scoped(run) {
+  try {
+    return await run();
+  } catch (err) {
+    if (!_hydrated || !isAccessDenied(err)) throw err;
+    throw refusedLocationError(err);
+  }
+}
+
 /**
  * Check if the S3/MinIO backend is available and responding.
+ *
+ * A HYDRATED bot child asks NOTHING about the bucket. MinIO evaluates HeadBucket — what
+ * `bucketExists` sends — as s3:ListBucket with NO prefix, so the policy's s3:prefix condition
+ * fails and a perfectly healthy backend answers AccessDenied; `listBuckets` is refused outright.
+ * The probe is therefore a call the scoped key really is granted: a NON-RECURSIVE list of ONE key
+ * under `bots/` (where a bot's own project-less uploads land). Success — including an empty
+ * answer, because nothing has been uploaded yet — is available; an AccessDenied is a policy gap
+ * and reads "storage refused this location"; anything else (a refused connection, a timeout) is
+ * simply unavailable.
+ *
+ * The owner's own path keeps the bucket listing it always used.
  */
 export async function isAvailable() {
   const client = getClient();
   if (!client) return false;
+  if (_hydrated) return await probeHydratedAvailability(client);
   try {
     await client.listBuckets();
     return true;
@@ -526,17 +614,58 @@ export async function isAvailable() {
 }
 
 /**
+ * The hydrated availability probe: one key under an allowed prefix (see isAvailable).
+ * @param {object} client the MinIO/S3 client
+ * @returns {Promise<true>} the backend answered (an empty prefix is available too)
+ * @throws the "storage refused this location" error on an S3 refusal
+ */
+async function probeHydratedAvailability(client) {
+  const bucket = defaultBucket();
+  try {
+    if (typeof client.listObjectsV2Query === "function") {
+      // One request, max-keys=1. The stream form would page 1000 keys for an answer we throw away.
+      await client.listObjectsV2Query(bucket, HYDRATED_PROBE_PREFIX, "", "", 1, "");
+      return true;
+    }
+    // A client stand-in without the query form: the same non-recursive list, read once.
+    const stream = client.listObjectsV2(bucket, HYDRATED_PROBE_PREFIX, false);
+    return await new Promise((resolve, reject) => {
+      stream.once("data", () => {
+        if (typeof stream.destroy === "function") stream.destroy();
+        resolve(true);
+      });
+      stream.once("end", () => resolve(true));
+      stream.once("error", reject);
+    });
+  } catch (err) {
+    if (isAccessDenied(err)) throw refusedLocationError(err);
+    return false;
+  }
+}
+
+/**
  * Ensure the default bucket exists. Creates it if missing.
+ *
+ * A HYDRATED bot child NEVER checks or creates a bucket: its key is path-scoped INSIDE a bucket
+ * the operator provisioned, `bucketExists` (HeadBucket) is refused by the policy's no-prefix
+ * s3:prefix condition, and `makeBucket` is not granted at all. So this is a no-op on that path —
+ * the bucket is the operator's, and one that is really missing shows up as an allowed call being
+ * refused, never as a creation attempt.
  * @param {string} [bucket]
  */
 export async function ensureBucket(bucket) {
   const client = getClient();
   if (!client) throw new Error("Storage not configured. Install File Storage (Garage) from Extensions, or configure Shared Storage in the Nest.");
+  if (_hydrated) return;
   const target = bucket || defaultBucket();
-  const exists = await client.bucketExists(target);
-  if (!exists) {
-    await client.makeBucket(target);
-  }
+  if (await client.bucketExists(target)) return;
+  await client.makeBucket(target);
+}
+
+/** TEST ONLY: install `client` as this process's S3 client (no network is built or used). */
+export function _setClientForTest(client) {
+  clientInstance = client || null;
+  return clientInstance;
 }
 
 /**
@@ -553,7 +682,7 @@ export async function uploadObject(key, data, opts = {}) {
   const bucket = opts.bucket || defaultBucket();
   await ensureBucket(bucket);
   const metaData = opts.contentType ? { "Content-Type": opts.contentType } : {};
-  await client.putObject(bucket, key, data, data.length, metaData);
+  await scoped(() => client.putObject(bucket, key, data, data.length, metaData));
 }
 
 /**
@@ -584,7 +713,7 @@ export async function getPresignedUploadUrl(key, opts = {}) {
   const bucket = opts.bucket || defaultBucket();
   const expiry = opts.expiry || 3600;
   await ensureBucket(bucket);
-  return client.presignedPutObject(bucket, key, expiry);
+  return scoped(() => client.presignedPutObject(bucket, key, expiry));
 }
 
 /**
@@ -598,8 +727,8 @@ export async function getObject(key, opts = {}) {
   const client = getClient();
   if (!client) throw new Error("Storage not configured");
   const bucket = opts.bucket || defaultBucket();
-  const stat = await client.statObject(bucket, key);
-  const stream = await client.getObject(bucket, key);
+  const stat = await scoped(() => client.statObject(bucket, key));
+  const stream = await scoped(() => client.getObject(bucket, key));
   return { stream, stat };
 }
 
@@ -611,7 +740,7 @@ export async function getObject(key, opts = {}) {
 export async function deleteObject(key, bucket) {
   const client = getClient();
   if (!client) throw new Error("Storage not configured");
-  await client.removeObject(bucket || defaultBucket(), key);
+  await scoped(() => client.removeObject(bucket || defaultBucket(), key));
 }
 
 /**
@@ -627,21 +756,39 @@ export async function listObjects(opts = {}) {
   const bucket = opts.bucket || defaultBucket();
   await ensureBucket(bucket);
 
-  return new Promise((resolve, reject) => {
+  return scoped(() => new Promise((resolve, reject) => {
     const objects = [];
     const stream = client.listObjectsV2(bucket, opts.prefix || "", true);
     stream.on("data", (obj) => objects.push(obj));
     stream.on("error", reject);
     stream.on("end", () => resolve(objects));
-  });
+  }));
 }
 
 /**
  * Get bucket statistics (total size, file count).
+ *
+ * A HYDRATED bot child may not list the bucket root at all (an empty prefix is refused by the
+ * policy), so it lists ONLY the four prefixes its key is granted — recursively, one after the
+ * other — and sums them: the same return shape, because this is the quota check in
+ * crow_upload_file, sunvox-studio's saveToStorage and Studio's take uploads. The owner's path is
+ * unchanged (the whole bucket, one listing).
  * @param {string} [bucket]
  */
 export async function getBucketStats(bucket) {
-  const objects = await listObjects({ bucket: bucket || defaultBucket() });
+  const target = bucket || defaultBucket();
+  if (_hydrated) {
+    let fileCount = 0;
+    let totalSizeBytes = 0;
+    for (const prefix of BOT_STORAGE_PREFIXES) {
+      for (const obj of await listObjects({ bucket: target, prefix })) {
+        fileCount += 1;
+        totalSizeBytes += obj.size || 0;
+      }
+    }
+    return { fileCount, totalSizeBytes };
+  }
+  const objects = await listObjects({ bucket: target });
   const totalSize = objects.reduce((sum, obj) => sum + (obj.size || 0), 0);
   return { fileCount: objects.length, totalSizeBytes: totalSize };
 }

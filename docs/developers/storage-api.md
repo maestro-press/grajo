@@ -216,11 +216,11 @@ Get or create the MinIO/S3 client singleton. Returns `null` if not configured (m
 
 ### isAvailable()
 
-Check if the S3/MinIO backend is available and responding. Returns `boolean`.
+Check if the S3/MinIO backend is available and responding. Returns `boolean`. In a HYDRATED bot child (a path-scoped bot storage key) the probe is a non-recursive one-key `listObjectsV2` under `bots/` rather than a bucket listing or `bucketExists`: MinIO reads HeadBucket as `s3:ListBucket` with no prefix, so the bot policy's `s3:prefix` condition refuses it, and `listBuckets` is not granted at all. An AccessDenied there is thrown as `storage refused this location`.
 
 ### ensureBucket(bucket?)
 
-Ensure a bucket exists, creating it if missing. Defaults to `"crow-files"`.
+Ensure a bucket exists, creating it if missing. Defaults to `"crow-files"`. A hydrated bot child does nothing here: the operator provisions the bucket, and the bot key may neither check for nor create one.
 
 ### uploadObject(key, data, opts?)
 
@@ -244,7 +244,7 @@ List objects in a bucket. `opts` may include `bucket` and `prefix`. Returns an a
 
 ### getBucketStats(bucket?)
 
-Get bucket statistics. Returns `{ fileCount, totalSizeBytes }`.
+Get bucket statistics. Returns `{ fileCount, totalSizeBytes }`. The owner path lists the whole bucket once. A hydrated bot child lists only the four prefixes its scoped key is granted (`projects/`, `bots/`, `studio/`, `sunvox-studio/`, `BOT_STORAGE_PREFIXES`) and sums them: an empty prefix (the bucket root) is refused by the bot policy.
 
 ### isAllowedMimeType(mimeType)
 

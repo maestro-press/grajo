@@ -21,8 +21,10 @@ try {
   process.exit(1);
 }
 
-// Follow the instance's Shared Storage settings in the DB, exactly like the gateway
-// (boot/admin-api.js initStorage); the S3_* / MINIO_* env is only the fallback.
+// Follow the instance's storage settings. A BOT child carries CROW_STORAGE_FROM_HOST, so
+// initStorageFromInstance takes the bot storage key the engine piped and never opens the DB or
+// the identity; an OWNER's own spawn opens the DB settings exactly like the gateway
+// (boot/admin-api.js initStorage), with the S3_* / MINIO_* env as the fallback.
 await initStorageFromInstance(db);
 
 const instructions = await generateInstructions({ deviceId: process.env.CROW_DEVICE_ID });

@@ -93,6 +93,38 @@ test("saveToStorage: a presign failure is not fatal", async () => {
   assert.ok(r.storage_key);
 });
 
+// --- storage expiry --------------------------------------------------------
+
+test("saveToStorage: a bot turn's presigned URL is capped at 300 s, an owner's keeps 3600", async () => {
+  const s3 = fakeS3();
+  const owner = await outputs.saveToStorage({ s3, db: fakeDb(), buf: Buffer.alloc(4), fileName: "a.mp3", mimeType: "audio/mpeg", kind: "renders" });
+  assert.equal(owner.url_expires_in_s, outputs.URL_EXPIRY_S);
+  assert.equal(s3.calls.at(-1)[2].expiry, 3600, "the owner's own spawn is unchanged");
+
+  assert.equal(outputs.BOT_URL_EXPIRY_S, 300, "the same 300 s cap crow-storage applies to a bot");
+  const botS3 = fakeS3();
+  const bot = await outputs.saveToStorage({ s3: botS3, db: fakeDb(), buf: Buffer.alloc(4), fileName: "a.mp3", mimeType: "audio/mpeg", kind: "renders", botBound: true });
+  assert.equal(bot.url_expires_in_s, 300);
+  assert.equal(botS3.calls.at(-1)[2].expiry, 300, "a bot's link is never an hour-long capability");
+
+  // A bot's child decides it from its env, the same way it decides its storage: the engine puts
+  // CROW_STORAGE_FROM_HOST on every bot block, and an owner's own spawn has no marker at all.
+  assert.equal(outputs.isBotTurn({}), false);
+  assert.equal(outputs.isBotTurn({ CROW_STORAGE_FROM_HOST: "1", S3_ENDPOINT: "127.0.0.1:19999" }), true);
+  assert.equal(outputs.isBotTurn({ CROW_STORAGE_FROM_HOST: "0" }), true, "a bot turn with storage off is still a bot");
+  assert.equal(outputs.isBotTurn({ CROW_ACTOR_KIND: "bot" }), false, "the marker is the signal, not an actor name");
+  const saved = process.env.CROW_STORAGE_FROM_HOST;
+  const envS3 = fakeS3();
+  process.env.CROW_STORAGE_FROM_HOST = "1";
+  try {
+    const viaEnv = await outputs.saveToStorage({ s3: envS3, db: fakeDb(), buf: Buffer.alloc(4), fileName: "a.ogg", mimeType: "audio/ogg", kind: "renders" });
+    assert.equal(viaEnv.url_expires_in_s, 300, "a hydrated bot child caps it without being told");
+  } finally {
+    if (saved === undefined) delete process.env.CROW_STORAGE_FROM_HOST;
+    else process.env.CROW_STORAGE_FROM_HOST = saved;
+  }
+});
+
 test("storageMode: auto saves when available, explicit true needs storage, false never saves", () => {
   assert.equal(outputs.storageMode(undefined, true), "save");
   assert.equal(outputs.storageMode(undefined, false), "skip-unavailable");

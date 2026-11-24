@@ -1,11 +1,15 @@
 /**
- * Shared Storage over the fd pipe (the identity file never enters a bot).
+ * Shared Storage over the fd pipe — from the BOT's own key, never the instance's.
  *
- * A bot's MCP children cannot read this instance's identity, and they do not need to: the key
- * is only ever used to OPEN the storage credentials. So the bot engine (host side) opens the
- * Shared Storage settings, wipes the identity, and pipes ONLY the opened config into the
- * block's env — endpoint, region, prefix, access key, secret key, plus
- * CROW_STORAGE_FROM_HOST=1. Never the seed, never the "crow-secret-box-v1" seal key.
+ * A bot's MCP children cannot read this instance's identity, and they must not hold this
+ * instance's storage credential either: `storage.shared.*` is the instance-wide (on a MinIO
+ * install, root-level) key and a sibling process in the sandbox can read a child's
+ * `/proc/<pid>/environ`. So the bot engine (host side) reads the instance's BOT storage key
+ * (`<CROW_HOME>/secrets/bot-storage.json`, provisioned by scripts/ops/minio-bot-storage.sh,
+ * outside crow.db, scoped to projects/*, bots/*, studio/*, sunvox-studio/*) and pipes ONLY the
+ * opened values into the block's env — endpoint, region, prefix, access key, secret key, plus
+ * CROW_STORAGE_FROM_HOST=1. Never the shared settings, never the seed, never the
+ * "crow-secret-box-v1" seal key. With no key the block is storage-OFF, never the env fallback.
  *
  * What this suite pins:
  *   1. the writer hydrates exactly the six S3_* names + the marker (nothing else), and never
@@ -18,19 +22,20 @@
  *      and one warning per storage-using server, so the child runs with no shared storage at
  *      all instead of silently falling back to a localhost MinIO where nothing listens;
  *   3. a validate-only turn opens nothing and reports the names it owes (like needsKeys);
- *   3b. there is NO env fallback for a bot: an instance with no Shared Storage settings (an
- *      env-only install) gets storage OFF with one warning, and an instance whose settings
- *      cannot be read gets storage OFF with a DIFFERENT warning;
- *   4. the per-bot boot line's four states;
+ *   3b. there is NO env fallback and NO shared-settings fallback for a bot: no key file gets
+ *      storage OFF with one warning, a key file that cannot be used gets storage OFF with a
+ *      DIFFERENT warning and its reason, and crow.db holding different shared settings
+ *      changes nothing;
+ *   4. the per-bot boot line's states;
  *   5. every storage-using child (crow-storage, studio, sunvox-studio, data-dashboard, and the
- *      artifacts bundle's blob backend) adopts the piped settings with CROW_STORAGE_FROM_HOST=1
+ *      artifacts bundle's blob backend) adopts the piped values with CROW_STORAGE_FROM_HOST=1
  *      and never loads identity.js at all (an ESM loader spy, plus a positive control so the spy
  *      cannot pass by doing nothing);
  *   6. the same children with the marker off have NO storage (getClient() null), even with a
  *      localhost S3_ENDPOINT in their env;
  *   7. a block that declares no `needs` still carries the marker off (an undeclared consumer must
- *      never take the owner path inside a bot), and an identity file that cannot be READ is the
- *      unreadable fault rather than "not configured";
+ *      never take the owner path inside a bot), and the writer's module reaches neither the
+ *      shared settings nor the identity at all;
  *   8. the OWNER path of sunvox-studio and data-dashboard retries a failed settings read on a
  *      later call (short backoff) and caches a success;
  *   9. a manifest `needs: ["shared-storage"]` is a REQUEST, not a grant: the bundle id must also
@@ -38,13 +43,16 @@
  *      store that declares the need gets NO credentials (fd and file alike), the marker 0 and
  *      one warning naming it — while the allow-listed four keep hydrating exactly as before.
  *
+ * The bot key file's own checks and the hydrated child's scoped behaviour (bucketExists, never
+ * listBuckets/makeBucket, an AccessDenied sentence) are tests/bot-storage-key.test.js.
+ *
  * Scratch only: $HOME, CROW_HOME, CROW_DATA_DIR and CROW_DB_PATH all point into one temp dir,
  * set before the bot engine's modules are imported (identity.js pins its data dir at load).
  */
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -115,6 +123,40 @@ function seedStorageSettings({ clear = false, seed = true } = {}) {
   } finally { raw.close(); }
 }
 seedStorageSettings();
+
+/**
+ * The BOT storage key the bridge reads: `<CROW_HOME>/secrets/bot-storage.json`, written 0600.
+ *
+ * This is the ONLY storage credential a bot block may hold, and it is its own key — not the six
+ * `storage.shared.*` rows above (those are the instance-wide credential). The fixture deliberately
+ * starts from the SAME values, so the assertions about "exactly the six S3_* names" stay
+ * meaningful while the SOURCE is unmistakably the file: the tests that matter plant DIFFERENT
+ * shared settings and check that the file's values are what boards the block.
+ */
+function writeBotKey(overrides = {}) {
+  const dir = join(CROW_HOME, "secrets");
+  mkdir(dir);
+  // The reader demands a REAL directory this user alone owns at mode 0700 exactly (never repaired
+  // for us), so the fixture sets it explicitly: mkdir's mode is masked by the umask.
+  chmodSync(dir, 0o700);
+  const path = join(dir, "bot-storage.json");
+  rmSync(path, { force: true }); // never write THROUGH a leftover symlink
+  const body = {
+    endpoint: ENGINE_PLAINTEXT.endpoint,
+    use_ssl: false,
+    region: "us-east-1",
+    bucket_prefix: ENGINE_PLAINTEXT.prefix,
+    access_key: ENGINE_PLAINTEXT.access,
+    secret_key: ENGINE_PLAINTEXT.secret,
+    ...overrides,
+  };
+  writeFileSync(path, `${JSON.stringify(body, null, 2)}\n`);
+  chmodSync(path, 0o600);
+  return path;
+}
+const BOT_KEY_PATH = () => join(CROW_HOME, "secrets", "bot-storage.json");
+const removeBotKey = () => rmSync(BOT_KEY_PATH(), { force: true });
+writeBotKey();
 
 // The storage-using servers a bot may select: the core one (registry `needs`) and the three
 // bundles whose manifests declare `needs: ["shared-storage"]`.
@@ -405,7 +447,7 @@ test("file mode + a repo .env with MINIO_*/S3_*: no credential and not even a cr
   assert.equal(written().includes(ADDON_MINIO_PASSWORD), false);
 });
 
-test("fd + hydrate + a repo .env: exactly the six S3_* names and the marker, and the instance's settings win", () => {
+test("fd + hydrate + a repo .env: exactly the six S3_* names and the marker, and the BOT KEY wins", () => {
   const res = withRepoEnv(() => build({ write: false, addonKeys: "hydrate" }));
   for (const id of STORAGE_SERVERS) {
     const block = res.json.mcpServers[id];
@@ -429,23 +471,67 @@ test("fd + hydrate + a repo .env: exactly the six S3_* names and the marker, and
   for (const name of Object.keys(addonEnv)) assert.equal(isStorageShaped(name), false, "env-addon lost " + name);
 });
 
-// ─── 4. no settings on the instance: off, with one warning ─────────────────
+// ─── 4. no bot storage key: off, with one warning ──────────────────────────
 
-test("fd + hydrate with no Shared Storage settings: off with one warning, never the ambient env", () => {
-  seedStorageSettings({ clear: true, seed: false });
+test("fd + hydrate with no bot storage key: off with one warning, never the shared settings and never the ambient env", () => {
+  removeBotKey();
+  // The shared settings are the INSTANCE credential. They stay in crow.db (a normal install),
+  // and they must not board a bot block now that no bot key is provisioned.
+  seedStorageSettings();
   try {
     const res = build({ write: false, addonKeys: "hydrate" });
     for (const id of STORAGE_SERVERS) {
       assert.equal(res.json.mcpServers[id].env.CROW_STORAGE_FROM_HOST, "0", id + " has no shared storage");
-      assert.ok(res.warnings.includes(W.WARN_SHARED_STORAGE_NO_SETTINGS(id)));
+      for (const name of Object.keys(res.json.mcpServers[id].env)) {
+        assert.equal(isStorageShaped(name), false, id + " must not carry " + name);
+      }
+      assert.ok(res.warnings.includes(W.WARN_SHARED_STORAGE_NO_BOT_KEY(id)));
     }
-    assert.deepEqual(res.sharedStorage, { servers: STORAGE_SERVERS, note: W.SHARED_STORAGE_NOTE_OFF_NO_SETTINGS });
+    assert.deepEqual(res.sharedStorage, { servers: STORAGE_SERVERS, note: W.SHARED_STORAGE_NOTE_OFF_NO_BOT_KEY });
+    assert.equal(W.SHARED_STORAGE_NOTE_OFF_NO_BOT_KEY, "shared storage: off (no bot storage key on this instance)");
+    assert.equal(JSON.stringify(res).includes(ENGINE_PLAINTEXT.secret), false,
+      "the shared credential is nowhere in the turn");
   } finally {
-    seedStorageSettings(); // put the instance back for the rest of the file
+    writeBotKey(); // put the instance back for the rest of the file
   }
 });
 
-test("an env-only instance (no Shared Storage settings): a bot gets NO storage, never the operator's env credentials", () => {
+test("the bot key file's VALUES are what boards the block, even when crow.db holds different shared settings", () => {
+  // Both sources are present and disagree. The block must carry the FILE's values: a bot never
+  // opens storage.shared.* at all. (The shared rows are plaintext here — nothing opens them, so
+  // sealing them would only prove the test can seal.)
+  const sharedAccess = "shared-access-" + randomUUID();
+  const sharedSecret = "shared-secret-" + randomUUID();
+  const raw = new Database(DB_PATH);
+  try {
+    const put = raw.prepare("INSERT OR REPLACE INTO dashboard_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))");
+    put.run("storage.shared.endpoint", "127.0.0.1:19901");
+    put.run("storage.shared.use_ssl", "true");
+    put.run("storage.shared.region", "other-region-1");
+    put.run("storage.shared.bucket_prefix", "instanceprefix");
+    put.run("storage.shared.access_key", sharedAccess);
+    put.run("storage.shared.secret_key", sharedSecret);
+  } finally { raw.close(); }
+  try {
+    const res = build({ write: false, addonKeys: "hydrate" });
+    for (const id of STORAGE_SERVERS) {
+      const block = res.json.mcpServers[id];
+      assert.equal(block.env.S3_ENDPOINT, ENGINE_PLAINTEXT.endpoint, id + ": the key file's endpoint");
+      assert.equal(block.env.S3_BUCKET_PREFIX, ENGINE_PLAINTEXT.prefix, id + ": the key file's prefix");
+      assert.equal(block.env.S3_ACCESS_KEY, ENGINE_PLAINTEXT.access, id + ": the bot's OWN access key");
+      assert.equal(block.env.S3_SECRET_KEY, ENGINE_PLAINTEXT.secret, id + ": the bot's OWN secret");
+      assert.equal(block.env.S3_REGION, "us-east-1");
+      assert.equal(JSON.stringify(block.env).includes(sharedSecret), false, id + ": the shared credential is nowhere");
+      assert.equal(JSON.stringify(block.env).includes(sharedAccess), false, id + ": not the shared access key either");
+    }
+    assert.deepEqual(res.sharedStorage, { servers: STORAGE_SERVERS, note: W.SHARED_STORAGE_NOTE_OVER_FD });
+  } finally {
+    seedStorageSettings(); // put the fixture rows back
+    writeBotKey();
+  }
+});
+
+test("an instance with no bot storage key and no shared settings: a bot gets NO storage, never the operator's env credentials", () => {
   const other = join(T, "envonly");
   mkdir(other);
   const data = mkdir(join(other, ".crow", "data"));
@@ -470,11 +556,11 @@ test("an env-only instance (no Shared Storage settings): a bot gets NO storage, 
       write: false, addonKeys: "hydrate",
     });
     const env = res.json.mcpServers["crow-storage"].env;
-    assert.equal(env.CROW_STORAGE_FROM_HOST, "0", "no settings: no shared storage at all");
+    assert.equal(env.CROW_STORAGE_FROM_HOST, "0", "no key file: no shared storage at all");
     for (const name of Object.keys(env)) assert.equal(isStorageShaped(name), false, "not " + name + " either");
     assert.equal(JSON.stringify(res).includes("env-secret-not-for-bots"), false, "the operator's credential is never piped to a bot");
-    assert.ok(res.warnings.includes(W.WARN_SHARED_STORAGE_NO_SETTINGS("crow-storage")));
-    assert.deepEqual(res.sharedStorage, { servers: ["crow-storage"], note: W.SHARED_STORAGE_NOTE_OFF_NO_SETTINGS });
+    assert.ok(res.warnings.includes(W.WARN_SHARED_STORAGE_NO_BOT_KEY("crow-storage")));
+    assert.deepEqual(res.sharedStorage, { servers: ["crow-storage"], note: W.SHARED_STORAGE_NOTE_OFF_NO_BOT_KEY });
   } finally {
     for (const k of Object.keys(saved)) {
       if (saved[k] === undefined) delete process.env[k];
@@ -484,71 +570,71 @@ test("an env-only instance (no Shared Storage settings): a bot gets NO storage, 
   }
 });
 
-test("settings that cannot be READ are a fault, not 'not configured': its own warning and boot line", () => {
-  const other = join(T, "unreadable");
-  const data = mkdir(join(other, ".crow", "data"));
-  const saved = { CROW_HOME: process.env.CROW_HOME, CROW_DATA_DIR: process.env.CROW_DATA_DIR, CROW_DB_PATH: process.env.CROW_DB_PATH };
+test("a bot storage key file that cannot be used is a fault, not 'no key': its own warning and boot line", () => {
+  // Every refusal reads the same way to the operator (OFF, one sentence with the reason) and is
+  // never the "no key on this instance" line: the file is there, and it is broken. A half-written
+  // key must not look like a fresh install.
+  const cases = [
+    ["group/world readable", () => chmodSync(BOT_KEY_PATH(), 0o644), /readable by other users/],
+    ["a symlink", () => {
+      const target = join(T, "planted-bot-storage.json");
+      writeFileSync(target, readFileSync(BOT_KEY_PATH(), "utf8"), { mode: 0o600 });
+      chmodSync(target, 0o600);
+      rmSync(BOT_KEY_PATH(), { force: true });
+      symlinkSync(target, BOT_KEY_PATH());
+    }, /symbolic link/],
+    ["a missing field", () => writeBotKey({ secret_key: "" }), /secret_key/],
+    ["not JSON", () => { writeFileSync(BOT_KEY_PATH(), "{not json\n"); chmodSync(BOT_KEY_PATH(), 0o600); }, /not valid JSON/],
+  ];
   try {
-    process.env.CROW_HOME = join(other, ".crow");
-    process.env.CROW_DATA_DIR = data;
-    // A crow.db that cannot be opened at all (the file is never created).
-    process.env.CROW_DB_PATH = join(data, "crow.db");
-    const res = W.writeBotMcp(def(["crow-storage"]), {
-      sessionDir: SESSION, canonicalPath: CANONICAL, crowHome: join(other, ".crow"),
-      write: false, addonKeys: "hydrate",
-    });
-    const env = res.json.mcpServers["crow-storage"].env;
-    assert.equal(env.CROW_STORAGE_FROM_HOST, "0", "storage is off either way");
-    assert.ok(res.warnings.includes(W.WARN_SHARED_STORAGE_UNREADABLE("crow-storage")), "the fault has its own sentence");
-    assert.equal(res.warnings.includes(W.WARN_SHARED_STORAGE_NO_SETTINGS("crow-storage")), false, "not the 'not configured' sentence");
-    assert.deepEqual(res.sharedStorage, { servers: ["crow-storage"], note: W.SHARED_STORAGE_NOTE_OFF_UNREADABLE });
-  } finally {
-    for (const k of Object.keys(saved)) {
-      if (saved[k] === undefined) delete process.env[k];
-      else process.env[k] = saved[k];
+    for (const [why, breakIt, pattern] of cases) {
+      writeBotKey();
+      breakIt();
+      const res = build({ write: false, addonKeys: "hydrate" });
+      for (const id of STORAGE_SERVERS) {
+        const block = res.json.mcpServers[id];
+        assert.equal(block.env.CROW_STORAGE_FROM_HOST, "0", why + ": storage is off either way");
+        for (const name of Object.keys(block.env)) assert.equal(isStorageShaped(name), false, why + ": " + id + " must not carry " + name);
+        const prefix = `${id}: the bot storage key file could not be read (`;
+        const warned = res.warnings.find((w) => w.startsWith(prefix));
+        assert.ok(warned, why + ": " + id + " reports the fault");
+        assert.match(warned, pattern, why + ": the reason travels with it");
+        assert.equal(res.warnings.includes(W.WARN_SHARED_STORAGE_NO_BOT_KEY(id)), false, why + ": not the 'no key' sentence");
+      }
+      const note = res.sharedStorage.note;
+      assert.match(note, /^shared storage: off \(the bot storage key file could not be read: /, why + ": " + note);
+      assert.match(note, pattern, why + ": the boot line carries the reason");
+      assert.notEqual(note, W.SHARED_STORAGE_NOTE_OFF_NO_BOT_KEY, why);
     }
+  } finally {
+    rmSync(BOT_KEY_PATH(), { force: true });
+    writeBotKey();
   }
 });
 
-test("an identity file that cannot be READ is the unreadable fault, not 'not configured'", () => {
-  // The three ways loadIdentityIfPresent throws: a permissions error (an unreadable file), corrupt
-  // JSON, and an encrypted seed this host holds no passphrase for. All three mean "this instance
-  // HAS an identity, so the settings may well exist" — the operator has to see a fault, not the
-  // "nothing configured" line.
-  const path = join(DATA, "identity.json");
-  const real = readFileSync(path, "utf8");
-  const broken = [
-    ["corrupt JSON", "{not json"],
-    ["an encrypted seed with no passphrase", JSON.stringify({ version: 1, crowId: "crow:fixture", encrypted: { salt: "00".repeat(32), iv: "00".repeat(12), encrypted: "00".repeat(32), tag: "00".repeat(16) } })],
-  ];
-  try {
-    for (const [why, text] of broken) {
-      writeFileSync(path, text);
-      const res = build({ write: false, addonKeys: "hydrate" });
-      for (const id of STORAGE_SERVERS) {
-        assert.equal(res.json.mcpServers[id].env.CROW_STORAGE_FROM_HOST, "0", why + ": storage is off either way");
-        assert.ok(res.warnings.includes(W.WARN_SHARED_STORAGE_UNREADABLE(id)), why + ": " + id + " reports the fault");
-        assert.equal(res.warnings.includes(W.WARN_SHARED_STORAGE_NO_SETTINGS(id)), false, why + ": not the 'not configured' sentence");
-      }
-      assert.deepEqual(res.sharedStorage, { servers: STORAGE_SERVERS, note: W.SHARED_STORAGE_NOTE_OFF_UNREADABLE }, why);
-    }
-    // A missing identity file is NOT a fault: it is an instance with no identity (and no settings).
-    rmSync(path, { force: true });
-    const none = build({ write: false, addonKeys: "hydrate" });
-    assert.deepEqual(none.sharedStorage, { servers: STORAGE_SERVERS, note: W.SHARED_STORAGE_NOTE_OFF_NO_SETTINGS });
-    assert.ok(none.warnings.includes(W.WARN_SHARED_STORAGE_NO_SETTINGS("crow-storage")));
-  } finally {
-    writeFileSync(path, real);
+test("the writer reads no shared settings and no identity for a bot: the module has no such reference", () => {
+  // The structural half of the promise the tests above make behaviourally: nothing on the bot
+  // config path can open the instance's sealed settings or the identity file any more.
+  const src = readFileSync(join(REPO, "scripts", "pi-bots", "mcp_writer.mjs"), "utf8");
+  for (const needle of [
+    '"storage.shared."', "'storage.shared.'", "storage.shared.endpoint",
+    "readSharedStorageSettingsSync", "loadSharedStorageFromDb", "loadIdentityIfPresent",
+    "servers/sharing/identity.js",
+  ]) {
+    assert.equal(src.includes(needle), false, "mcp_writer.mjs must not reference " + needle);
   }
+  assert.match(src, /readBotStorageKey/, "it reads the BOT storage key instead");
 });
 
 // ─── 5. the boot line ──────────────────────────────────────────────────────
 
-test("the per-bot boot line has exactly four states, and the engine logs it beside the config warnings", () => {
+test("the per-bot boot line has exactly five states, and the engine logs it beside the config warnings", () => {
   assert.equal(W.SHARED_STORAGE_NOTE_OVER_FD, "shared storage: over fd");
   assert.equal(W.SHARED_STORAGE_NOTE_OFF_FILE, "shared storage: off (file delivery)");
-  assert.equal(W.SHARED_STORAGE_NOTE_OFF_NO_SETTINGS, "shared storage: off (no Shared Storage settings on this instance)");
-  assert.equal(W.SHARED_STORAGE_NOTE_OFF_UNREADABLE, "shared storage: off (the Shared Storage settings could not be read)");
+  assert.equal(W.SHARED_STORAGE_NOTE_OFF_NO_BOT_KEY, "shared storage: off (no bot storage key on this instance)");
+  assert.equal(W.SHARED_STORAGE_NOTE_OFF_KEY_UNREADABLE("it is a symbolic link"),
+    "shared storage: off (the bot storage key file could not be read: it is a symbolic link)");
+  assert.equal(W.SHARED_STORAGE_NOTE_DEFERRED, "shared storage: not piped in this turn");
   const world = readFileSync(join(REPO, "scripts", "pi-bots", "bot-world.mjs"), "utf8");
   assert.match(world, /if \(w\.sharedStorage && w\.sharedStorage\.note\) a\.log\(w\.sharedStorage\.note\);/,
     "the world builder logs the note it was handed (the spawn log, next to the [containment] line)");

@@ -85,9 +85,11 @@ export function isIdentityFileName(n) {
  * Written out here because this is the module that decides the mask, and the
  * honest answer is not "nothing".
  *
- * Storage is NOT one of the costs any more. The storage-using servers open this
- * instance's sealed `storage.shared.*` settings, which needs the identity — so
- * the HOST does that once and pipes only the OPENED config over the fd:
+ * Storage is NOT one of the costs any more. A bot's storage credential is its OWN, not this
+ * instance's, so the identity is not involved at all: the HOST reads the bot storage key
+ * (`<CROW_HOME>/secrets/bot-storage.json`, provisioned by scripts/ops/minio-bot-storage.sh,
+ * outside crow.db, scoped to projects/*, bots/*, studio/*, sunvox-studio/*) and pipes only the
+ * OPENED values over the fd:
  *
  *  - `crow-storage` (`servers/storage/s3-client.js`) gets S3_ENDPOINT,
  *    S3_USE_SSL, S3_REGION, S3_BUCKET_PREFIX, S3_ACCESS_KEY and S3_SECRET_KEY
@@ -104,7 +106,8 @@ export function isIdentityFileName(n) {
  *    servers/gateway/addon-env.js). A manifest `needs` is a REQUEST, not a
  *    grant: the installed manifest is operator-writable, and a store add-on is
  *    not reviewed code.
- *  - storage is OFF — never an env fallback — on a file-delivery turn (a file
+ *  - storage is OFF — never an env fallback and never the shared settings — when no bot
+ *    storage key is provisioned, on a file-delivery turn (a file
  *    cannot carry credentials) and for a bundle that declared the need without
  *    being on that list (the marker `0` and one warning naming it). A bot never
  *    falls back to an inherited `S3_*`/`MINIO_*` endpoint: for a sandboxed bot
