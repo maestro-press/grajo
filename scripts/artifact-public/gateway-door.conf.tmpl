@@ -1,0 +1,46 @@
+# Crow: a crow-gateway.service drop-in that gives the gateway the reports door
+# socket. Installed as
+#   /etc/systemd/system/crow-gateway.service.d/report-readers.conf
+#
+# WHY A DROP-IN AND NOT THE SHIPPED UNIT: the gateway's own unit is the installer's
+# (scripts/crow-install.sh) and an owner may edit it; a drop-in adds the lines this
+# feature needs without rewriting their file, the same way the proxy socket's drop-in
+# does. Everything this file does not name stays exactly as the unit has it,
+# WorkingDirectory included.
+#
+# WHY Wants=/After= AND NOT Requires=: the gateway must be able to start whether or
+# not the door socket exists — that is what keeps a gateway restartable for its own
+# reasons while the socket is missing or broken, and the listener answers its 503
+# "this link doesn't open a report" page until the socket is back. After= is what
+# makes the socket be started first, so the fd exists before the process that needs it.
+#
+# WHY Sockets= NAMES ONLY THIS ONE UNIT: a Sockets= line in a drop-in APPENDS to the
+# list, it does not replace it, so the Caddy proxy socket's own drop-in keeps that
+# unit in place and this line adds the door beside it. That is also why the proxy
+# socket unit is deliberately NOT repeated here: a second mention would hand the same
+# fd over twice.
+#
+# WHY ExecStart IS RESET AND RE-STATED: systemd hands socket-activation fds to the
+# MAIN PID and to no other process, and pickActivatedFd refuses a LISTEN_PID that is
+# not this process's own (servers/gateway/proxy-socket.js). The installer's ExecStart
+# is `ExecStart=$(which node) servers/gateway/index.js` — systemd execs that directly,
+# with no shell in between, so a plain node unit is already the MainPID. A unit
+# written as `npm run gateway` is the one that needs this: there npm is the MainPID
+# and node the gateway runs in is npm's CHILD, which inherits neither the fd's
+# LISTEN_PID nor the argv the fd was meant for, so the gateway would refuse the
+# socket. An empty ExecStart= clears the inherited value and the absolute @NODE_BIN@
+# below makes node itself the MainPID.
+#
+# WHY @NODE_BIN@ IS AN ABSOLUTE PATH THE INSTALLER READ OFF THIS VERY UNIT: it is the
+# node the gateway is running now, not whatever node comes first on PATH — on a box
+# whose system node is older than the version this repo declares, a PATH lookup would
+# pin a binary that cannot load the gateway. The script path stays relative, so it
+# resolves inside the unit's own WorkingDirectory and nowhere else.
+[Unit]
+Wants=crow-report-readers.socket
+After=crow-report-readers.socket
+
+[Service]
+Sockets=crow-report-readers.socket
+ExecStart=
+ExecStart=@NODE_BIN@ servers/gateway/index.js

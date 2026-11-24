@@ -34,9 +34,9 @@ test("ports 3090-3093 are registered for the artifact origins and the public-lin
     assert.match(rows.get(p).bind, /^127\.0\.0\.1 or the sidecar bridge gateway IP/, `port ${p} binds loopback or the bridge gateway`);
   }
   assert.match(rows.get(3092).bind, /^container namespace/, "port 3092 needs no host publish");
-  assert.match(rows.get(3093).bind, /^127\.0\.0\.1/, "the public-link listener stays loopback");
+  assert.match(rows.get(3093).bind, /^127\.0\.0\.1 or the sidecar bridge gateway IP/, "the report-link listener binds loopback or the bridge gateway");
   for (const p of [3090, 3091, 3092, 3093]) assert.doesNotMatch(rows.get(p).bind, /0\.0\.0\.0|every interface/, `port ${p} never binds everywhere`);
-  assert.match(rows.get(3093).what, /public/i);
+  assert.match(rows.get(3093).what, /report-link/i);
 });
 
 test("every CROW_ARTIFACT_ORIGIN_PORT value named in the docs is a registered artifact-origin port", () => {

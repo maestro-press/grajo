@@ -1,0 +1,71 @@
+# Crow: the public-link listener — the only HTTP surface a mailed report link
+# touches (scripts/artifact-public/server.mjs, port 3093,
+# docs/developers/port-allocation.md).
+#
+# WHAT IT IS FOR: a recipient has no Crow account and no place on this instance's
+# network, so the page their link opens is served by this process, which knows
+# nothing about Crow: no database, no storage, no session, no repo module. It
+# opens one fresh connection to the gateway's reports door per request and writes
+# the answer back under a sandbox CSP.
+#
+# WHY THE SANDBOX IS THIS TIGHT: the port is reachable by a stranger through the
+# front door the operator points at it, so the process that answers must be able
+# to do exactly one thing. It runs as its own system user, cannot see $CROW_HOME
+# at all (a dash-prefixed InaccessiblePaths= plus ProtectHome=tmpfs), cannot write anything
+# (ProtectSystem=strict), has no capabilities, may open only internet/unix sockets,
+# and may read exactly two things: the node installation the repo declared (its
+# own install PREFIX, i.e. the bin directory's parent — node loads its bundled
+# libraries from there) and the one directory this listener's code lives in. Both
+# are read-only binds. There is no second bind line of any kind, no writable bind,
+# no $CROW_HOME, no repo checkout, no operator file, and no mention of the
+# gateway's own user.
+#
+# WHY After=/Wants= THE DOOR: the door socket is the gateway's, so the listener is
+# only useful once it exists; the restart policy then keeps a listener that lost
+# its bind or its door from staying down. The hard time and memory ceilings
+# (MemoryMax=, TasksMax=) are there because this is the one process a stranger's
+# requests reach directly.
+# THE PLACEHOLDERS are rendered by install.sh: @NODE_BIN@, @NODE_DIR@ (node's own
+# install prefix), @APP_DIR@ (this checkout), @CROW_HOME@ (the instance home it
+# must not see) and @BIND@ (CROW_ARTIFACT_PUBLIC_BIND, validated as a dotted IPv4
+# before anything is installed).
+[Unit]
+Description=Crow artifacts public-link listener (mailed report links)
+After=docker.service network-online.target crow-report-readers.socket
+Wants=network-online.target crow-report-readers.socket
+
+[Service]
+Type=simple
+User=crow-artifact-public
+Group=crow-artifact-public
+Environment=CROW_ARTIFACT_PUBLIC_BIND=@BIND@
+Environment=CROW_ARTIFACT_PUBLIC_PORT=3093
+ExecStart=@NODE_BIN@ @APP_DIR@/scripts/artifact-public/server.mjs
+Restart=on-failure
+RestartSec=5
+
+# The sandbox. Read-only, no capabilities, no devices, no new privileges.
+NoNewPrivileges=yes
+# The leading '-' makes a path that is not there a non-error, and under
+# ProtectHome=tmpfs it IS not there: the home is an empty tmpfs for this process,
+# so @CROW_HOME@ names nothing inside it. Without the dash systemd refuses to set
+# the namespace up at all, and the listener would fail to start with 226/NAMESPACE
+# instead of simply not seeing a home it is never meant to read.
+InaccessiblePaths=-@CROW_HOME@
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindReadOnlyPaths=@NODE_DIR@ @APP_DIR@/scripts/artifact-public
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+SystemCallFilter=@system-service
+MemoryMax=256M
+TasksMax=64
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

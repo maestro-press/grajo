@@ -1,0 +1,36 @@
+# Crow: the reports door socket. SYSTEMD owns it, exactly as it owns the gateway's
+# Caddy proxy socket, so no process ever creates, chmods or unlinks a path and the
+# mode below is the mode that is in force.
+#
+# WHY root:crow-artifact-public 0660: the gateway serves this door on the inherited
+# fd (servers/gateway/reports/public-door.js names the unit below and the gateway
+# picks its fd by LISTEN_FDNAMES), and the only other process that may open it is
+# the public-link listener, which runs as crow-artifact-public. Root keeps it too,
+# so a reader can be tested by hand. DirectoryMode=0750 gives that one group the
+# directory to traverse and nobody else.
+#
+# FileDescriptorName= is set explicitly, and to this unit's own name, because the
+# gateway finds its fd by NAME, never by position: the name systemd passes must
+# always be the name the gateway looks for, whatever the file is called on disk.
+# No placeholder here: this unit needs no value from the installer.
+#
+# WHY PartOf=crow-gateway.service: Service= below names that very unit, so an incoming
+# public request would START a gateway the operator stopped on purpose. PartOf= makes
+# stopping or restarting the gateway stop or restart this socket too, so a gateway that
+# was deliberately stopped stays stopped — nothing here can wake it — and the listener
+# answers its 503 page until the operator starts the gateway again.
+[Unit]
+Description=Crow reports door socket (the public reports door, gateway-owned)
+PartOf=crow-gateway.service
+
+[Socket]
+ListenStream=/run/crow-report-readers/door.sock
+Service=crow-gateway.service
+FileDescriptorName=crow-report-readers.socket
+SocketUser=root
+SocketGroup=crow-artifact-public
+SocketMode=0660
+DirectoryMode=0750
+
+[Install]
+WantedBy=sockets.target

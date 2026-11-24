@@ -45,6 +45,11 @@
  * to the page's own URL), errors carry a code, and nothing here logs a request body. The only token fact
  * that travels anywhere is the hash the form nonce is bound to, and that hash is not secret anyway.
  *
+ * EVERY PAGE REPLY SAYS WHETHER IT CARRIES THE COMMENT FORM: a 200 carries `form: true` or `form: false`,
+ * so the front end that serves this door can relax its sandbox for exactly the pages that need a form
+ * rather than searching the html. A notice page (404/410/503) carries no `form` at all, because a refusal
+ * is never something a reader can post from.
+ *
  * Node built-ins only, plus the reports modules this door is the front of.
  */
 import { createServer } from "node:net";
@@ -196,11 +201,17 @@ async function allowedLinksOf(db, artifactId, n) {
  * process cannot use). The caller turns null into the fixed unavailable page, so nothing about why is
  * ever shown to a reader.
  *
+ * THE PAGE AND ITS FORM ARE REPORTED TOGETHER, as `{html, form}`: `form` is true only when this page really
+ * carries the comment form (a `commentForm` with a string nonce was rendered into it), which is the one
+ * fact the front end needs to relax its sandbox. Saying it here, where the page is built, is what lets the
+ * front end stop searching the html for a marker: a stored report's own text could contain one.
+ *
  * @param {object} db
  * @param {object} given the door's deps
  * @param {{resolved: object, token: string, lang: string, notice: object|null}} input `notice` is the
  *   fixed line a refusal or a sent comment puts above the form, or null for a plain page
- * @returns {Promise<string|null>} one complete HTML document
+ * @returns {Promise<{html: string, form: boolean}|null>} one complete HTML document and whether it has the
+ *   comment form
  */
 async function renderPage(db, given, {
   resolved, token, lang, notice: line = null,
@@ -235,7 +246,7 @@ async function renderPage(db, given, {
     commentForm = { notice: line };
   }
   const allowedLinks = await allowedLinksOf(db, artifactId, versionN);
-  return buildRecipientView({
+  const html = await buildRecipientView({
     indexHtml: version.indexHtml,
     readAsset: version.readAsset,
     allowedLinks,
@@ -243,20 +254,24 @@ async function renderPage(db, given, {
     commentForm,
     lang,
   });
+  return { html, form: commentForm != null && typeof commentForm.nonce === "string" };
 }
 
 /**
  * The `view` operation: the page one token opens, or the refusal page that says why not.
  *
- * @returns {Promise<{status: number, html: string}>}
+ * Every 200 carries `form`, the page's own answer about the comment form; a notice page carries none (and
+ * never a true one), because a refusal is never a page a reader can post from.
+ *
+ * @returns {Promise<{status: number, html: string, form?: boolean}>}
  */
 async function viewReply(db, given, { token, lang }) {
   const resolved = await resolveLinkToken(db, linksDepsOf(given), token);
   if (resolved.status === "expired") return notice(410, "expired", lang);
   if (resolved.status !== "ok") return notice(404, "unknown", lang);
-  const html = await renderPage(db, given, { resolved, token, lang });
-  if (html == null) return notice(503, "unavailable", lang);
-  return { status: 200, html };
+  const page = await renderPage(db, given, { resolved, token, lang });
+  if (page == null) return notice(503, "unavailable", lang);
+  return { status: 200, html: page.html, form: page.form };
 }
 
 /**
@@ -268,7 +283,11 @@ async function viewReply(db, given, { token, lang }) {
  * then the comment itself. Every refusal keeps the fixed line and the code, and nothing else: the
  * reader's text is never echoed back except inside the re-rendered thread, where the view escapes it.
  *
- * @returns {Promise<object>} a 404/410 notice page, or `{status: 200, ok, error?, line, html}`
+ * Every 200 — the sent comment and a refusal alike — carries `form`, the re-rendered page's own answer
+ * about the comment form, so a refusal on a page that still offers one keeps it (a reader who mistyped
+ * has to be able to try again) while a refusal with no form to offer says so.
+ *
+ * @returns {Promise<object>} a 404/410 notice page, or `{status: 200, ok, error?, line, html, form}`
  */
 async function commentReply(db, given, {
   token, formNonce, body, lang,
@@ -279,11 +298,11 @@ async function commentReply(db, given, {
   if (resolved.status !== "ok") return notice(404, "unknown", lang);
 
   const refused = async (code, line) => {
-    const html = await renderPage(db, given, {
+    const page = await renderPage(db, given, {
       resolved, token, lang, notice: { kind: "error", text: line },
     });
-    if (html == null) return notice(503, "unavailable", lang);
-    return { status: 200, ok: false, error: code, line, html };
+    if (page == null) return notice(503, "unavailable", lang);
+    return { status: 200, ok: false, error: code, line, html: page.html, form: page.form };
   };
 
   if (resolved.token.scope !== "comment") return refused("view_only", table.errViewOnly);
@@ -315,11 +334,11 @@ async function commentReply(db, given, {
   }
 
   const line = table.sent;
-  const html = await renderPage(db, given, {
+  const page = await renderPage(db, given, {
     resolved, token, lang, notice: { kind: "ok", text: line },
   });
-  if (html == null) return notice(503, "unavailable", lang);
-  return { status: 200, ok: true, line, html };
+  if (page == null) return notice(503, "unavailable", lang);
+  return { status: 200, ok: true, line, html: page.html, form: page.form };
 }
 
 /**

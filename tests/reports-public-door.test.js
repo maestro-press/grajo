@@ -320,6 +320,7 @@ test("view: a valid token returns the recipient view", async () => {
   const comment = await world({ tier: "a" });
   const reply = await handlerFor(comment)({ op: "view", token: comment.token });
   assert.equal(reply.status, 200);
+  assert.equal(reply.form, true, "a comment-scope link says it carries the form");
   assert.ok(reply.html.startsWith("<!doctype html>"), "one complete page");
   assert.ok(reply.html.includes(DOC_TEXT), "the stored document is on it");
   assert.ok(reply.html.includes('method="post"'), "a comment-scope link gets the form");
@@ -331,6 +332,7 @@ test("view: a valid token returns the recipient view", async () => {
   const view = await world({ tier: "b", address: "sam@example.com" });
   const viewReply = await handlerFor(view)({ op: "view", token: view.token });
   assert.equal(viewReply.status, 200);
+  assert.equal(viewReply.form, false, "a view-only link says it carries no form");
   assert.ok(viewReply.html.includes(DOC_TEXT));
   assert.ok(!viewReply.html.includes('name="formNonce"'), "a view-scope link carries no nonce");
   assert.ok(!viewReply.html.includes('class="comment-form"'), "and no form");
@@ -695,6 +697,52 @@ test("the raw token never appears in any reply", async () => {
     const dump = JSON.stringify(reply);
     assert.equal(dump.includes(w.token), false, "no reply echoes the raw token");
     assert.equal(dump.includes(hashToken(w.token)), false, "and not even its hash in a page");
+  }
+});
+
+test("the door says whether the page carries the comment form", async () => {
+  clock = T0;
+  const comment = await world({ tier: "a" });
+  const page = await handlerFor(comment)({ op: "view", token: comment.token });
+  assert.equal(page.status, 200);
+  assert.equal(page.form, true, "a comment-scope page really carries the form");
+  assert.ok(page.html.includes('class="comment-form"'), "and the html says the same");
+
+  const view = await world({ tier: "b", address: "sam@example.com" });
+  const viewOnly = await handlerFor(view)({ op: "view", token: view.token });
+  assert.equal(viewOnly.status, 200);
+  assert.equal(viewOnly.form, false, "a view-only page carries no form");
+
+  // A refused comment on a comment-scope link re-renders that same page, so the permission it needs (and
+  // a reader needs, to correct what they typed) is still there. The line and the code say what went wrong.
+  const refused = await handlerFor(comment)({
+    op: "comment", token: comment.token, text: "too late?", formNonce: "0".repeat(64),
+  });
+  assert.equal(refused.status, 200);
+  assert.equal(refused.ok, false);
+  assert.equal(refused.error, "form_expired");
+  assert.equal(refused.form, true, "a refusal keeps the form it was rendered with");
+
+  // A refusal with no form to offer says so, so a front end never relaxes its sandbox for it.
+  const viewRefused = await handlerFor(view)({
+    op: "comment", token: view.token, text: "let me in", formNonce: "0".repeat(64),
+  });
+  assert.equal(viewRefused.error, "view_only");
+  assert.equal(viewRefused.form, false, "a view-only refusal carries no form");
+
+  // The fixed notice pages never claim a form, so nothing a stranger gets can ask for one.
+  const missing = await handlerFor(comment)({ op: "view", token: "Z".repeat(43) });
+  assert.equal(missing.status, 404);
+  assert.notEqual(missing.form, true, "the unknown-link page carries no form");
+
+  const expiring = await world({ tier: "a", address: "kim@example.com", linkDays: 1 });
+  clock = T0 + 2 * DAY_MS;
+  try {
+    const gone = await handlerFor(expiring)({ op: "view", token: expiring.token });
+    assert.equal(gone.status, 410);
+    assert.notEqual(gone.form, true, "the expired page carries no form");
+  } finally {
+    clock = T0;
   }
 });
 
