@@ -6419,6 +6419,17 @@ export const translations = {
   "projectReports.settings.ai": { en: "AI commentary", es: "Comentario de la IA" },
   "projectReports.settings.on": { en: "On", es: "Activado" },
   "projectReports.settings.off": { en: "Off", es: "Desactivado" },
+  // The owner's settings form on the report page: its sender label, its Save button, the line a live
+  // report carries above that button, the range line under the comment window's number box, and the
+  // answers a save gets back.
+  "projectReports.settings.senderLabel": { en: "Sending account", es: "Cuenta de envío" },
+  "projectReports.settings.save": { en: "Save settings", es: "Guardar ajustes" },
+  "projectReports.settings.liveWarning": { en: "Saving changes pauses this report until you approve it again.", es: "Al guardar los cambios, este informe se pausa hasta que lo apruebes de nuevo." },
+  "projectReports.settings.saved": { en: "Settings saved.", es: "Ajustes guardados." },
+  "projectReports.settings.savedPaused": { en: "Settings saved. The report is paused until you approve it again.", es: "Ajustes guardados. El informe está en pausa hasta que lo apruebes de nuevo." },
+  "projectReports.settings.windowRange": { en: "Choose a number from 1 to 50.", es: "Elige un número del 1 al 50." },
+  "projectReports.settings.nothingChanged": { en: "Nothing changed.", es: "No hubo cambios." },
+  "projectReports.settings.senderNotReady": { en: "That account can't send right now. Choose another one, or sign in to it again in Mail.", es: "Esa cuenta no puede enviar ahora. Elige otra o vuelve a iniciar sesión en ella en Correo." },
   "projectReports.delivery.email_full": { en: "Email, the full report", es: "Correo con el informe completo" },
   "projectReports.delivery.email_link": { en: "Email with a link", es: "Correo con un enlace" },
   "projectReports.delivery.both": { en: "Email, the full report and a link", es: "Correo con el informe completo y un enlace" },

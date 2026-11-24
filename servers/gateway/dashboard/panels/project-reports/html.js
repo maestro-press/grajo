@@ -27,10 +27,14 @@ const RESULT_WORDS = new Set(["ok", "empty", "failed", "late", "queued", "runnin
 /** The states a recipient or a step row may be in. */
 const STATES = new Set(["proposed", "approved", "refused", "revoked"]);
 
-/** The delivery rules, comment tiers and comment visibilities a report may carry. */
-const DELIVERY_MODES = new Set(["email_full", "email_link", "both", "crow_only"]);
-const TIERS = new Set(["a", "b", "c"]);
-const VISIBILITIES = new Set(["own", "all"]);
+/** The delivery rules, comment tiers and comment visibilities a report may carry, in the order the
+ *  settings form lists them. */
+const DELIVERY_ORDER = ["email_full", "email_link", "both", "crow_only"];
+const DELIVERY_MODES = new Set(DELIVERY_ORDER);
+const TIER_ORDER = ["a", "b", "c"];
+const TIERS = new Set(TIER_ORDER);
+const VISIBILITY_ORDER = ["own", "all"];
+const VISIBILITIES = new Set(VISIBILITY_ORDER);
 
 /** The run triggers a history row may name. */
 const TRIGGERS = new Set(["preview", "schedule", "manual"]);
@@ -89,11 +93,8 @@ function nextRunLine(report, lang) {
   return escapeHtml(t("projectReports.noSchedule", lang));
 }
 
-/** The delivery rule's words. */
-function deliveryText(mode, lang) {
-  const word = DELIVERY_MODES.has(mode) ? mode : "email_link";
-  return t(`projectReports.delivery.${word}`, lang);
-}
+/** The delivery word a report carries: one this page does not know is the link-only rule. */
+const deliveryWord = (mode) => (DELIVERY_MODES.has(mode) ? mode : "email_link");
 
 /** A comment tier's words; a missing tier is the report's own default. */
 function tierText(tier, lang) {
@@ -102,11 +103,9 @@ function tierText(tier, lang) {
   return t(`projectReports.tier.${word}`, lang);
 }
 
-/** The comment visibility's words. */
-function visibilityText(value, lang) {
-  const word = VISIBILITIES.has(value) ? value : "own";
-  return t(`projectReports.visibility.${word}`, lang);
-}
+/** The comment visibility a report carries: one this page does not know is "each person sees only
+ *  their own". */
+const visibilityWord = (value) => (VISIBILITIES.has(value) ? value : "own");
 
 /** A button the page's client wires: action, the report it is about, and the words on it. A go-live
  *  button also carries `data-rp-sender`, the sender account id the page showed (the empty string when
@@ -251,13 +250,8 @@ function scheduleSection(report, owner, lang) {
     </section>`;
 }
 
-/** One read-only settings row: its label and its words. */
-function settingsRow(labelKey, value, lang) {
-  return `<div class="rp-setting"><span class="rp-setting-label">${escapeHtml(t(labelKey, lang))}</span> <span class="rp-setting-value">${escapeHtml(value)}</span></div>`;
-}
-
 /**
- * How many recent runs keep comments open, as the page reads it out. ./data.js already answers the
+ * How many recent runs keep comments open, as the page reads it. ./data.js already answers the
  * report's own `comment_window_runs`, defaulted to the same number when the column is empty; this falls
  * back to that number for a view a caller built by hand, so no page ever prints "{n}".
  */
@@ -268,27 +262,132 @@ function commentWindowRunsOf(report) {
   return Number.isInteger(runs) && runs > 0 ? runs : DEFAULT_COMMENT_WINDOW_RUNS;
 }
 
-/**
- * One read-only settings row whose copy is a whole sentence rather than a label beside a value
- * (the comment window, 6a C4): the sentence IS the row, its one placeholder filled here.
- */
-function settingsSentenceRow(labelKey, params, lang) {
-  return `<div class="rp-setting"><span class="rp-setting-value">${escapeHtml(fill(t(labelKey, lang), params))}</span></div>`;
+/* --------------------------------------------------------------- the settings form */
+
+/** One <option> of a settings menu: the value a save writes, and the words a person reads. */
+function settingOption(value, label, selected) {
+  return `<option value="${escapeHtml(value)}"${selected ? " selected" : ""}>${escapeHtml(label)}</option>`;
 }
 
-/** The settings the page reads out: delivery, comment defaults and the AI switch. */
+/**
+ * One setting's menu. `choices` is a list of [value, words] pairs, so a caller says the words the page
+ * already carries and this says the markup; the choice whose value is `current` is the selected one.
+ */
+function settingSelect(setting, current, choices) {
+  const options = choices.map(([value, label]) => settingOption(value, label, value === current)).join("");
+  return `<select class="rp-input" data-rp-setting="${escapeHtml(setting)}" data-rp-current="${escapeHtml(current)}">${options}</select>`;
+}
+
+/**
+ * The sending-account menu: the accounts that can send right now, then the report's own sender when it
+ * is not one of them any more (a person must be able to see and change what the report sends from), and
+ * "No sending account chosen yet." as the first choice when the report has no sender at all.
+ */
+function senderSelect(report, lang) {
+  const current = senderId(report);
+  const choices = [];
+  const seen = new Set();
+  if (!current) choices.push(["", t("projectReports.sender.none", lang)]);
+  const options = Array.isArray(report.senderOptions) ? report.senderOptions : [];
+  for (const option of options) {
+    const id = option && typeof option.id === "string" ? option.id : "";
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    choices.push([id, option.address ? String(option.address) : id]);
+  }
+  if (current && !seen.has(current)) {
+    const address = report.sender && report.sender.address ? String(report.sender.address) : current;
+    choices.push([current, address]);
+  }
+  return settingSelect("sender_account_id", current, choices);
+}
+
+/** The delivery menu. */
+function deliverySelect(report, lang) {
+  return settingSelect("delivery_mode", deliveryWord(report.deliveryMode),
+    DELIVERY_ORDER.map((word) => [word, t(`projectReports.delivery.${word}`, lang)]));
+}
+
+/** The comment-tier menu: always the three tiers, a, b and c, and never an empty choice. The column is
+ *  TEXT NOT NULL DEFAULT 'c', so a report always holds one of the three. A stored tier this page cannot use
+ *  shows `c` selected: an empty or missing value is `c`, as in `commentTierOf` in
+ *  `servers/gateway/reports/links.js`, and an unknown word also shows `c` here, which is this form's own
+ *  choice (`commentTierOf` returns a non-empty unknown word unchanged). */
+function tierSelect(report, lang) {
+  const stored = report.commentTierDefault;
+  const current = TIERS.has(stored) ? stored : "c";
+  return settingSelect("comment_tier_default", current,
+    TIER_ORDER.map((tier) => [tier, t(`projectReports.tier.${tier}`, lang)]));
+}
+
+/** The comment-visibility menu. */
+function visibilitySelect(report, lang) {
+  return settingSelect("comment_visibility", visibilityWord(report.commentVisibility),
+    VISIBILITY_ORDER.map((word) => [word, t(`projectReports.visibility.${word}`, lang)]));
+}
+
+/** The AI commentary menu: "1" and "0", which is what the save writes. */
+function aiSelect(report, lang) {
+  return settingSelect("ai_commentary", report.aiCommentary ? "1" : "0", [
+    ["1", t("projectReports.settings.on", lang)],
+    ["0", t("projectReports.settings.off", lang)],
+  ]);
+}
+
+/**
+ * The comment window (6a C4): one sentence with the number box in the place the copy leaves for it. The
+ * sentence is translated as a whole, so it is split on its one placeholder here and each part escaped. A
+ * sentence that carries no placeholder is rendered as it is with the box after it, so the box is never
+ * dropped.
+ */
+function windowField(report, lang) {
+  const runs = commentWindowRunsOf(report);
+  const sentence = t("projectReports.settings.commentWindow", lang);
+  const parts = sentence.split("{n}");
+  const input = `<input class="rp-input rp-input--inline" type="number" min="1" max="50" step="1" inputmode="numeric" data-rp-setting="comment_window_runs" data-rp-current="${escapeHtml(runs)}" value="${escapeHtml(runs)}">`;
+  if (parts.length < 2) return `<span>${escapeHtml(sentence)}${input}</span>`;
+  const head = escapeHtml(parts[0] || "");
+  const tail = escapeHtml(parts.slice(1).join("{n}"));
+  return `<span>${head}${input}${tail}</span>`;
+}
+
+/**
+ * The settings the owner may change: the sending account, the delivery rule, the comment defaults, the
+ * AI switch and how many recent runs keep comments open. One form and one Save; the three empty status
+ * lines are where the client writes the answer (a bad number, a sender that cannot send, what the save
+ * did). Everything here is the owner's: a reader gets no settings section at all.
+ *
+ * The comment-tier menu always offers exactly a, b and c (tierSelect), because `reports.comment_tier_default`
+ * is TEXT NOT NULL DEFAULT 'c' and a report therefore always holds one of them; a stored value this page
+ * cannot use shows `c` selected, where an empty or missing value is the column's own default and an unknown
+ * word is this form's own choice.
+ */
 function settingsSection(report, owner, lang) {
   if (!owner) return "";
-  const rows = [
-    settingsRow("projectReports.settings.delivery", deliveryText(report.deliveryMode, lang), lang),
-    settingsRow("projectReports.settings.tier", tierText(report.commentTierDefault, lang), lang),
-    settingsRow("projectReports.settings.visibility", visibilityText(report.commentVisibility, lang), lang),
-    settingsSentenceRow("projectReports.settings.commentWindow", { n: commentWindowRunsOf(report) }, lang),
-    settingsRow("projectReports.settings.ai", t(report.aiCommentary ? "projectReports.settings.on" : "projectReports.settings.off", lang), lang),
-  ];
+  const live = report.status === "live";
+  const liveWarning = live
+    ? `<p class="rp-meta" data-rp-settings-live>${escapeHtml(t("projectReports.settings.liveWarning", lang))}</p>`
+    : "";
   return `<section class="rp-section" id="settings">
       <h3 class="rp-label">${escapeHtml(t("projectReports.section.settings", lang))}</h3>
-      ${rows.join("")}
+      <form class="rp-form" method="post" data-rp-settings data-rp-report="${escapeHtml(report.id)}"${live ? ' data-rp-live="1"' : ""}>
+        <label class="rp-field"><span>${escapeHtml(t("projectReports.settings.senderLabel", lang))}</span>
+          ${senderSelect(report, lang)}</label>
+        <label class="rp-field"><span>${escapeHtml(t("projectReports.settings.delivery", lang))}</span>
+          ${deliverySelect(report, lang)}</label>
+        <label class="rp-field"><span>${escapeHtml(t("projectReports.settings.tier", lang))}</span>
+          ${tierSelect(report, lang)}</label>
+        <label class="rp-field"><span>${escapeHtml(t("projectReports.settings.visibility", lang))}</span>
+          ${visibilitySelect(report, lang)}</label>
+        <label class="rp-field"><span>${escapeHtml(t("projectReports.settings.ai", lang))}</span>
+          ${aiSelect(report, lang)}</label>
+        <label class="rp-field">${windowField(report, lang)}</label>
+        <p class="rp-status rp-status--error" role="status" aria-live="polite" data-rp-window-error></p>
+        ${liveWarning}
+        <p class="rp-status rp-status--error" role="status" aria-live="polite" data-rp-settings-note></p>
+        <button type="submit" class="rp-btn">${escapeHtml(t("projectReports.settings.save", lang))}</button>
+        <p class="rp-status" role="status" aria-live="polite" data-rp-settings-result></p>
+      </form>
     </section>`;
 }
 

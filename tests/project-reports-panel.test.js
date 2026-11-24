@@ -300,6 +300,15 @@ function panelOf(body) {
   return body.slice(start, end > start ? end : body.length).replace(/<style>[\s\S]*?<\/style>/g, "");
 }
 
+/** The owner's settings form of one page body, or "" when the page carries none. */
+function settingsFormOf(body) {
+  const at = body.indexOf("data-rp-settings data-rp-report");
+  if (at < 0) return "";
+  const start = body.lastIndexOf("<form", at);
+  const end = body.indexOf("</form>", at);
+  return body.slice(start, end + "</form>".length);
+}
+
 /* ------------------------------------------------------------------ the server pages */
 
 test("list shows next run in report tz", async () => {
@@ -560,6 +569,33 @@ test("a go-live button carries the report's sender account id", async () => {
   }
 });
 
+test("the owner's page data carries the send-ready accounts, and a reader's has no such key", async () => {
+  const { loadReportPage } = await import("../servers/gateway/dashboard/panels/project-reports/data.js");
+  const { createMailCredentials } = await import("../servers/gateway/mail/credentials.js");
+  const { createDbClient } = await import("../servers/db.js");
+  const db = createDbClient();
+  try {
+    // A credential on this machine is what makes an account send-ready (reports/sender-ready.js), and
+    // the report's own sender account is the one account the page knows about.
+    await createMailCredentials({ db, crowHome: HOME })
+      .saveSecret(SENDER_ACCOUNT, "MAIL_PASSWORD", "app-password-value");
+    const owner = await loadReportPage(db, { project: PROJECT, reportId: LISTINGS, viewer: "owner" });
+    assert.ok(owner && owner.owner, "the owner's page data is there");
+    assert.deepEqual(owner.report.senderOptions, [{ id: SENDER_ACCOUNT, address: SENDER_ADDRESS }],
+      "the sender menu is built from the accounts that can send right now");
+    // A reader's page data is the reduced shape, so there is no list of accounts to leak from it.
+    const reader = await loadReportPage(db, { project: PROJECT, reportId: LISTINGS, viewer: "member" });
+    assert.ok(reader && !reader.owner, "the reader's page data is the reduced one");
+    assert.equal(Object.hasOwn(reader.report, "senderOptions"), false, "no sender list for a reader");
+  } finally {
+    db.close();
+  }
+  const page = await get(pagePath(LISTINGS), { session: GUEST });
+  assert.equal(page.status, 200);
+  assert.ok(!page.body.includes(SENDER_ACCOUNT), "no sender account id on a reader's page");
+  assert.ok(!page.body.includes(SENDER_ADDRESS), "and no address from the list either");
+});
+
 test("the data block carries the words of the page's own language", async () => {
   const { writeSetting } = await import("../servers/gateway/dashboard/settings/registry.js");
   const { createDbClient } = await import("../servers/db.js");
@@ -658,17 +694,13 @@ test("only an approved recipient's row offers Revoke links", () => {
   assert.match(unnamed, /data-rp-name="alex@example\.com"/);
 });
 
-test("the settings section reads out how many recent runs keep comments open", async () => {
+test("the settings section is one form whose number box sits inside the comment window sentence", async () => {
   const r = await get(pagePath(LISTINGS));
   assert.equal(r.status, 200);
   const panel = panelOf(r.body);
-  // The report's own column (4 by default), in the read-only row after the visibility row.
-  assert.match(panel, /Comments stay open for the last 4 reports/);
-  const settings = panel.slice(panel.indexOf('<section class="rp-section" id="settings">'));
-  const visibility = settings.indexOf("Each person sees only their own");
-  const windowRow = settings.indexOf("Comments stay open for the last 4 reports");
-  assert.ok(visibility > -1 && windowRow > visibility, "the row sits after the visibility row");
-  assert.ok(!settings.slice(0, windowRow).includes("<input"), "it is read-only, like every other row");
+  const sentence = panel.slice(panel.indexOf("Comments stay open for the last "), panel.indexOf(" reports</span>"));
+  assert.match(sentence, /data-rp-setting="comment_window_runs" data-rp-current="4" value="4"/,
+    "the number box is in the sentence, carrying the report's own number");
   // The number is the report's own: a view that carries another one prints that one.
   const page = projectReportPageHtml({
     project: PROJECT,
@@ -680,7 +712,7 @@ test("the settings section reads out how many recent runs keep comments open", a
       recipients: [], steps: [], hosts: [], preview: null, runs: [],
     },
   }, "en");
-  assert.match(page, /Comments stay open for the last 7 reports/);
+  assert.match(page, /Comments stay open for the last <input[^>]*data-rp-current="7" value="7"> reports/);
 });
 
 test("the Spanish page says the revoke links control and the comment window in Spanish", async () => {
@@ -691,7 +723,7 @@ test("the Spanish page says the revoke links control and the comment window in S
     await writeSetting(db, "language", "es");
     const body = (await get(pagePath(LISTINGS))).body;
     assert.match(body, />Revocar enlaces</);
-    assert.match(body, /Los comentarios siguen abiertos en los últimos 4 informes/);
+    assert.match(body, /Los comentarios siguen abiertos en los últimos <input[^>]*value="4"> informes/);
     const strings = dataBlockOf(body)?.strings || {};
     assert.equal(strings["projectReports.recipients.revokeLinksConfirm"],
       t("projectReports.recipients.revokeLinksConfirm", "es"), "the confirmation is Spanish too");
@@ -701,6 +733,180 @@ test("the Spanish page says the revoke links control and the comment window in S
     await writeSetting(db, "language", "en");
     db.close();
   }
+});
+
+/* ------------------------------------------------------------ the settings form */
+
+/** The settings form of one page rendered from a view the test builds. */
+function settingsPageOf(over = {}, lang = "en") {
+  const view = reportView();
+  Object.assign(view.report, { status: "draft", live: false }, over);
+  return projectReportPageHtml(view, lang);
+}
+
+/** The sender menu of one settings form. */
+function senderSelectOf(form) {
+  const at = form.indexOf('data-rp-setting="sender_account_id"');
+  assert.ok(at > 0, "the form has a sender menu");
+  return form.slice(form.lastIndexOf("<select", at), form.indexOf("</select>", at) + "</select>".length);
+}
+
+test("the owner's settings form carries its six controls on a draft, a live and a paused report", async () => {
+  const warning = translations["projectReports.settings.liveWarning"].en;
+  for (const id of [DRAFT, LISTINGS, PAUSED]) {
+    const page = await get(pagePath(id));
+    assert.equal(page.status, 200, id);
+    const form = settingsFormOf(page.body);
+    assert.ok(form, `${id}: the settings form is on the page`);
+    assert.match(form, new RegExp(`^<form class="rp-form" method="post" data-rp-settings data-rp-report="${id}"`));
+    const controls = [...form.matchAll(/data-rp-setting="([a-z_]+)"/g)].map((match) => match[1]);
+    assert.deepEqual(controls, [
+      "sender_account_id", "delivery_mode", "comment_tier_default",
+      "comment_visibility", "ai_commentary", "comment_window_runs",
+    ], `${id}: the six controls, in the order the page reads them`);
+    assert.equal((form.match(/<select /g) || []).length, 5, `${id}: five menus`);
+    assert.equal((form.match(/<input class="rp-input rp-input--inline"/g) || []).length, 1, `${id}: one number box`);
+    // The live warning is the live report's alone, and it sits above the button inside the form.
+    if (id === LISTINGS) {
+      assert.ok(form.includes(warning), "a live report says a save pauses it");
+      assert.ok(form.indexOf(warning) < form.indexOf('type="submit"'), "above the Save button");
+      assert.match(form, /^<form[^>]* data-rp-live="1"/);
+      assert.ok(form.includes("data-rp-settings-live"), "in the line the page marks for it");
+    } else {
+      assert.ok(!form.includes(warning), `${id}: no live warning`);
+      assert.ok(!form.includes("data-rp-live"), `${id}: and no live mark on the form`);
+      assert.ok(!form.includes("data-rp-settings-live"), `${id}: and no live line`);
+    }
+    // One Save button, the form's own submit, carrying no action of the page's.
+    assert.match(form, /<button type="submit" class="rp-btn">Save settings<\/button>/);
+    assert.ok(!form.includes("data-rp-action"), `${id}: the Save button is not one of the page's actions`);
+    for (const marker of ["data-rp-window-error", "data-rp-settings-note", "data-rp-settings-result"]) {
+      assert.ok(form.includes(marker), `${id}: the client's line ${marker} is there`);
+    }
+  }
+});
+
+test("the sender menu lists the send-ready accounts and keeps the report's own sender", () => {
+  const menu = (over) => senderSelectOf(settingsFormOf(settingsPageOf(over)));
+
+  // Two accounts that can send: both are offered, and the report's own one is the selected one.
+  const listed = menu({
+    senderOptions: [
+      { id: "ma-0000000000000001", address: "one@example.com" },
+      { id: "ma-0000000000000002", address: "two@example.com" },
+    ],
+    senderAccountId: "ma-0000000000000002",
+    sender: { address: "two@example.com" },
+  });
+  assert.match(listed, /data-rp-current="ma-0000000000000002"/);
+  assert.match(listed, /<option value="ma-0000000000000001">one@example\.com<\/option>/);
+  assert.match(listed, /<option value="ma-0000000000000002" selected>two@example\.com<\/option>/);
+  assert.ok(!listed.includes(translations["projectReports.sender.none"].en),
+    "no 'none' choice beside a chosen account");
+
+  // A sender that can no longer send is still listed, so the owner can see what it sends from.
+  const stale = menu({
+    senderOptions: [{ id: "ma-0000000000000001", address: "one@example.com" }],
+    senderAccountId: "ma-0000000000000009",
+    sender: { address: "gone@example.com" },
+  });
+  assert.match(stale, /<option value="ma-0000000000000009" selected>gone@example\.com<\/option>/);
+  // A row whose account is gone names the id, which is all the page knows about it.
+  assert.match(menu({ senderOptions: [], senderAccountId: "ma-0000000000000009", sender: null }),
+    /<option value="ma-0000000000000009" selected>ma-0000000000000009<\/option>/);
+
+  // A report with no sender at all offers "none" as the selected empty choice, above the accounts.
+  const none = menu({
+    senderOptions: [{ id: "ma-0000000000000001", address: "one@example.com" }],
+    senderAccountId: "",
+    sender: null,
+  });
+  assert.match(none, /data-rp-current=""/);
+  assert.match(none, /<option value="" selected>No sending account chosen yet\.<\/option><option value="ma-0000000000000001">/);
+});
+
+test("every settings label and choice is the page's own translated words", () => {
+  const labels = [
+    "projectReports.settings.senderLabel", "projectReports.settings.delivery", "projectReports.settings.tier",
+    "projectReports.settings.visibility", "projectReports.settings.ai", "projectReports.settings.save",
+  ];
+  const choices = [
+    "projectReports.sender.none",
+    "projectReports.settings.on", "projectReports.settings.off",
+    ...["email_full", "email_link", "both", "crow_only"].map((word) => `projectReports.delivery.${word}`),
+    ...["a", "b", "c"].map((word) => `projectReports.tier.${word}`),
+    ...["own", "all"].map((word) => `projectReports.visibility.${word}`),
+  ];
+  for (const lang of ["en", "es"]) {
+    const form = settingsFormOf(settingsPageOf({
+      commentTierDefault: "", senderAccountId: "", sender: null,
+      senderOptions: [{ id: "ma-0000000000000001", address: "one@example.com" }],
+    }, lang));
+    for (const key of labels) assert.ok(form.includes(`>${t(key, lang)}<`), `${lang}: ${key}`);
+    for (const key of choices) assert.ok(form.includes(`>${t(key, lang)}</`), `${lang}: ${key}`);
+    // The one tier words the settings menus do not carry are the recipient rows' own: a person with no tier
+    // of their own still reads the report's default words.
+    assert.ok(!form.includes(t("projectReports.tier.default", lang)),
+      `${lang}: the tier menu offers the three tiers and no default choice`);
+    const page = settingsPageOf({
+      recipients: [{
+        id: "rrc-0000000000000001", address: "alex@example.com", displayName: "Alex", state: "approved",
+        tier: null,
+      }],
+    }, lang);
+    assert.ok(page.includes(t("projectReports.tier.default", lang)),
+      `${lang}: a recipient row with no tier of its own still says the report's default`);
+  }
+});
+
+test("the Spanish page's settings form is Spanish", async () => {
+  const { writeSetting } = await import("../servers/gateway/dashboard/settings/registry.js");
+  const { createDbClient } = await import("../servers/db.js");
+  const db = createDbClient();
+  try {
+    await writeSetting(db, "language", "es");
+    const form = settingsFormOf((await get(pagePath(DRAFT))).body);
+    assert.ok(form.includes(`>${t("projectReports.settings.senderLabel", "es")}<`), "S1 in Spanish");
+    assert.ok(form.includes(`>${t("projectReports.settings.save", "es")}<`), "S2 in Spanish");
+    assert.ok(form.includes(`>${t("projectReports.delivery.both", "es")}</`), "the delivery choices too");
+  } finally {
+    await writeSetting(db, "language", "en");
+    db.close();
+  }
+});
+
+test("a hostile sender address and id are text in the settings form", () => {
+  const hostile = "<img src=x onerror=1>";
+  const form = settingsFormOf(settingsPageOf({
+    senderOptions: [{ id: hostile, address: hostile }],
+    senderAccountId: hostile,
+    sender: { address: hostile },
+  }));
+  assert.ok(!form.includes(hostile), "no markup from an address");
+  assert.ok(form.includes("&lt;img src=x onerror=1&gt;"), "the address is escaped text");
+});
+
+test("a reader's page has no settings form, no menu and none of the sender menu's words", async () => {
+  // Even handed the owner's own report object, a reader's page draws no form.
+  const view = reportView();
+  Object.assign(view.report, {
+    senderOptions: [{ id: SENDER_ACCOUNT, address: SENDER_ADDRESS }],
+  });
+  const readerHtml = projectReportPageHtml({ project: PROJECT, owner: false, report: view.report }, "en");
+  assert.ok(!readerHtml.includes("data-rp-settings"), "no settings form for a reader");
+  assert.ok(!readerHtml.includes("<select"), "and no menu");
+  assert.ok(!readerHtml.includes(SENDER_ADDRESS), "and no address from the menu");
+  assert.ok(!readerHtml.includes("Sending account"), "and no label of it");
+
+  // The real read: the sender menu's addresses never reach a reader's page.
+  const reader = await get(pagePath(LISTINGS), { session: GUEST });
+  assert.equal(reader.status, 200);
+  const readerPanel = panelOf(reader.body);
+  assert.ok(!readerPanel.includes("data-rp-settings"), "no settings form on the served reader page");
+  assert.ok(!readerPanel.includes("<select"), "no menu either");
+  assert.ok(!reader.body.includes(SENDER_ADDRESS), "and no account address");
+  assert.ok(!reader.body.includes(SENDER_ACCOUNT), "and no account id");
+  assert.equal(settingsFormOf(reader.body), "", "nothing of the form");
 });
 
 test("an unknown slug and an unknown report id are the project's missing page", async () => {
@@ -785,7 +991,7 @@ function goLiveView({ senderAccountId = "", sender = null } = {}) {
   return view;
 }
 
-function boot({ html, fetchImpl }) {
+function boot({ html, fetchImpl, storage = null }) {
   const { window, document } = parseHTML(`<html><body class="shell"><main>${html}</main></body></html>`);
   const calls = [];
   let reloads = 0;
@@ -805,6 +1011,9 @@ function boot({ html, fetchImpl }) {
   };
   const consoleStub = { log() {}, warn() {}, error() {} };
   const ctx = vm.createContext({ window, document, location, fetch: fetchStub, URL, console: consoleStub });
+  // A page in a browser has sessionStorage; a test that cares about the settings answer hands in its
+  // own stand-in, and one that does not leaves it out (the client must survive both).
+  if (storage) ctx.sessionStorage = storage;
   vm.runInContext(CLIENT_JS, ctx);
   const click = (el) => el.dispatchEvent(new window.Event("click", { bubbles: true }));
   const submit = (form) => form.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
@@ -986,14 +1195,335 @@ test("preview says it started; a pause that lands re-renders; the schedule form 
   assert.equal(save.reloads(), 1);
 });
 
+/* ------------------------------------------------------- the settings form's client */
+
+/** A sessionStorage stand-in: the three methods the client uses, over a plain map. */
+function memoryStorage(initial = {}) {
+  const map = new Map(Object.entries(initial));
+  return {
+    getItem: (key) => (map.has(key) ? map.get(key) : null),
+    setItem: (key, value) => { map.set(key, String(value)); },
+    removeItem: (key) => { map.delete(key); },
+    get: (key) => (map.has(key) ? map.get(key) : null),
+  };
+}
+
+/** The owner's report as the settings form renders it: a draft with a sender that can send. */
+function settingsView(over = {}) {
+  const view = reportView();
+  Object.assign(view.report, {
+    status: "draft",
+    live: false,
+    deliveryMode: "email_link",
+    commentTierDefault: "c",
+    commentVisibility: "own",
+    commentWindowRuns: 4,
+    aiCommentary: false,
+    senderOptions: [
+      { id: SENDER_ACCOUNT, address: SENDER_ADDRESS },
+      { id: "ma-0000000000000002", address: "second@example.com" },
+    ],
+    senderAccountId: SENDER_ACCOUNT,
+    sender: { address: SENDER_ADDRESS },
+    ...over,
+  });
+  return view;
+}
+
+/** A page booted at the settings form, with a fetch stub and (optionally) a sessionStorage stub. */
+function settingsBoot({ over = {}, fetchImpl, storage = null } = {}) {
+  const view = settingsView(over);
+  const answer = fetchImpl || (() => ({ status: 200, body: { report: { status: view.report.status } } }));
+  return boot({
+    html: projectReportPageHtml(view, "en") + CLIENT_DATA_SCRIPT(view, "en"),
+    fetchImpl: answer,
+    storage,
+  });
+}
+
+/** Move a settings menu to another value. linkedom's select has no value setter, so the selected
+ *  option moves instead, which is what a browser reports through select.value. */
+function choose(form, setting, value) {
+  const select = form.querySelector(`[data-rp-setting="${setting}"]`);
+  assert.ok(select, `the ${setting} menu is on the page`);
+  for (const option of select.querySelectorAll("option")) option.selected = false;
+  const chosen = select.querySelector(`option[value="${value}"]`);
+  assert.ok(chosen, `the ${setting} menu offers ${value}`);
+  chosen.selected = true;
+  return select;
+}
+
+test("a settings save PUTs only what moved, as a number, and keeps its answer for the reload", async () => {
+  const storage = memoryStorage();
+  const s = settingsBoot({ storage });
+  const form = s.document.querySelector("[data-rp-settings]");
+  assert.ok(form, "the owner's settings form is on the page");
+  assert.equal(form.getAttribute("data-rp-live"), null, "a draft does not warn about a pause");
+  choose(form, "delivery_mode", "both");
+  form.querySelector('[data-rp-setting="comment_window_runs"]').value = "8";
+  s.submit(form);
+  await s.settle();
+  assert.equal(s.calls.length, 1, "one request for one save");
+  assert.equal(s.calls[0].method, "PUT");
+  assert.equal(s.calls[0].url, `/dashboard/api/reports/${LISTINGS}/settings`);
+  assert.equal(s.calls[0].headers["X-Crow-Csrf"], "csrf-abc");
+  assert.deepEqual(JSON.parse(s.calls[0].body), { settings: { delivery_mode: "both", comment_window_runs: 8 } });
+  assert.equal(typeof JSON.parse(s.calls[0].body).settings.comment_window_runs, "number",
+    "the number box sends a number, not a string");
+  assert.equal(s.reloads(), 1, "a save re-renders the page");
+  assert.equal(storage.get("rp-settings-msg:" + LISTINGS), translations["projectReports.settings.saved"].en,
+    "the answer is kept for the page that comes back");
+});
+
+test("a moved comment tier is sent, and an unchanged one is left out", async () => {
+  // c to a: the menu's own value is the patch.
+  const moved = settingsBoot();
+  const movedForm = moved.document.querySelector("[data-rp-settings]");
+  assert.equal(movedForm.querySelector('[data-rp-setting="comment_tier_default"]').getAttribute("data-rp-current"),
+    "c", "the page rendered c as the report's tier");
+  choose(movedForm, "comment_tier_default", "a");
+  moved.submit(movedForm);
+  await moved.settle();
+  assert.equal(moved.calls.length, 1);
+  assert.deepEqual(JSON.parse(moved.calls[0].body), { settings: { comment_tier_default: "a" } },
+    "c to a sends exactly that patch");
+
+  // Unchanged: another field moves, the tier stays out of the patch.
+  const still = settingsBoot();
+  const stillForm = still.document.querySelector("[data-rp-settings]");
+  choose(stillForm, "delivery_mode", "both");
+  still.submit(stillForm);
+  await still.settle();
+  assert.equal(still.calls.length, 1);
+  const patch = JSON.parse(still.calls[0].body).settings;
+  assert.deepEqual(patch, { delivery_mode: "both" });
+  assert.ok(!("comment_tier_default" in patch), "an unchanged tier is not sent");
+});
+
+test("a live report's save says the report is paused until it is approved again", async () => {
+  const storage = memoryStorage();
+  const s = settingsBoot({
+    over: { status: "live", live: true },
+    storage,
+    fetchImpl: () => ({ status: 200, body: { report: { status: "paused" } } }),
+  });
+  const form = s.document.querySelector("[data-rp-settings]");
+  assert.equal(form.getAttribute("data-rp-live"), "1", "the form knows it was live");
+  choose(form, "ai_commentary", "1");
+  s.submit(form);
+  await s.settle();
+  assert.equal(s.calls.length, 1);
+  assert.equal(storage.get("rp-settings-msg:" + LISTINGS), translations["projectReports.settings.savedPaused"].en);
+  assert.equal(s.reloads(), 1);
+});
+
+test("a settings save with nothing changed sends nothing and says so", async () => {
+  const s = settingsBoot();
+  const form = s.document.querySelector("[data-rp-settings]");
+  s.submit(form);
+  await s.settle();
+  assert.equal(s.calls.length, 0, "no request");
+  assert.equal(form.querySelector("[data-rp-settings-result]").textContent,
+    translations["projectReports.settings.nothingChanged"].en);
+  assert.equal(s.reloads(), 0);
+});
+
+test("a comment window outside 1 to 50, or not a whole number, sends nothing and says the range", async () => {
+  for (const value of ["0", "51", "abc", "", "2.5"]) {
+    const label = value === "" ? "blank" : value;
+    const s = settingsBoot();
+    const form = s.document.querySelector("[data-rp-settings]");
+    form.querySelector('[data-rp-setting="comment_window_runs"]').value = value;
+    s.submit(form);
+    await s.settle();
+    assert.equal(s.calls.length, 0, `${label}: no request`);
+    assert.equal(form.querySelector("[data-rp-window-error]").textContent,
+      translations["projectReports.settings.windowRange"].en, `${label}: the range line`);
+    assert.equal(form.querySelector("[data-rp-settings-result]").textContent, "", `${label}: no save line`);
+    assert.equal(s.reloads(), 0, `${label}: the page stays`);
+  }
+});
+
+test("a sender that cannot send shows the page's line, not the API's sentence", async () => {
+  const apiSentence = "Choose a mail account that is ready to send.";
+  const s = settingsBoot({
+    fetchImpl: () => ({ status: 409, body: { error: "sender_not_ready", message: apiSentence } }),
+  });
+  const form = s.document.querySelector("[data-rp-settings]");
+  choose(form, "sender_account_id", "ma-0000000000000002");
+  s.submit(form);
+  await s.settle();
+  assert.equal(s.calls.length, 1);
+  assert.deepEqual(JSON.parse(s.calls[0].body), { settings: { sender_account_id: "ma-0000000000000002" } });
+  const note = form.querySelector("[data-rp-settings-note]");
+  assert.equal(note.textContent, translations["projectReports.settings.senderNotReady"].en);
+  assert.ok(!note.textContent.includes(apiSentence), "the API's English sentence is not shown");
+  assert.ok(note.classList.contains("rp-status--error"));
+  assert.equal(s.reloads(), 0, "a refused save keeps the page");
+  assert.equal(form.querySelector("[data-rp-settings-result]").textContent, "", "and says nothing about a save");
+});
+
+test("another refusal on a settings save shows the generic line", async () => {
+  const s = settingsBoot({ fetchImpl: () => ({ status: 500, body: {} }) });
+  const form = s.document.querySelector("[data-rp-settings]");
+  choose(form, "comment_visibility", "all");
+  s.submit(form);
+  await s.settle();
+  assert.equal(s.calls.length, 1);
+  assert.deepEqual(JSON.parse(s.calls[0].body), { settings: { comment_visibility: "all" } });
+  const line = s.document.querySelector("[data-rp-status]");
+  assert.equal(line.textContent, translations["projectReports.error.generic"].en);
+  assert.ok(line.classList.contains("rp-status--error"));
+  assert.equal(s.reloads(), 0);
+});
+
+test("the AI switch is sent as a boolean, both ways", async () => {
+  const on = settingsBoot();
+  const onForm = on.document.querySelector("[data-rp-settings]");
+  choose(onForm, "ai_commentary", "1");
+  on.submit(onForm);
+  await on.settle();
+  assert.deepEqual(JSON.parse(on.calls[0].body), { settings: { ai_commentary: true } });
+
+  const off = settingsBoot({ over: { aiCommentary: true } });
+  const offForm = off.document.querySelector("[data-rp-settings]");
+  assert.equal(offForm.querySelector('[data-rp-setting="ai_commentary"]').getAttribute("data-rp-current"), "1");
+  choose(offForm, "ai_commentary", "0");
+  off.submit(offForm);
+  await off.settle();
+  assert.deepEqual(JSON.parse(off.calls[0].body), { settings: { ai_commentary: false } });
+});
+
+test("the answer a save left behind is shown once, when the page comes back", () => {
+  const message = translations["projectReports.settings.savedPaused"].en;
+  const key = "rp-settings-msg:" + LISTINGS;
+  const storage = memoryStorage({ [key]: message });
+  const s = settingsBoot({ storage });
+  assert.equal(s.document.querySelector("[data-rp-settings-result]").textContent, message);
+  assert.equal(storage.get(key), null, "read once, then taken away");
+  assert.equal(s.calls.length, 0, "nothing was sent to show it");
+});
+
+test("the answer a save left behind belongs to the report that saved it", () => {
+  const message = translations["projectReports.settings.saved"].en;
+  const otherKey = "rp-settings-msg:" + ELSEWHERE;
+  const storage = memoryStorage({ [otherKey]: message });
+  const other = settingsBoot({ storage });
+  assert.equal(other.document.querySelector("[data-rp-settings-result]").textContent, "",
+    "another report's answer is not shown on this page");
+  assert.equal(storage.get(otherKey), message, "and it is not taken away either");
+  // The same storage, this report's own key: shown once, then gone.
+  const ownKey = "rp-settings-msg:" + LISTINGS;
+  storage.setItem(ownKey, message);
+  const own = settingsBoot({ storage });
+  assert.equal(own.document.querySelector("[data-rp-settings-result]").textContent, message);
+  assert.equal(storage.get(ownKey), null, "read once");
+  assert.equal(storage.get(otherKey), message, "the other report's answer is still waiting for it");
+});
+
+test("a go-live refused because the sender cannot send shows the API's sentence, not the settings line", async () => {
+  const apiSentence = "Choose a mail account that is ready to send.";
+  const view = goLiveView({ senderAccountId: SENDER_ACCOUNT, sender: { address: SENDER_ADDRESS } });
+  const s = boot({
+    html: projectReportPageHtml(view, "en") + CLIENT_DATA_SCRIPT(view, "en"),
+    fetchImpl: () => ({ status: 409, body: { error: "sender_not_ready", message: apiSentence } }),
+  });
+  s.click(s.document.querySelector(`[data-rp-action="go-live"][data-rp-report="${LISTINGS}"]`));
+  await s.settle();
+  const line = s.document.querySelector("[data-rp-status]");
+  assert.equal(line.textContent, apiSentence, "the API's own sentence, as for every other write");
+  assert.notEqual(line.textContent, translations["projectReports.settings.senderNotReady"].en,
+    "not the settings form's line: this request was not a settings save");
+  assert.ok(line.classList.contains("rp-status--error"));
+  assert.equal(s.document.querySelector("[data-rp-settings-note]").textContent, "",
+    "the settings form's own note line is untouched");
+  assert.equal(s.reloads(), 0, "a refused go-live keeps the page");
+});
+
+test("the settings save still shows its own line when the sender cannot send", async () => {
+  const apiSentence = "Choose a mail account that is ready to send.";
+  const s = settingsBoot({
+    fetchImpl: () => ({ status: 409, body: { error: "sender_not_ready", message: apiSentence } }),
+  });
+  const form = s.document.querySelector("[data-rp-settings]");
+  choose(form, "sender_account_id", "ma-0000000000000002");
+  s.submit(form);
+  await s.settle();
+  assert.equal(form.querySelector("[data-rp-settings-note]").textContent,
+    translations["projectReports.settings.senderNotReady"].en, "the settings form's own line, not the API's");
+  assert.equal(s.document.querySelector("[data-rp-status]").textContent, "");
+});
+
+test("the comment tier menu is always a, b and c, and anything unusable shows c", () => {
+  const tierMenu = (over) => {
+    const form = settingsFormOf(settingsPageOf(over));
+    const at = form.indexOf('data-rp-setting="comment_tier_default"');
+    assert.ok(at > 0, "the form has a comment tier menu");
+    return form.slice(form.lastIndexOf("<select", at), form.indexOf("</select>", at) + "</select>".length);
+  };
+  const words = (menu) => [...menu.matchAll(/<option value="([a-z]*)"/g)].map((match) => match[1]);
+  const selected = (menu) => (menu.match(/<option value="([a-z]*)" selected>/) || [])[1];
+
+  // A stored tier is the selected one.
+  const stored = tierMenu({ commentTierDefault: "b" });
+  assert.deepEqual(words(stored), ["a", "b", "c"], "exactly the three tiers, and no empty choice");
+  assert.equal(selected(stored), "b", "the stored tier is the selected one");
+  assert.match(stored, /data-rp-current="b"/);
+
+  // A stored tier the page cannot use, an empty string, or no value at all all fall back to c.
+  const fallbacks = [
+    ["an unknown word", { commentTierDefault: "z" }],
+    ["an empty string", { commentTierDefault: "" }],
+    ["null", { commentTierDefault: null }],
+    ["missing", { commentTierDefault: undefined }],
+  ];
+  for (const [label, over] of fallbacks) {
+    const menu = tierMenu(over);
+    assert.deepEqual(words(menu), ["a", "b", "c"], `${label}: still exactly the three tiers`);
+    assert.equal(selected(menu), "c", `${label}: c is selected`);
+    assert.match(menu, /data-rp-current="c"/, `${label}: and c is what the page rendered`);
+  }
+});
+
+test("a comment window sentence with no placeholder still shows the number box after it", () => {
+  // The copy is replaced for this one render, because a translation that lost its {n} is exactly the case
+  // under test; the table entry is put back whatever happens.
+  const key = "projectReports.settings.commentWindow";
+  const original = translations[key];
+  try {
+    translations[key] = { en: "Comments stay open for the last few reports.", es: original.es };
+    const page = settingsPageOf();
+    assert.match(page,
+      /Comments stay open for the last few reports\.<input[^>]*data-rp-setting="comment_window_runs"[^>]*data-rp-current="4" value="4">/,
+      "the sentence is rendered, then the number box: never dropped");
+    assert.equal((page.match(/data-rp-setting="comment_window_runs"/g) || []).length, 1, "one box");
+  } finally {
+    translations[key] = original;
+  }
+  // And the shipped sentence still puts the box inside it.
+  assert.match(settingsPageOf(), /Comments stay open for the last <input[^>]*value="4"> reports/);
+});
+
+test("a save still re-renders the page when there is no sessionStorage", async () => {
+  const s = settingsBoot();
+  const form = s.document.querySelector("[data-rp-settings]");
+  choose(form, "delivery_mode", "both");
+  s.submit(form);
+  await s.settle();
+  assert.equal(s.calls.length, 1, "the save still went");
+  assert.equal(s.reloads(), 1, "and the page still comes back");
+});
+
 test("no backtick in client.js, and the client source uses no template placeholders", () => {
   const src = readFileSync(join(REPO, "servers/gateway/dashboard/panels/project-reports/client.js"), "utf8");
   assert.ok(!src.includes("`"), "the client's own file carries no backtick");
   assert.ok(!CLIENT_HTML.includes("`"), "nor does the script it emits");
   assert.ok(!CLIENT_JS.includes("${"), "no dollar-brace sequence either");
-  for (const bad of ["localStorage", "sessionStorage", "indexedDB", "console.", "innerHTML", "outerHTML", "document.write"]) {
+  for (const bad of ["localStorage", "indexedDB", "console.", "innerHTML", "outerHTML", "document.write"]) {
     assert.ok(!CLIENT_JS.includes(bad), `the client never uses ${bad}`);
   }
+  // sessionStorage is the one exception, and only behind a try: an answer kept for one reload.
+  assert.match(CLIENT_JS, /try \{ sessionStorage\.setItem/, "the one sessionStorage write is guarded");
   assert.match(CLIENT_JS, /"X-Crow-Csrf": csrf\(\)/);
 });
 

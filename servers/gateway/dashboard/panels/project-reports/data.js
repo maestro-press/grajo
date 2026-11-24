@@ -41,6 +41,7 @@ import { listRuns } from "../../../reports/run.js";
 import { listSends } from "../../../reports/send-log.js";
 import { listHosts, listStepsForPage } from "../../../reports/steps.js";
 import { getReport, listReports } from "../../../reports/store.js";
+import { listSendReadyAccounts } from "../../../reports/sender-ready.js";
 import { getAccount } from "../../../mail/store/accounts.js";
 
 /** How many runs a report page shows. */
@@ -488,6 +489,9 @@ export async function loadReportPage(db, { project, reportId, viewer = "member",
     aiCommentary: Number(report.ai_commentary) === 1,
     recipe: recipeBlocks(report),
     sender: await senderOf(db, report),
+    // The accounts the settings form's sender menu offers (owner only): the ones that can send right
+    // now, in the order the owner added them. A reader's page carries no such list.
+    senderOptions: await senderOptionsOf(db),
     // The sender account id the page showed, exactly as the go-live route compares it: the row's own
     // column, the empty string when it has none. The client sends it back with a go-live.
     senderAccountId: text(report.sender_account_id),
@@ -498,6 +502,16 @@ export async function loadReportPage(db, { project, reportId, viewer = "member",
     preview: previewRunId ? { runId: previewRunId } : null,
   };
   return { project, owner, report: view };
+}
+
+/** The accounts the sender menu offers: `{id, address}` for each one that can send right now, or none. */
+async function senderOptionsOf(db) {
+  try {
+    const rows = await listSendReadyAccounts(db);
+    return Array.isArray(rows) ? rows : [];
+  } catch {
+    return [];
+  }
 }
 
 /** The account the report sends from, as an address, or null. A missing or unreadable row is null. */

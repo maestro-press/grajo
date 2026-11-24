@@ -78,6 +78,12 @@ export function projectReportsCss() {
     border: 1px solid var(--crow-border); border-radius: var(--crow-radius-control, 10px);
     background: var(--crow-bg-elevated); color: var(--crow-text-primary); font: inherit;
   }
+  /* The comment window's number box stands inside its sentence, so it is as wide as a number. */
+  body.shell .rp-input--inline {
+    display: inline-block; width: 5rem; min-height: 36px; padding: 4px 8px; vertical-align: middle;
+  }
+  /* The settings form stacks its six fields at every width (the schedule form's one row is for two). */
+  body.shell .rp-form[data-rp-settings] { flex-direction: column; }
   body.shell .rp-setting { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
   body.shell .rp-setting-label { color: var(--crow-text-secondary); }
   body.shell .rp-setting-value { font-weight: 600; overflow-wrap: anywhere; }
