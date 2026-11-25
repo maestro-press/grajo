@@ -150,7 +150,7 @@ function ourUid() {
  * @param {string} path the family's raw token file
  * @returns {{ok: true, token: string} | {ok: false}} `token` is the file's trimmed contents
  */
-function readTrustedProofFile(path) {
+export function readTrustedProofFile(path) {
   const uid = ourUid();
   const read = readHardenedTokenFile(path);
   if (!read.ok) return { ok: false };

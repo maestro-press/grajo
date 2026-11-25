@@ -647,7 +647,7 @@ test("--reset revokes every report link (sending nothing), keeps the era, and a 
   assert.equal(Number(sends[0].n), 0, "nothing was queued or sent");
 });
 
-test("--rollback neither crashes on a report:link snapshot nor deletes it, and says so", async () => {
+test("--rollback restores a report:link snapshot, revokes a link minted after the conversion, and moves the snapshot aside", async () => {
   clock = T0;
   const home = newHome();
   const w = await world({ tier: "a" });
@@ -655,10 +655,18 @@ test("--rollback neither crashes on a report:link snapshot nor deletes it, and s
   await runReportLinkTokenHmacBoot({ db: w.db });
   const [snapshot] = reportSnapshots(home);
   assert.ok(snapshot, "the converter wrote its snapshot");
+  // The gateway writes `<data dir>/instance-id` on its first boot; the rollback targets this
+  // instance's era mirror rows with it and refuses a home that has none.
+  writeFileSync(join(root, "master", "instance-id"), "0123456789abcdef0123456789abcdef", { mode: 0o600 });
+  const before = (await rowsOf(w.db))[0];
+  assert.match(before.token_hash, /^h1\./, "the link was converted");
   const out = runTool(["--rollback"], w);
-  assert.match(out, /report:link\s+1 snapshot file\(s\) left in place: not restored by this tool yet/);
-  assert.ok(existsSync(join(home, "secrets", snapshot)), "the snapshot file is still there, untouched");
-  assert.equal(reportSnapshots(home).length, 1);
+  assert.match(out, /report:link\s+1 restored, 0 gone, 0 revoked \(minted after conversion\), 0 removed/);
+  assert.equal((await rowsOf(w.db))[0].token_hash, hashToken(w.token), "the previous release's sha256 lookup finds the link again");
+  assert.ok(!existsSync(join(home, "secrets", snapshot)), "the snapshot moved aside");
+  assert.equal(reportSnapshots(home).filter((n) => n.endsWith(".json")).length, 0);
+  assert.ok(readdirSync(join(home, "secrets")).some((n) => n.startsWith(snapshot) && n.includes(".rolledback-")),
+    "kept as .rolledback-, never deleted");
 });
 
 /* --------------------------------------------------------------------------------------- dry run */

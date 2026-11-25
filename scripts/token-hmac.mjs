@@ -61,9 +61,12 @@
  *   node scripts/token-hmac.mjs --reset          # asks for confirmation
  *   node scripts/token-hmac.mjs --reset --yes    # no prompt (scripts, runbooks)
  *
- * ─── --rollback: the deploy-day undo of the oauth_tokens conversion ─────────
- * (After a rollback the settings, peer and report-link DB mirrors are adopted at the next boot unless the
- * operator deletes them; a later re-upgrade then refuses legacy rows in those families.)
+ * ─── --rollback: the deploy-day undo of EVERY keyed family ─────────────────
+ * One run restores all four conversions the previous release cannot read: the three `oauth_tokens`
+ * families, the sixteen settings-backed static-token families, the paired-instance bearer verifiers
+ * (`crow_instances.auth_token_hash`) and the report-link verifiers (`report_link_tokens.token_hash`).
+ * The `oauth_tokens` mechanics are described first (steps 1-5), because the other families follow the
+ * same shape; "FAMILIES BEYOND oauth_tokens" below says what each of them does differently.
  *
  * Rolling the RELEASE back does not roll the ROWS back: once the pre-listen boot has converted
  * `oauth_tokens`, every row holds an `h1.` verifier, and the previous release's
@@ -89,9 +92,10 @@
  *   3. In ONE DB transaction, in this order:
  *      a. POST-CONVERSION LEGACY WRITES. In EVERY converted family, a bare (non-`h1.`) row was
  *         written AFTER the conversion, so it is a forgery the alarm refused: it is DELETEd and
- *         counted as "removed (written after conversion, never valid)". Every value a snapshot
- *         itself names is SPARED — on a re-run of a rollback that already committed, those rows ARE
- *         the restored genuine ones. This is also what clears a forged row sitting on a snapshot's
+ *         counted as "removed (written after conversion, never valid)". A snapshot value is NOT
+ *         thereby genuine: a bare row equal to one may be a REPLANT of a credential the operator
+ *         logged out, rotated or deleted after the conversion, so on a first run nothing is spared.
+ *         Only the values the ROLLBACK JOURNAL names are SPARED (see below). This is also what clears a forged row sitting on a snapshot's
  *         own value, which would otherwise collide with the restore below (the stored value IS the
  *         primary key). A family with NO usable snapshot spares NOTHING: it has no genuine bare row
  *         to protect (a `--reset` box, a snapshot written under another key), and a converted
@@ -128,13 +132,58 @@
  *   5. Prints per-family counts (restored / gone / revoked / removed), the ignored and missing
  *      snapshots, and the moved-aside paths. Never a token and never a hash.
  *
+ * FAMILIES BEYOND oauth_tokens (all in the SAME transaction as step 3; per-family counts are printed):
+ *   - SETTINGS families (`dashboard_settings_overrides` for THIS instance id, read from
+ *     `<data dir>/instance-id` like `--reset`'s step 2b, which this run also refuses without — exit 1,
+ *     nothing changed — plus the global `dashboard_settings` rows; snapshots
+ *     `secrets/settings-token-hmac-rollback-*.json`).
+ *       Non-file-backed (local MCP token, the rotated-at-boot families): a snapshot's legacy value is
+ *       restored with CAS (only where the override still holds `macFromLegacy(family, legacy)`); an
+ *       `h1.` value no snapshot names was minted after the conversion and is DELETED (the previous
+ *       release re-mints a rotated-at-boot family on its next start; the local MCP token has to be
+ *       generated again in Settings → Connect, its raw value is kept nowhere).
+ *       File-backed (board, phone, artifacts, models, peer relay, kiosk announce): the verifier is
+ *       rewritten as `sha256(raw token file)`, the file read the way the converter reads its proof
+ *       (`readTrustedProofFile`: O_NOFOLLOW|O_NONBLOCK, regular, ours, not group/world-writable,
+ *       <= 4 KiB, parent directory ours) AND only when the file proves the stored keyed value
+ *       (`macFromLegacy(family, sha256(file)) === stored`). A missing, untrusted or non-matching file
+ *       deletes the verifier instead; the previous release's boot re-ensures the token and the file.
+ *       A global settings row of a converted family is never a credential and is deleted.
+ *   - PEERS (`crow_instances.auth_token_hash`, family `peer:inbound`): an `h1.` row is restored to the
+ *     peer's `inbound_bearer_sha256` record in `secrets/peer-tokens.json` (design D4 — the enroll route
+ *     and the pairing CLI write it for pairings made AFTER the conversion too), with CAS on the current
+ *     value AND only when `macFromLegacy("peer:inbound", record)` IS that current value: a record that
+ *     does not match the row is never restored. A row with no record falls back to its snapshot entry
+ *     under the same check; any other row (no record and no entry, a mismatch, a revoked peer) is set
+ *     to NULL, so that peer re-pairs. The record in peer-tokens.json stays in place.
+ *   - REPORT LINKS (`report_link_tokens.token_hash`, family `report:link`; snapshot
+ *     `secrets/report-token-hmac-rollback-*.json`, `{id, legacy}`): snapshot values are restored with
+ *     CAS on (id, keyed value); a link minted after the conversion keeps its `h1.` value (the
+ *     previous release can never match it) and gets `revoked_at`; tombstoned `revoked:` rows are
+ *     untouched. A bare row nothing in a snapshot names is a forgery: it is revoked and its value
+ *     replaced by a tombstone (the column is NOT NULL UNIQUE, and the tombstone frees a value a
+ *     restore needs).
+ *   - Step 3a's sweep applies to every family (a bare legacy value in a converted family that no
+ *     snapshot — and, for peers, no D4 record — names is a forgery: deleted / NULLed / revoked per
+ *     family and counted as "removed"; uppercase 64-hex counts as legacy). A family whose era state
+ *     records `rollback_file: null` (an adopted era, a `--reset` box) has nothing to restore, so its
+ *     `h1.` rows are all "minted after" and are handled per family as above.
+ *   - Every `token_hmac_era:<family>` mirror row, all 21 families, both stores.
+ *   - bot:def is NOT a token family and is not rolled back. Its MACs are keyed under the key this run
+ *     moves aside, and `secrets/bot-def-era.json` (not touched here) still says "converted", so after
+ *     a re-upgrade mints a new key every bot definition reads as foreign and is refused until it is
+ *     re-approved; the run prints that, naming `scripts/cli/bot-def-reapprove.mjs`.
+ *   - A snapshot a converted family's era state still promises but that is not on disk refuses the
+ *     whole run, for EVERY family (not only oauth_tokens), as does a snapshot that does not parse or
+ *     names a family outside its prefix's set.
+ *
  * INTERRUPTION POINTS — every one of them is recoverable, because the DB changes are ONE
  * transaction and the file moves are renames of files that are never overwritten:
  *   - BEFORE the commit: nothing changed. Re-run from the start.
  *   - AFTER the commit, BEFORE the first move: the rows are restored and the mirror is gone, while
  *     every file is still in place. A RE-RUN completes cleanly and is a no-op restore (the rows
  *     already sit at their snapshot values, so nothing is rewritten and the legacy sweep spares
- *     every value a snapshot names) followed by the moves; booting the previous release instead
+ *     every value the journal names) followed by the moves; booting the previous release instead
  *     also works, because its value lookup finds the bare rows.
  *   - AFTER the state file moved, BEFORE the key: the key file is still on disk, so a boot is
  *     NORMAL, not "key lost" — a key file answers for itself. No era is recorded for the three
@@ -152,16 +201,27 @@
  * sessions that release issued. Order, not a check, is what keeps the two apart: finish the moves
  * first, then start the old release.
  *
- * ONE RESIDUAL, on a re-run of an ALREADY-COMMITTED rollback: a bot that recorded a keyed (`h1.`)
- * value before the first run can plant it as a row of its own, and the per-item collision check
- * (step 3b) then takes the bare row it collides with instead of keeping it — a genuine restored row
- * is dropped and counted as "removed". It is not a new capability: the value is one the bot can
- * already copy out of crow.db and writing rows there is what it already does. It cannot start a run
- * (no shell, and the CLI refuses while a gateway answers), and a single run with the gateway stopped
- * cannot be raced at all; the dropped row lands in the reported `removed` count.
+ * THE JOURNAL. A snapshot entry is genuine only if THIS rollback restored it: its `h1.` row was present
+ * and the CAS UPDATE put the legacy value back. The restores are collected INSIDE the one real
+ * transaction, and only AFTER it committed — before the first move-aside — they are written to
+ * `secrets/token-hmac-rbjournal-<stamp>.json` (0600, atomic) per family: identifiers plus legacy values,
+ * hashes the snapshots beside it already hold. A first run (no journal) spares NOTHING, so a bare row
+ * that merely equals a snapshot value — the replant of a session the operator logged out, of a rotated
+ * local-token verifier, of a pairing or a deleted report link, which a crow.db writer holding the
+ * pre-conversion hashes can do — is swept and counted as "removed". A RE-RUN after an interruption finds
+ * the journal and spares exactly its entries (file-backed settings and peers included; a revoked peer
+ * never); with NO journal it sweeps every bare row in a converted family. Because the journal exists
+ * only once the transaction has committed, a crash BEFORE the commit leaves no journal at all (a later
+ * rollback can never be told to spare something by a run that restored nothing), and a death between
+ * the commit and the journal write simply means the re-run has no journal and sweeps. That fails closed:
+ * the only cost is that the genuine restored rows are swept too, so those people sign in again and those
+ * peers re-pair; nothing is laundered. The journal is moved aside with the snapshots, last, together with
+ * any journal written under another key (ignored on read) and any leftover `.tmp-*` journal file. A
+ * journal that does not parse, or carries an unknown `v`, refuses the run (exit 3).
  *
- * TEST SEAM — `CROW_TEST_ONLY_TOKEN_HMAC_ROLLBACK_INTERRUPT=<point>` (`commit`, `state`, `key`,
- * `snapshots`) stops the run right after that step with exit 7, which is how the tests model a crash
+ * TEST SEAM — `CROW_TEST_ONLY_TOKEN_HMAC_ROLLBACK_INTERRUPT=<point>` (`precommit`, `commit`, `state`,
+ * `key`, `snapshots`) stops the run right after that step with exit 7 (`precommit` throws inside the
+ * transaction, so it rolls back and leaves no journal), which is how the tests model a crash
  * at each point above. It is TEST-ONLY: production never sets it, and nothing in `servers/` reads it.
  *
  * THE ACCEPTED WINDOW. Between a rollback and the next deploy the PREVIOUS release is on duty
@@ -169,24 +229,31 @@
  * release fixes. The next deploy converts every legacy row it finds, including one written in that
  * window (accepted). A rollback is a deploy-day undo, never a resting state.
  */
-import { existsSync, readdirSync, readFileSync, renameSync } from "node:fs";
-import { dirname, join } from "node:path";
+import {
+  closeSync, existsSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, writeSync,
+} from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { basename, dirname, join } from "node:path";
 import { request } from "node:http";
 import { createInterface } from "node:readline";
 import { createDbClient } from "../servers/db.js";
 import {
-  TokenMacKeyError, adoptOperatorKey, ensureKey, eraSettingKey, macFromLegacy, markConverted, readState,
-  tokenMacKeyPath, tokenMacStatePath,
+  TokenMacKeyError, adoptOperatorKey, ensureKey, eraSettingKey, familyConverted, macFromLegacy, markConverted,
+  readState, tokenMacKeyPath, tokenMacStatePath,
 } from "../servers/shared/token-mac.js";
 import { gatewayListenHost } from "../servers/gateway/listen-host.js";
 import { gatewayListenPort } from "../servers/gateway/listen-port.js";
 import { readLocalInstanceIdOrNull } from "../servers/shared/crow-home.js";
-import { writeSetting } from "../servers/gateway/dashboard/settings/registry.js";
-import { getOrCreateLocalInstanceId } from "../servers/gateway/instance-registry.js";
+import { readSetting, writeSetting } from "../servers/gateway/dashboard/settings/registry.js";
 import { FAMILY_PREDICATE, TOKEN_STORE_FAMILIES, tokenFamilyConverted } from "../servers/gateway/token-store.js";
-import { SETTINGS_TOKEN_FAMILIES } from "../servers/gateway/token-settings.js";
+import {
+  RAW_TOKEN_FILES, ROTATED_AT_BOOT, SETTINGS_TOKEN_FAMILIES, settingsTokenRawFile,
+} from "../servers/gateway/token-settings.js";
 import { PEER_INBOUND_FAMILY } from "../servers/gateway/peer-inbound-token.js";
 import { ROLLBACK_PREFIX } from "../servers/gateway/boot/token-hmac.js";
+import { SETTINGS_ROLLBACK_PREFIX, readTrustedProofFile } from "../servers/gateway/boot/token-hmac-settings.js";
+import { PEER_ROLLBACK_PREFIX } from "../servers/gateway/boot/token-hmac-peers.js";
+import { getInboundBearerSha256 } from "../servers/shared/peer-credentials.js";
 import { REPORT_LINK_FAMILY } from "../servers/gateway/reports/link-token.js";
 import { REPORT_LINK_ROLLBACK_PREFIX } from "../servers/gateway/boot/token-hmac-reports.js";
 
@@ -209,7 +276,7 @@ function moveAside(path, suffix, at = new Date()) {
 /** A pre-conversion stored verifier: the old code's `sha256hex(token)`. */
 const LEGACY_STORED = /^[0-9a-f]{64}$/;
 
-/** The three families a rollback may restore — exactly the ones the boot converter visits. */
+/** The `oauth_tokens` families a rollback restores — exactly the ones the boot converter visits. */
 const RESTORABLE = new Set(TOKEN_STORE_FAMILIES);
 
 /**
@@ -222,6 +289,9 @@ const RESTORABLE = new Set(TOKEN_STORE_FAMILIES);
 const CONVERTED_FAMILIES = Object.freeze([
   ...TOKEN_STORE_FAMILIES, ...SETTINGS_TOKEN_FAMILIES, PEER_INBOUND_FAMILY, REPORT_LINK_FAMILY,
 ]);
+
+/** Every family a rollback visits: the same twenty-one `--reset` re-marks converted. */
+const ROLLBACK_FAMILIES = CONVERTED_FAMILIES;
 
 /**
  * `--reset`'s refusal when this home carries no `<data dir>/instance-id` (step 2b). Fixed text:
@@ -584,10 +654,136 @@ async function reset({ yes, force }) {
 }
 
 /**
+ * The snapshot files a rollback reads, one entry per converter that writes them: its file prefix, the
+ * families a file under that prefix may name, and the shape of its rows.
+ *   - "token": `{…, token: <64 hex>}` (oauth_tokens: `{rowid, token}`; settings: `{store, key, token}`);
+ *   - "id":    `{id, <field>: <64 hex>}` (peers: `token`; report links: `legacy`).
+ * The prefixes do not start with one another, so a file belongs to at most one entry.
+ */
+const SNAPSHOT_KINDS = Object.freeze([
+  { prefix: ROLLBACK_PREFIX, families: new Set(TOKEN_STORE_FAMILIES), shape: "token", field: "token" },
+  { prefix: SETTINGS_ROLLBACK_PREFIX, families: new Set(SETTINGS_TOKEN_FAMILIES), shape: "token", field: "token" },
+  { prefix: PEER_ROLLBACK_PREFIX, families: new Set([PEER_INBOUND_FAMILY]), shape: "id", field: "token" },
+  { prefix: REPORT_LINK_ROLLBACK_PREFIX, families: new Set([REPORT_LINK_FAMILY]), shape: "id", field: "legacy" },
+]);
+
+/** Either hex case: the peer and report-link converters count an uppercase 64-hex as legacy too. */
+const LEGACY_ANY_CASE = /^[0-9a-f]{64}$/i;
+
+/** The `h1.` keyed form every converter writes. */
+const isKeyed = (value) => typeof value === "string" && value.startsWith("h1.");
+
+/** The key a snapshot row is deduplicated and spared by: the bare value, or `<id>\0<value>`. */
+const rowKey = (row) => (typeof row === "string" ? row : `${row.id}\u0000${row.legacy}`);
+
+/**
+ * The ROLLBACK JOURNAL (`secrets/token-hmac-rbjournal-<stamp>.json`, 0600, atomic): what THIS
+ * run's transaction restored, per family — identifiers plus legacy values, which the snapshots beside it
+ * already hold. Its prefix deliberately does not start with a snapshot prefix.
+ * A snapshot entry is genuine only if a rollback RESTORED it (its `h1.` row was present and the CAS
+ * UPDATE ran); a bare row that merely equals a snapshot value is a replant of a credential the operator
+ * had revoked or rotated, and is swept. The journal is what lets an interrupted run's RE-RUN tell the two
+ * apart: it spares exactly the journal's entries. With no journal a re-run sweeps every bare row.
+ */
+const JOURNAL_PREFIX = "token-hmac-rbjournal-";
+const JOURNAL_VERSION = 1;
+
+/** A journal entry's spare key: the bare value (oauth_tokens, settings) or `<id>\0<value>`. */
+const spareKey = (entry) => (typeof entry === "string" ? entry.toLowerCase() : `${entry.id}\u0000${entry.legacy}`);
+
+const emptySpare = () => new Map();
+const spareHas = (ctx, family, key) => ctx.spare.get(family)?.has(key) === true;
+
+/** Record that THIS pass restored `entry` (a legacy string, or `{id, legacy}`) for `family`. */
+function noteRestored(ctx, family, entry) {
+  if (!ctx.restored.has(family)) ctx.restored.set(family, new Map());
+  ctx.restored.get(family).set(spareKey(entry), entry);
+}
+
+/**
+ * Journals left by an earlier, interrupted run under THIS key. A journal that does not parse refuses the
+ * run (exit 3); one written under another key is ignored.
+ *
+ * @returns {{ok: true, names: string[], aside: string[], spare: Map<string, Set<string>>} | {ok: false, reason: string}}
+ *          `names` are the journals this run spares from; `aside` additionally holds journals under another
+ *          key and leftover `.tmp-*` files, which are only moved aside.
+ */
+function readJournals(dir, keyId) {
+  let entries;
+  try {
+    entries = readdirSync(dir);
+  } catch (err) {
+    if (err.code === "ENOENT") return { ok: true, names: [], aside: [], spare: emptySpare() };
+    throw err;
+  }
+  const names = [];
+  const aside = [];
+  const spare = emptySpare();
+  for (const name of entries.slice().sort()) {
+    if (!name.startsWith(JOURNAL_PREFIX)) continue;
+    if (name.includes(".tmp-")) { aside.push(name); continue; }
+    if (!name.endsWith(".json")) continue;
+    let body;
+    try {
+      body = JSON.parse(readFileSync(join(dir, name), "utf8"));
+    } catch (err) {
+      return { ok: false, reason: `secrets/${name} does not parse as a rollback journal (${err.code || err.message}).` };
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body) || !body.families || typeof body.families !== "object") {
+      return { ok: false, reason: `secrets/${name} is not a rollback journal.` };
+    }
+    if (body.v !== JOURNAL_VERSION) {
+      return { ok: false, reason: `secrets/${name} is a rollback journal of an unknown version.` };
+    }
+    if (body.key_id !== keyId) { aside.push(name); continue; }
+    for (const [family, list] of Object.entries(body.families)) {
+      if (!ROLLBACK_FAMILIES.includes(family) || !Array.isArray(list)) {
+        return { ok: false, reason: `secrets/${name} is not a rollback journal.` };
+      }
+      if (!spare.has(family)) spare.set(family, new Set());
+      for (const item of list) {
+        const ok = typeof item === "string"
+          ? LEGACY_ANY_CASE.test(item)
+          : typeof item?.id === "string" && typeof item?.legacy === "string" && LEGACY_ANY_CASE.test(item.legacy);
+        if (!ok) return { ok: false, reason: `secrets/${name} is not a rollback journal.` };
+        spare.get(family).add(spareKey(item));
+      }
+    }
+    names.push(name);
+  }
+  return { ok: true, names, aside, spare };
+}
+
+/** Write the journal atomically and owner-only (temp 0600 + fsync + rename), AFTER the commit. */
+function writeJournal(dir, keyId, restored) {
+  const families = {};
+  let any = false;
+  for (const [family, map] of restored) {
+    if (map.size === 0) continue;
+    families[family] = [...map.values()];
+    any = true;
+  }
+  if (!any) return null;
+  const final = join(dir, `${JOURNAL_PREFIX}${stamp()}.json`);
+  const tmp = `${final}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
+  const fd = openSync(tmp, "wx", 0o600);
+  try {
+    writeSync(fd, `${JSON.stringify({
+      v: JOURNAL_VERSION, key_id: keyId, created_at: new Date().toISOString(), families,
+    }, null, 2)}\n`);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmp, final);
+  return final;
+}
+
+/**
  * Every conversion snapshot in `secrets/`, validated together.
  *
  * A rollback restores only what a snapshot can PROVE, so one file that cannot be read at all — it
- * does not parse, it is not the snapshot shape, or it names a family a rollback does not restore —
+ * does not parse, it is not the snapshot shape, or it names a family its prefix does not belong to —
  * refuses the whole run before anything moves. But a file written under a DIFFERENT key is IGNORED
  * (and reported): its values belong to an era this box no longer holds the key for (a `--reset`, a
  * key rotation), so it can neither be restored nor be allowed to block what the current key can
@@ -595,12 +791,14 @@ async function reset({ yes, force }) {
  * family it names.
  *
  * A file moved aside by an earlier rollback ends in `.rolledback-<stamp>`, not `.json`, so a
- * second rollback never picks one up. A row whose `token` is not a bare sha256 hex cannot be
- * restored and is ignored (the converter only ever writes those).
+ * second rollback never picks one up. A row whose value is not a bare sha256 hex cannot be
+ * restored and is ignored (the converters only ever write those).
  *
- * @returns {{ok: true, names: string[], snapshots: {name: string, family: string, rows: string[]}[],
+ * @returns {{ok: true, names: string[], snapshots: {name: string, family: string, rows: Array<string|{id: string, legacy: string}>}[],
  *            ignored: {name: string, family: string}[]}
  *          | {ok: false, reason: string}} `names` are the USABLE files, the only ones moved aside.
+ *          A row is the lowercase legacy string (oauth_tokens, settings) or `{id, legacy}` (peers,
+ *          report links; `legacy` exactly as the converter stored it).
  */
 function readSnapshots(dir, keyId) {
   let entries;
@@ -614,7 +812,8 @@ function readSnapshots(dir, keyId) {
   const snapshots = [];
   const ignored = [];
   for (const name of entries.slice().sort()) {
-    if (!name.startsWith(ROLLBACK_PREFIX) || !name.endsWith(".json")) continue;
+    const kind = SNAPSHOT_KINDS.find((k) => name.startsWith(k.prefix));
+    if (!kind || !name.endsWith(".json")) continue;
     let body;
     try {
       body = JSON.parse(readFileSync(join(dir, name), "utf8"));
@@ -634,33 +833,37 @@ function readSnapshots(dir, keyId) {
       ignored.push({ name, family: String(body.family ?? "") });
       continue;
     }
-    if (!RESTORABLE.has(body.family)) {
+    if (!kind.families.has(body.family)) {
       return {
         ok: false,
         reason: `secrets/${name} names the family ${JSON.stringify(String(body.family))}, `
           + "which a rollback does not restore.",
       };
     }
+    const rows = [];
+    for (const row of body.rows) {
+      const value = typeof row?.[kind.field] === "string" ? row[kind.field] : "";
+      if (kind.shape === "token") {
+        if (LEGACY_STORED.test(value.toLowerCase())) rows.push(value.toLowerCase());
+      } else if (typeof row?.id === "string" && row.id && LEGACY_ANY_CASE.test(value)) {
+        rows.push({ id: row.id, legacy: value });
+      }
+    }
     names.push(name);
-    snapshots.push({
-      name,
-      family: body.family,
-      rows: body.rows
-        .map((row) => (typeof row?.token === "string" ? row.token.toLowerCase() : ""))
-        .filter((token) => LEGACY_STORED.test(token)),
-    });
+    snapshots.push({ name, family: body.family, rows });
   }
   return { ok: true, names, snapshots, ignored };
 }
 
 /**
  * The rollback snapshots the ERA STATE still promises: the `rollback_file` each converted family
- * records in `secrets/token-hmac-state.json`.
+ * records in `secrets/token-hmac-state.json`, for EVERY keyed family (oauth_tokens, settings, peers,
+ * report links).
  *
- * This is what tells "there is nothing to restore" (a `--reset` box: it re-marks the three
- * families CONVERTED with no rollback file and writes no snapshot, so no row can be brought back)
- * from "a snapshot this box was relying on is MISSING". A corrupt or unreadable state file cannot
- * answer, and a rollback that cannot tell must not proceed.
+ * This is what tells "there is nothing to restore" (a `--reset` box, or an adopted era: they record
+ * no rollback file, so no row can be brought back) from "a snapshot this box was relying on is
+ * MISSING". A corrupt or unreadable state file cannot answer, and a rollback that cannot tell must
+ * not proceed.
  */
 function promisedSnapshots() {
   let st;
@@ -671,7 +874,7 @@ function promisedSnapshots() {
   }
   if (st.corrupt) return { ok: false, reason: `the era state file ${st.path} is corrupt` };
   const families = [];
-  for (const family of TOKEN_STORE_FAMILIES) {
+  for (const family of ROLLBACK_FAMILIES) {
     const entry = st.families?.[family];
     if (!entry || typeof entry !== "object" || !entry.converted_at) continue;
     if (typeof entry.rollback_file === "string" && entry.rollback_file) {
@@ -682,9 +885,9 @@ function promisedSnapshots() {
 }
 
 /**
- * Delete the three `token_hmac_era:<family>` mirror rows — this instance's overrides AND the
- * global rows — through the transaction's own synchronous `run`, so they commit with the restored
- * rows.
+ * Delete every `token_hmac_era:<family>` mirror row (all keyed families) — this instance's overrides
+ * AND the global rows — through the transaction's own synchronous `run`, so they commit with the
+ * restored rows.
  *
  * R5: each store is asked about SEPARATELY. A DB without `dashboard_settings_overrides` (an older
  * store, a unit-test DB) still loses its global era rows, instead of one missing table aborting the
@@ -695,14 +898,10 @@ function promisedSnapshots() {
  * @returns {number} rows deleted
  */
 function deleteEraMirrorRows(run, localId) {
-  const hasTable = (table) => run({
-    sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-    args: [table],
-  }).rows.length > 0;
-  const overrides = hasTable("dashboard_settings_overrides");
-  const globals = hasTable("dashboard_settings");
+  const overrides = txHasTable(run, "dashboard_settings_overrides");
+  const globals = txHasTable(run, "dashboard_settings");
   let deleted = 0;
-  for (const family of TOKEN_STORE_FAMILIES) {
+  for (const family of ROLLBACK_FAMILIES) {
     const setting = eraSettingKey(family);
     if (overrides) {
       const res = run({
@@ -719,18 +918,281 @@ function deleteEraMirrorRows(run, localId) {
   return deleted;
 }
 
+const txHasTable = (run, table) => run({
+  sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", args: [table],
+}).rows.length > 0;
+
+const changesOf = (res) => Number(res?.rowsAffected ?? 0) || 0;
+
+const newCounts = () => ({
+  restored: 0, gone: 0, revoked: 0, removed: 0,
+});
+
 /**
- * `--rollback`: put the converted `oauth_tokens` rows back into the old `sha256hex` form.
+ * `readSetting` for the era mirror, with "this DB has no settings store" answering null (a unit-test
+ * DB). Any other failure is rethrown, so `familyConverted` fails CLOSED on it.
+ */
+async function mirrorReader(db, key) {
+  try {
+    return await readSetting(db, key);
+  } catch (err) {
+    if (/no such table/i.test(String(err?.message || ""))) return null;
+    throw err;
+  }
+}
+
+/**
+ * What the proof file of a FILE-BACKED settings family says, judged exactly as the converter judges
+ * it (`readTrustedProofFile`). `{ok: true, sha}` is `sha256(raw file content)`, the previous
+ * release's stored form; `{ok: false}` is "missing or untrustworthy".
+ */
+function fileVerdict(family) {
+  const path = settingsTokenRawFile(family);
+  if (!path) return null;
+  const read = readTrustedProofFile(path);
+  if (!read.ok) return { ok: false };
+  return { ok: true, sha: createHash("sha256").update(read.token).digest("hex") };
+}
+
+/** What the previous release does for a settings family whose verifier a rollback deleted. */
+function settingsNote(family) {
+  if (RAW_TOKEN_FILES[family]) return "a deleted verifier is re-ensured by the previous release's own boot";
+  if (ROTATED_AT_BOOT.includes(family)) return "a deleted verifier is re-minted at the previous release's next start";
+  return "a deleted verifier means the token is generated again in Settings -> Connect";
+}
+
+/**
+ * The SETTINGS families, inside the rollback transaction (`run` is synchronous).
+ *
+ * @param {{localId: string, converted: Map<string, boolean>, snapshotRows: Map<string, string[]>,
+ *          files: Map<string, {ok: boolean, sha?: string}>}} ctx
+ * @returns {Map<string, ReturnType<typeof newCounts> & {fromFile: number, fileGone: number}>}
+ */
+function restoreSettingsFamilies(run, ctx) {
+  const out = new Map();
+  const overrides = txHasTable(run, "dashboard_settings_overrides");
+  const globals = txHasTable(run, "dashboard_settings");
+  for (const family of SETTINGS_TOKEN_FAMILIES) {
+    const count = { ...newCounts(), fromFile: 0, fileGone: 0 };
+    out.set(family, count);
+    const isConverted = Boolean(ctx.converted.get(family));
+    const legacies = ctx.snapshotRows.get(family) ?? [];
+    const file = RAW_TOKEN_FILES[family] ? ctx.files.get(family) : null;
+    let accounted = 0; // snapshot values found restored or already in place
+
+    if (overrides) {
+      const row = run({
+        sql: "SELECT value AS value FROM dashboard_settings_overrides WHERE key = ? AND instance_id = ?",
+        args: [family, ctx.localId],
+      }).rows[0];
+      const value = row?.value === undefined || row?.value === null ? null : String(row.value);
+      const write = (to) => changesOf(run({
+        sql: "UPDATE dashboard_settings_overrides SET value = ?, updated_at = datetime('now') "
+          + "WHERE key = ? AND instance_id = ? AND value = ?",
+        args: [to, family, ctx.localId, value],
+      }));
+      const drop = () => changesOf(run({
+        sql: "DELETE FROM dashboard_settings_overrides WHERE key = ? AND instance_id = ? AND value = ?",
+        args: [family, ctx.localId, value],
+      }));
+      if (value !== null && isKeyed(value)) {
+        if (file) {
+          // FILE-BACKED: the previous release stores sha256(raw file). The file must PROVE the keyed
+          // value (it is the token's only raw copy); anything else is deleted and re-ensured.
+          if (file.ok && macFromLegacy(family, file.sha) === value) {
+            if (write(file.sha) > 0) {
+              count.restored += 1; count.fromFile += 1; noteRestored(ctx, family, file.sha);
+            }
+          } else if (drop() > 0) {
+            count.revoked += 1;
+            count.fileGone += 1;
+          }
+        } else {
+          const match = legacies.find((legacy) => macFromLegacy(family, legacy) === value);
+          if (match) {
+            if (write(match) > 0) {
+              count.restored += 1; accounted += 1; noteRestored(ctx, family, match);
+            }
+          } else if (drop() > 0) {
+            count.revoked += 1; // minted after the conversion: no snapshot knows its raw token
+          }
+        }
+      } else if (value !== null && LEGACY_ANY_CASE.test(value)) {
+        const lower = value.toLowerCase();
+        if (file) {
+          // Spared ONLY when an earlier run of this rollback restored it (its journal says so): a bare
+          // value that merely equals sha256(file) is a replant of a credential the operator rotated.
+          if (file.ok && lower === file.sha && spareHas(ctx, family, lower)) {
+            count.restored += 1; count.fromFile += 1; // a re-run of a committed rollback
+          } else if (isConverted && drop() > 0) count.removed += 1;
+        } else if (spareHas(ctx, family, lower)) {
+          count.restored += 1; // already in place: THIS rollback's own earlier run put it there
+          accounted += 1;
+        } else if (isConverted && drop() > 0) {
+          count.removed += 1; // written after the conversion: a forgery the alarm refused
+        }
+      }
+    }
+    count.gone = file ? 0 : legacies.length - accounted;
+
+    // A GLOBAL row of a converted family is never read and never legitimate (design OQ-8): whatever
+    // form it holds, the previous release would read a bare value there, so it goes.
+    if (globals && isConverted) {
+      count.removed += changesOf(run({ sql: "DELETE FROM dashboard_settings WHERE key = ?", args: [family] }));
+    }
+  }
+  return out;
+}
+
+/**
+ * The PAIRED-INSTANCE verifiers, inside the rollback transaction.
+ *
+ * @returns {{restoredRecord: number, restoredSnapshot: number, nulled: number, removed: number} | null}
+ *          null when this DB has no `crow_instances`.
+ */
+function restorePeers(run, ctx) {
+  if (!txHasTable(run, "crow_instances")) return null;
+  const result = {
+    restoredRecord: 0, restoredSnapshot: 0, nulled: 0, removed: 0,
+  };
+  const isConverted = Boolean(ctx.converted.get(PEER_INBOUND_FAMILY));
+  const fromSnapshot = new Map();
+  for (const row of ctx.snapshotRows.get(PEER_INBOUND_FAMILY) ?? []) fromSnapshot.set(row.id, row.legacy);
+  const { rows } = run({
+    sql: "SELECT id AS id, auth_token_hash AS stored, status AS status FROM crow_instances WHERE auth_token_hash IS NOT NULL",
+    args: [],
+  });
+  const cas = (id, stored, to) => changesOf(run({
+    sql: "UPDATE crow_instances SET auth_token_hash = ? WHERE id = ? AND auth_token_hash = ?",
+    args: [to, id, stored],
+  }));
+  for (const row of rows) {
+    const id = String(row.id ?? "");
+    const stored = String(row.stored ?? "");
+    const revoked = String(row.status ?? "") === "revoked";
+    const record = getInboundBearerSha256(id);
+    const snap = fromSnapshot.get(id) ?? null;
+    if (isKeyed(stored)) {
+      // The D4 record decides (it also covers a pairing made AFTER the conversion); a snapshot entry
+      // is the fallback ONLY for a peer with no record. Either must reproduce the row's CURRENT keyed
+      // value, so a recorded hash that is not this row's verifier is never restored.
+      let target = null;
+      let via = null;
+      if (record) {
+        if (macFromLegacy(PEER_INBOUND_FAMILY, record) === stored) { target = record; via = "record"; }
+      } else if (snap && macFromLegacy(PEER_INBOUND_FAMILY, snap) === stored) {
+        target = snap;
+        via = "snapshot";
+      }
+      if (target && !revoked && cas(id, stored, target) > 0) {
+        if (via === "record") result.restoredRecord += 1; else result.restoredSnapshot += 1;
+        noteRestored(ctx, PEER_INBOUND_FAMILY, { id, legacy: target });
+      } else if (cas(id, stored, null) > 0) {
+        result.nulled += 1; // that peer re-pairs
+      }
+    } else if (LEGACY_ANY_CASE.test(stored) && isConverted) {
+      // A bare value is genuine only when an earlier run of THIS rollback restored it (its journal
+      // names this peer and this value) and the peer is not revoked. Equal to the record or a snapshot
+      // is not enough: that is exactly what a replant of a rotated or revoked pairing looks like.
+      const genuine = !revoked && spareHas(ctx, PEER_INBOUND_FAMILY, spareKey({ id, legacy: stored }));
+      if (genuine) {
+        if (record && stored.toLowerCase() === record) result.restoredRecord += 1; else result.restoredSnapshot += 1;
+      } else if (cas(id, stored, null) > 0) {
+        result.removed += 1;
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * The REPORT-LINK verifiers, inside the rollback transaction.
+ *
+ * @returns {{restored: number, gone: number, revoked: number, removed: number} | null}
+ *          null when this DB has no `report_link_tokens`.
+ */
+function restoreReportLinks(run, ctx) {
+  if (!txHasTable(run, "report_link_tokens")) return null;
+  const count = newCounts();
+  const isConverted = Boolean(ctx.converted.get(REPORT_LINK_FAMILY));
+  const entries = ctx.snapshotRows.get(REPORT_LINK_FAMILY) ?? [];
+  const nowMs = Date.now();
+  // A tombstone is never a credential (neither 64-hex nor `h1.`); its random suffix means a bot cannot
+  // pre-insert the value an UPDATE will write.
+  const tombstone = (id) => run({
+    sql: "UPDATE report_link_tokens SET revoked_at = COALESCE(revoked_at, ?), token_hash = ? WHERE id = ?",
+    args: [nowMs, `revoked:${id}:${randomBytes(8).toString("hex")}`, id],
+  });
+
+  // 3a. A bare row in a converted family that no earlier run of THIS rollback restored (same id AND
+  //     same value in its journal) is a forgery the alarm refused — or a replant of a link the operator
+  //     deleted or revoked. It is revoked and its value freed (UNIQUE) before the restores.
+  if (isConverted) {
+    const { rows } = run({ sql: "SELECT id AS id, token_hash AS stored FROM report_link_tokens", args: [] });
+    for (const row of rows) {
+      const stored = String(row.stored ?? "");
+      if (!LEGACY_ANY_CASE.test(stored) || spareHas(ctx, REPORT_LINK_FAMILY, spareKey({ id: String(row.id), legacy: stored }))) continue;
+      tombstone(String(row.id));
+      count.removed += 1;
+    }
+  }
+
+  // 3b. The restores: CAS on (id, keyed value).
+  for (const entry of entries) {
+    const h1 = macFromLegacy(REPORT_LINK_FAMILY, entry.legacy);
+    // The same primary-key collision, one row at a time: another row holding this value cannot be
+    // the genuine one (only reachable on a family the era does not call converted).
+    const clash = run({
+      sql: "SELECT id AS id FROM report_link_tokens WHERE token_hash = ? AND id != ?", args: [entry.legacy, entry.id],
+    }).rows[0];
+    if (clash) {
+      tombstone(String(clash.id));
+      count.removed += 1;
+    }
+    const res = run({
+      sql: "UPDATE report_link_tokens SET token_hash = ? WHERE id = ? AND token_hash = ?",
+      args: [entry.legacy, entry.id, h1],
+    });
+    if (changesOf(res) > 0) {
+      count.restored += 1;
+      noteRestored(ctx, REPORT_LINK_FAMILY, entry);
+    } else if (spareHas(ctx, REPORT_LINK_FAMILY, spareKey(entry)) && run({
+      sql: "SELECT 1 AS present FROM report_link_tokens WHERE id = ? AND token_hash = ?",
+      args: [entry.id, entry.legacy],
+    }).rows.length > 0) count.restored += 1; // already in place: this rollback's own earlier run
+    else count.gone += 1; // tombstoned as a twin/copy, or its row is gone
+  }
+
+  // 3c. Whatever still holds an `h1.` value was minted AFTER the conversion: the previous release can
+  //     never match it, and it is stamped revoked (the value stays; `revoked:` tombstones are untouched).
+  //     NOTE (re-upgrade): such a link keeps its OLD-key `h1.` value. That does not make the re-upgrade
+  //     read as "key lost" (an `h1.` value on a key-less box), but ONLY because the oauth_tokens boot
+  //     runs first, creates the new key, and scans oauth_tokens alone; every later boot finds a key.
+  //     If a re-upgrade reports an adopted era or a lost key, `--reset` is the way out.
+  count.revoked += changesOf(run({
+    sql: "UPDATE report_link_tokens SET revoked_at = ? WHERE token_hash LIKE 'h1.%' AND revoked_at IS NULL",
+    args: [nowMs],
+  }));
+  return count;
+}
+
+/** Settings, peer and report-link family names are longer than the oauth_tokens ones. */
+const padFamily = (family) => family.padEnd(32);
+
+/**
+ * `--rollback`: put every converted keyed verifier back into the form the previous release reads.
  *
  * Steps and their rationale are in this file's header. Every check runs BEFORE the first change
- * (the DB transaction is atomic, and the file moves happen only after it committed), so the two
- * refusals — a running gateway (2) and an unusable key or snapshot (3) — leave the box exactly as
- * it was.
+ * (the DB transaction is atomic, and the file moves happen only after it committed), so the
+ * refusals — a running gateway (2), an unusable key or snapshot (3), a home with no instance id (1)
+ * — leave the box exactly as it was.
  *
  * TEST SEAM: `CROW_TEST_ONLY_TOKEN_HMAC_ROLLBACK_INTERRUPT=<point>` (`commit`, `state`, `key`,
  * `snapshots`) reports and exits 7 right after that step, which is how the interruption tests model a
  * crash at each of the header's interruption points. TEST-ONLY: production never sets it.
  */
+class PrecommitInterrupt extends Error {}
+
 async function rollback({ yes, force }) {
   const keyPath = tokenMacKeyPath();
   const statePath = tokenMacStatePath();
@@ -752,11 +1214,14 @@ async function rollback({ yes, force }) {
 
   if (!yes) {
     console.log("This will:");
-    console.log("  - restore the oauth_tokens rows listed in the conversion snapshots to the form the");
-    console.log("    previous release reads (rows that expired or were revoked since stay gone)");
-    console.log("  - delete old-style rows written after the conversion, and revoke every token minted");
-    console.log("    after it (neither one has a pre-conversion form)");
-    console.log("  - delete the three token_hmac_era:* mirror rows, so the next deploy converts again");
+    console.log("  - restore every converted verifier to the form the previous release reads: the oauth_tokens");
+    console.log("    rows and the report links from their conversion snapshots, the static-token verifiers");
+    console.log("    (file-backed ones as sha256 of their token file), and every paired instance's bearer");
+    console.log("    verifier from its recorded hash (rows that expired or were revoked since stay gone)");
+    console.log("  - delete, NULL or revoke old-style values written after the conversion, and every verifier");
+    console.log("    minted after it (neither one has a pre-conversion form); a peer with nothing to restore");
+    console.log("    from has to re-pair");
+    console.log("  - delete every token_hmac_era:* mirror row, so the next deploy converts again");
     console.log("  - move the era state, the token HMAC key and the snapshots aside (never delete them)");
     const ok = await confirm("Continue? [y/N] ");
     if (!ok) {
@@ -786,23 +1251,37 @@ async function rollback({ yes, force }) {
     return 3;
   }
 
+  // 2b'. A journal an interrupted earlier run of THIS rollback left behind: its entries are the only bare
+  //     rows a sweep may spare. Validated before anything changes, like the snapshots.
+  const journals = readJournals(dir, key.id);
+  if (!journals.ok) {
+    console.error(`${journals.reason} Nothing was changed.`);
+    return 3;
+  }
+
   // A usable snapshot's values are the rows that may legitimately hold a bare value after this
-  // run. They are keyed by family: the legacy sweep below spares exactly these, and the restore
-  // plan is one entry per (family, legacy) pair.
+  // run. They are keyed by family: the legacy sweeps below spare exactly these, and the oauth
+  // restore plan is one entry per (family, legacy) pair.
   const usableByFamily = new Map();
+  const snapshotRows = new Map();
   const plan = [];
   for (const snap of scan.snapshots) {
-    if (!usableByFamily.has(snap.family)) usableByFamily.set(snap.family, new Map());
+    if (!usableByFamily.has(snap.family)) {
+      usableByFamily.set(snap.family, new Map());
+      snapshotRows.set(snap.family, []);
+    }
     const values = usableByFamily.get(snap.family);
-    for (const legacy of snap.rows) {
-      if (values.has(legacy)) continue;
-      values.set(legacy, snap.name);
-      plan.push({ family: snap.family, legacy, h1: macFromLegacy(snap.family, legacy) });
+    for (const row of snap.rows) {
+      const k = rowKey(row);
+      if (values.has(k)) continue;
+      values.set(k, snap.name);
+      snapshotRows.get(snap.family).push(row);
+      if (RESTORABLE.has(snap.family)) plan.push({ family: snap.family, legacy: row, h1: macFromLegacy(snap.family, row) });
     }
   }
 
   // 2c. Nothing usable to restore: only a box the era state does not promise a snapshot for may
-  //     proceed (a `--reset` box re-marks the three families converted with NO rollback file, so no
+  //     proceed (a `--reset` box re-marks every family converted with NO rollback file, so no
   //     row can be brought back and the whole point of the run is to retire the era). A snapshot the
   //     state still names and that is neither usable nor merely foreign on disk is GONE — proceeding
   //     there would silently revoke rows this run could never prove, so it stops and says which
@@ -826,24 +1305,24 @@ async function rollback({ yes, force }) {
     return 3;
   }
 
-  // 2d. The instance id the era-mirror override rows are scoped by, read BEFORE the transaction so a
-  //     failure here changes nothing (an unreadable instance-id is not a mirror we may guess at).
-  let localId;
-  try {
-    localId = getOrCreateLocalInstanceId();
-  } catch (err) {
-    console.error(
-      `This instance's id could not be read (${err.message}), so the token_hmac_era:* override rows could not `
-      + "be targeted. Nothing was changed.",
-    );
+  // 2d. The instance id the settings rows and the era-mirror override rows are scoped by, read BEFORE
+  //     the transaction from the file the gateway itself uses (`--reset` does the same): an id this
+  //     process invented would match no row, and the run would report success having restored none.
+  const localId = readLocalInstanceIdOrNull();
+  if (!localId) {
+    console.error(NO_INSTANCE_ID_REFUSAL);
     return 1;
   }
 
-  const counts = new Map(TOKEN_STORE_FAMILIES.map((family) => [
-    family, { restored: 0, gone: 0, revoked: 0, removed: 0 },
-  ]));
+  const counts = new Map(TOKEN_STORE_FAMILIES.map((family) => [family, newCounts()]));
   let mirrored = 0;
-  const db = createDbClient();  try {
+  let settings = new Map();
+  let peers = null;
+  let links = null;
+  let journalPath = null;
+  let realCtx = null;
+  const db = createDbClient();
+  try {
     // Does the ERA say this family is converted? (state file OR the DB mirror, failing closed).
     // Computed outside the transaction because a transaction callback must not await.
     const converted = new Map();
@@ -851,19 +1330,25 @@ async function rollback({ yes, force }) {
       // eslint-disable-next-line no-await-in-loop -- three families, one operator run
       converted.set(family, await tokenFamilyConverted(family, db));
     }
-
-    // 3. ONE transaction, in the order the header documents. The mirror rows go INSIDE it, so the
-    //    commit is the single point of no return: the restored rows and the deletion of the reason
-    //    they would be called forgeries arrive together, or not at all.
-    await db.runTransaction((run) => {
-      const changes = (res) => Number(res?.rowsAffected ?? 0) || 0;
-
+    for (const family of [...SETTINGS_TOKEN_FAMILIES, PEER_INBOUND_FAMILY, REPORT_LINK_FAMILY]) {
+      // eslint-disable-next-line no-await-in-loop -- one operator run
+      converted.set(family, await familyConverted(family, { readSetting: (k) => mirrorReader(db, k) }));
+    }
+    // The raw token files of the file-backed families, judged before anything is written.
+    const files = new Map();
+    for (const family of Object.keys(RAW_TOKEN_FILES)) files.set(family, fileVerdict(family));
+    // The pass body, in the order the header documents. It runs ONCE FOR REAL, and first (on a first run
+    // only) as a DRY pass that is rolled back, to learn exactly which snapshot entries the CAS restores:
+    // those, and only those, go into the journal before the real transaction.
+    const pass = (run, ctx) => {
       // 3a. POST-CONVERSION LEGACY WRITES (R2). A bare (non-`h1.`) row in a CONVERTED family was
       //     written after the conversion, so it is a forgery the alarm refused. It is deleted
       //     FIRST, because a forged row sitting on a snapshot's own value would collide with the
-      //     restore below (the stored value is the primary key). Values a snapshot names are
-      //     SPARED: on a re-run of a rollback that already committed, those rows ARE the restored
-      //     genuine ones, so a sweep that took them would destroy the recovery it is repeating.
+      //     restore below (the stored value is the primary key). A snapshot value is NOT thereby
+      //     genuine: a bare row equal to one is a replant of a credential the operator logged out or
+      //     rotated since the conversion. Only the values a JOURNAL names — restored by an earlier,
+      //     interrupted run of this very rollback — are SPARED, because on that re-run those rows ARE
+      //     the restored genuine ones. With no journal (a first run) nothing is spared.
       //     EVERY converted family is swept — a family with no usable snapshot simply spares
       //     nothing (it has no genuine bare row to protect, and a promised-but-missing snapshot
       //     already refused this run).
@@ -874,7 +1359,7 @@ async function rollback({ yes, force }) {
         // No usable snapshot for this family (a `--reset` box, a snapshot written under another
         // key): it spares nothing, because a converted family's PROMISED snapshot being gone
         // already refused this run above. An empty set is exactly "every bare row is a forgery".
-        const keep = usableByFamily.get(family) ?? new Set();
+        const keep = ctx.spare.get(family) ?? new Set();
         const { rows } = run({
           sql: `SELECT rowid AS rowid, token FROM oauth_tokens WHERE token NOT LIKE 'h1.%' AND (${FAMILY_PREDICATE[family]})`,
           args: [],
@@ -883,7 +1368,7 @@ async function rollback({ yes, force }) {
           const value = String(row?.token ?? "");
           if (keep.has(value)) continue;
           const res = run({ sql: "DELETE FROM oauth_tokens WHERE token = ?", args: [value] });
-          counts.get(family).removed += changes(res);
+          counts.get(family).removed += changesOf(res);
         }
       }
 
@@ -898,18 +1383,20 @@ async function rollback({ yes, force }) {
         // claim is removed and the restore proceeds.
         if (present(item.legacy) && present(item.h1)) {
           const res = run({ sql: "DELETE FROM oauth_tokens WHERE token = ?", args: [item.legacy] });
-          count.removed += changes(res);
+          count.removed += changesOf(res);
         }
         const res = run({
           sql: `UPDATE oauth_tokens SET token = ? WHERE token = ? AND (${FAMILY_PREDICATE[item.family]})`,
           args: [item.legacy, item.h1],
         });
-        if (changes(res) > 0) count.restored += 1;
-        else if (run({
+        if (changesOf(res) > 0) {
+          count.restored += 1;
+          noteRestored(ctx, item.family, item.legacy);
+        } else if (run({
           sql: `SELECT 1 AS present FROM oauth_tokens WHERE token = ? AND (${FAMILY_PREDICATE[item.family]})`,
           args: [item.legacy],
-        }).rows.length > 0) {
-          count.restored += 1; // already in place: this is a re-run of a committed rollback
+        }).rows.length > 0 && ctx.spare.get(item.family)?.has(item.legacy)) {
+          count.restored += 1; // already in place: this rollback's own earlier run put it there
         } else {
           count.gone += 1; // expired, logged out or revoked since the conversion
         }
@@ -923,14 +1410,36 @@ async function rollback({ yes, force }) {
           sql: `DELETE FROM oauth_tokens WHERE token LIKE 'h1.%' AND (${FAMILY_PREDICATE[family]})`,
           args: [],
         });
-        counts.get(family).revoked += changes(res);
+        counts.get(family).revoked += changesOf(res);
       }
+
+      // 3c'. The other three kinds of family, same rules in their own stores (see the header).
+      settings = restoreSettingsFamilies(run, ctx);
+      peers = restorePeers(run, ctx);
+      links = restoreReportLinks(run, ctx);
 
       // 3d. The one-way era mirror, in the SAME transaction (R1) — see the header for why it must
       //     go, and R5 for why a missing settings table skips only itself.
       mirrored = deleteEraMirrorRows(run, localId);
+    };
+    const freshCtx = (spare) => ({
+      localId, converted, snapshotRows, files, spare, restored: new Map(),
+    });
+
+    realCtx = freshCtx(journals.spare);
+    await db.runTransaction((run) => {
+      pass(run, realCtx);
+      // TEST SEAM: a crash BEFORE the commit. Throwing here rolls the transaction back; no journal exists.
+      if (interruptAfter === "precommit") throw new PrecommitInterrupt();
     });
   } catch (err) {
+    if (err instanceof PrecommitInterrupt) {
+      console.error(
+        "token-hmac: interrupted before the commit (CROW_TEST_ONLY_TOKEN_HMAC_ROLLBACK_INTERRUPT). Nothing was "
+        + "changed and no journal was written.",
+      );
+      return 7;
+    }
     console.error(`The rollback transaction failed (${err.message}); nothing was changed.`);
     return 1;
   } finally {
@@ -947,6 +1456,16 @@ async function rollback({ yes, force }) {
     );
     return 7;
   };
+  // The journal is written only now, after the commit and before the first move-aside. A death between
+  // the commit and this write leaves no journal, so the re-run sweeps (people sign in again, peers
+  // re-pair): that fails closed. A re-run with a journal keeps it; it describes the first run.
+  if (journals.names.length === 0) {
+    try {
+      journalPath = writeJournal(dir, key.id, realCtx.restored);
+    } catch (err) {
+      console.error(`token-hmac: the rollback journal could not be written (${err.code || err.message}); a re-run would sweep.`);
+    }
+  }
   if (interruptAfter === "commit") return interrupted("commit");
   const at = new Date();
   const moved = [];
@@ -954,6 +1473,9 @@ async function rollback({ yes, force }) {
     { step: "state", path: statePath },
     { step: "key", path: keyPath },
     ...scan.names.map((name) => ({ step: "snapshots", path: join(dir, name) })),
+    // The journal goes last: until the snapshots have moved, a re-run may still need it.
+    ...[...journals.names, ...journals.aside, ...(journalPath ? [basename(journalPath)] : [])]
+      .map((name) => ({ step: "snapshots", path: join(dir, name) })),
   ];
   for (const { step, path } of steps) {
     const aside = moveAside(path, "rolledback", at);
@@ -972,6 +1494,31 @@ async function rollback({ yes, force }) {
       + `${count.removed} removed (written after conversion, never valid)`,
     );
   }
+  for (const family of SETTINGS_TOKEN_FAMILIES) {
+    const count = settings.get(family);
+    if (!count) continue;
+    const fileBacked = RAW_TOKEN_FILES[family];
+    const detail = fileBacked
+      ? `${count.fromFile} restored as sha256 of the token file, ${count.fileGone} deleted (token file missing, `
+        + "untrusted or not matching), "
+      : `${count.restored} restored, ${count.gone} gone, ${count.revoked} deleted (minted after conversion), `;
+    console.log(`  ${padFamily(family)} ${detail}${count.removed} removed (written after conversion, never valid)`
+      + `${count.revoked || count.fileGone ? `; ${settingsNote(family)}` : ""}`);
+  }
+  if (peers) {
+    console.log(
+      `  ${padFamily(PEER_INBOUND_FAMILY)} ${peers.restoredRecord} restored from the recorded bearer hash, `
+      + `${peers.restoredSnapshot} restored from the snapshot (no record), ${peers.nulled} set to NULL `
+      + `(no matching record: that peer re-pairs), ${peers.removed} removed (written after conversion, never valid)`,
+    );
+  }
+  if (links) {
+    console.log(
+      `  ${padFamily(REPORT_LINK_FAMILY)} ${links.restored} restored, ${links.gone} gone, `
+      + `${links.revoked} revoked (minted after conversion), `
+      + `${links.removed} removed (written after conversion, never valid)`,
+    );
+  }
   if (scan.snapshots.length === 0) {
     console.log("  conversion:        no usable snapshot, so no row was restored; every keyed row was revoked");
   }
@@ -981,18 +1528,16 @@ async function rollback({ yes, force }) {
       + "different token-hmac key, so its rows cannot be computed back)",
     );
   }
-  try {
-    const reportSnaps = readdirSync(dir).filter((n) => n.startsWith(REPORT_LINK_ROLLBACK_PREFIX) && n.endsWith(".json")).length;
-    if (reportSnaps) {
-      console.log(
-        `  ${REPORT_LINK_FAMILY.padEnd(18)} ${reportSnaps} snapshot file(s) left in place: not restored by this tool yet`,
-      );
-    }
-  } catch { /* an unreadable secrets/ was already reported above */ }
   console.log(`  era mirror:        ${mirrored} marker row(s) deleted, so the next deploy converts again`);
   console.log(`  moved aside:       ${moved.length ? "" : "nothing (already absent)"}`);
   for (const path of moved) console.log(`    ${path}`);
   console.log("");
+  console.log("  bot defs:          NOT rolled back (not a token family). Their MACs are keyed under the key just moved");
+  console.log("                     aside, so after the next deploy mints a new key every bot definition is refused until");
+  console.log("                     re-approved: node scripts/cli/bot-def-reapprove.mjs <bot_id> --show, then");
+  console.log("                     node scripts/cli/bot-def-reapprove.mjs <bot_id> --approve <digest>");
+  console.log("");
+  console.log("If the re-upgrade reports an adopted era or a lost key, run `node scripts/token-hmac.mjs --reset`.");
   console.log("The rows are in the form the previous release reads. Start that release again; the next");
   console.log("deploy converts them once more, under a fresh key.");
   console.log("Until it does, that release reads a bare sha256 by value, so the forged-row issue is back");
@@ -1008,11 +1553,11 @@ async function main(argv) {
     console.error("  --reset   move the token HMAC key aside, revoke every OAuth grant and dashboard");
     console.error("            session, re-mark the three families converted and create a new key (operator");
     console.error("            shell; run it with the gateway stopped)");
-    console.error("  --rollback  undo the oauth_tokens conversion: restore the rows listed in the");
-    console.error("            conversion snapshots to their pre-conversion form, delete the old-style rows");
-    console.error("            written after it and revoke the tokens minted after it, then move the era state,");
-    console.error("            the key and the snapshots aside and delete the era mirror (operator shell; run it");
-    console.error("            with the gateway stopped)");
+    console.error("  --rollback  undo every keyed-verifier conversion: restore the oauth_tokens rows, the static-token");
+    console.error("            verifiers, the paired-instance bearer verifiers and the report links to their");
+    console.error("            pre-conversion form, delete/NULL/revoke what was written or minted after it, then");
+    console.error("            move the era state, the key and the snapshots aside and delete the era mirror");
+    console.error("            (operator shell; run it with the gateway stopped)");
     console.error("  --yes     do not ask for confirmation");
     console.error("  --force-while-running  skip the /health probe (it says a gateway is running)");
     return 2;
