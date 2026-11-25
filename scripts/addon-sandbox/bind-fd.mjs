@@ -57,10 +57,12 @@ function describeOpenFailure(full, err) {
  *   `home`    the owner's home: every component at or inside it must be `uid`'s
  *   `refuse`  `(realPath) => reason | null`, the caller's refuse list
  *   `expect`  `"any"` (default), `"dir"` or `"file"`
+ *   `anyOwner` skip the per-component owner check (the contained bot plan, whose paths are
+ *             already judged by the plan; the symlink/path walk still applies)
  * @returns {{fd: number, realPath: string, isDir: boolean}}
  * @throws {ContainRefused}
  */
-export function openCheckedBindSource(path, { uid = process.getuid(), home = null, refuse = () => null, expect = "any" } = {}) {
+export function openCheckedBindSource(path, { uid = process.getuid(), home = null, refuse = () => null, expect = "any", anyOwner = false } = {}) {
   if (typeof path !== "string" || !path) throw new ContainRefused("refused: no bind source was named");
   if (expect !== "any" && expect !== "dir" && expect !== "file") throw new ContainRefused("refused: unknown expectation " + String(expect));
   const target = resolve(path);
@@ -106,7 +108,7 @@ export function openCheckedBindSource(path, { uid = process.getuid(), home = nul
       if (st.isSymbolicLink()) fail("refused: a symlink in the path (" + full + ")");
 
       const insideHome = !!homePath && (full === homePath || under(full, homePath));
-      if (insideHome ? st.uid !== uid : st.uid !== 0 && st.uid !== uid) {
+      if (!anyOwner && (insideHome ? st.uid !== uid : st.uid !== 0 && st.uid !== uid)) {
         fail("refused: " + full + " is owned by another user");
       }
 

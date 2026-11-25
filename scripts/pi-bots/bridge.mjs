@@ -48,7 +48,7 @@ import { resolveModel, escalateRequested, stripEscalateToken } from "./model_res
 import { getTrackerContext, kanbanText, cardStatus, resolveTrackerType, boardVocab, cardText } from "./tracker.mjs";
 import { cardBriefBlock } from "./card-brief.mjs";
 import { resolveNodeBin, requirePiCli } from "./pi_resolver.mjs";
-import { wrapPiSpawn, piSandboxMode, probePiSandbox } from "./pi_sandbox.mjs";
+import { wrapPiSpawn, piSandboxMode, probePiSandbox, openBindFds } from "./pi_sandbox.mjs";
 import { gitPreSpawn, gitPostLaunch, countEnabledPiBots } from "./bot_git_spawn.mjs";
 import { BOT_GIT_DIRNAME, checkKeyDir, gitAllowedForInstance, isSafeKeyPath, isValidGitBotId } from "../../servers/shared/bot-git/paths.js";
 import { botGitMeta, writeSpawnFiles } from "../../servers/shared/bot-git/store.js";
@@ -1486,6 +1486,7 @@ export class PiRpc {
     // set. In every case the fd is closed in the parent once bwrap has it (and
     // on every failure path, through _runContainCleanup).
     let seccompFdHost = null;
+    let bindFds = null;
     const gitFdBound = gitFd != null && launch.wrapper === "bwrap" && launch.pidNamespace === true
       && Array.isArray(launch.exposed) && launch.exposed.includes(gitDir);
     if (gitFdBound) {
@@ -1501,11 +1502,19 @@ export class PiRpc {
         while (stdio.length < SECCOMP_FD) stdio.push("ignore");
         stdio[SECCOMP_FD] = seccompFdHost;
       }
-      this.proc = spawn(launch.cmd, launch.args, { cwd: spawnCwd, env: launch.env, stdio, detached: true });
+      // Contain tier: every bind source is mounted from an fd opened and verified right here
+      // (a swap since the plan refuses the spawn); a no-op for every other tier.
+      bindFds = openBindFds(launch);
+      for (const b of bindFds.fds) {
+        while (stdio.length < b.childFd) stdio.push("ignore");
+        stdio[b.childFd] = b.fd;
+      }
+      this.proc = spawn(launch.cmd, bindFds.args, { cwd: spawnCwd, env: launch.env, stdio, detached: true });
     } catch (e) {
       this._runContainCleanup();
       throw e;
     } finally {
+      if (bindFds) bindFds.close();
       if (seccompFdHost != null) { try { closeSync(seccompFdHost); } catch {} }
       closeGitFd();
     }

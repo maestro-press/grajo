@@ -504,7 +504,10 @@ export function makeBindPolicy({ home, crowHome, crowHomeReal, dataDir, appRoot,
  */
 export function rootArgs({ systemDirs, exists = existsSync, home } = {}) {
   const args = ["--tmpfs", "/"];
-  for (const d of systemDirs || ["/usr", "/etc", "/opt"]) if (exists(d)) args.push("--ro-bind", d, d);
+  // A bind SOURCE is always the canonical path (the spawner opens it as an fd and verifies it
+  // resolves to exactly that path); the destination keeps its own spelling.
+  const canon = (p) => real(p, exists, home) || p;
+  for (const d of systemDirs || ["/usr", "/etc", "/opt"]) if (exists(d)) args.push("--ro-bind", canon(d), d);
   for (const [link, target] of [["/bin", "usr/bin"], ["/sbin", "usr/sbin"], ["/lib", "usr/lib"], ["/lib64", "usr/lib64"], ["/lib32", "usr/lib32"]]) {
     let isLink = false;
     try { isLink = lstatSync(link).isSymbolicLink(); } catch {}
@@ -515,7 +518,7 @@ export function rootArgs({ systemDirs, exists = existsSync, home } = {}) {
   // required: without it a same-uid process could signal every host process of
   // that uid; kill(2) checks the uid, not the namespace).
   args.push("--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/run");
-  if (exists("/run/systemd/resolve")) args.push("--ro-bind", "/run/systemd/resolve", "/run/systemd/resolve");
+  if (exists("/run/systemd/resolve")) args.push("--ro-bind", canon("/run/systemd/resolve"), "/run/systemd/resolve");
   if (exists("/etc/crow")) args.push("--tmpfs", "/etc/crow");
   if (home) args.push("--tmpfs", home);
   return args;
@@ -1399,12 +1402,14 @@ export function buildContainPlan(o) {
   // pi agent shadow goes in path order too
   const agentEntries = [...commandEntries];
   // Network tier (2c): the relay's socket dir, read-only, at a fixed path.
-  if (o.net && o.net.relayDir) agentEntries.push(["--ro-bind", o.net.relayDir, NET_RELAY_MOUNT]);
+  if (o.net && o.net.relayDir) agentEntries.push(["--ro-bind", real(o.net.relayDir, exists) || o.net.relayDir, NET_RELAY_MOUNT]);
   if (o.piAgentDir && o.shadowAgentDir) {
-    agentEntries.push(["--bind", o.shadowAgentDir, o.piAgentDir]);
+    agentEntries.push(["--bind", real(o.shadowAgentDir, exists) || o.shadowAgentDir, o.piAgentDir]);
     for (const d of AGENT_RO_SUBDIRS) {
       const p = join(o.piAgentDir, d);
-      if (exists(p)) agentEntries.push(["--ro-bind", p, p]);
+      // SOURCE canonical (a symlinked home or subdir still resolves to what the fd check verifies);
+      // the destination keeps the spelling pi looks for.
+      if (exists(p)) agentEntries.push(["--ro-bind", real(p, exists) || p, p]);
     }
   }
   // One list in destination order: a dir's bind, then masks inside it, then
@@ -1451,7 +1456,57 @@ export function buildContainPlan(o) {
     if ([...rw.keys()].some((d) => under(lexical, d) || under(realish, d))) continue;
     droppedWrites.push(p);
   }
-  return { args, env, refused, net, mountPoints, droppedWrites };
+  return { args, env, refused, net, mountPoints, droppedWrites, judged: judgeBindSources(args) };
+}
+
+/**
+ * What the plan judged about each bind SOURCE at the end of planning: its type by lstat
+ * (never following a link). The spawner (pi_sandbox.mjs openBindFds) mounts every source from
+ * an fd it opens and verifies, and refuses the spawn when the path no longer is what was judged
+ * here. /dev/null masks are not sources. Plan args stay path-based; this is a side table.
+ * @returns {Object<string, "dir"|"file"|"link"|"other"|"missing">}
+ */
+export function judgeBindSources(args) {
+  const out = Object.create(null);
+  for (const i of bindOpIndexes(args)) {
+    const src = args[i + 1];
+    let kind = "missing";
+    try {
+      const st = lstatSync(src);
+      kind = st.isSymbolicLink() ? "link" : st.isDirectory() ? "dir" : st.isFile() ? "file" : "other";
+    } catch { /* missing */ }
+    out[src] = kind;
+  }
+  return out;
+}
+
+/** How many arguments each bwrap option takes (0.9). An unlisted option takes none. */
+const BWRAP_ARITY = Object.freeze({
+  "--setenv": 2, "--symlink": 2, "--bind": 2, "--bind-try": 2, "--ro-bind": 2, "--ro-bind-try": 2,
+  "--dev-bind": 2, "--dev-bind-try": 2, "--bind-fd": 2, "--ro-bind-fd": 2, "--file": 2, "--bind-data": 2,
+  "--ro-bind-data": 2, "--chmod": 2, "--overlay": 3,
+  "--chdir": 1, "--tmpfs": 1, "--dev": 1, "--proc": 1, "--mqueue": 1, "--dir": 1, "--remount-ro": 1,
+  "--seccomp": 1, "--add-seccomp-fd": 1, "--info-fd": 1, "--json-status-fd": 1, "--block-fd": 1,
+  "--userns-block-fd": 1, "--sync-fd": 1, "--userns": 1, "--userns2": 1, "--pidns": 1, "--uid": 1,
+  "--gid": 1, "--hostname": 1, "--unsetenv": 1, "--lock-file": 1, "--cap-add": 1, "--cap-drop": 1,
+  "--exec-label": 1, "--file-label": 1, "--args": 1, "--perms": 1, "--size": 1, "--overlay-src": 1,
+  "--tmp-overlay": 1, "--ro-overlay": 1,
+});
+
+/**
+ * Indexes of the real bind SOURCE operations in a bwrap argv: `--bind`/`--ro-bind` whose source
+ * is not /dev/null, parsing option by option (an option's arguments are skipped, so
+ * `--setenv X --bind` never reads a value as a flag) and stopping at the first `--`.
+ */
+export function bindOpIndexes(args) {
+  const out = [];
+  for (let i = 0; i < args.length;) {
+    const a = args[i];
+    if (a === "--") break;
+    if ((a === "--bind" || a === "--ro-bind") && args[i + 1] !== "/dev/null") out.push(i);
+    i += 1 + (BWRAP_ARITY[a] || 0);
+  }
+  return out;
 }
 
 /**

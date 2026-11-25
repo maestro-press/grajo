@@ -123,10 +123,11 @@
  * to spawn pi without bwrap), "off" (never wrap).
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, fstatSync, lstatSync, mkdirSync, realpathSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, lstatSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { containSelected, buildContainPlan, ContainRefused, ensureContainMountPoints, ensureContainOwnWorldRoot } from "./pi_contain.mjs";
+import { openCheckedBindSource } from "../addon-sandbox/bind-fd.mjs";
+import { bindOpIndexes, containSelected, buildContainPlan, ContainRefused, ensureContainMountPoints, ensureContainOwnWorldRoot } from "./pi_contain.mjs";
 import { buildSeccompProgram, seccompSupported } from "./pi_seccomp.mjs";
 import { ENTRY_MARK } from "./pi_netns_entry.mjs";
 import { fileURLToPath } from "node:url";
@@ -333,6 +334,82 @@ export function piSandboxStatus() {
   return (p.setpriv ? "nnp-only: " : "fallback: ") + p.reason;
 }
 
+/** First fd number the bind-source fds go on in a contained spawn (3 info, 4 MCP config,
+ *  5 secret values, 6 seccomp, 7 git key dir; 8 and 9 stay free). */
+export const BIND_FD_BASE = 10;
+
+const bindFdSupport = new Map(); // bwrap path -> bool (probed once per process)
+/** Does this bubblewrap take `--bind-fd`/`--ro-bind-fd`? `help` is a test seam. */
+export function bwrapHasBindFd(bwrap, help) {
+  if (typeof help === "string") return /(^|\s)--bind-fd\b/.test(help) && /--ro-bind-fd\b/.test(help);
+  if (!bindFdSupport.has(bwrap)) {
+    const h = runBwrapHelp(bwrap);
+    bindFdSupport.set(bwrap, /(^|\s)--bind-fd\b/.test(h) && /--ro-bind-fd\b/.test(h));
+  }
+  return bindFdSupport.get(bwrap);
+}
+
+/**
+ * Mount every bind SOURCE of a contained spawn from a file descriptor opened and verified HERE,
+ * just before exec, instead of by path.
+ *
+ * The plan judged each path (realpath, masks), but bwrap would mount it by path string and
+ * follow symlinks: a bot with a writable parent folder (its own session dir inside the project
+ * workspace) can rename that folder between the plan and the mount so the path becomes a
+ * symlink to crow.db or an identity file, and bwrap then binds the REAL file writable over its
+ * /dev/null mask. So each source is opened by the add-on wall's component-by-component
+ * O_PATH|O_NOFOLLOW walk (addon-sandbox/bind-fd.mjs openCheckedBindSource, with its per-component
+ * owner check off: the plan already judged these paths, and the bot plan binds system dirs and
+ * service-owned trees), which also requires /proc/self/fd to read back as EXACTLY the source
+ * path. On top: the leaf type must match the plan's `judged` type and be a dir or a regular file.
+ * Anything else, or a bwrap without --bind-fd, refuses the spawn (ContainRefused); no path is
+ * in the message.
+ *
+ * DEST (NOT fully covered, known follow-up H1, no fix claimed here): sources are pinned, but a
+ * destination is still resolved by bwrap by name inside the new root. A mask nested below a
+ * non-mount-point parent inside a bot-writable bind (a masked <data>/projects/<other>, a nested
+ * .env from scanEnvMasks) can be sidestepped: the bot renames the parent (`mv projects p2`,
+ * allowed because the dir holds no mount point) and plants a decoy, and a later spawn's nested
+ * mask lands on the decoy while the real content sits at the new name.
+ *
+ * @param {{args: string[], tier?: string, judged?: object}} launch  a wrapPiSpawn result
+ * @param {{firstFd?: number, bwrapHelp?: string, bwrap?: string}} [o]
+ * @returns {{args: string[], fds: {fd: number, childFd: number}[], close: () => void}}
+ *   the caller puts `fd` at stdio[childFd] and calls close() after spawn (or on failure).
+ */
+export function openBindFds(launch, { firstFd = BIND_FD_BASE, bwrapHelp, bwrap } = {}) {
+  const none = { args: launch.args, fds: [], close() {} };
+  if (!launch || launch.wrapper !== "bwrap" || !String(launch.tier || "").startsWith("contain")) return none;
+  const refuse = (kind) => {
+    const msg = "spawn refused: a bind changed between the check and the mount (" + kind + ")";
+    console.error("[contain] " + msg);
+    throw new ContainRefused("contain refused: " + msg);
+  };
+  if (!bwrapHasBindFd(bwrap || launch.cmd, bwrapHelp)) refuse("this bubblewrap has no --bind-fd");
+  const judged = launch.judged || {};
+  const fds = [];
+  const close = () => { for (const f of fds.splice(0)) { try { closeSync(f.fd); } catch { /* already closed */ } } };
+  const out = [...launch.args];
+  try {
+    for (const i of bindOpIndexes(launch.args)) {
+      const src = launch.args[i + 1];
+      const want = judged[src];
+      if (want === "link" || want === "other" || want === "missing") refuse("type");
+      let opened;
+      try { opened = openCheckedBindSource(src, { expect: want === "dir" || want === "file" ? want : "any", anyOwner: true }); }
+      catch { refuse("path"); }
+      const rec = { fd: opened.fd, childFd: firstFd + fds.length };
+      fds.push(rec);
+      let st;
+      try { st = fstatSync(opened.fd); } catch { refuse("open"); }
+      if (!st.isDirectory() && !st.isFile()) refuse("type");
+      out[i] = launch.args[i] + "-fd";
+      out[i + 1] = String(rec.childFd);
+    }
+  } catch (e) { close(); throw e; }
+  return { args: out, fds: [...fds], close };
+}
+
 /**
  * The `exposeInHidden` entries this spawn may really bind back: a dir INSIDE a
  * dir it hides, handed over as an already-open fd (`O_DIRECTORY|O_NOFOLLOW`) so
@@ -509,7 +586,7 @@ export function wrapPiSpawn(cmd, args, opts = {}) {
       masked, exposed: [], unreachable, refused: plan.refused, seccomp, net: plan.net, mountPoints,
       // Configured writable paths that did not exist and that no writable bind covers; the
       // containment status names them (the spawner's `[containment]` line).
-      droppedWrites: plan.droppedWrites, ownWorldRoot };
+      droppedWrites: plan.droppedWrites, ownWorldRoot, judged: plan.judged };
   }
   if (!probe.ok) {
     if (mode === "required" || mode === "contain") {
