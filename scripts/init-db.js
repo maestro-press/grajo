@@ -1992,6 +1992,10 @@ await addColumnIfMissing("crow_instances", "lamport_ts", "INTEGER DEFAULT 0");
 // sibling table. readSetting/writeSetting in registry.js merge the two.
 
 await addColumnIfMissing("dashboard_settings", "lamport_ts", "INTEGER DEFAULT 0");
+// M6: which instance wrote the current lamport_ts, so an equal-Lamport tie breaks
+// the same way on every Crow (sync-stamp.js incomingLosesLww). Additive, no
+// SCHEMA_GENERATION bump; existing rows keep NULL (loses a tie to any stamped write).
+await addColumnIfMissing("dashboard_settings", "lamport_origin", "TEXT");
 
 await initTable("dashboard_settings_overrides table", `
   CREATE TABLE IF NOT EXISTS dashboard_settings_overrides (

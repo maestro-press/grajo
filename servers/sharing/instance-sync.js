@@ -56,7 +56,7 @@ import { validateAvatar, avatarFieldValue } from "./avatar.js";
 import bus from "../shared/event-bus.js";
 import { TRUSTED_PEER_SQL } from "../shared/peer-trust.js";
 import { SYNC_PB_KEY_PREFIX, SYNC_PB_CLEARED_PREFIX } from "../shared/self-dial-address.js";
-import { mintLamport, advanceCounter, stampSql, ensureLamportOriginColumn, incomingLosesLww } from "../shared/sync-stamp.js";
+import { mintLamport, advanceCounter, stampSql, ensureLamportOriginColumn, incomingLosesLww, settingsOriginReady, normalizeLamportOrigin, NO_ORIGIN_COLUMN } from "../shared/sync-stamp.js";
 import { deleteContactArtifactComments } from "../shared/artifact-comment-delete.js";
 import { noticeProviderKeyNeeded } from "../shared/provider-key-need.js";
 import { hasProviderKey } from "../shared/provider-key-shape.js";
@@ -2136,8 +2136,10 @@ export class InstanceSyncManager {
     // in dashboard_settings_overrides (never synced). No instance_id column.
     let rows;
     try {
+      // lamport_origin rides along so the re-emit keeps the ORIGINAL writer.
+      const hasOrigin = await settingsOriginReady(this.db);
       const r = await this.db.execute({
-        sql: "SELECT key, value, lamport_ts FROM dashboard_settings",
+        sql: `SELECT key, value, lamport_ts${hasOrigin ? ", lamport_origin" : ""} FROM dashboard_settings`,
       });
       rows = r.rows || [];
     } catch (err) {
@@ -2161,6 +2163,7 @@ export class InstanceSyncManager {
           key: row.key,
           value: row.value,
           instance_id: null,
+          lamport_origin: normalizeLamportOrigin(row.lamport_origin),
         }, { lamportTs: Number(row.lamport_ts) || 0 });
         emitted++;
       } catch (err) {
@@ -3057,6 +3060,24 @@ export class InstanceSyncManager {
     const transform = OUTBOUND_TRANSFORMS[table];
     if (transform) cleanRow = transform(cleanRow);
 
+    // M6: a synced setting names the instance that WROTE its Lamport inside the
+    // row, so an equal-Lamport tie breaks the same on every Crow. A live write
+    // is this Crow's — but ONLY when the local stamp below can write it too
+    // (column ready), so wire and local never disagree; a preserve-mode re-emit
+    // keeps the ORIGINAL writer the caller read from the row (NULL for a
+    // pre-origin row — never re-attributed to the re-emitter). An old peer
+    // ignores the extra field.
+    let settingsOriginOk = false;
+    if (table === "dashboard_settings") {
+      if (preservedTs === null) {
+        settingsOriginOk = await settingsOriginReady(this.db);
+        if (settingsOriginOk) cleanRow.lamport_origin = this.localInstanceId;
+        else delete cleanRow.lamport_origin;
+      } else {
+        cleanRow.lamport_origin = normalizeLamportOrigin(row?.lamport_origin);
+      }
+    }
+
     const entry = {
       table,
       op,
@@ -3084,8 +3105,11 @@ export class InstanceSyncManager {
         // Only when the column is really there: if the guarded ALTER failed
         // (BUSY, read-only), stamp the pre-origin shape rather than lose the
         // Lamport stamp altogether (review N-2).
-        const hasOrigin = await ensureLamportOriginColumn(this.db, table);
-        const stmt = stampSql(table, row, lamportTs, hasOrigin ? this.localInstanceId : undefined);
+        const isSettings = table === "dashboard_settings";
+        const hasOrigin = isSettings ? settingsOriginOk : await ensureLamportOriginColumn(this.db, table);
+        // dashboard_settings: with no origin the stamp clears lamport_origin (never
+        // a stale foreign one); NO_ORIGIN_COLUMN only when the column is truly absent.
+        const stmt = stampSql(table, row, lamportTs, hasOrigin ? this.localInstanceId : (isSettings ? NO_ORIGIN_COLUMN : undefined));
         if (stmt) await this.db.execute(stmt);
       } catch {
         // Non-fatal — row may not have lamport_ts column yet
@@ -3730,16 +3754,24 @@ export class InstanceSyncManager {
   async _applyDashboardSetting(op, row, lamportTs) {
     if (!row || !row.key) return;
 
+    // Which instance wrote the incoming Lamport: carried IN the row (a preserve-
+    // mode re-emit keeps the original writer). An old peer sends none -> NULL.
+    const origin = normalizeLamportOrigin(row.lamport_origin);
+    const hasOrigin = await settingsOriginReady(this.db);
+
     const { rows: existing } = await this.db.execute({
-      sql: `SELECT value, lamport_ts FROM dashboard_settings WHERE key = ?`,
+      sql: `SELECT value, lamport_ts${hasOrigin ? ", lamport_origin" : ""} FROM dashboard_settings WHERE key = ?`,
       args: [row.key],
     });
     const localTs = existing[0]?.lamport_ts || 0;
-    if (lamportTs < localTs) return;
-    if (lamportTs === localTs && existing[0]?.value === row.value) return;
-    // Tie + different value falls through: incoming wins silently (no conflict
-    // row — operator-only settings rarely diverge; asymmetric with _checkConflict
-    // by design, pre-existing behavior).
+    const localOrigin = hasOrigin ? normalizeLamportOrigin(existing[0]?.lamport_origin) : null;
+    // Strictly older loses; strictly newer wins; an equal Lamport goes to the
+    // greater origin id (NULL loses to non-null; two NULLs / the same origin
+    // keep apply-on-tie). Every Crow judges the same pair, so a tie converges
+    // instead of each side taking the other's write (M6).
+    if (incomingLosesLww(lamportTs, localTs, origin, localOrigin)) return;
+    // Same Lamport, same bytes, same writer: nothing would change.
+    if (lamportTs === localTs && existing[0]?.value === row.value && origin === localOrigin) return;
 
     if (op === "delete") {
       await this.db.execute({
@@ -3749,6 +3781,17 @@ export class InstanceSyncManager {
       return;
     }
 
+    if (hasOrigin) {
+      await this.db.execute({
+        sql: `INSERT INTO dashboard_settings (key, value, updated_at, lamport_ts, lamport_origin)
+              VALUES (?, ?, datetime('now'), ?, ?)
+              ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value, updated_at = datetime('now'), lamport_ts = excluded.lamport_ts,
+                lamport_origin = excluded.lamport_origin`,
+        args: [row.key, row.value ?? "", lamportTs, origin],
+      });
+      return;
+    }
     await this.db.execute({
       sql: `INSERT INTO dashboard_settings (key, value, updated_at, lamport_ts)
             VALUES (?, ?, datetime('now'), ?)

@@ -153,6 +153,36 @@ export const RAMBLE_LWW_TABLES = Object.freeze([
   "ramble_marks", "ramble_settings", "ramble_blocks", "ramble_eggs", "ramble_pet", "ramble_trades",
 ]);
 
+/**
+ * Every table that carries `lamport_origin`: the LWW Ramble tables plus the
+ * synced global `dashboard_settings` (M6 — equal-Lamport tie-break, same rule).
+ * Kept apart from RAMBLE_LWW_TABLES so Ramble-only callers are unchanged.
+ */
+export const LAMPORT_ORIGIN_TABLES = Object.freeze([...RAMBLE_LWW_TABLES, "dashboard_settings"]);
+
+/**
+ * A stored or incoming `lamport_origin` is an instance id: real ones are 32 hex
+ * characters, but a local id may be any short token (`local-cli-mcp`, a uuid in
+ * a test). Anything else — not a string, empty, over 64 chars, odd characters —
+ * is treated as NULL, so a hostile or corrupt value can neither win a tie by
+ * length nor bloat a signed entry.
+ */
+const ORIGIN_SHAPE = /^[A-Za-z0-9._:-]{1,64}$/;
+export function normalizeLamportOrigin(value) {
+  return typeof value === "string" && ORIGIN_SHAPE.test(value) ? value : null;
+}
+
+/**
+ * Pass as `stampSql`'s origin to get the pre-origin `dashboard_settings` shape
+ * (no `lamport_origin` in the statement) — for a table that truly lacks the
+ * column, or a preserve-mode re-stamp that must leave the stored origin alone.
+ */
+export const NO_ORIGIN_COLUMN = Symbol("no-lamport-origin-column");
+
+let _failEnsureForTest = 0;
+/** Test seam: make the next `n` ensureLamportOriginColumn calls report false. */
+export function _failOriginEnsureForTest(n) { _failEnsureForTest = n; }
+
 const _originColumnReady = new WeakMap(); // db -> Set<table>
 
 /**
@@ -164,7 +194,8 @@ const _originColumnReady = new WeakMap(); // db -> Set<table>
  * returns false (and remembers nothing) while the table does not exist yet.
  */
 export async function ensureLamportOriginColumn(db, table) {
-  if (!RAMBLE_LWW_TABLES.includes(table)) return false;
+  if (!LAMPORT_ORIGIN_TABLES.includes(table)) return false;
+  if (_failEnsureForTest > 0) { _failEnsureForTest--; return false; }
   let ready = _originColumnReady.get(db);
   if (!ready) { ready = new Set(); _originColumnReady.set(db, ready); }
   if (ready.has(table)) return true;
@@ -182,6 +213,29 @@ export async function ensureLamportOriginColumn(db, table) {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Is `lamport_origin` usable on dashboard_settings? Ensure it; on a false
+ * (PRAGMA/ALTER hit BUSY, say) retry once, then probe the column directly — a
+ * failed ALTER on a table that already has the column must not read as "absent".
+ * False only when the column truly is not there, so callers that get false use
+ * the pre-origin shape and put NO origin on the wire.
+ */
+export async function settingsOriginReady(db) {
+  if (await ensureLamportOriginColumn(db, "dashboard_settings")) return true;
+  if (await ensureLamportOriginColumn(db, "dashboard_settings")) return true;
+  try {
+    await db.execute("SELECT lamport_origin FROM dashboard_settings LIMIT 0");
+    return true;
+  } catch (err) {
+    // Only a missing column means "absent". Any other failure (BUSY on the schema
+    // read, say) answers true: the caller then stamps AND sends the origin in one
+    // write, which either lands whole or fails whole. Answering false here would
+    // stamp a new lamport beside the previous writer's origin while the wire
+    // carries none, the divergence this rule exists to prevent (M6 LOW-A).
+    return !/no such column/i.test(String(err?.message));
   }
 }
 
@@ -229,13 +283,18 @@ export function stampSql(table, row, lamportTs, origin) {
   // id; the outbox cap's NULL re-stamp passes none and leaves it alone). The
   // origin is always the SECOND placeholder, after the lamport, so
   // sync-emit's subselect swap of args[0] still lines up.
-  const withOrigin = origin !== undefined && RAMBLE_LWW_TABLES.includes(table);
-  const o = withOrigin ? ", lamport_origin = ?" : "";
+  const noColumn = origin === NO_ORIGIN_COLUMN;
+  const withOrigin = !noColumn && origin !== undefined && LAMPORT_ORIGIN_TABLES.includes(table);
+  // A dashboard_settings stamp with no origin NEVER leaves a foreign origin
+  // behind (M6 LOW-2). In practice only the outbox cap's NULL re-stamp reaches
+  // this: it clears the lamport and the origin together.
+  const clearOrigin = !noColumn && origin === undefined && table === "dashboard_settings";
+  const o = withOrigin ? ", lamport_origin = ?" : clearOrigin ? ", lamport_origin = NULL" : "";
   const oa = withOrigin ? [origin ?? null] : [];
   if (table === "dashboard_settings" && row.key !== undefined) {
     return {
-      sql: `UPDATE dashboard_settings SET lamport_ts = ? WHERE key = ?`,
-      args: [lamportTs, row.key],
+      sql: `UPDATE dashboard_settings SET lamport_ts = ?${o} WHERE key = ?`,
+      args: [lamportTs, ...oa, row.key],
     };
   }
   if (table === "crow_context" && row.section_key !== undefined) {

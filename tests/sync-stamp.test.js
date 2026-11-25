@@ -142,7 +142,9 @@ test("seedCounterSql / bumpCounterSql: return {sql, args} shapes usable standalo
 
 test("stampSql: dashboard_settings stamps by key", () => {
   const result = stampSql("dashboard_settings", { key: "theme", value: "dark" }, 42);
-  assert.equal(normSql(result.sql), normSql("UPDATE dashboard_settings SET lamport_ts = ? WHERE key = ?"));
+  // No origin passed: the stamp clears lamport_origin, so a re-stamp by a process
+  // that does not know the origin never leaves a foreign writer behind (M6).
+  assert.equal(normSql(result.sql), normSql("UPDATE dashboard_settings SET lamport_ts = ?, lamport_origin = NULL WHERE key = ?"));
   assert.deepEqual(result.args, [42, "theme"]);
 });
 

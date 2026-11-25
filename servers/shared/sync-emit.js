@@ -24,6 +24,9 @@ import {
   floorCounterSql,
   stampSql,
   ensureLamportOriginColumn,
+  settingsOriginReady,
+  NO_ORIGIN_COLUMN,
+  normalizeLamportOrigin,
 } from "./sync-stamp.js";
 
 /** Spec-verbatim: outbox depth should never reach this on a healthy instance. */
@@ -155,7 +158,11 @@ async function enforceOutboxCap(db) {
     sourceRow = null;
   }
   if (sourceRow) {
-    const nullStmt = stampSql(victim.table_name, sourceRow, null);
+    // A dashboard_settings NULL re-stamp also clears lamport_origin (stampSql's
+    // no-origin shape) — unless the column is truly absent.
+    const origin = victim.table_name === "dashboard_settings" && !(await settingsOriginReady(db))
+      ? NO_ORIGIN_COLUMN : undefined;
+    const nullStmt = stampSql(victim.table_name, sourceRow, null, origin);
     if (nullStmt) await db.execute(nullStmt);
   }
 
@@ -229,11 +236,25 @@ export async function emitOrQueue(syncManager, db, table, op, row, opts = {}) {
     // the column exists first (an installed bundle copy may predate it).
     // Only pass the origin when the column is really there: a failed ALTER
     // must leave the pre-origin stamp, not sink the whole atomic batch (N-2).
-    const origin = (await ensureLamportOriginColumn(db, table)) ? instanceId : undefined;
-
+    const isSettings = table === "dashboard_settings";
+    // A synced setting retries the ensure once and probes the column, so a
+    // transient BUSY on a table that HAS the column never reads as "absent"
+    // (M6 LOW-1). The origin goes on the wire only when the stamp writes it.
+    const originReady = isSettings ? await settingsOriginReady(db) : await ensureLamportOriginColumn(db, table);
+    const origin = originReady ? instanceId : undefined;
     await enforceOutboxCap(db);
 
     const preserveLamport = Number.isFinite(opts.lamportTs) ? Number(opts.lamportTs) : null;
+    // A synced setting carries its writer in the ROW (`lamport_origin`), so a
+    // preserve-mode re-emit by another instance keeps the ORIGINAL writer. A
+    // live write names this Crow; a preserve-mode write keeps what the caller
+    // read from the row (never restamped here, never invented).
+    if (isSettings) {
+      row = { ...row };
+      if (preserveLamport === null && originReady) row.lamport_origin = instanceId;
+      else if (preserveLamport === null) delete row.lamport_origin;
+      else row.lamport_origin = normalizeLamportOrigin(row.lamport_origin);
+    }
 
     if (preserveLamport !== null) {
       // Preserve-lamport batch: seed, floor (never a fresh mint), row-stamp
@@ -241,7 +262,9 @@ export async function emitOrQueue(syncManager, db, table, op, row, opts = {}) {
       // INSERT — all with the caller's literal value, still one atomic batch.
       const statements = [seedCounterSql(instanceId), floorCounterSql(instanceId, preserveLamport)];
       if (op !== "delete" && op !== "erase") {
-        const stampStmt = stampSql(table, row, preserveLamport, origin);
+        // dashboard_settings: a re-delivery keeps its original origin, so the
+        // preserve stamp never rewrites lamport_origin (Ramble tables still do).
+        const stampStmt = stampSql(table, row, preserveLamport, isSettings ? NO_ORIGIN_COLUMN : origin);
         if (stampStmt) statements.push(stampStmt);
       }
       statements.push(outboxInsertLiteralSql(table, op, row, preserveLamport));
@@ -258,7 +281,7 @@ export async function emitOrQueue(syncManager, db, table, op, row, opts = {}) {
     const statements = [seedCounterSql(instanceId)];
     const bumpIdx = statements.push(bumpCounterSql(instanceId)) - 1;
     if (op !== "delete" && op !== "erase") {
-      const stampStmt = subselectStampSql(table, row, instanceId, origin);
+      const stampStmt = subselectStampSql(table, row, instanceId, isSettings ? (origin ?? NO_ORIGIN_COLUMN) : origin);
       if (stampStmt) statements.push(stampStmt);
     }
     statements.push(outboxInsertSql(table, op, row, instanceId));
