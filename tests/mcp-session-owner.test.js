@@ -117,3 +117,37 @@ test("an owner-less mount continues a session from a new connection", async () =
   const sse = await openSse("/open/sse", {});
   try { assert.equal((await raw(`/open/messages?sessionId=${sse.sessionId}`, { body: PING })).status, 202); } finally { sse.close(); }
 });
+
+test("a different client's refusal logs one deduped line with hashed owners and no session id", async () => {
+  const sid = await open("/own/mcp", as("connector-A"));
+  const lines = [];
+  const orig = console.warn;
+  console.warn = (...a) => { lines.push(a.join(" ")); };
+  try {
+    for (let i = 0; i < 3; i++) {
+      const r = await raw("/own/mcp", { headers: { ...as("connector-C"), "mcp-session-id": sid }, body: PING });
+      assert.equal(r.status, 400, "the client's answer is unchanged");
+    }
+    // The owner itself, and an unknown id, never log a mismatch.
+    assert.equal((await raw("/own/mcp", { headers: { ...as("connector-A"), "mcp-session-id": sid }, body: PING })).status, 200);
+    await raw("/own/mcp", { headers: { ...as("connector-C"), "mcp-session-id": "nope" }, body: PING });
+  } finally { console.warn = orig; }
+  const hits = lines.filter((l) => l.includes("session owner mismatch"));
+  assert.equal(hits.length, 1, "deduped to one line");
+  assert.match(hits[0], /^\[mcp\] session owner mismatch on \S+: session owner [0-9a-f]{10}, caller [0-9a-f]{10} \(refused as an unknown session\)$/);
+  for (const secret of [sid, "connector-A", "connector-C"]) assert.ok(!hits[0].includes(secret), "no session id or raw owner tag in the line");
+});
+
+test("noteOwnerMismatch dedupes per server+owner+caller for 10 minutes", async () => {
+  const { noteOwnerMismatch } = await import("../servers/gateway/routes/mcp.js");
+  const orig = console.warn;
+  console.warn = () => {};
+  try {
+    const t0 = 1_000_000_000;
+    assert.equal(noteOwnerMismatch("x-srv", "o1", "c1", t0), true);
+    assert.equal(noteOwnerMismatch("x-srv", "o1", "c1", t0 + 60_000), false);
+    assert.equal(noteOwnerMismatch("x-srv", "o1", "c2", t0 + 60_000), true, "another caller is its own line");
+    assert.equal(noteOwnerMismatch("y-srv", "o1", "c1", t0 + 60_000), true, "another server is its own line");
+    assert.equal(noteOwnerMismatch("x-srv", "o1", "c1", t0 + 10 * 60_000 + 1), true, "again after the window");
+  } finally { console.warn = orig; }
+});

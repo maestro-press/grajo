@@ -6,7 +6,7 @@
  * transports.
  */
 
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -84,10 +84,36 @@ function sessionOwner(req) {
  * answer as an unknown id). Enforced here, on the exact id each handler uses, so a guard that read a
  * different id source can never be steered onto another caller's session. Owner-less sessions pass.
  */
-function visibleSession(sessions, id, req) {
+function visibleSession(sessions, id, req, serverName) {
   if (!id || !sessions.has(id)) return undefined;
   const session = sessions.get(id);
-  return session.owner && session.owner !== sessionOwner(req) ? undefined : session;
+  if (session.owner && session.owner !== sessionOwner(req)) {
+    noteOwnerMismatch(serverName, session.owner, sessionOwner(req));
+    return undefined;
+  }
+  return session;
+}
+
+/**
+ * One log line when a live session is used by a different owner, so a real client that breaks
+ * (a connector whose client id changed, a door caller whose tuple drifted) is visible instead of
+ * looking like an expired session. The client's response is unchanged. Owner tags are hashed (a
+ * short sha256 prefix) and no session id or token is logged; the same server+owner+caller line
+ * is printed at most once per 10 minutes.
+ */
+const OWNER_MISMATCH_DEDUPE_MS = 10 * 60 * 1000;
+const ownerMismatchSeen = new Map();
+function ownerTagHash(tag) {
+  return tag == null ? "none" : createHash("sha256").update(String(tag)).digest("hex").slice(0, 10);
+}
+export function noteOwnerMismatch(serverName, owner, caller, now = Date.now()) {
+  const line = `[mcp] session owner mismatch on ${serverName || "?"}: session owner ${ownerTagHash(owner)}, caller ${ownerTagHash(caller)} (refused as an unknown session)`;
+  const last = ownerMismatchSeen.get(line);
+  if (last !== undefined && now - last < OWNER_MISMATCH_DEDUPE_MS) return false;
+  if (ownerMismatchSeen.size >= 500) ownerMismatchSeen.clear();
+  ownerMismatchSeen.set(line, now);
+  console.warn(line);
+  return true;
 }
 
 /**
@@ -126,7 +152,7 @@ export function createMcpHandler(sessions, createServer, serverName, { resumable
   const postHandler = async (req, res) => {
     const sessionId = req.headers["mcp-session-id"];
     try {
-      const session = visibleSession(sessions, sessionId, req);
+      const session = visibleSession(sessions, sessionId, req, serverName);
       if (session) {
         await session.transport.handleRequest(req, res, req.body);
       } else if (!sessionId && isInitializeRequest(req.body)) {
@@ -173,7 +199,7 @@ export function createMcpHandler(sessions, createServer, serverName, { resumable
 
   const getHandler = async (req, res) => {
     const sessionId = req.headers["mcp-session-id"];
-    const session = visibleSession(sessions, sessionId, req);
+    const session = visibleSession(sessions, sessionId, req, serverName);
     if (!session) {
       res.status(400).send("Invalid or missing session ID");
       return;
@@ -183,7 +209,7 @@ export function createMcpHandler(sessions, createServer, serverName, { resumable
 
   const deleteHandler = async (req, res) => {
     const sessionId = req.headers["mcp-session-id"];
-    const session = visibleSession(sessions, sessionId, req);
+    const session = visibleSession(sessions, sessionId, req, serverName);
     if (!session) {
       res.status(400).send("Invalid or missing session ID");
       return;
@@ -224,7 +250,7 @@ function createSseHandler(sessions, createServer, messagesPath, serverName) {
 
   const messagesHandler = async (req, res) => {
     const sessionId = req.query.sessionId;
-    const session = visibleSession(sessions, sessionId, req);
+    const session = visibleSession(sessions, sessionId, req, serverName);
     if (!session) {
       res.status(400).send("Invalid or missing sessionId query parameter");
       return;
