@@ -52,7 +52,7 @@ import { livenessStatusSql } from "../shared/instance-status.js";
 import { getOwnTailnetIp } from "../shared/tailnet-ip.js";
 import {
   isTailnetAddress, gatewayUrlHost, lookupTailnetIpForHost, tailscaleStatusAsync, rememberPeerSyncPort,
-  SYNC_PORT_KEY_PREFIX, SYNC_CR_KEY_PREFIX,
+  SYNC_PORT_KEY_PREFIX, SYNC_CR_KEY_PREFIX, SYNC_SA_KEY_PREFIX,
 } from "../shared/self-dial-address.js";
 import {
   recordDialAttempt, recordDialFailure, recordLinkUp, recordLinkClosed,
@@ -89,7 +89,7 @@ const IDLE_RECHECK_MS = testTunableMs("CROW_TEST_TAILNET_IDLE_RECHECK_MS", 15_00
 // A peer that answers "unknown peer"/"not paired" (it revoked us, or never
 // paired) is re-tried at this slow cadence, not every backoff cycle.
 const REFUSED_RECHECK_MS = 30 * 60_000;
-export { SYNC_PORT_KEY_PREFIX, SYNC_CR_KEY_PREFIX };
+export { SYNC_PORT_KEY_PREFIX, SYNC_CR_KEY_PREFIX, SYNC_SA_KEY_PREFIX };
 // HALF-OPEN: a link whose peer vanished without a FIN/RST (NAT rebind, host
 // suspend, a tailnet path that silently drops) used to look "linked" forever
 // — no data, no close, no re-dial. Both ends ping on this cadence; two whole
@@ -198,6 +198,13 @@ function addrMessage(instanceId, nonce, addr) {
 // later CR-less handshake under its id is REFUSED — that closes the downgrade
 // a replayed pre-upgrade hello would otherwise get.
 const CR_VERSION = 1;
+// Storage-AAD capability, advertised beside `cr`/`pb`/`sm` in both hellos. It says "this build
+// can open an `enc:v2:` storage.shared.* value bound to its setting key, endpoint and SSL flag".
+//
+// NOT COVERED BY THE HELLO SIGNATURE (like `cr`/`pb`): a value in a hello is a claim, not a
+// proof, so release 2 must treat the gate it feeds as a COMPATIBILITY check (would that peer
+// break on a bound value?) and never as a security proof of what the peer can do.
+const SA_VERSION = 1;
 const NONCE_RE = /^[0-9a-f]{16,128}$/;
 function crRespMessage(serverId, clientId, clientNonce, serverNonce) {
   return `cr-resp:${serverId}:${clientId}:${clientNonce}:${serverNonce}`;
@@ -245,6 +252,72 @@ async function markPeerCr(ctx, peerId) {
       console.log(`[tailnet-sync] peer ${String(peerId).slice(0, 12)}… completed a challenge-response handshake; CR-less handshakes from it are refused from now on`);
     }
   } catch { /* table missing on an old DB — no downgrade guard, CR still enforced per-connection */ }
+}
+
+/**
+ * Record what a peer advertised as its storage-AAD capability (`sa`) as a LOCAL override row
+ * keyed by peer id. Absent, non-integer or non-positive counts as 0.
+ *
+ * Written only AFTER the peer is authenticated (its cr_proof, respectively its cr_sig,
+ * verified), so a replayed or spoofed hello can never raise it. Unlike the CR pin this is NOT
+ * a downgrade guard: it records the LATEST value — a drop to 0 included — because a peer that
+ * went back to older code really cannot open a bound value.
+ */
+async function markPeerSa(ctx, peerId, saValue) {
+  const localId = ctx.instanceSyncManager?.localInstanceId;
+  if (!localId || !peerId) return;
+  const sa = Number.isInteger(saValue) && saValue > 0 ? saValue : 0;
+  try {
+    await ctx.db.execute({
+      sql: `INSERT INTO dashboard_settings_overrides (key, instance_id, value, updated_at)
+            VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT(key, instance_id) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+            WHERE dashboard_settings_overrides.value IS NOT excluded.value`,
+      args: [`${SYNC_SA_KEY_PREFIX}${peerId}`, localId, String(sa)],
+    });
+  } catch { /* table missing on an old DB — no recorded capability, and the gate stays closed */ }
+}
+
+/**
+ * Can EVERY trusted paired peer open a storage.shared.* value bound to its setting key,
+ * endpoint and SSL flag?
+ *
+ * TRUE only when each of them last advertised `sa >= 1`; FALSE when any has no recorded value,
+ * a 0 or a non-numeric one, when `localInstanceId` is missing, or on any DB error (fail closed:
+ * an unknown fleet is not a capable one). No trusted peers at all is TRUE — there is nobody to
+ * break.
+ *
+ * Release 1 does not act on this answer (nothing writes a bound value yet); release 2's writer
+ * gate calls it. Because the hello's `sa` is not covered by the hello signature, the answer is
+ * a COMPATIBILITY fact about the fleet, never a security proof.
+ */
+export async function peersStorageAadCapable(db, localInstanceId) {
+  if (!db || !localInstanceId) return false;
+  try {
+    const { rows: peers } = await db.execute({
+      sql: `SELECT id FROM crow_instances WHERE ${TRUSTED_PEER_SQL} AND id != ?`,
+      args: [localInstanceId],
+    });
+    if (peers.length === 0) return true;
+    // `substr`, not LIKE: the prefix carries `_`, which LIKE reads as a wildcard, so a row
+    // under a look-alike key would have counted as that peer's capability. A prefix compare
+    // matches only the literal spelling.
+    const { rows } = await db.execute({
+      sql: "SELECT key, value FROM dashboard_settings_overrides WHERE substr(key, 1, ?) = ? AND instance_id = ?",
+      args: [SYNC_SA_KEY_PREFIX.length, SYNC_SA_KEY_PREFIX, localInstanceId],
+    });
+    const advertised = new Map();
+    for (const r of rows) advertised.set(String(r.key).slice(SYNC_SA_KEY_PREFIX.length), r.value);
+    for (const peer of peers) {
+      const value = advertised.get(String(peer.id));
+      if (value === undefined) return false;
+      const n = Number(value);
+      if (!Number.isInteger(n) || n < 1) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /* ------------------------------------------------------- pair binding (PT-2a) */
@@ -849,6 +922,8 @@ async function handleAcceptedConnection(ws, peerHandshake, c1Raw, frameReader, c
   if (useCr) ourHs.cr_sig = sign(crRespMessage(localId, remoteInstanceId, peerHandshake.nonce_hex, ourHs.nonce_hex), identity.ed25519Priv);
   if (canBind) ourHs.pb_mac = tailnetRespMac(k, { server: localId, client: remoteInstanceId, cN: peerHandshake.nonce_hex, sN: ourHs.nonce_hex });
   if (negotiateSm) ourHs.sm = SM_VERSION;
+  // Advertised by every CR-capable (non-legacy) server hello, beside cr_sig/pb_mac/sm.
+  if (useCr) ourHs.sa = SA_VERSION;
   const s1Text = JSON.stringify(ourHs);
   ws.send(s1Text);
 
@@ -914,6 +989,7 @@ async function handleAcceptedConnection(ws, peerHandshake, c1Raw, frameReader, c
       if (sd.legacySession && pairBound) noteLegacySession(ctx, remoteInstanceId, { side: "server", now: ctx.now });
     }
     await markPeerCr(ctx, remoteInstanceId);
+    await markPeerSa(ctx, remoteInstanceId, peerHandshake.sa);
     // Our own dial may have started while we waited for the proof.
     if (fallbackRefused()) {
       ws.close(1013, "already linked");
@@ -1251,7 +1327,7 @@ export class PeerDialer {
         const offerSm = sessionOn(this.ctx) && offerPb;
         const sessionMode = this.ctx.pairBindingMode ?? pairBindingMode();
         const ourHs = buildHandshakePayload(identity, instanceSyncManager.localInstanceId, await resolveSelfAddress(this.ctx),
-          this.ctx.legacyHandshake ? null : { cr: CR_VERSION, ...(offerPb ? { pb: PB_VERSION } : {}), ...(offerSm ? { sm: SM_VERSION } : {}) });
+          this.ctx.legacyHandshake ? null : { cr: CR_VERSION, sa: SA_VERSION, ...(offerPb ? { pb: PB_VERSION } : {}), ...(offerSm ? { sm: SM_VERSION } : {}) });
         const c1Text = JSON.stringify(ourHs);
         ws.send(c1Text);
         // Read server handshake — with its exact bytes (the transcript's other half).
@@ -1376,6 +1452,7 @@ export class PeerDialer {
             if (session !== NULL_SESSION) Object.assign(proofFrame, session.seal("proof", [proofFrame.cr_proof, proofFrame.pb_proof]));
             ws.send(JSON.stringify(proofFrame));
             await markPeerCr(this.ctx, remoteInstanceId);
+            await markPeerSa(this.ctx, remoteInstanceId, serverHs.sa);
           } else if (await peerCrRequired(this.ctx, remoteInstanceId)) {
             console.warn(`[tailnet-sync] ${wsUrl} answered without challenge-response, but this peer has done CR before (replay or downgrade); closing`);
             recordDialFailure(peerId, `${wsUrl}: answered without challenge-response (downgrade refused)`);

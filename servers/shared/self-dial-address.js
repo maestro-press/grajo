@@ -199,6 +199,16 @@ export const SYNC_PORT_KEY_PREFIX = "tailnet_sync_port:";
 /** …and for "this peer has completed a challenge-response handshake with us" (downgrade guard). */
 export const SYNC_CR_KEY_PREFIX = "tailnet_sync_cr:";
 /**
+ * …and for the storage-AAD capability (`sa`) a peer advertised in its sync hello: the version
+ * it last advertised, `0` when it carried none or a non-integer.
+ *
+ * NOT a downgrade pin like SYNC_CR_KEY_PREFIX: it records the LATEST value a peer advertised,
+ * including a drop back to 0, because it is a compatibility fact about that peer's build, not a
+ * security threshold. It exists so a writer (release 2) can gate on "every paired peer that
+ * receives the storage.shared.* allowlist can open a bound value".
+ */
+export const SYNC_SA_KEY_PREFIX = "tailnet_sync_sa:";
+/**
  * …and for "this peer has completed a pair-bound sync handshake with us"
  * (PT-2a, sync-pair-binding.js). One pin covers both sync transports, and it
  * is never cleared automatically: forgetPeerHandshakeState leaves it alone.

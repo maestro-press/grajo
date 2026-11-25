@@ -45,7 +45,8 @@
 
 import * as Minio from "minio";
 import { createRequire } from "node:module";
-import { openSecret, isSealed } from "../sharing/secret-box.js";
+import { isSealed } from "../sharing/secret-box.js";
+import { STORAGE_SHARED_CREDENTIAL_KEYS, openStorageSharedValue, parseStorageUseSSL, splitNormalizedEndpoint } from "../shared/storage-shared-seal.js";
 
 const DEFAULT_BUCKET_BASE = "crow-files";
 const SHARED_KEYS = [
@@ -388,6 +389,26 @@ export function loadSharedStorageFromDbSync(dbPath, identity) {
 }
 
 /**
+ * Why a Shared Storage credential that cannot be opened leaves storage OFF (one fixed,
+ * value-free sentence: it is logged by the readers, never shown to anyone as copy).
+ */
+const SHARED_STORAGE_CREDENTIAL_REFUSED = "shared storage credentials could not be opened";
+
+/**
+ * One credential row, opened through the shared opener and BOUND to this setting name, this
+ * endpoint and this SSL flag. A refusal (a swapped blob, a re-pointed endpoint, an unknown
+ * `enc:` envelope, a non-canonical body, a value that opens to another envelope) THROWS, so the
+ * callers take their existing fail-closed path: storage is OFF (null in the async reader,
+ * `unreadable` in the sync one), never a config carrying the ciphertext or a null key.
+ * @returns {{plaintext: string, version: "v1"|"v2"|"plain"}}
+ */
+function _openSharedCredential(value, settingKey, endpoint, useSSL, identity) {
+  const opened = openStorageSharedValue(value, { settingKey, endpoint, useSSL, identity });
+  if (!opened.ok) throw new Error(SHARED_STORAGE_CREDENTIAL_REFUSED);
+  return opened;
+}
+
+/**
  * The six storage.shared.* rows as an opened config. THE one place the key names, the seal
  * opening and the endpoint parsing live — the async and the sync reader (and the sync one's
  * caller in the bot engine) share it, so the two cannot drift.
@@ -398,18 +419,30 @@ function _configFromRows(rows, identity) {
   const accessSealed = kv["storage.shared.access_key"];
   const secretSealed = kv["storage.shared.secret_key"];
   if (!endpoint || !accessSealed || !secretSealed) return null;
-  const accessKey = isSealed(accessSealed) ? openSecret(accessSealed, identity) : accessSealed;
-  const secretKey = isSealed(secretSealed) ? openSecret(secretSealed, identity) : secretSealed;
-  const { host, port } = _splitHostPort(endpoint);
+  const useSSL = parseStorageUseSSL(kv["storage.shared.use_ssl"]);
+  const access = _openSharedCredential(accessSealed, STORAGE_SHARED_CREDENTIAL_KEYS[0], endpoint, useSSL, identity);
+  const secret = _openSharedCredential(secretSealed, STORAGE_SHARED_CREDENTIAL_KEYS[1], endpoint, useSSL, identity);
+  // A value that OPENS to another envelope is a sealed value sealed twice (or a blob copied
+  // between settings): it is never a credential, so it fails closed here instead of being
+  // echoed to the endpoint as a key id. (openStorageSharedValue refuses it as
+  // nested_envelope; the check stays so this module keeps reaching secret-box.)
+  if (isSealed(access.plaintext) || isSealed(secret.plaintext)) throw new Error(SHARED_STORAGE_CREDENTIAL_REFUSED);
+  // A v2 value is sealed BOUND to the NORMALIZED endpoint, so the address the AAD names is the
+  // address this client must dial: host, port and the endpoint string all come from that one
+  // normalization (which the opener has already run — a value that cannot be normalized was
+  // refused as unbound). A v1 or plaintext credential is not bound to anything, so the legacy
+  // split (and the raw endpoint, path and all) stays exactly as it was.
+  const bound = access.version === "v2" || secret.version === "v2";
+  const { host, port } = bound ? splitNormalizedEndpoint(endpoint) : _splitHostPort(endpoint);
   return {
-    endpoint,
+    endpoint: bound ? `${host}:${port}` : endpoint,
     host,
     port,
-    useSSL: kv["storage.shared.use_ssl"] === "true" || kv["storage.shared.use_ssl"] === "1",
+    useSSL,
     region: kv["storage.shared.region"] || "us-east-1",
     bucketPrefix: kv["storage.shared.bucket_prefix"] || "crow",
-    accessKey,
-    secretKey,
+    accessKey: access.plaintext,
+    secretKey: secret.plaintext,
   };
 }
 
@@ -420,9 +453,11 @@ async function _reloadCachedConfig() {
 
 function _splitHostPort(endpoint) {
   // Accepts "host", "host:port", or "scheme://host:port" — only the host:port
-  // matters; scheme is taken from the use_ssl flag.
+  // matters; scheme is taken from the use_ssl flag. The scheme strip is
+  // case-insensitive, exactly like normalizeStorageEndpoint's (the AAD), so an
+  // `HTTPS://` spelling can never name one host while this dials another.
   let s = String(endpoint).trim();
-  s = s.replace(/^https?:\/\//, "");
+  s = s.replace(/^https?:\/\//i, "");
   // Strip any trailing path
   s = s.split("/")[0];
   const colon = s.lastIndexOf(":");

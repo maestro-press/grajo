@@ -17,8 +17,9 @@ import { escapeHtml } from "../../shared/components.js";
 import { tJs } from "../../shared/i18n.js";
 import * as Minio from "minio";
 import { readSetting, readSettings, writeSetting } from "../registry.js";
-import { isSealed, openSecret, sealSecret } from "../../../../sharing/secret-box.js";
-import { loadOrCreateIdentity } from "../../../../sharing/identity.js";
+import { sealSecret } from "../../../../sharing/secret-box.js";
+import { openStorageSharedValue, parseStorageUseSSL } from "../../../../shared/storage-shared-seal.js";
+import { loadIdentityIfPresent, loadOrCreateIdentity } from "../../../../sharing/identity.js";
 import { resetStorageClient } from "../../../../storage/s3-client.js";
 
 const KEYS = {
@@ -32,7 +33,9 @@ const KEYS = {
 };
 
 function _splitHostPort(endpoint) {
-  let s = String(endpoint || "").trim().replace(/^https?:\/\//, "").split("/")[0];
+  // The scheme strip is case-insensitive, like the AAD's normalizeStorageEndpoint: the form,
+  // the client and the AAD must agree on the host even when the owner types `HTTPS://`.
+  let s = String(endpoint || "").trim().replace(/^https?:\/\//i, "").split("/")[0];
   const c = s.lastIndexOf(":");
   if (c === -1) return { host: s, port: 9000 };
   return { host: s.slice(0, c), port: parseInt(s.slice(c + 1), 10) || 9000 };
@@ -42,7 +45,7 @@ async function _readAll(db) {
   const m = await readSettings(db, "storage.%");
   return {
     endpoint: m.get(KEYS.endpoint) || "",
-    useSSL: m.get(KEYS.useSSL) === "true",
+    useSSL: parseStorageUseSSL(m.get(KEYS.useSSL)),
     region: m.get(KEYS.region) || "us-east-1",
     prefix: m.get(KEYS.prefix) || "crow",
     accessSealed: m.get(KEYS.accessKey) || "",
@@ -54,6 +57,23 @@ async function _readAll(db) {
 function _buildClient({ endpoint, useSSL, accessKey, secretKey }) {
   const { host, port } = _splitHostPort(endpoint);
   return new Minio.Client({ endPoint: host, port, useSSL, accessKey, secretKey });
+}
+
+/**
+ * A stored credential opened for the endpoint and SSL flag CURRENTLY in the DB, or null.
+ *
+ * A null means exactly what a missing row means, and nothing new is said about it: the save
+ * then needs both keys (its existing 400), and the form shows a blank field. It is also how a
+ * bot's RAW endpoint/use_ssl rewrite shows up — the stored blobs no longer open under the AAD
+ * built from those rows (`storage_credentials_unbound`), so a blank-key save can never
+ * silently re-seal the owner's keys to a re-pointed address.
+ */
+function _openStored(value, settingKey, cfg, identity) {
+  if (!value || !identity) return null;
+  const opened = openStorageSharedValue(value, {
+    settingKey, endpoint: cfg.endpoint, useSSL: cfg.useSSL, identity,
+  });
+  return opened.ok ? opened.plaintext : null;
 }
 
 export default {
@@ -75,8 +95,16 @@ export default {
 
   async render({ db, lang }) {
     const cfg = await _readAll(db);
-    const maskedAccess = cfg.accessSealed ? "••••••••" : "";
-    const maskedSecret = cfg.secretSealed ? "••••••••" : "";
+    // "Keys are set" means "they open for this endpoint and SSL flag", not "a row exists":
+    // a blob that cannot be opened is shown as unset, and a save then needs both keys.
+    // The identity is read WITHOUT creating one (a settings page never mints one), and an
+    // unreadable one is the same answer as none: the fields read as unset.
+    let identity = null;
+    try { identity = loadIdentityIfPresent(); } catch { identity = null; }
+    const accessUsable = _openStored(cfg.accessSealed, KEYS.accessKey, cfg, identity) !== null;
+    const secretUsable = _openStored(cfg.secretSealed, KEYS.secretKey, cfg, identity) !== null;
+    const maskedAccess = accessUsable ? "••••••••" : "";
+    const maskedSecret = secretUsable ? "••••••••" : "";
 
     return `<style>
       .ss-grid { display:grid; grid-template-columns:180px 1fr; gap:0.75rem 1rem; align-items:center; }
@@ -119,10 +147,10 @@ export default {
       <input name="prefix" type="text" value="${escapeHtml(cfg.prefix)}" placeholder="crow" />
 
       <label>Access key</label>
-      <input name="access_key" type="text" value="${escapeHtml(maskedAccess)}" placeholder="${cfg.accessSealed ? "(leave to keep current)" : "crowadmin"}" />
+      <input name="access_key" type="text" value="${escapeHtml(maskedAccess)}" placeholder="${accessUsable ? "(leave to keep current)" : "crowadmin"}" />
 
       <label>Secret key</label>
-      <input name="secret_key" type="password" value="${escapeHtml(maskedSecret)}" placeholder="${cfg.secretSealed ? "(leave to keep current)" : ""}" autocomplete="new-password" />
+      <input name="secret_key" type="password" value="${escapeHtml(maskedSecret)}" placeholder="${secretUsable ? "(leave to keep current)" : ""}" autocomplete="new-password" />
 
       <label>Auto-apply to bundles</label>
       <div><input name="auto_apply" type="checkbox" ${cfg.autoApply ? "checked" : ""}/> <span style="font-size:0.85rem;color:var(--crow-text-muted)">Force-recreate S3-capable bundles on save (local-only, not synced)</span></div>
@@ -267,11 +295,13 @@ export default {
     const identity = loadOrCreateIdentity();
 
     // Resolve effective access/secret for the pre-flight. If the operator didn't
-    // touch the field, use the stored (sealed) value opened in-memory.
+    // touch the field, use the stored value opened in-memory under the CURRENT endpoint
+    // and use_ssl (the same AAD a v2 blob is bound to). One that does not open is treated
+    // exactly like a missing key: the save then requires both below.
     let accessKey = payload.access_key;
-    if (!accessKey) accessKey = current.accessSealed ? openSecret(current.accessSealed, identity) : "";
+    if (!accessKey) accessKey = _openStored(current.accessSealed, KEYS.accessKey, current, identity) || "";
     let secretKey = payload.secret_key;
-    if (!secretKey) secretKey = current.secretSealed ? openSecret(current.secretSealed, identity) : "";
+    if (!secretKey) secretKey = _openStored(current.secretSealed, KEYS.secretKey, current, identity) || "";
 
     const endpoint = payload.endpoint;
     const useSSL = !!payload.use_ssl;
