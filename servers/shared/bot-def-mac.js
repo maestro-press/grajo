@@ -136,8 +136,12 @@ export const BOT_DEF_REFUSALS = Object.freeze([
   "no-mac", "no-mac-column", "mac-mismatch", "mac-invalid", "foreign-mac",
   "key-lost", "key-invalid", "key-missing",
   "generation-invalid", "generation-behind", "generation-ahead", "generations-missing",
-  "row-types", "definition-text", "definition-too-complex",
+  "row-types", "definition-text", "definition-too-complex", "incomplete-row",
 ]);
+
+/** The MAC-covered fields a caller's row must carry as OWN KEYS (null is fine; absent is not). */
+const MACD_ROW_KEYS = Object.freeze(["bot_id", "definition", "enabled", "project_id"]);
+const incompleteSeen = new Set();
 
 /** The generations file's own version + its lock's staleness bound. */
 const GENERATIONS_VERSION = 1;
@@ -848,6 +852,8 @@ const refusalSeen = new Map();
  * @returns {boolean} true when this call emitted the line
  */
 export function botDefRefusalAlarm(botId, reason, { now = Date.now(), windowMs = TOKEN_MAC_ALARM_WINDOW_MS } = {}) {
+  // An incomplete row already logged its own, clearer line when the verifier refused it.
+  if (reason === "incomplete-row") return false;
   const slot = `${String(botId ?? "")}\0${String(reason ?? "")}`;
   const at = refusalSeen.get(slot);
   if (typeof at === "number" && now - at < windowMs) return false;
@@ -977,6 +983,18 @@ function verifyBotDefInner(row, opts) {
   }
   const converted = opts.converted;
   const botId = String(row?.bot_id ?? "");
+  // A caller that SELECTed too few columns would otherwise read as a MAC mismatch (a missing field
+  // MACs as null). That is a bug in the caller, not tampering: say so, once per bot and field set.
+  const missing = MACD_ROW_KEYS.filter((k) => !Object.prototype.hasOwnProperty.call(row ?? {}, k));
+  if (missing.length) {
+    const slot = `${botId}\0${missing.join(",")}`;
+    if (!incompleteSeen.has(slot)) {
+      if (incompleteSeen.size > 1000) incompleteSeen.clear();
+      incompleteSeen.add(slot);
+      console.warn(`[bot-def] incomplete row passed to the verifier for ${botId} (missing ${missing.join(", ")}): a programming error, not tampering`);
+    }
+    return { ok: false, reason: "incomplete-row" };
+  }
   const mac = typeof row?.def_mac === "string" && row.def_mac !== "" ? row.def_mac : null;
 
   // BEFORE the era there is nothing to check: the row has no MAC because the converter has not

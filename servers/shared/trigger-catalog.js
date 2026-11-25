@@ -34,6 +34,7 @@
  * changed — the exact tamper this catalogue exists to notice.
  */
 
+import { createHash } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -325,6 +326,31 @@ const asTriggerRow = (row) => ({
 });
 
 /**
+ * The legacy knowledge-base 1.0.2 `hsds_services` full-text-index triggers. Their bodies only maintain
+ * `hsds_services_fts`. Reviewed by hand: add entries here only after reviewing the body, NEVER by
+ * reading a bundle file (a bundle directory is easier to write than this repo, so a derived list would
+ * let a planted file whitelist itself). An entry matches only on name, table (any case) AND the sha256
+ * of `normalizeTriggerSql(stored sql)`.
+ */
+export const REVIEWED_LEGACY_TRIGGERS = Object.freeze([
+  { name: "hsds_services_ad", table: "hsds_services", sha256: "210323c12764a28a6141185abc8f4425ef0299c01ee63f6b9f22bc14e2a1befc" },
+  { name: "hsds_services_ai", table: "hsds_services", sha256: "cc9a56d11d69b45ee6411c47fc0cc27e6e2d72f040e18b71ff545452a567e877" },
+  { name: "hsds_services_au", table: "hsds_services", sha256: "56835866eef3d73b958caf0d183cbdea1bd7cf3d6426c67cca328d1e4d13b735" },
+]);
+
+/** sha256 (hex) of a trigger's normalised SQL. */
+export function triggerSqlHash(sql) {
+  return createHash("sha256").update(normalizeTriggerSql(sql)).digest("hex");
+}
+
+/** "ok" for exactly a reviewed legacy trigger, "body-changed" for its name+table with another body, else null. */
+function reviewedLegacyStatus(trigger) {
+  const entry = REVIEWED_LEGACY_TRIGGERS.find((e) => e.name === trigger.name);
+  if (!entry || !sameTableName(entry.table, trigger.table)) return null;
+  return entry.sha256 === triggerSqlHash(trigger.sql) ? "ok" : "body-changed";
+}
+
+/**
  * Which of `rows` Crow did NOT install, or whose body is no longer the body Crow installs.
  *
  * @param {Array<{name: string, tbl_name?: string, sql?: string}>} rows `sqlite_master` rows
@@ -338,7 +364,9 @@ export function unexpectedTriggers(rows, expected) {
     if (!trigger.name) continue;
     const def = expected.get(trigger.name);
     if (!def) {
-      out.push({ name: trigger.name, table: trigger.table, reason: "foreign" });
+      const legacy = reviewedLegacyStatus(trigger);
+      if (legacy === "ok") continue;
+      out.push({ name: trigger.name, table: trigger.table, reason: legacy || "foreign" });
       continue;
     }
     // A name-only entry has no derivable body, so the NAME alone is not enough to accept it (item

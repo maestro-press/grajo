@@ -102,14 +102,14 @@ let busHandler = null;
 let tickInFlight = false;
 
 /** Read enabled bots' discord gateway configs (token/guild/channels/allowlist). */
-function discordBotConfigs(conn) {
+export function discordBotConfigs(conn) {
   let rows = [];
   try {
     try {
-      rows = conn.prepare("SELECT bot_id, definition, def_mac, def_generation FROM pi_bot_defs WHERE enabled=1").all();
+      rows = conn.prepare("SELECT bot_id, definition, enabled, project_id, def_mac, def_generation FROM pi_bot_defs WHERE enabled=1").all();
     } catch {
       // A store shaped before the seal columns exist: every row reads as unsealed (pre-era).
-      rows = conn.prepare("SELECT bot_id, definition FROM pi_bot_defs WHERE enabled=1").all();
+      rows = conn.prepare("SELECT bot_id, definition, enabled, project_id FROM pi_bot_defs WHERE enabled=1").all();
     }
   } catch {
     return [];
@@ -122,7 +122,7 @@ function discordBotConfigs(conn) {
   const converted = botDefEraConvertedSync();
   const out = [];
   for (const row of rows) {
-    const verification = verifyBotDefSync({ ...row, enabled: 1 }, { converted });
+    const verification = verifyBotDefSync(row, { converted });
     if (!verification.ok) {
       botDefRefusalAlarm(row.bot_id, verification.reason);
       continue;

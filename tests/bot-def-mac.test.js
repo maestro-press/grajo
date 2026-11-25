@@ -1870,3 +1870,94 @@ test("converted evidence: a fresh home converts for the first time", async () =>
     assert.match(String((await rowOf(s.db, "victim")).def_mac), /^h1\./);
   } finally { s.close(); }
 });
+
+// ─── incomplete rows (a caller that SELECTs too few columns is a bug, not tampering) ────────────
+
+test("verifier: a row missing any MAC'd field is refused as incomplete-row, never as a mismatch", async (t) => {
+  const s = scratch();
+  t.after(s.close);
+  await createBot(s.db, "inc-bot", { project_id: null });
+  const full = { ...(await rowOf(s.db, "inc-bot")) };
+  assert.equal(gate(full).ok, true, "the complete row (project_id null, key present) verifies");
+  const warn = console.warn;
+  const lines = [];
+  console.warn = (m) => lines.push(String(m));
+  try {
+    for (const field of ["bot_id", "definition", "enabled", "project_id"]) {
+      const partial = { ...full };
+      delete partial[field];
+      assert.deepEqual(gate(partial), { ok: false, reason: "incomplete-row" }, `missing ${field}`);
+    }
+  } finally { console.warn = warn; }
+  assert.equal(lines.filter((l) => l.includes("a programming error, not tampering")).length, 4);
+  assert.ok(lines.some((l) => l.includes("(missing project_id)")));
+  const { botDefRefusalAlarm } = await import("../servers/shared/bot-def-mac.js");
+  assert.equal(botDefRefusalAlarm("inc-bot", "incomplete-row"), false, "no second, mismatch-style line");
+  // Missing def_mac / def_generation are NOT incompleteness: the columnless handling owns them.
+  const { def_mac, def_generation, ...columnless } = full;
+  assert.notEqual(gate(columnless).reason, "incomplete-row");
+});
+
+test("discordBotConfigs: a sealed bot WITH a project verifies and starts its gateway", async (t) => {
+  const s = scratch();
+  t.after(s.close);
+  await s.db.execute({ sql: "PRAGMA foreign_keys = OFF", args: [] }).catch(() => {});
+  const def = { ...DEF, gateways: [{ type: "discord", token: "tok", guild_id: "g", channel_ids: ["c"], allowlist: ["u"] }] };
+  await createBot(s.db, "proj-bot", { project_id: 1, definition: def });
+  const { default: Database } = await import("better-sqlite3");
+  const { discordBotConfigs } = await import("../servers/gateway/bot-runtime.js");
+  const conn = new Database(process.env.CROW_DB_PATH, { readonly: true });
+  try {
+    const cfgs = discordBotConfigs(conn);
+    assert.deepEqual(cfgs.map((c) => c.bot_id), ["proj-bot"]);
+  } finally { conn.close(); }
+});
+
+test("source scan: SELECTs feeding a verifier name project_id (or SELECT *)", () => {
+  // LIMITS: a line-level regex over files that mention a verifier. It checks that every
+  // `SELECT <cols> FROM pi_bot_defs` on a single line in those files carries project_id, enabled,
+  // bot_id and definition (or is SELECT *); it cannot follow a row across functions, so a SELECT
+  // in a verifier-using file that feeds something else must also name them (none do today).
+  const files = [];
+  const walk = (dir) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      if (e.name === "node_modules" || e.name === "tests") continue;
+      const p = join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (/\.(m?js)$/.test(e.name)) files.push(p);
+    }
+  };
+  for (const d of ["servers", "scripts", "bundles"]) walk(join(ROOT, d));
+  // Reviewed: these SELECTs never hand their row to a verifier (display lookups, counts, or a
+  // column list built from the table's own columns whose row is rebuilt whole before verifying).
+  const REVIEWED = [
+    "servers/shared/history/api.js:tableColumns",
+    "servers/shared/project-bot-shares.js:SELECT bot_id, display_name, project_id, definition",
+    "scripts/pi-bots/bridge.mjs:SELECT display_name, created_at",
+    "scripts/pi-bots/bridge.mjs:SELECT enabled, definition",
+    "bundles/artifacts/panel/routes.js:SELECT bot_id, display_name, definition",
+    "bundles/artifacts/panel/routes.js:SELECT definition, enabled, project_id",
+    "bundles/artifacts/panel/routes.js:SELECT display_name",
+  ];
+  const verifierRe = /\b(verifyBotDefSync|verifyBotDefSealed|verifyBotRows|verifyBotDef)\b/;
+  const bad = [];
+  let scanned = 0;
+  for (const f of files) {
+    const text = readFileSync(f, "utf8");
+    if (!verifierRe.test(text)) continue;
+    for (const [i, line] of text.split("\n").entries()) {
+      const m = line.match(/SELECT\s+(.+?)\s+FROM\s+pi_bot_defs\b/i);
+      if (!m) continue;
+      const cols = m[1];
+      if (cols === "*" || /^\s*[\w.]+\.\*/.test(cols)) continue;
+      if (/^\s*(1|COUNT|def_mac, def_generation)/i.test(cols) || /\bLIMIT 0\b/i.test(line)) continue;
+      scanned += 1;
+      if (REVIEWED.some((r) => { const [f2, ...q] = r.split(":"); return f.endsWith(f2) && line.includes(q.join(":")); })) continue;
+      const missing = ["bot_id", "definition", "enabled", "project_id"].filter((c) => !new RegExp(`\\b${c}\\b`).test(cols));
+      // Narrow lookups that never reach a verifier (a single-column existence/ID check) are exempt.
+      if (missing.length && !/^bot_id$/.test(cols.trim())) bad.push(`${f.slice(ROOT.length)}:${i + 1} lacks ${missing.join(",")}`);
+    }
+  }
+  assert.ok(scanned >= 4, "the scan saw the known explicit-column SELECTs");
+  assert.deepEqual(bad, []);
+});

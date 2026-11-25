@@ -24,7 +24,7 @@ import { fileURLToPath } from "node:url";
 
 import { createDbClient } from "../servers/db.js";
 import { forgetTokenMacKey } from "../servers/shared/token-mac.js";
-import { expectedTriggerIndex, normalizeTriggerSql, triggerBlocksIn, unexpectedTriggers } from "../servers/shared/trigger-catalog.js";
+import { expectedTriggerIndex, normalizeTriggerSql, triggerBlocksIn, triggerSqlHash, unexpectedTriggers } from "../servers/shared/trigger-catalog.js";
 import {
   forgetTriggerInventory, runTriggerInventory, startTriggerInventory,
 } from "../servers/gateway/boot/trigger-inventory.js";
@@ -275,4 +275,21 @@ test("I3: the hourly timer is unref'd, and a failing pass never throws", async (
   } finally {
     started.stop();
   }
+});
+test("reviewed legacy knowledge-base hsds_services triggers: exact name + table + body hash only", () => {
+  const del = "INSERT INTO hsds_services_fts(hsds_services_fts, rowid, name, description, eligibility_description, keywords, search_terms) VALUES ('delete', old.id, old.name, old.description, old.eligibility_description, old.keywords, old.search_terms);";
+  const ins = "INSERT INTO hsds_services_fts(rowid, name, description, eligibility_description, keywords, search_terms) VALUES (new.id, new.name, new.description, new.eligibility_description, new.keywords, new.search_terms);";
+  const ad = `CREATE TRIGGER hsds_services_ad AFTER DELETE ON hsds_services BEGIN ${del} END`;
+  const ai = `CREATE TRIGGER hsds_services_ai AFTER INSERT ON hsds_services BEGIN ${ins} END`;
+  const au = `CREATE TRIGGER hsds_services_au AFTER UPDATE ON hsds_services BEGIN ${del} ${ins} END`;
+  assert.equal(triggerSqlHash(ad), "210323c12764a28a6141185abc8f4425ef0299c01ee63f6b9f22bc14e2a1befc");
+  assert.equal(triggerSqlHash(ai), "cc9a56d11d69b45ee6411c47fc0cc27e6e2d72f040e18b71ff545452a567e877");
+  const au_hash_matches = triggerSqlHash(au) === "56835866eef3d73b958caf0d183cbdea1bd7cf3d6426c67cca328d1e4d13b735";
+  const rows = (name, tbl, sql) => [{ name, tbl_name: tbl, sql }];
+  const none = new Map();
+  assert.deepEqual(unexpectedTriggers(rows("hsds_services_ad", "hsds_services", ad), none), []);
+  assert.deepEqual(unexpectedTriggers(rows("hsds_services_ai", "HSDS_Services", ai), none), []);
+  if (au_hash_matches) assert.deepEqual(unexpectedTriggers(rows("hsds_services_au", "hsds_services", au), none), []);
+  assert.equal(unexpectedTriggers(rows("hsds_services_ad", "hsds_services", ad.replace("END", "SELECT 1; END")), none)[0].reason, "body-changed");
+  assert.equal(unexpectedTriggers(rows("hsds_services_ad", "other_table", ad), none)[0].reason, "foreign");
 });
