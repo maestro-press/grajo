@@ -57,6 +57,20 @@ import { resolveCrowHome } from "../../shared/crow-home.js";
 export const AAD_ERA_SETTING = "keychain_aad_era";
 /** The state file's name inside the secrets dir. */
 export const AAD_STATE_FILENAME = "keychain-aad-state.json";
+/**
+ * One log line, once per process per (write, error code), when a security-state write fails.
+ * A silent catch on such a write is how the mirror bug of #119 hid. Never logs a value: only
+ * the name of the write and the error's code or class.
+ */
+const writeFailuresLogged = new Set();
+export function noteSecurityWriteFailure(what, err) {
+  const code = String(err?.code || err?.name || "Error").replace(/[^A-Za-z0-9_]/g, "").slice(0, 40) || "Error";
+  const k = `${what}:${code}`;
+  if (writeFailuresLogged.has(k)) return;
+  writeFailuresLogged.add(k);
+  try { console.warn(`[keychain-aad] ${what} failed (${code})`); } catch { /* never throws */ }
+}
+
 /** A state file bigger than this is not one this instance wrote (it holds four fields). */
 export const MAX_STATE_BYTES = 8192;
 /**
@@ -306,14 +320,17 @@ export async function eraConvertedAsync(db, secretsDir) {
  *  one a crow.db restored without the state file still carries. */
 export function writeAadMirrorSync(rawDb, instanceId, { now = new Date() } = {}) {
   if (typeof instanceId !== "string" || instanceId === "") return false;
+  const at = (now instanceof Date ? now : new Date()).toISOString();
   try {
+    // value and updated_at are both the conversion time (four placeholders, four values).
     rawDb.prepare(
       `INSERT INTO dashboard_settings_overrides (key, instance_id, value, updated_at, lamport_ts)
        VALUES (?, ?, ?, ?, 0)
        ON CONFLICT(key, instance_id) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-    ).run(AAD_ERA_SETTING, instanceId, (now instanceof Date ? now : new Date()).toISOString());
+    ).run(AAD_ERA_SETTING, instanceId, at, at);
     return true;
-  } catch {
+  } catch (err) {
+    noteSecurityWriteFailure("era mirror write", err);
     return false;
   }
 }
@@ -379,11 +396,11 @@ export function raiseLegacyFormAlarmSync(rawDb, row) {
   if (!shouldAlarm(row)) return;
   try {
     rawDb.prepare("INSERT INTO audit_log (event_type, details) VALUES (?, ?)").run(LEGACY_FORM_EVENT, alarmDetails(row));
-  } catch { /* no audit_log on an old store */ }
+  } catch (err) { noteSecurityWriteFailure("alarm audit row", err); }
   try {
     const q = rawDb.prepare("SELECT 1 AS hit FROM notifications WHERE source = 'security' AND title = ? AND created_at > datetime('now', '-1 day') LIMIT 1");
     if (!q.get(LEGACY_FORM_BELL)) rawDb.prepare(BELL_SQL_ASYNC).run(LEGACY_FORM_BELL);
-  } catch { /* no notifications table */ }
+  } catch (err) { noteSecurityWriteFailure("alarm bell", err); }
 }
 
 /** The same alarm for a libsql-shaped client. */
@@ -392,11 +409,11 @@ export async function raiseLegacyFormAlarmAsync(db, row) {
   if (!shouldAlarm(row)) return;
   try {
     await db.execute({ sql: "INSERT INTO audit_log (event_type, details) VALUES (?, ?)", args: [LEGACY_FORM_EVENT, alarmDetails(row)] });
-  } catch { /* no audit_log on an old store */ }
+  } catch (err) { noteSecurityWriteFailure("alarm audit row", err); }
   try {
     const { rows } = await db.execute({ sql: BELL_EXISTS_ASYNC, args: [LEGACY_FORM_BELL] });
     if (!rows || rows.length === 0) await db.execute({ sql: BELL_SQL_ASYNC, args: [LEGACY_FORM_BELL] });
-  } catch { /* no notifications table */ }
+  } catch (err) { noteSecurityWriteFailure("alarm bell", err); }
 }
 
 /**
@@ -413,9 +430,9 @@ export function raiseMirrorUntrustedAlarmSync(rawDb) {
   mirrorUntrustedAlarmed = true;
   try {
     rawDb.prepare("INSERT INTO audit_log (event_type, details) VALUES (?, ?)").run(LEGACY_FORM_EVENT, JSON.stringify({ mirror: AAD_ERA_SETTING }));
-  } catch { /* no audit_log on an old store */ }
+  } catch (err) { noteSecurityWriteFailure("alarm audit row", err); }
   try {
     const q = rawDb.prepare("SELECT 1 AS hit FROM notifications WHERE source = 'security' AND title = ? AND created_at > datetime('now', '-1 day') LIMIT 1");
     if (!q.get(LEGACY_FORM_BELL)) rawDb.prepare(BELL_SQL_ASYNC).run(LEGACY_FORM_BELL);
-  } catch { /* no notifications table */ }
+  } catch (err) { noteSecurityWriteFailure("alarm bell", err); }
 }

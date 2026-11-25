@@ -108,7 +108,7 @@ import { MAIL_BUNDLE, isSystemBundleId, rowAad } from "../keychain/store.js";
 import { exportFingerprint, remapExportFingerprintsSync } from "../keychain/export-fingerprint.js";
 import {
   aadSecretsDirFromHome, mirrorConvertedSync, raiseLegacyFormAlarmSync, raiseMirrorUntrustedAlarmSync,
-  readAadState, writeAadMirrorSync, writeAadState,
+  noteSecurityWriteFailure, readAadState, writeAadMirrorSync, writeAadState,
 } from "../keychain/aad-era.js";
 
 /** `<CROW_HOME>/secrets/backups/keychain-aad` — 0700, one verified copy per conversion. */
@@ -493,6 +493,12 @@ export async function runKeychainAadBoot(options = {}) {
     if (mirrorTrusted) {
       out.state = "converted-earlier";
       if (fileState !== "converted") recordEraStateFile(db, secretsDir, keyState.key?.id ?? null, now, log);
+      // Catch the DB mirror up when the host state file proves the era and the mirror is gone
+      // (a bot deleted it, or a build whose mirror write never landed). It is only a refusal
+      // trigger, so re-writing it can never accept anything.
+      if (!mirrorSays && options.mirror !== false && typeof options.mirrorInstanceId === "string" && options.mirrorInstanceId !== "") {
+        try { writeAadMirrorSync(db, options.mirrorInstanceId, { now }); } catch (err) { noteSecurityWriteFailure("era mirror catch-up", err); }
+      }
       if (!tableExists(db, "crow_keychain")) return out;
       const legacy = db.prepare(`SELECT id, kind, secret_sealed FROM crow_keychain WHERE ${V1_SQL} ORDER BY id`).all();
       out.v1 = legacy.length;
@@ -763,7 +769,8 @@ function recordEraStateFile(db, secretsDir, keyId, now, log) {
     writeAadState(secretsDir, { keyId, rows, snapshot: null, now });
     log("  keychain AAD: the era was proven by the database alone; its state file was written again");
     return true;
-  } catch {
+  } catch (err) {
+    noteSecurityWriteFailure("era state file write", err);
     log("  keychain AAD: the era state file could not be written; the database marker still enforces it");
     return false;
   }
@@ -773,7 +780,8 @@ function recordEraStateFile(db, secretsDir, keyId, now, log) {
 async function markEra(db, secretsDir, { keyId, rows, snapshot, now, mirror, mirrorInstanceId }) {
   try {
     writeAadState(secretsDir, { keyId, rows, snapshot, now });
-  } catch {
+  } catch (err) {
+    noteSecurityWriteFailure("era state file write", err);
     return false;
   }
   if (mirror === false) return true;
@@ -781,8 +789,9 @@ async function markEra(db, secretsDir, { keyId, rows, snapshot, now, mirror, mir
     // The CALLER owns the instance id (the gateway's instance registry); a pass that has none —
     // the satellite, the dry-run tool — writes only the state file, which is the primary trigger.
     if (typeof mirrorInstanceId === "string" && mirrorInstanceId !== "") writeAadMirrorSync(db, mirrorInstanceId, { now });
-  } catch {
-    // The state file is the primary trigger; the mirror is the extra one.
+  } catch (err) {
+    // The state file is the primary trigger; the mirror is the extra one (and its writer logs).
+    noteSecurityWriteFailure("era mirror write", err);
   }
   return true;
 }

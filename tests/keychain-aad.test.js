@@ -353,6 +353,41 @@ test("converter: a second boot changes nothing (the era is already recorded)", a
   assert.deepEqual(addonRead(ctx, "addon-a", ["FOO"]), { FOO: SENTINEL });
 });
 
+test("converter: the gateway's DB mirror is really written under its instance id, on both the converted and the fresh path", async (t) => {
+  const ctx = await instance(t);
+  const iid = "b".repeat(32);
+  const saved = await K.saveExtensionSecret(ctx.db, ctx.key, { bundleId: "addon-a", envKey: "FOO", label: "A FOO", secret: SENTINEL, origin: "typed" });
+  setV1(ctx, saved.id, SENTINEL);
+  assert.equal((await runBoot(ctx, { mirror: true, mirrorInstanceId: iid })).state, "converted");
+  const row = ctx.raw.prepare("SELECT value, updated_at FROM dashboard_settings_overrides WHERE key = ? AND instance_id = ?").get(ERA.AAD_ERA_SETTING, iid);
+  assert.ok(row, "the mirror row exists after a conversion");
+  assert.ok(row.value && row.updated_at, "with a value and an updated_at");
+  assert.equal(ERA.writeAadMirrorSync(ctx.raw, iid), true, "and the writer reports success");
+
+  const fresh = await instance(t);
+  const fid = "c".repeat(32);
+  assert.equal((await runBoot(fresh, { mirror: true, mirrorInstanceId: fid })).state, "marked-empty");
+  assert.ok(fresh.raw.prepare("SELECT 1 AS hit FROM dashboard_settings_overrides WHERE key = ? AND instance_id = ?").get(ERA.AAD_ERA_SETTING, fid),
+    "a fresh install's era is mirrored too");
+
+  // A failing mirror write is logged once (a code, never a value), not swallowed.
+  const lines = [];
+  const prevWarn = console.warn;
+  console.warn = (line) => lines.push(String(line));
+  try {
+    assert.equal(ERA.writeAadMirrorSync({ prepare: () => { const e = new Error("boom"); e.code = "SQLITE_TEST"; throw e; } }, iid), false);
+  } finally {
+    console.warn = prevWarn;
+  }
+  assert.deepEqual(lines, ["[keychain-aad] era mirror write failed (SQLITE_TEST)"], "one line naming the write and the code");
+
+  // An instance converted by a build whose mirror never landed: the next boot catches it up.
+  ctx.raw.prepare("DELETE FROM dashboard_settings_overrides WHERE key = ?").run(ERA.AAD_ERA_SETTING);
+  assert.equal((await runBoot(ctx, { mirror: true, mirrorInstanceId: iid })).state, "converted-earlier");
+  assert.ok(ctx.raw.prepare("SELECT 1 AS hit FROM dashboard_settings_overrides WHERE key = ? AND instance_id = ?").get(ERA.AAD_ERA_SETTING, iid),
+    "a converted instance with no mirror gets it back on its next boot");
+});
+
 test("converter: a proof that does not verify rolls back, writes no marker, and leaves v1 accepted", async (t) => {
   const ctx = await instance(t);
   const ext = await K.saveExtensionSecret(ctx.db, ctx.key, { bundleId: "addon-a", envKey: "FOO", label: "A FOO", secret: SENTINEL, origin: "typed" });
