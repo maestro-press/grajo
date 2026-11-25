@@ -21,13 +21,18 @@
  * With --peer-url, the peer's gateway must expose the /instance/enroll
  * endpoints (Phase 5-MVP wires these into routes/bundles.js sibling route
  * file servers/gateway/routes/instance-enroll.js).
+ *
+ * BOTH modes check the local keyed-verifier key FIRST (`ensurePeerKey`), before
+ * the peer is contacted (or our half is printed): the verifier stored for the
+ * peer's bearer is minted from that key, and finding it missing afterwards
+ * would leave a half pairing — the peer already committed (its code is spent
+ * and it holds our bearer) while this side cannot verify anything it says.
  */
 
 import { createDbClient, resolveDataDir } from "../../servers/db.js";
 import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 import { resolve as resolvePath } from "path";
-import { createHash } from "crypto";
 import {
   registerInstance,
   getInstance,
@@ -40,6 +45,7 @@ import {
   pickPeerGatewayUrl, isTailnetAddress, rememberPeerSyncPort, forgetPeerHandshakeState,
   isDialableGatewayUrl, gatewayUrlHost, ownTailnetSuffix,
 } from "../../servers/shared/self-dial-address.js";
+import { ensurePeerKey, legacyStoredHash, mintPeerInbound } from "../../servers/gateway/peer-inbound-token.js";
 import {
   setPeerCreds,
   pinPeerOrigin,
@@ -317,6 +323,13 @@ async function networkPair(db, { peerUrl, peerName, peerId: expectPeerId, otc: o
   if (otc.length < ENROLL_OTC_MIN_LENGTH) {
     throw new Error(`a one-time code is required (>= ${ENROLL_OTC_MIN_LENGTH} chars): on the PEER run \`node scripts/cli/instance-pair.js --generate-otc\`, follow its instructions, then pass --otc <code> here`);
   }
+  // THE KEY IS CHECKED BEFORE THE PEER IS CONTACTED, exactly as the enroll route mints before it
+  // commits. The verifier this side STORES for the peer's bearer is an `h1.` MAC, minted after the
+  // answer arrives — but the PEER has already committed by then (its one-time code is spent and it
+  // holds our bearer), so a key that turns out to be missing/unusable would leave a HALF pairing:
+  // the peer trusts us and we cannot verify it. Here the failure costs nothing and nothing is
+  // written on either side.
+  await ensurePeerKey(db);
   const localId = getOrCreateLocalInstanceId();
   // Our outbound bearer (what we send to peer in Authorization: Bearer).
   // Peer stores its hash in crow_instances.auth_token_hash.
@@ -375,22 +388,25 @@ async function networkPair(db, { peerUrl, peerName, peerId: expectPeerId, otc: o
     // Creds for OUTBOUND calls us → peer:
     auth_token: sourceOutboundBearer,   // we generated; peer stored its hash
     signing_key: sharedSigningKey,      // both sides share
-    // Hash of peer's outbound bearer (for us to validate inbound calls from peer):
-    peerOutboundBearerHash: sha256Hex(peerPayload.peer_outbound_bearer),
+    // The verifier we store for the peer's bearer is the KEYED MAC (family `peer:inbound`); the
+    // legacy sha256 of the same bearer is kept for the re-pair proof (design D4) — the peer's own
+    // install computes that value, and `repairProofKey` has always been keyed by it.
+    peerOutboundBearerHash: await mintPeerInbound(db, peerPayload.peer_outbound_bearer),
+    inboundBearerSha256: legacyStoredHash(peerPayload.peer_outbound_bearer),
   });
 
   console.log(`✓ Paired with peer ${peerId} (${peerName || peerPayload.peer_name || "unnamed"})`);
   console.log(`  Credentials stored: ${peerTokensPath()}`);
 }
 
-function sha256Hex(s) {
-  return createHash("sha256").update(s).digest("hex");
-}
-
 async function manualPair(db, { peerId, peerName, peerUrl }) {
   if (!peerId || !peerName || !peerUrl) {
     throw new Error("--manual-paste requires --peer-id, --peer-name, --peer-url");
   }
+  // Same rule as `networkPair`, before anything is printed or read: the peer operator pastes its
+  // half out of band, so a key problem found AFTER our credentials are printed leaves the same
+  // half pairing (the peer holds a bearer we cannot verify). Fail before the ceremony starts.
+  await ensurePeerKey(db);
   const localId = getOrCreateLocalInstanceId();
   const sourceOutboundBearer = generateSecret();
   const sharedSigningKey = generateSecret();
@@ -445,7 +461,8 @@ async function manualPair(db, { peerId, peerName, peerUrl }) {
     peerCrowId: peerPayload.peer_crow_id || peerId,
     auth_token: sourceOutboundBearer,
     signing_key: sharedSigningKey,
-    peerOutboundBearerHash: sha256Hex(peerPayload.peer_outbound_bearer),
+    peerOutboundBearerHash: await mintPeerInbound(db, peerPayload.peer_outbound_bearer),
+    inboundBearerSha256: legacyStoredHash(peerPayload.peer_outbound_bearer),
   });
 
   console.log(`✓ Paired with peer ${peerId} (${peerName})`);
@@ -469,6 +486,7 @@ export async function storePeerCredsLocally(db, {
   auth_token,
   signing_key,
   peerOutboundBearerHash,
+  inboundBearerSha256 = null,
 }) {
   const tailscaleIp = typeof peerTailscaleIp === "string" && isTailnetAddress(peerTailscaleIp.trim()) ? peerTailscaleIp.trim() : null;
   const existing = await getInstance(db, peerId);
@@ -500,7 +518,14 @@ export async function storePeerCredsLocally(db, {
   await rememberPeerSyncPort(db, getOrCreateLocalInstanceId(), peerId, peerSyncPort);
   await forgetPeerHandshakeState(db, getOrCreateLocalInstanceId(), peerId);
 
-  setPeerCreds(peerId, { auth_token, signing_key });
+  setPeerCreds(peerId, {
+    auth_token,
+    signing_key,
+    // Design D4: the legacy `sha256(bearer)` of the bearer the peer presents TO us, which is what
+    // the peer's own install still computes for the re-pair proof. `setPeerCreds` MERGES, so an
+    // entry that already carries one keeps it when a caller passes nothing.
+    ...(inboundBearerSha256 ? { inbound_bearer_sha256: inboundBearerSha256 } : {}),
+  });
   // Pin only an ORIGIN this ceremony itself supplied (the peer's accepted
   // advertised address, else the --peer-url the operator typed). The row above
   // is bot-writable, so an address read from it (or kept from an older row) is

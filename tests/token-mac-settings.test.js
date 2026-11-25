@@ -1155,6 +1155,38 @@ test("a value written over the snapshot's row between crash and restart is never
   }
 });
 
+test("an EMPTY snapshot is still pending: a value written after it is refused, not converted, and the family is marked", async () => {
+  const s = scratch();
+  try {
+    // The family held no old-style value when the snapshot was taken; the process died before the
+    // era marker. A restart must not read the empty file as "no snapshot" and convert whatever
+    // was written since.
+    const key = ensureKey({ allowCreate: true, mirrorConverted: false, h1ValuesExist: false });
+    const plantedLater = sha256("planted-after-an-empty-snapshot");
+    await writeSetting(s.db, "mcp_local_token_hash", plantedLater, { scope: "local" });
+    writeFileSync(join(s.home, "secrets", `${SETTINGS_ROLLBACK_PREFIX}2026-01-04T03-04-05-000Z-mcp-local-token-hash.json`), JSON.stringify({
+      v: 1,
+      family: "mcp_local_token_hash",
+      key_id: key.id,
+      created_at: "2026-01-04T03:04:05.000Z",
+      rows: [],
+    }), { mode: 0o600 });
+
+    forgetTokenMacAlarms();
+    const boot = await runSettingsTokenHmacBoot({ db: s.db });
+    const entry = boot.families.find((f) => f.family === "mcp_local_token_hash");
+    assert.equal(entry.count, 0, "the snapshot lists nothing, so nothing is converted");
+    assert.equal(entry.refused, 1, "the post-snapshot value is refused");
+    assert.equal(entry.alarms, 1, "and reported, not laundered");
+    assert.equal(await stored(s.db, "mcp_local_token_hash"), plantedLater, "left exactly as it was written");
+    assert.equal(await validateLocalToken(s.db, "planted-after-an-empty-snapshot"), false, "never a credential");
+    assert.ok(readState().families.mcp_local_token_hash?.converted_at, "the family is marked converted now");
+    assert.equal(snapshotFiles(s.home).length, 1, "the empty snapshot is reused, not replaced");
+  } finally {
+    s.close();
+  }
+});
+
 // ─── sync (§6.9, OQ-4) ────
 
 test("no verifier key, no password and no device record is ever syncable", () => {

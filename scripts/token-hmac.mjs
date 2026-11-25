@@ -24,15 +24,24 @@
  *      gateway itself uses — and the run REFUSES before changing anything (exit 1) when this
  *      home has no such file: an id this process invented would match no row, and the reset
  *      would delete nothing while reporting success.
+ *   2c. Clears every paired instance's inbound bearer verifier
+ *      (`crow_instances.auth_token_hash`). It is keyed under the key this run retires, so each
+ *      one would read as a FOREIGN keyId and refuse; and unlike a static token there is no
+ *      re-mint on this side — the BEARER lives on the peer. Each peer therefore has to re-pair,
+ *      which its own install can prove (design D4): `secrets/peer-tokens.json` still carries the
+ *      `inbound_bearer_sha256` the re-pair proof is keyed by, so `crow instance pair` on the
+ *      peer re-establishes the pair without the operator's `--allow-re-pair`. A revoked row
+ *      already holds NULL and is untouched.
  *   3. Creates a new key and reports its id.
  *   4. Re-marks EVERY family CONVERTED (no rows behind them) — the three `oauth_tokens`
- *      families AND the thirteen settings-backed ones — in the state file AND the
- *      `token_hmac_era:*` mirror. The settings families are marked even on a box whose key was
- *      lost BEFORE their conversion ever ran, and that is the point: with no marker of its own,
- *      a bare sha256 a bot plants in `mcp_local_token_hash` while the gateway is stopped (its
- *      units keep running) would be laundered into a valid `h1.` credential by the next boot —
- *      owner authority from a row something without the key wrote. Marked converted, that value
- *      is refused and alarmed instead, and each family's own mint writes its fresh verifier.
+ *      families, the thirteen settings-backed ones AND the paired-instance family
+ *      (`peer:inbound`) — in the state file AND the `token_hmac_era:*` mirror. Every family is
+ *      marked even on a box whose key was lost BEFORE its conversion ever ran, and that is the
+ *      point: with no marker of its own, a bare sha256 something without the key plants while
+ *      the gateway is stopped (its units keep running) would be laundered into a valid `h1.`
+ *      credential by the next boot — owner (or peer) authority from a row something without the
+ *      key wrote. Marked converted, that value is refused and alarmed instead, and each family's
+ *      own mint writes its fresh verifier.
  *      NO step of this tool clears or deletes a family marker: they stay CONVERTED throughout,
  *      because a converted family means "a bare sha256 is not a credential here", so a legacy
  *      row written between this reset and the next gateway boot is refused and alarmed instead
@@ -174,6 +183,7 @@ import { writeSetting } from "../servers/gateway/dashboard/settings/registry.js"
 import { getOrCreateLocalInstanceId } from "../servers/gateway/instance-registry.js";
 import { FAMILY_PREDICATE, TOKEN_STORE_FAMILIES, tokenFamilyConverted } from "../servers/gateway/token-store.js";
 import { SETTINGS_TOKEN_FAMILIES } from "../servers/gateway/token-settings.js";
+import { PEER_INBOUND_FAMILY } from "../servers/gateway/peer-inbound-token.js";
 import { ROLLBACK_PREFIX } from "../servers/gateway/boot/token-hmac.js";
 
 /** The health probe's budget: a live gateway answers long before this. */
@@ -200,12 +210,14 @@ const RESTORABLE = new Set(TOKEN_STORE_FAMILIES);
 
 /**
  * Every family `--reset` marks CONVERTED (step 4): the three `oauth_tokens` families, whose rows
- * this run just deleted, and the thirteen settings-backed ones, whose stored verifiers it just
- * deleted. Marking a settings family that had no era yet is deliberate — see the header's step 4:
- * without the marker, the next boot would CONVERT a bare sha256 a bot planted while the gateway
- * was stopped.
+ * this run just deleted; the thirteen settings-backed ones, whose stored verifiers it just
+ * deleted; and the paired-instance family, whose row values it just cleared. Marking a family
+ * that had no era yet is deliberate — see the header's step 4: without the marker, the next boot
+ * would CONVERT a bare sha256 something without the key planted while the gateway was stopped.
  */
-const CONVERTED_FAMILIES = Object.freeze([...TOKEN_STORE_FAMILIES, ...SETTINGS_TOKEN_FAMILIES]);
+const CONVERTED_FAMILIES = Object.freeze([
+  ...TOKEN_STORE_FAMILIES, ...SETTINGS_TOKEN_FAMILIES, PEER_INBOUND_FAMILY,
+]);
 
 /**
  * `--reset`'s refusal when this home carries no `<data dir>/instance-id` (step 2b). Fixed text:
@@ -330,6 +342,33 @@ async function dropSettingTokens(db, localId) {
   return deleted;
 }
 
+/**
+ * Clear every paired instance's inbound bearer verifier (`--reset` step 2c).
+ *
+ * Those values were minted under the key this run retires, so each would read as a FOREIGN keyId
+ * and be refused anyway; clearing makes the required state explicit (every peer must re-pair)
+ * and keeps the refusal from being mistaken for a keyId mismatch. The BEARER lives on the peer,
+ * so nothing is re-minted here; the re-pair proof still works because
+ * `secrets/peer-tokens.json` keeps the `inbound_bearer_sha256` this run does not touch (design
+ * D4). A revoked row already holds NULL and is untouched, and an absent table (a unit-test
+ * database) is skipped on its own.
+ *
+ * @param {object} db the gateway's crow.db client
+ * @returns {Promise<number>} rows cleared
+ */
+async function clearPeerBearers(db) {
+  try {
+    const res = await db.execute({
+      sql: "UPDATE crow_instances SET auth_token_hash = NULL WHERE auth_token_hash IS NOT NULL AND status != 'revoked'",
+      args: [],
+    });
+    return Number(res?.rowsAffected ?? 0) || 0;
+  } catch (err) {
+    if (/no such table/i.test(String(err?.message || ""))) return 0;
+    throw err;
+  }
+}
+
 async function reset({ yes, force }) {
   const keyPath = tokenMacKeyPath();
 
@@ -359,6 +398,8 @@ async function reset({ yes, force }) {
   if (!yes) {
     console.log("This will:");
     console.log("  - revoke EVERY OAuth grant and dashboard session (all oauth_tokens rows)");
+    console.log("  - delete the stored verifiers of every static token, and clear every paired instance's");
+    console.log("    inbound bearer verifier (each peer then has to re-pair)");
     console.log("  - move the token HMAC key aside and create a new one");
     console.log("  - keep the dashboard password (you sign in again afterwards)");
     const ok = await confirm("Continue? [y/N] ");
@@ -394,6 +435,7 @@ async function reset({ yes, force }) {
   let revoked = 0;
   let droppedStatic = 0;
   let resealed = { resealed: 0, failed: 0, refused: [] };
+  let droppedPeers = 0;
   let key;
   let mirrored = 0;
   try {
@@ -411,6 +453,12 @@ async function reset({ yes, force }) {
     //     converted in step 4 (which is what makes a bare sha256 written in the meantime refused
     //     and alarmed rather than laundered by the next boot).
     droppedStatic = await dropSettingTokens(db, localId);
+
+    // 2c. Every paired instance's inbound bearer verifier goes too: it is keyed under the key this
+    //     run retires, it cannot be re-minted on this side (the bearer lives on the peer), and the
+    //     peer's own re-pair proof still works from the `inbound_bearer_sha256` the credential
+    //     store keeps. Revoked rows hold NULL already and are left alone.
+    droppedPeers = await clearPeerBearers(db);
 
     // 3. A fresh key, so the box is immediately coherent (no login has to mint it). This is
     //    the one place a key may be created over an existing state file: the operator retired
@@ -456,12 +504,16 @@ async function reset({ yes, force }) {
   console.log(`  key file:      ${movedKey ? `moved aside → ${movedKey}` : "none (already absent)"}`);
   console.log(`  new key id:    ${key.id} (${keyPath})`);
   console.log(`  era state:     re-marked converted, never cleared: the ${TOKEN_STORE_FAMILIES.length} oauth_tokens`);
-  console.log(`                 families and the ${SETTINGS_TOKEN_FAMILIES.length} settings-backed ones (no rows behind them)`);
+  console.log(`                 families, the ${SETTINGS_TOKEN_FAMILIES.length} settings-backed ones and the paired-instance`);
+  console.log("                 family (no rows behind them)");
   console.log(`  oauth_tokens:  ${revoked} row(s) deleted — every OAuth grant and dashboard session is revoked`);
   console.log(`  static tokens: ${droppedStatic} stored verifier(s) deleted — board, phone, artifacts, models,`);
   console.log("                 peer relay, cloud door, services, satellite tools, secrets, sharing bot, reports");
   console.log("                 and kiosk announce are re-minted at the next start; the local MCP token has to");
   console.log("                 be generated again in Settings → Connect (its raw value is not kept anywhere)");
+  console.log(`  peers:         ${droppedPeers} paired-instance verifier(s) cleared — every peer has to re-pair;`);
+  console.log("                 its own `crow instance pair` can prove the old pairing (secrets/peer-tokens.json");
+  console.log("                 keeps the record the re-pair proof is keyed by), so no --allow-re-pair is needed");
   console.log(`  era mirror:    ${mirrored} family marker(s) written to the DB as converted (no rows behind them)`);
   console.log(
     `  bot defs:      ${resealed.resealed} definition(s) re-sealed under the new key`

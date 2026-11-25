@@ -10,6 +10,11 @@
 import { z } from "zod";
 import { createNotification } from "../../shared/notifications.js";
 import { stripConflictSnapshot } from "../instance-sync.js";
+// The keyed verifier for this instance's own bearer (family `peer:inbound`). Host-side: this
+// stdio server runs as the OWNER's sharing server (never emitted to a bot by the catalog), so it
+// may hold the work that needs <CROW_HOME>/secrets/token-hmac.key; the bot-reachable
+// instance-registry.js deliberately may not.
+import { mintPeerAuthToken } from "../../gateway/peer-inbound-token.js";
 
 /**
  * A short, SAFE preview of one stored conflict snapshot, for the tool's text
@@ -195,15 +200,17 @@ export function registerInstancesTools(server, ctx) {
       const {
         registerInstance,
         getOrCreateLocalInstanceId,
-        generateAuthToken,
         computeInstanceSyncTopic,
       } = await import("../../gateway/instance-registry.js");
 
       const instanceId = getOrCreateLocalInstanceId();
       const crowId = identity.crowId;
 
-      // Generate auth token for this instance
-      const { token, hash } = generateAuthToken();
+      // Generate auth token for this instance. The STORED value is the keyed `h1.` verifier
+      // (family `peer:inbound`), minted host-side under <CROW_HOME>/secrets/token-hmac.key;
+      // `generateAuthToken()` in instance-registry stays key-free because that module is
+      // reachable from bot code (tests/bot-seed-import-guard.test.js).
+      const { token, hash } = await mintPeerAuthToken(db);
 
       // Compute Hyperswarm sync topic
       const syncTopic = computeInstanceSyncTopic(crowId);

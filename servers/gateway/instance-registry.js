@@ -22,7 +22,8 @@ import { hostname as osHostname, tmpdir } from "os";
 import { resolveCrowHome, resolveInstanceDataDir, readLocalInstanceIdOrNull, isDefaultCrowHome } from "../shared/crow-home.js";
 import bus from "../shared/event-bus.js";
 import { livenessStatusSql } from "../shared/instance-status.js";
-import { TRUSTED_PEER_SQL } from "../shared/peer-trust.js";
+import { rowIsTrusted } from "../shared/peer-trust.js";
+import { peerBearerFind, peerBearerMint } from "../shared/peer-bearer.js";
 import { fenceStatements } from "../shared/repair-fence.js";
 import { createDbClient } from "../db.js";
 import { isPeerUsableUrl, deriveSelfDialAddress } from "../shared/self-dial-address.js";
@@ -48,6 +49,14 @@ export function generateInstanceId() {
 /**
  * Generate a bearer token for instance-to-instance auth.
  * Returns { token, hash } — token is given to the peer, hash is stored locally.
+ *
+ * KEY-FREE BY DESIGN. This module is reachable from bot code (`scripts/pi-bots/*`, sync-emit and
+ * several shared modules import `getOrCreateLocalInstanceId`), so it must never reach the token
+ * HMAC key (`tests/bot-seed-import-guard.test.js`). `hash` is therefore the LEGACY
+ * `sha256(token)` — a lookup input, never the value to store. What belongs in
+ * `crow_instances.auth_token_hash` is the keyed `h1.` form, minted host-side by
+ * `peerBearerMint` (the seam in servers/shared/peer-bearer.js, implemented by
+ * servers/gateway/peer-inbound-token.js) or by `mintPeerAuthToken(db)` there.
  */
 export function generateAuthToken() {
   const token = randomBytes(32).toString("hex");
@@ -340,9 +349,15 @@ export async function setHomeInstance(db, id) {
 
 /**
  * Rotate auth token for an instance. Returns the new plaintext token.
+ *
+ * The stored value is the keyed `h1.` verifier, minted through the seam: this module holds no
+ * key. A process where the implementation is not installed (a bot child, a half-booted
+ * gateway) refuses with PEER_BEARER_MINT_UNAVAILABLE and writes nothing — it never falls back
+ * to storing `sha256(token)`.
  */
 export async function rotateAuthToken(db, id) {
-  const { token, hash } = generateAuthToken();
+  const { token } = generateAuthToken();
+  const hash = await peerBearerMint(db, token);
   await db.execute({
     sql: "UPDATE crow_instances SET auth_token_hash = ?, updated_at = datetime('now') WHERE id = ? AND status != 'revoked'",
     args: [hash, id],
@@ -960,14 +975,22 @@ export function computeInstanceSyncTopic(crowId) {
  * Validate a bearer token against registered instances.
  * Used for instance-to-instance HTTP authentication.
  *
+ * The verifier is the keyed MAC in `crow_instances.auth_token_hash` (family `peer:inbound`), so
+ * the lookup goes through `peerBearerFind` — the seam into
+ * servers/gateway/peer-inbound-token.js, which holds the key. A bare `sha256(token)` row
+ * authenticates only while that family is not converted, and is refused (and alarmed) after it.
+ * Nothing in this module compares a hash itself.
+ *
+ * The ONE trust predicate is applied inside the lookup (`TRUSTED_PEER_SQL`: trusted = 1 AND
+ * status IN ('active','offline')) and `rowIsTrusted` re-checks the row it hands back, so a seam
+ * implementation that forgot the predicate could never widen trust here.
+ *
  * @param {import("@libsql/client").Client} db
  * @param {string} token - The bearer token from the Authorization header
  * @returns {Promise<object|null>} The matching instance row, or null if invalid
  */
 export async function validateInstanceToken(db, token, opts = {}) {
   if (!token) return null;
-
-  const tokenHash = createHash("sha256").update(token).digest("hex");
 
   // Authenticate any paired, non-revoked peer regardless of liveness.
   // Filtering on status='active' created a deadlock: a peer marked
@@ -977,11 +1000,11 @@ export async function validateInstanceToken(db, token, opts = {}) {
   // liveness signal, not a trust gate. Trust is the token-hash match plus the
   // one trust predicate (PT-1): a paired-but-untrusted (legacy trusted=0) or
   // paused row authenticates nothing.
-  const sql = `SELECT * FROM crow_instances WHERE auth_token_hash = ? AND ${TRUSTED_PEER_SQL}`;
+  const lookup = (client) => peerBearerFind(client, token, { channel: "instance-bearer" });
 
   try {
-    const { rows } = await db.execute({ sql, args: [tokenHash] });
-    return rows[0] || null;
+    const row = await lookup(db);
+    return row && rowIsTrusted(row) ? row : null;
   } catch (err) {
     // A DB error here is NOT proof the token is invalid. The old
     // `catch { return null }` silently rejected EVERY paired peer as
@@ -1001,8 +1024,8 @@ export async function validateInstanceToken(db, token, opts = {}) {
     let fresh;
     try {
       fresh = makeFresh();
-      const { rows } = await fresh.execute({ sql, args: [tokenHash] });
-      return rows[0] || null;
+      const row = await lookup(fresh);
+      return row && rowIsTrusted(row) ? row : null;
     } catch (err2) {
       console.error(
         `[instance-registry] validateInstanceToken: retry on a fresh client ALSO failed — federated auth is degraded, peer will be rejected: ${err2.message}`,

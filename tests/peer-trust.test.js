@@ -156,6 +156,16 @@ describe("U7: peer-tokens.json store lock", () => {
 // ---------------------------------------------------------------------------
 import { createHash } from "node:crypto";
 import { validateInstanceToken } from "../servers/gateway/instance-registry.js";
+// The keyed verifier for the paired-instance bearer (family `peer:inbound`): loading this module
+// installs the host-side implementation `validateInstanceToken` reaches through its seam, and it
+// is how a test seeds a row the way the product writes one.
+import { ensurePeerKey, mintPeerInbound } from "../servers/gateway/peer-inbound-token.js";
+
+/** The stored verifier this instance writes for `bearer` (an `h1.` MAC under its own key). */
+async function peerStored(db, bearer) {
+  await ensurePeerKey(db);
+  return mintPeerInbound(db, bearer);
+}
 
 describe("U2: validateInstanceToken", () => {
   const sha = (t) => createHash("sha256").update(t).digest("hex");
@@ -166,7 +176,8 @@ describe("U2: validateInstanceToken", () => {
       const rows = [["u2-active", "active", 1], ["u2-offline", "offline", 1], ["u2-untrusted", "active", 0], ["u2-paused", "paused", 1]];
       for (const [id, status, trusted] of rows) {
         await addPeerRow(xdb, id, { status, trusted });
-        await xdb.execute({ sql: "UPDATE crow_instances SET auth_token_hash = ? WHERE id = ?", args: [sha(`tok-${id}`), id] });
+        // eslint-disable-next-line no-await-in-loop -- one row at a time, by design
+        await xdb.execute({ sql: "UPDATE crow_instances SET auth_token_hash = ? WHERE id = ?", args: [await peerStored(xdb, `tok-${id}`), id] });
       }
       assert.equal((await validateInstanceToken(xdb, "tok-u2-active"))?.id, "u2-active");
       assert.equal((await validateInstanceToken(xdb, "tok-u2-offline"))?.id, "u2-offline");
@@ -200,7 +211,8 @@ describe("U1: crossHostVerifyMiddleware on real rows", () => {
     const store = {};
     for (const [id, status, trusted] of ROWS) {
       await addPeerRow(u1db, id, { status, trusted });
-      await u1db.execute({ sql: "UPDATE crow_instances SET auth_token_hash = ? WHERE id = ?", args: [status === "revoked" ? null : sha(tok(id)), id] });
+      // eslint-disable-next-line no-await-in-loop -- one row at a time, by design
+      await u1db.execute({ sql: "UPDATE crow_instances SET auth_token_hash = ? WHERE id = ?", args: [status === "revoked" ? null : await peerStored(u1db, tok(id)), id] });
       store[id] = { auth_token: tok(id), signing_key: KEY, created_at: new Date().toISOString(), rotated_at: null };
     }
     store["u1-missing-row"] = { auth_token: tok("u1-missing-row"), signing_key: KEY, created_at: new Date().toISOString(), rotated_at: null };

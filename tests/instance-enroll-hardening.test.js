@@ -26,12 +26,21 @@ import { trustedProxyList } from "../servers/shared/peer-class.js";
 import { actAsServe } from "./fixtures/serve-peer.mjs";
 import { rejectFunneledMiddleware } from "../servers/gateway/funnel.js";
 import { validateInstanceToken } from "../servers/gateway/instance-registry.js";
+import { macToken } from "../servers/shared/token-mac.js";
 import { repairProof, repairProofKey, writeRepairAllowance, generateEnrollOtc } from "../servers/shared/enroll-guard.js";
 
 const REPO = new URL("..", import.meta.url).pathname;
 // The Serve stand-ins below run in this process, so this process plays tailscaled's uid.
 actAsServe();
 const sha = (s) => createHash("sha256").update(s).digest("hex");
+
+/**
+ * The value `home` stores for `bearer` — the keyed `h1.` MAC (family `peer:inbound`) under that
+ * home's own `secrets/token-hmac.key`. Both writers below (the in-process enroll route and the
+ * pairing CLI child) mint it that way, so this is the expected stored form; a bare
+ * `sha256(bearer)` is the PRE-conversion form and would mean the writer regressed.
+ */
+const keyed = (home, bearer) => macToken("peer:inbound", bearer, { crowHome: home });
 
 function snapshotEnv() {
   const saved = { ...process.env };
@@ -133,19 +142,40 @@ function cli(S, args) {
   });
 }
 
+/**
+ * Validate a bearer on ONE side, with THAT side's home.
+ *
+ * Each instance has its own `<home>/secrets/token-hmac.key`, and a stored verifier is an `h1.` MAC
+ * under it — so a check that reused whichever home the test process happens to be pointed at would
+ * read a FOREIGN keyId and refuse. `side.env` carries the three paths the resolvers use.
+ */
+async function validateAt(side, token) {
+  const saved = {};
+  for (const key of ["CROW_HOME", "CROW_DATA_DIR", "CROW_DB_PATH", "CROW_PEER_TOKENS_PATH"]) saved[key] = process.env[key];
+  Object.assign(process.env, side.env);
+  try {
+    return await validateInstanceToken(side.db, token);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 /** Mutual-case check: both directions authenticate, one shared signing key. */
 async function assertMutuallyPaired(P, S) {
   const sTok = S.tokens()[P.id];
   const pTok = P.tokens()[S.id];
   assert.ok(sTok?.auth_token && pTok?.auth_token, "both sides hold creds for the other");
   assert.equal(sTok.signing_key, pTok.signing_key, "one shared signing key");
-  const onP = await validateInstanceToken(P.db, sTok.auth_token);
-  const onS = await validateInstanceToken(S.db, pTok.auth_token);
+  const onP = await validateAt(P, sTok.auth_token);
+  const onS = await validateAt(S, pTok.auth_token);
   assert.equal(onP?.id, S.id, "S's outbound bearer authenticates S on P");
   assert.equal(onS?.id, P.id, "P's outbound bearer authenticates P on S");
   assert.equal(Number(onP.trusted), 1);
   assert.equal(Number(onS.trusted), 1);
-  assert.equal(await validateInstanceToken(P.db, pTok.auth_token), null, "directions are not interchangeable");
+  assert.equal(await validateAt(P, pTok.auth_token), null, "directions are not interchangeable");
 }
 
 const baseBody = (id, extra = {}) => ({
@@ -218,6 +248,42 @@ test("two-instance pairing through the real CLI: OTC mandatory, single-use, re-p
   } finally {
     restore();
     P.cleanup();
+    S.cleanup();
+  }
+});
+
+test("the pair CLI checks its own key BEFORE it contacts the peer: a lost key refuses with nothing written and no request", async () => {
+  const restore = snapshotEnv();
+  const S = await makeSide("instKeyless", "100.64.0.11");
+  let hits = 0;
+  const counter = createServer((req, res) => { hits += 1; res.statusCode = 500; res.end("{}"); });
+  await new Promise((r) => counter.listen(0, "127.0.0.1", r));
+  const url = `http://127.0.0.1:${counter.address().port}`;
+  try {
+    // A state file says this box HAS an era (so a key may never be minted over it) and the key
+    // FILE is gone: the verifier this side would store for the peer's bearer cannot be minted.
+    // Finding that out AFTER the peer committed is a half pairing — its code is spent and it holds
+    // our bearer while we can verify nothing it says — so the check comes first.
+    writeFileSync(join(S.dir, "secrets", "token-hmac-state.json"), JSON.stringify({ v: 1, families: {} }), { mode: 0o600 });
+    const lost = await cli(S, ["--peer-url", url, "--otc", generateEnrollOtc()]);
+    assert.notEqual(lost.code, 0, lost.out);
+    assert.match(lost.out, /token-mac key is lost/);
+    assert.equal(hits, 0, "the peer was never contacted");
+    assert.deepEqual(S.tokens(), {}, "and no credentials were written here");
+
+    // Positive control: with a usable key the same command DOES reach the peer (which answers
+    // 500), so the zero above is the key check and not a dead harness.
+    const statePath = join(S.dir, "secrets", "token-hmac-state.json");
+    assert.equal(existsSync(statePath), true, "the lost-key state file is still there");
+    unlinkSync(statePath);
+    const reached = await cli(S, ["--peer-url", url, "--otc", generateEnrollOtc()]);
+    assert.notEqual(reached.code, 0, reached.out);
+    assert.match(reached.out, /HTTP 500/);
+    assert.equal(hits, 1, "the peer was contacted once the key was usable");
+    assert.deepEqual(S.tokens(), {}, "a failed enroll still wrote no credentials");
+  } finally {
+    await new Promise((r) => { counter.closeAllConnections?.(); counter.close(r); });
+    restore();
     S.cleanup();
   }
 });
@@ -405,7 +471,8 @@ test("existing TRUSTED row: no proof → 409 and nothing (creds, dial address, p
       assert.equal(ok.status, 200, JSON.stringify(ok.body));
       assert.equal(await P.override("enroll_repair_allow:peerX"), null, "allowance cleared by any successful enroll of the id");
       const after = await snapshot();
-      assert.equal(after.row.auth_token_hash, sha(legit.source_outbound_bearer));
+      assert.equal(after.row.auth_token_hash, keyed(P.dir, legit.source_outbound_bearer));
+      assert.match(after.row.auth_token_hash, /^h1\.[0-9a-f]{16}\.[0-9a-f]{64}$/, "the stored verifier is the keyed MAC");
       assert.equal(after.row.gateway_url, "http://100.64.5.6:3001");
       assert.equal(after.row.tailscale_ip, "100.64.5.6");
       assert.equal(after.port, "3002");
@@ -850,7 +917,8 @@ test("CLI side: the answering peer cannot choose which local peer gets re-keyed 
     answer = answerAs("instV");
     const viaId = await run(["--peer-id", "instV"]);
     assert.equal(viaId.code, 0, viaId.out);
-    assert.equal((await S.row("instV")).auth_token_hash, sha("p".repeat(64)));
+    assert.equal((await S.row("instV")).auth_token_hash, keyed(S.dir, "p".repeat(64)));
+    assert.match((await S.row("instV")).auth_token_hash, /^h1\.[0-9a-f]{16}\.[0-9a-f]{64}$/, "the CLI stores the keyed MAC");
     assert.equal((await S.row("instV")).gateway_url, "http://100.64.30.30:3001");
 
     // Legit re-pair via address match (stored address host == --peer-url host).
@@ -858,7 +926,7 @@ test("CLI side: the answering peer cannot choose which local peer gets re-keyed 
     answer = answerAs("instV", { peer_outbound_bearer: "q".repeat(64) });
     const viaAddr = await run([]);
     assert.equal(viaAddr.code, 0, viaAddr.out);
-    assert.equal((await S.row("instV")).auth_token_hash, sha("q".repeat(64)));
+    assert.equal((await S.row("instV")).auth_token_hash, keyed(S.dir, "q".repeat(64)));
 
     // Bare rows (trusted=0, no hash, not revoked — operator-registered / learned by sync).
     await S.db.execute("INSERT INTO crow_instances (id, name, crow_id, gateway_url, tailscale_ip, status, trusted) VALUES ('bareFar', 'BF', 'bareFar', 'http://100.64.8.8:3001', '100.64.8.8', 'active', 0)");

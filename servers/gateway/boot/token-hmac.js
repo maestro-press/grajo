@@ -16,7 +16,8 @@
  *   3. Commit, then `markConverted` (secrets-side marker + the DB mirror).
  *
  * CRASH RE-RUN (§3.2): if the process dies between 2 and 3, the family has no
- * `converted_at` but its snapshot file is still there. That boot converts ONLY the rows
+ * `converted_at` but its snapshot file is still there — including an EMPTY one, taken when the
+ * family held no legacy row (see `pendingSnapshot`). That boot converts ONLY the rows
  * listed in the snapshot that still hold their snapshot value; any other legacy row is a
  * post-snapshot write, so it is NOT converted and raises the alarm. That is what keeps a
  * bot from laundering a write through a crash-and-restart.
@@ -106,6 +107,13 @@ function writeSnapshot(name, body) {
  * The newest snapshot file for a family that has NO `converted_at` — a conversion a crash
  * interrupted. `null` when there is none. A file whose JSON is unreadable is ignored (it is
  * not one of ours); the family then converts fresh, and any row it fails to cover alarms.
+ *
+ * AN EMPTY SNAPSHOT IS STILL A PENDING ONE. `rows: []` means the snapshot was taken when the
+ * family held no legacy row — the conversion committed (nothing) and the process died before
+ * `markConverted`. Skipping such a file would let this boot convert FRESH, laundering a legacy
+ * row something wrote after the crash into a credential its writer knows the token of. Any
+ * snapshot naming this family and this key therefore counts as pending: the rerun converts only
+ * its (zero) rows, alarms every other old-style row, and marks the family.
  */
 function pendingSnapshot(family, keyId) {
   const dir = secretsDir();
@@ -134,7 +142,6 @@ function pendingSnapshot(family, keyId) {
     const rows = body.rows
       .map((r) => ({ rowid: r?.rowid ?? null, token: typeof r?.token === "string" ? r.token : "" }))
       .filter((r) => isLegacyStored(r.token));
-    if (rows.length === 0) continue;
     if (!best || mtimeMs > best.mtimeMs) best = { name, rows, mtimeMs };
   }
   return best;

@@ -72,10 +72,17 @@ export const FAMILY_PREDICATE = Object.freeze({
   [DASHBOARD_SESSION_FAMILY]: "token_type = 'access' AND client_id = 'dashboard'",
 });
 
-/** A pre-conversion stored verifier: today's `sha256hex(token)`. */
-const LEGACY_STORED = /^[0-9a-f]{64}$/;
+/** A pre-conversion stored verifier: today's `sha256hex(token)`, in either hex case. */
+const LEGACY_STORED = /^[0-9a-f]{64}$/i;
 
-/** True for a bare sha256 stored value (the form the converter rewrites, §3.2). */
+/**
+ * True for a bare sha256 stored value (the form the converter rewrites, §3.2).
+ *
+ * CASE-INSENSITIVE, matching `verifyStored`'s own `HEX64` (case-insensitive) + byte compare in
+ * token-mac.js: an UPPERCASE stored value is a working legacy credential there, so a
+ * lowercase-only test here would leave it unconverted and un-alarmed at boot while the validator
+ * kept accepting it. It is treated as legacy everywhere — converted, refused, alarmed.
+ */
 export function isLegacyStored(value) {
   return typeof value === "string" && LEGACY_STORED.test(value);
 }
@@ -90,9 +97,14 @@ export function legacyStoredHash(token) {
 }
 
 /**
- * `readSetting` for the era mirror, with "this DB has no settings store at all"
+ * The one definition of the era mirror read, with "this DB has no settings store at all"
  * (a unit-test DB that only created `oauth_tokens`) answering "no mirror". Any OTHER
  * read failure is rethrown, so `familyConverted` fails CLOSED on it as designed.
+ *
+ * RESIDUAL, named deliberately: a database without the settings table reads as "no mirror"
+ * rather than "lost". The secrets-side STATE FILE is the primary trigger for the era (and the
+ * copy no bot can reach), so this only shapes a bare harness; it stays as is because a stub DB
+ * answering "no such table" would otherwise read as "era lost" for every caller.
  */
 async function mirrorReader(db, key) {
   try {

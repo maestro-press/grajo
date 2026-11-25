@@ -17,6 +17,13 @@
  *                                            //   — inbound validation goes through the
  *                                            //   existing instanceAuthMiddleware which
  *                                            //   hashes against crow_instances.auth_token_hash)
+ *       "inbound_bearer_sha256": "<64 hex>", // sha256 of the bearer the peer presents TO us
+ *                                            //   — the PRE-conversion stored form, kept only so
+ *                                            //   the re-pair proof stays keyed by the value the
+ *                                            //   peer's own install computes (design D4). It is
+ *                                            //   NOT a verifier: nothing compares a presented
+ *                                            //   bearer against it (crow_instances.auth_token_hash
+ *                                            //   is an h1. MAC and is the only credential).
  *       "created_at":    "ISO-8601",
  *       "rotated_at":    "ISO-8601 | null",
  *       "pinned_origin": "http://host:port"  // the peer's gateway ORIGIN, recorded
@@ -610,6 +617,69 @@ export function setPeerCreds(instanceId, patch) {
     all[instanceId] = next;
     return next;
   });
+}
+
+/**
+ * The `inbound_bearer_sha256` recorded for a peer, or null.
+ *
+ * READ-ONLY and never a credential: it is the legacy `sha256(bearer)` form of the bearer the
+ * peer presents TO this instance, kept so the enroll route can key the re-pair proof by the
+ * same value the peer's own install computes (design D4). Nothing in the codebase compares a
+ * presented bearer against it — `crow_instances.auth_token_hash` (an `h1.` MAC) is the only
+ * verifier; this is an input to `repairProofKey` and nothing else.
+ *
+ * @param {string} instanceId
+ * @returns {string|null} 64 lowercase hex, or null when absent/unusable
+ */
+export function getInboundBearerSha256(instanceId) {
+  let entry = null;
+  try { entry = getPeerCreds(instanceId); } catch { entry = null; }
+  const value = entry && typeof entry === "object" ? entry.inbound_bearer_sha256 : null;
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value.toLowerCase()) ? value.toLowerCase() : null;
+}
+
+/**
+ * Record the legacy `sha256(bearer)` of the bearer a peer presents TO this instance.
+ *
+ * Written by the three places that store a NEW inbound verifier: the conversion boot (the value
+ * being converted IS that hash), the enroll route and the pairing CLI. It NEVER creates a store
+ * entry (a peer we hold no credentials for gets no phantom entry: the record lives beside the
+ * `signing_key` the proof also needs, so without one it is useless), and it does NOT touch
+ * `created_at`/`rotated_at` — this is not a rotation, and bumping `rotated_at` would make a
+ * revoked peer's entry look newer than its revoke and keep the key the trust sweeper deletes.
+ *
+ * The write goes through `updatePeerCreds`, so it takes the store lock, re-reads inside it, keeps
+ * a sibling's fields (including `pinned_origin`) and stays 0600 + crash-atomic.
+ *
+ * @param {Array<{id: string, sha256: string}>} records
+ * @returns {string[]} the ids whose entry was actually updated
+ */
+export function setInboundBearerSha256Many(records) {
+  const wanted = new Map();
+  for (const record of Array.isArray(records) ? records : []) {
+    const id = record?.id;
+    const value = record?.sha256;
+    if (typeof id !== "string" || !id) continue;
+    if (typeof value !== "string" || !/^[0-9a-f]{64}$/i.test(value)) continue;
+    wanted.set(id, value.toLowerCase());
+  }
+  if (wanted.size === 0) return [];
+  const updated = [];
+  updatePeerCreds((all) => {
+    let changed = false;
+    for (const [id, value] of wanted) {
+      const entry = all[id];
+      // Only a real entry: a missing one is a peer with no signing key, and a legacy store
+      // metadata string is never an entry.
+      if (!isPeerEntry(entry)) continue;
+      if (entry.inbound_bearer_sha256 === value) continue;
+      entry.inbound_bearer_sha256 = value;
+      updated.push(id);
+      changed = true;
+    }
+    return changed ? {} : { write: false };
+  });
+  return updated;
 }
 
 /**

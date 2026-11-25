@@ -94,6 +94,13 @@ import { markGatewayProcess } from "./models/local-model-servers.js";
 
 import { validateRoomToken } from "../sharing/server.js";
 import { createDbClient } from "../db.js";
+// Keyed verifiers for the paired-instance bearer (`crow_instances.auth_token_hash`, family
+// `peer:inbound`). A SIDE-EFFECT import: loading this module INSTALLS its find/mint
+// implementation into the host-only seam (servers/shared/peer-bearer.js) that the bot-reachable
+// `instance-registry.js` calls, which is how that module validates and rotates a peer bearer
+// without ever importing the token HMAC key (tests/bot-seed-import-guard.test.js). It is static,
+// so the seam is installed before any route or middleware can run.
+import "./peer-inbound-token.js";
 import { createOAuthProvider, initOAuthTables } from "./auth.js";
 import { setOAuthProvider } from "./oauth-consent.js";
 import { resolveIssuerUrl, issuerSource } from "./issuer-url.js";
@@ -559,6 +566,32 @@ try {
     console.error("[bot-def] could not force the unsealed refusal:", e2.message);
   }
   console.error("[bot-def] boot conversion failed:", err.message);
+}
+
+// Keyed token verifiers, the PAIRED-INSTANCE family (§1b/§8 PR 4 of the same design): convert every
+// legacy (bare sha256) `crow_instances.auth_token_hash` to its `h1.` form, record the pre-conversion
+// value the re-pair proof is keyed by (design D4) in `secrets/peer-tokens.json`, and alarm on any
+// old-style value that appears afterwards. It runs here, after the other eras and long before
+// listen, so `validateInstanceToken`, the cross-host signed-call middleware and the enroll route
+// never see a value the converter has not visited — the old-style window is zero. A lost or invalid
+// key never stops the boot: it logs one loud line and every peer bearer is then refused.
+try {
+  const { runPeerTokenHmacBoot } = await import("./boot/token-hmac-peers.js");
+  const _peerDb = createDbClient();
+  try {
+    const _peerHmac = await runPeerTokenHmacBoot({ db: _peerDb });
+    if (_peerHmac.key !== "ok") {
+      console.error(`[token-hmac] boot is running WITHOUT a usable key (${_peerHmac.key}): ${_peerHmac.keyPath}`);
+    } else if (_peerHmac.alarms) {
+      console.warn(`[token-hmac] peer bearers: ${_peerHmac.alarms} old-style row(s) reported at boot`);
+    }
+  } finally {
+    _peerDb.close();
+  }
+} catch (err) {
+  // The conversion must never take the gateway down; a failed family refuses its old-style values
+  // in this process (forceRefusePeerLegacy) and is converted by the next boot.
+  console.error("[token-hmac] peer-token boot conversion failed:", err.message);
 }
 
 // Stamp the moment the new/classic shell first existed on this instance, before

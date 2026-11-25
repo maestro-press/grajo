@@ -45,8 +45,10 @@
  *      so it converts from the stored sha256 itself, which is the MAC's input (design D1) — from
  *      the override only, per 1b.
  *   6. A CRASH RE-RUN is confined to the values a snapshot lists: a family with a snapshot but
- *      no `converted_at` converts ONLY those, and alarms anything else. Without that rule, a
- *      value a bot planted between the crash and the restart would be laundered into a
+ *      no `converted_at` converts ONLY those, and alarms anything else. That holds for an EMPTY
+ *      snapshot too (`rows: []` — the family held nothing when it was taken): it still refuses
+ *      and alarms anything written since, instead of converting that value fresh. Without that
+ *      rule, a value a bot planted between the crash and the restart would be laundered into a
  *      credential the bot knows the raw token for.
  *   7. `markConverted` last: converted_at in the secrets-side state file plus the
  *      `token_hmac_era:<family>` DB mirror. Writing the era BEFORE the rewrite would lock every
@@ -216,6 +218,14 @@ function writeSnapshot(name, body) {
  * crash interrupted — or null. Only its own prefix is scanned, so the `oauth_tokens` era's
  * files are never read as ours (and vice versa). A snapshot written under another key is
  * ignored: its values belong to a key this box no longer holds.
+ *
+ * AN EMPTY SNAPSHOT IS STILL A PENDING ONE (design §3.2 / §3.3). `rows: []` means the snapshot
+ * was taken when this family held no old-style value — the conversion committed (nothing) and
+ * the process died before `markConverted`. Skipping such a file would let this boot convert
+ * FRESH, laundering a value something wrote after the crash into a credential its writer knows
+ * the token of. Any snapshot naming this family and this key therefore counts as pending: the
+ * rerun converts only its (zero) rows, refuses-and-alarms every other old-style value, and
+ * marks the family.
  */
 function pendingSnapshot(family, keyId) {
   const dir = secretsDir();
@@ -244,7 +254,6 @@ function pendingSnapshot(family, keyId) {
         value: typeof r?.token === "string" ? r.token.toLowerCase() : "",
       }))
       .filter((r) => isLegacyStored(r.value));
-    if (rows.length === 0) continue;
     if (!best || mtimeMs > best.mtimeMs) best = { name, rows, mtimeMs };
   }
   return best;

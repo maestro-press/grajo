@@ -468,6 +468,46 @@ test("an interrupted conversion converts only its snapshot rows; any other legac
   }
 });
 
+test("an EMPTY snapshot is still pending: a legacy row written after it is refused, not converted, and the era is recorded", async () => {
+  const s = scratch(seedLegacy([
+    { token: "written-after-an-empty-snapshot", client: "bot-client", scopes: "mcp:tools" },
+  ]));
+  try {
+    const provider = createOAuthProvider(process.env.CROW_DB_PATH);
+    try {
+      // The family held no legacy row when the snapshot was taken; the process died before the
+      // era marker. A restart must not read the empty file as "no snapshot" and convert whatever
+      // was written since.
+      const key = ensureKey({ allowCreate: true, mirrorConverted: false, h1ValuesExist: false });
+      mkdirSync(s.secrets, { recursive: true });
+      const snapshotName = `${ROLLBACK_PREFIX}2026-11-24T00-00-00-000Z-oauth-access.json`;
+      writeFileSync(join(s.secrets, snapshotName), JSON.stringify({
+        v: 1,
+        family: OAUTH_ACCESS_FAMILY,
+        key_id: key.id,
+        created_at: "2026-11-24T00:00:00.000Z",
+        rows: [],
+      }), { mode: 0o600 });
+
+      forgetTokenMacAlarms();
+      const boot = await runTokenHmacBoot({ db: s.db });
+      const access = boot.families.find((f) => f.family === OAUTH_ACCESS_FAMILY);
+      assert.equal(access.count, 0, "the snapshot lists nothing, so nothing is converted");
+      assert.equal(access.alarms, 1, "the row written since the snapshot is reported");
+      assert.equal(await storedFor(s.db, "written-after-an-empty-snapshot", OAUTH_ACCESS_FAMILY),
+        sha256Hex("written-after-an-empty-snapshot"), "and left exactly as written");
+      assert.ok(readState().families[OAUTH_ACCESS_FAMILY]?.converted_at, "the era is recorded now");
+      assert.equal(rollbackFiles(s).filter((f) => f === snapshotName).length, 1, "the empty snapshot is reused");
+      await assert.rejects(() => provider.verifyAccessToken("written-after-an-empty-snapshot"),
+        "the post-snapshot value is refused, never a credential");
+    } finally {
+      provider.db.close();
+    }
+  } finally {
+    s.close();
+  }
+});
+
 // ─── key lost + the operator reset (§2.6) ────────────────────────────────
 
 test("a lost key still boots, refuses everything, and the operator reset restores password login", async () => {

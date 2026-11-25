@@ -72,6 +72,8 @@ import {
 } from "../../shared/peer-credentials.js";
 import { fenceStatements } from "../../shared/repair-fence.js";
 import { rowIsTrusted } from "../../shared/peer-trust.js";
+import { getInboundBearerSha256 } from "../../shared/peer-credentials.js";
+import { legacyStoredHash, mintPeerInbound, peerFamilyConverted } from "../peer-inbound-token.js";
 import {
   ENROLL_OTC_MIN_LENGTH, MAX_REPAIR_PROOFS, sha256Hex, safeEqual, verifyRepairProofs, repairProofKey,
   hasRepairAllowance, otcFirstSeen, OTC_USED_KEY_PREFIX, REPAIR_ALLOW_KEY_PREFIX,
@@ -109,6 +111,48 @@ export const enrollSourceAllowed = (req) => isAllowedEnrollNetwork(req);
 // acceptableAdvertisedUrl / tailnetSuffix live in servers/shared/enroll-guard.js
 // (the CLI applies the same rule to the peer's answer).
 export { acceptableAdvertisedUrl };
+
+/**
+ * The value the re-pair proof is keyed by (design D4) — the LEGACY `sha256(bearer)` form of the
+ * source's current bearer, which is what that peer's own install computes and what
+ * `repairProofKey` has always taken.
+ *
+ * After the keyed-hash conversion `crow_instances.auth_token_hash` holds an `h1.` MAC, so the
+ * stored verifier can no longer supply this: it lives beside the peer's `signing_key` in
+ * `secrets/peer-tokens.json` (`inbound_bearer_sha256`), written by the conversion boot and by
+ * every pairing that stores a new inbound verifier. It is NOT a credential and nothing compares
+ * a presented bearer against it.
+ *
+ * The stored verifier is used as a fallback ONLY while it is itself the legacy 64-hex form AND
+ * the family is NOT converted (an install the conversion boot has not visited). An `h1.` value is
+ * NEVER fed into `repairProofKey`: the peers would compute a different key and every re-pair proof
+ * would fail silently — and the "fix" of hashing the MAC again would make the proof key a
+ * function of a value any DB reader can see, which is exactly what the pair needs to stay
+ * unguessable. After conversion a bare sha256 is not a verifier at all (§3.3), so a stored one
+ * was written by something without the key: keying the proof by it would let whoever wrote it
+ * choose the proof key, so it is refused here as well.
+ *
+ * Null when neither is available: the caller then refuses the proof path and falls back to the
+ * operator's `--allow-re-pair`.
+ *
+ * @param {object} db crow.db client (the era mirror lives here)
+ * @param {object|null} existing the peer's `crow_instances` row
+ * @returns {Promise<string|null>}
+ */
+async function repairProofSecret(db, existing) {
+  const recorded = getInboundBearerSha256(existing?.id);
+  if (recorded) return recorded;
+  if (await peerFamilyConverted(db)) return null;
+  const stored = typeof existing?.auth_token_hash === "string" ? existing.auth_token_hash : "";
+  if (/^[0-9a-fA-F]{64}$/.test(stored)) return stored.toLowerCase();
+  return null;
+}
+
+/**
+ * Exported for the tests that must pin the D4 rule (an `h1.` value is never a proof input). Not
+ * part of the route's public surface: nothing else calls it.
+ */
+export { repairProofSecret };
 
 export function instanceEnrollRouter(db, { execFileSyncImpl, now = () => Date.now() } = {}) {
   const router = express.Router();
@@ -219,10 +263,12 @@ export function instanceEnrollRouter(db, { execFileSyncImpl, now = () => Date.no
       const fresh = (!existing || bareRow) && !existingCreds;
       let usedAllowance = false;
       if (!fresh) {
+        const proofSecret = await repairProofSecret(db, existing);
         const proofOk = Boolean(existing)
           && rowIsTrusted(existing)
+          && Boolean(proofSecret)
           && verifyRepairProofs(
-            repairProofKey(existing.auth_token_hash, existingCreds?.signing_key),
+            repairProofKey(proofSecret, existingCreds?.signing_key),
             body, repair_proofs, { targetId: localId, otcDigest: digest },
           );
         if (!proofOk) {
@@ -243,7 +289,10 @@ export function instanceEnrollRouter(db, { execFileSyncImpl, now = () => Date.no
       // anything is written.
       const self = await selfPairingAddress(db, execFileSyncImpl ? { execFileSyncImpl } : {});
 
-      const sourceHash = sha256Hex(source_outbound_bearer);
+      // The verifier we STORE is the keyed MAC (family `peer:inbound`); the legacy sha256 of the
+      // same bearer is kept beside the peer's signing key for the re-pair proof (design D4).
+      const inboundBearerSha256 = legacyStoredHash(source_outbound_bearer);
+      const sourceHash = await mintPeerInbound(db, source_outbound_bearer);
       // Our own tailnet (for MagicDNS names): from our advertised URL, else
       // from tailscaled itself (a host advertising a bare IP still knows it).
       const ownTailnet = tailnetSuffix(gatewayUrlHost(self.gateway_url))
@@ -342,7 +391,11 @@ export function instanceEnrollRouter(db, { execFileSyncImpl, now = () => Date.no
       const prevAll = loadPeerCreds();
       const hadPrev = Object.prototype.hasOwnProperty.call(prevAll, source_instance_id);
       const prevCreds = prevAll[source_instance_id];
-      setPeerCreds(source_instance_id, { auth_token: peerOutboundBearer, signing_key: shared_signing_key });
+      setPeerCreds(source_instance_id, {
+        auth_token: peerOutboundBearer,
+        signing_key: shared_signing_key,
+        inbound_bearer_sha256: inboundBearerSha256,
+      });
       // Pin the gateway ORIGIN this request itself vetted and wrote to
       // crow_instances.gateway_url (the local `pinUrl` above) — never a later
       // re-read of that row, and never a value kept from it. A credential for

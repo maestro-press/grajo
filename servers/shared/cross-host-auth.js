@@ -32,17 +32,17 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "crypto";
 import { getPeerCreds } from "./peer-credentials.js";
 import { peerTrust } from "./peer-trust.js";
 import { isRelayedSocket } from "./bot-doors.js";
+import { verifyPeerBearer } from "../gateway/peer-inbound-token.js";
 
 /** The one body every refused signed call gets (PT-1). */
 export const PEER_AUTH_FAILED = "peer_auth_failed";
 
-// The dashboard's exported hashToken (one sha256-hex helper, review S9),
-// imported lazily so this module stays light for stdio servers.
-let _hashToken = null;
-async function hashBearer(t) {
-  if (!_hashToken) ({ hashToken: _hashToken } = await import("../gateway/dashboard/auth.js"));
-  return _hashToken(t);
-}
+// The bearer half of a signed call is verified by the KEYED verifier in
+// `crow_instances.auth_token_hash` (family `peer:inbound`), through
+// servers/gateway/peer-inbound-token.js: a bare `sha256(bearer)` row authenticates only while
+// that family is not converted, and after the conversion a planted sha256 is refused (and
+// alarmed) instead of comparing equal. `verifyPeerBearer` verifies the row this middleware
+// already resolved from `X-Crow-Source`, so the two factors of a signed call stay independent.
 
 const DEFAULT_SKEW_MS = 60_000;  // ±60s
 const NONCE_TTL_MS = 120_000;    // entries evicted after 120s
@@ -518,11 +518,13 @@ export function crossHostVerifyMiddleware(dbClient, {
     }
 
     // Bearer binding: the Authorization bearer every signer sends must match
-    // the row's bearer hash. Two independent factors per signed call: the
-    // HMAC key from the pairing AND the bearer the row still trusts.
+    // the row's verifier. Two independent factors per signed call: the
+    // HMAC key from the pairing AND the bearer the row still trusts. The
+    // verifier is a keyed MAC (`peer:inbound`), so a bare sha256 the row could
+    // be made to hold by anything with crow.db write access does not pass.
     const authz = String(req.headers.authorization || "");
     const bearer = authz.startsWith("Bearer ") ? authz.slice(7) : "";
-    if (!bearer || !trust.row?.auth_token_hash || !safeEqHex(await hashBearer(bearer), String(trust.row.auth_token_hash))) {
+    if (!bearer || !(await verifyPeerBearer(dbClient, trust.row, bearer, { channel: "cross-host" }))) {
       return refuse({ ...auditBase, error: "bearer_mismatch" });
     }
 

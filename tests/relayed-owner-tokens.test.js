@@ -37,6 +37,10 @@ import express from "express";
 import llmRouterRouter from "../servers/gateway/routes/llm-router.js";
 import llmModelsRouter from "../servers/gateway/routes/llm-models.js";
 import { instanceAuthMiddleware, validateInstanceToken } from "../servers/gateway/instance-registry.js";
+// The keyed verifier for `crow_instances.auth_token_hash` (family `peer:inbound`). Loading the
+// host module installs the implementation `validateInstanceToken` reaches through its seam, and
+// `ensurePeerKey` mints this home's key so the row can be seeded the way the product writes it.
+import { ensurePeerKey, mintPeerInbound } from "../servers/gateway/peer-inbound-token.js";
 import { loopbackActorGate } from "../servers/gateway/loopback-gate.js";
 import { allowFirstRun } from "../servers/gateway/dashboard/setup-token.js";
 import { requireLocalhost } from "../servers/gateway/routes/admin-backup.js";
@@ -109,9 +113,13 @@ before(async () => {
   // read from the global `dashboard_settings` row, so a global fixture would now seed nothing).
   await writeSetting(db, "mcp_local_token_hash", sha(LOCAL_TOKEN), { scope: "local" });
   await writeSetting(db, "mcp_models_token_hash", sha(MODELS_TOKEN), { scope: "local" });
+  // The paired-instance bearer is seeded in the form the product STORES now: the `h1.` MAC under
+  // this home's key. A planted `sha256(bearer)` would be the forgery the keyed verifier exists to
+  // refuse, and a test that seeded one would prove nothing about the real rail.
+  await ensurePeerKey(db);
   await db.execute({
     sql: "INSERT OR REPLACE INTO crow_instances (id, name, crow_id, auth_token_hash, trusted, status) VALUES (?, ?, ?, ?, 1, 'active')",
-    args: ["peer-a", "A paired peer", "peer-crow-id", sha(PEER_TOKEN)],
+    args: ["peer-a", "A paired peer", "peer-crow-id", await mintPeerInbound(db, PEER_TOKEN)],
   });
 
   // A local model upstream, so an admitted door request really answers 200.
