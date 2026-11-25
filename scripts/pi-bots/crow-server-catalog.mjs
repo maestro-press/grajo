@@ -18,7 +18,7 @@
  * so neither ext_registry.mjs nor mcp_writer.mjs can form a cycle through here.
  */
 import { resolveAddonCommand, checkLauncherArgs } from "../../servers/shared/resolve-command.js";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -389,6 +389,144 @@ export const CORE_DOOR_SERVERS = Object.freeze({
   "crow-projects": Object.freeze({ path: "/projects-bot/mcp", tokenFile: "projects-bot-token", kind: "projects", sign: signProjectsActor }),
 });
 
+/**
+ * The ONE reviewed table of servers the gateway serves through a door: name -> the exact mount path
+ * of THIS instance's gateway its http `{url, headers}` block points at (each is where that door's
+ * block is built above), so the stdio child that would open crow.db / tasks.db is not spawned for
+ * them. Anything NOT in the table (crow-blog, crow-storage, every installed bundle's server,
+ * pm-workspace, the remote proxy, ...) counts as NEEDING the database. A listed name only counts
+ * while its block is really that door: an http url on loopback, at the gateway's port, at exactly
+ * that path (a name-collision block aimed anywhere else still needs the database), never a stdio one.
+ */
+const DOOR_PATHS = Object.freeze({
+  "crow-memory": CORE_DOOR_SERVERS["crow-memory"].path,     // the core doors (CORE_DOOR_SERVERS)
+  "crow-projects": CORE_DOOR_SERVERS["crow-projects"].path,
+  [BOT_SHARING_SERVER]: SHARING_BOT_DOOR_PATH,              // /sharing-bot/mcp
+  [REPORTS_SERVER]: "/reports/mcp",
+  board: "/board/mcp",
+  phone: "/phone/mcp",
+  artifacts: "/artifacts/mcp",                              // the Phone and Artifacts bundle doors
+  [SECRETS_SERVER]: "/secrets/mcp",                         // the credential-request door
+});
+export const DOOR_SERVED_SERVERS = Object.freeze(Object.keys(DOOR_PATHS));
+
+const DOOR_LOOPBACK_HOSTS = Object.freeze(["127.0.0.1", "[::1]", "localhost"]);
+
+/** True when `block` is the door block `name` is served by: http, loopback, the gateway's port, the exact path. */
+export function isDoorServedBlock(name, block, gatewayPort) {
+  const path = DOOR_PATHS[name];
+  if (!path || !block || typeof block !== "object" || block.command) return false;
+  if (typeof block.url !== "string" || block.url === "") return false;
+  let u;
+  try { u = new URL(block.url); } catch { return false; }
+  const port = Number(gatewayPort || process.env.CROW_GATEWAY_PORT || 3001);
+  return u.protocol === "http:" && DOOR_LOOPBACK_HOSTS.includes(u.hostname) && Number(u.port) === port
+    && u.pathname === path && !u.search && !u.hash && !u.username && !u.password;
+}
+
+/** An object holding the inert (stdio) blocks as NON-enumerable properties: it can be carried by
+ *  reference through Object.assign / spreads, and no JSON / log / clone of the carrier shows a block. */
+export function sealInertBlocks(blocks) {
+  const out = {};
+  for (const [k, v] of Object.entries(blocks || {})) Object.defineProperty(out, k, { value: v, enumerable: false });
+  return out;
+}
+
+/**
+ * Hard-link check for a no-database spawn: every database file the gateway uses (and its -wal /
+ * -shm / -journal) must have exactly ONE link. A bot that hard-linked one into its workspace in an
+ * earlier database-bound turn would otherwise keep a writable path to it. Returns a reason or null.
+ * Fails closed when no paths were given.
+ */
+export function databaseLinkProblem(dbPaths) {
+  if (!Array.isArray(dbPaths) || dbPaths.length === 0) return "the database paths are unknown";
+  // (A host bind-mount alias of the data dir is not detectable from here.)
+  for (const configured of dbPaths) {
+    if (typeof configured !== "string" || configured === "") return "the database paths are unknown";
+    const base = resolveSqlitePath(configured); // a file: URI becomes its path
+    for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+      let l;
+      try { l = lstatSync(base + suffix); } catch (e) {
+        // A companion may be absent; the base file may not (fail closed).
+        if (e && e.code === "ENOENT" && suffix !== "") continue;
+        return "the database could not be checked";
+      }
+      if (l.isSymbolicLink()) return "the database path is a link";
+      let st;
+      try { st = statSync(base + suffix); } catch { return "the database could not be checked"; }
+      if (st.nlink > 1) return "the database has another link";
+    }
+  }
+  return null;
+}
+
+/**
+ * The all-or-nothing decision for ONE spawn (design D5a): `noDb` is true only when the opt-in is
+ * requested AND every active server in the FINAL config is a gateway door block, so the sandbox
+ * can hold no database at all. Otherwise the whole opt-in is inert (the caller rebuilds without
+ * door blocks and keeps the bind). Computed once per spawn by writeBotMcp; the same object feeds
+ * the MCP config and the contain plan, so they cannot disagree. Pure.
+ *
+ * @param {{requested: boolean, mcpServers: object, botLabel?: string, gatewayPort?: number}} a
+ * @returns {{requested: boolean, noDb: boolean, blockers: string[], doorUnavailable: string[], warning: string|null}}
+ */
+export function decideCoreDoors({ requested, mcpServers, botLabel, gatewayPort } = {}) {
+  if (requested !== true) return { requested: false, noDb: false, blockers: [], doorUnavailable: [], warning: null };
+  const blockers = [];
+  const doorUnavailable = [];
+  for (const [name, block] of Object.entries(mcpServers || {})) {
+    if (!block || typeof block !== "object" || block.disabled === true) continue;
+    if (isDoorServedBlock(name, block, gatewayPort)) continue;
+    // A listed name as a stdio block (a door with no token yet) is "door unavailable"; a listed name
+    // whose http block points anywhere but its door (a collision) needs the database like any other.
+    if (DOOR_SERVED_SERVERS.includes(name) && (block.command || typeof block.url !== "string" || block.url === "")) doorUnavailable.push(name);
+    else blockers.push(name);
+  }
+  if (!blockers.length && !doorUnavailable.length) return { requested: true, noDb: true, blockers, doorUnavailable, warning: null };
+  const why = blockers.length
+    ? `still needs the database: ${blockers.join(", ")}`
+    : `door unavailable: ${doorUnavailable.join(", ")}`;
+  return { requested: true, noDb: false, blockers, doorUnavailable, warning: `[core-doors] ${botLabel || "bot"}: core doors stay off (${why})` };
+}
+
+/**
+ * The FINAL judgement, self-enforcing: the incoming `noDb` is NOT trusted (and not read). PiRpc
+ * (bridge.mjs) hands the final `mcpConfig` here before the contain plan is built and before the
+ * config is serialised, and the answer is recomputed from that config alone: if any core door
+ * block is present, `noDb` is true only when (1) every active server passes the door-served rule
+ * (decideCoreDoors), (2) the spawn is contained (`containedSpawn === true`: an uncontained spawn has
+ * the full filesystem, so a door beside it is no containment), and (3) no database file has a second
+ * link (`dbPaths`). Otherwise every core door block is replaced by its `inertBlocks[name]` stdio
+ * block (held in memory, never written); a core door with no inert block is dropped and the one
+ * warning says so. No core door block present: noDb false. It can never return a door with noDb false. Pure
+ * apart from the lstat of `dbPaths`.
+ *
+ * @returns {{noDb: boolean, warning: string|null, mcpConfig: object, flipped: boolean}}
+ */
+export function finalizeCoreDoors({ mcpConfig, botLabel, inertBlocks, containedSpawn, dbPaths, gatewayPort } = {}) {
+  const servers0 = (mcpConfig && mcpConfig.mcpServers) || {};
+  const live = (b) => b && typeof b === "object" && b.disabled !== true;
+  const coreDoorNames = Object.keys(CORE_DOOR_SERVERS).filter((n) => live(servers0[n]) && !servers0[n].command
+    && typeof servers0[n].url === "string" && servers0[n].url !== "");
+  if (!coreDoorNames.length) return { noDb: false, warning: null, mcpConfig, flipped: false };
+  const d = decideCoreDoors({ requested: true, mcpServers: servers0, botLabel, gatewayPort });
+  let warning = d.warning;
+  if (d.noDb) {
+    const why = containedSpawn !== true ? "not contained" : databaseLinkProblem(dbPaths);
+    if (!why) return { noDb: true, warning: null, mcpConfig, flipped: false };
+    warning = `[core-doors] ${botLabel || "bot"}: core doors stay off (${why})`;
+  }
+  const servers = { ...servers0 };
+  const dropped = [];
+  for (const name of coreDoorNames) {
+    const inert = inertBlocks && inertBlocks[name];
+    if (inert && typeof inert === "object" && inert.command) servers[name] = inert;
+    else { delete servers[name]; dropped.push(name); }
+  }
+  warning += (dropped.length ? ` (no stdio block to fall back to, dropped: ${dropped.join(", ")})` : "");
+  return { noDb: false, warning, mcpConfig: { ...mcpConfig, mcpServers: servers }, flipped: true };
+}
+
 /** The paths a core door block may point at. */
 export const CORE_DOOR_PATHS = Object.freeze(Object.values(CORE_DOOR_SERVERS).map((d) => d.path));
 
@@ -685,7 +823,8 @@ export function crowServerCatalog(crowHome = process.env.CROW_HOME || join(homed
   // bot's opt-in, coreDoorsWanted), `crow-memory` and `crow-projects` are emitted as HTTP door
   // blocks under their own names, so a def's existing selection resolves to the doors and the bot
   // never spawns them as stdio children. A door block that cannot be complete leaves the stdio
-  // block in place (today's behaviour) and says why in `coreDoors.fellBack`.
+  // block in place and says why in `coreDoors.fellBack`; writeBotMcp then treats the WHOLE opt-in
+  // as inert for that spawn (decideCoreDoors), rebuilding with no door blocks at all.
   const coreDoors = { requested: opts.coreDoors === true, served: [], fellBack: {} };
   const doorBlocks = {};
   if (coreDoors.requested) {

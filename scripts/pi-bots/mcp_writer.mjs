@@ -42,7 +42,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { botsDbPath } from "./instance-paths.mjs";
 import { mintRemoteBlocks } from "./remote-blocks.mjs";
-import { crowServerCatalog, instanceBinding, rebindBlock, SECRETS_SERVER, addonKeychainNeeds, manifestNeeds, SHARED_STORAGE_NEED, withoutKeychainValues, isBotExcludedServer, isSharingDoorBlock, coreDoorsWanted } from "./crow-server-catalog.mjs";
+import { crowServerCatalog, instanceBinding, rebindBlock, SECRETS_SERVER, addonKeychainNeeds, manifestNeeds, SHARED_STORAGE_NEED, withoutKeychainValues, isBotExcludedServer, isSharingDoorBlock, coreDoorsWanted, decideCoreDoors, CORE_DOOR_SERVERS, sealInertBlocks } from "./crow-server-catalog.mjs";
 // The reviewed, code-held storage-consumer table (STORAGE_ENV_CONSUMERS): a bundle manifest's
 // `needs` only ASKS — the grant also needs the id on this list, so a store add-on can never
 // take this instance's storage credentials by declaring a need in its (operator-writable)
@@ -927,7 +927,7 @@ export function warnIfAddonKeysUnanchorable(log = (m) => console.warn(m), { env 
  * `crowHome` that is not this process's CROW_HOME drops the add-on (WARN_ADDON_KEYS_UNREADABLE).
  * The ADDON_SECRET_SHARES table is NOT an option (see _setAddonSecretSharesForTest).
  */
-export function writeBotMcp(def, opts = {}) {
+function writeBotMcpPass(def, opts, doorsOn) {
   const sessionDir = opts.sessionDir || (def && def.session_dir);
   if (!sessionDir) throw new Error("bot def has no session_dir (and no opts.sessionDir override)");
   const canonical = opts.canonical || readCanonicalMcp(opts.canonicalPath);
@@ -958,7 +958,8 @@ export function writeBotMcp(def, opts = {}) {
   // `core_doors: true` make the catalog emit crow-memory / crow-projects as HTTP door blocks
   // (/memory-bot/mcp, /projects-bot/mcp) instead of stdio children. Either half off: exactly
   // today's stdio blocks. `opts.env` is the test seam for the flag.
-  const wantDoors = coreDoorsWanted(def, opts.env || process.env);
+  // `doorsOn` is decided by writeBotMcp (all-or-nothing, decideCoreDoors), never here.
+  const wantDoors = doorsOn === true;
   const { servers: catalog, unconfigured, needsKeys: catalogNeedsKeys, needsSharedStorage: catalogSharedStorage, sharedStorageUnreviewed: catalogStorageUnreviewed, coreDoors } = crowServerCatalog(crowHome, {
     binding, botId: opts.botId, jobId: opts.jobId, threadId: opts.threadId, gatewayType: opts.gatewayType,
     coreDoors: wantDoors,
@@ -969,13 +970,6 @@ export function writeBotMcp(def, opts = {}) {
     interactive: opts.interactive === true,
     actor: actorOf(opts) || undefined,
   });
-  // A requested door that could not be minted kept its stdio block: say so, only for a server
-  // this bot actually has active (a def that never selected crow-memory needs no line about it).
-  if (coreDoors && coreDoors.requested) {
-    for (const [name, reason] of Object.entries(coreDoors.fellBack || {})) {
-      if (built.servers.includes(name)) built.warnings.push(`server '${name}' runs as a stdio child, not through its core door: ${reason}`);
-    }
-  }
   // F4a L2b: merge cross-instance forward-proxy blocks when the caller has
   // confirmed feature_flags.remote_invocation is on (the DB read is done by the
   // caller — bridge/panel/CLI — since this module is DB-agnostic). Default
@@ -1260,9 +1254,50 @@ export function writeBotMcp(def, opts = {}) {
     disabled: built.disabled,
     remoteWarnings,
     // Core bot doors (D2): which of crow-memory / crow-projects the catalog served as door blocks
-    // this build, and why any requested door kept its stdio block. null when not requested.
+    // this pass, and why any door could not be minted. null when this pass did not ask for doors.
     coreDoors: coreDoors && coreDoors.requested ? coreDoors : null,
   };
+}
+
+/**
+ * Build (and, in file mode, write) a bot's MCP config. Core bot doors are ALL OR NOTHING per spawn
+ * (design D5a): with the instance flag and the def's `core_doors: true`, a probe pass builds the
+ * config with door blocks and decideCoreDoors judges the FINAL servers. Only when every active
+ * server is a gateway door is `noDb` true and the door config kept (the contain plan then binds no
+ * database, see buildContainPlan `noDb`); otherwise the opt-in is inert for this spawn: the config
+ * is rebuilt with no door blocks (every server stays stdio) and ONE warning names the blockers.
+ * The result carries `noDb` and `coreDoorsDecision`; callers hand `noDb` to the contain plan, never
+ * recompute it. The non-contained (uncontained tier) path has no sandbox to strip a database from,
+ * so it only uses the door config the decision allows and `noDb` is simply not consumed there.
+ */
+export function writeBotMcp(def, opts = {}) {
+  const requested = coreDoorsWanted(def, opts.env || process.env);
+  if (!requested) {
+    const r = writeBotMcpPass(def, opts, false);
+    return { ...r, noDb: false, coreDoorsDecision: decideCoreDoors({ requested: false }) };
+  }
+  // Probe: never writes a file, never hydrates a key; only its servers are read.
+  const probe = writeBotMcpPass(def, { ...opts, write: false, addonKeys: "omit" }, true);
+  const botLabel = opts.botId || (def && (def.bot_id || def.id)) || "bot";
+  const decision = decideCoreDoors({ requested: true, mcpServers: probe.json.mcpServers, botLabel: String(botLabel) });
+  if (decision.noDb) {
+    // The stdio blocks the core doors would have had, built exactly as the inert path builds them
+    // (same hydration), kept ONLY in memory on the decision: finalizeCoreDoors swaps them in if a
+    // block merged after this point makes the bot need the database (a door never coexists with a
+    // crow.db bind). Non-enumerable so no log/JSON of the decision can carry a hydrated value.
+    const inert = writeBotMcpPass(def, { ...opts, write: false }, false);
+    const inertBlocks = {};
+    for (const n of Object.keys(CORE_DOOR_SERVERS)) {
+      const b = inert.json.mcpServers && inert.json.mcpServers[n];
+      if (b && typeof b === "object" && !b.disabled && b.command) inertBlocks[n] = b;
+    }
+    Object.defineProperty(decision, "inertBlocks", { value: sealInertBlocks(inertBlocks), enumerable: false });
+    const r = writeBotMcpPass(def, opts, true);
+    return { ...r, noDb: true, coreDoorsDecision: decision };
+  }
+  const r = writeBotMcpPass(def, opts, false);
+  r.warnings.push(decision.warning);
+  return { ...r, noDb: false, coreDoorsDecision: decision, coreDoors: null };
 }
 
 // ---- dependency-free MCP stdio tools/list (GUI picker source) -------------

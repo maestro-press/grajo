@@ -16,7 +16,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -551,7 +551,92 @@ test("catalog: flag off → stdio as today; flag on + opt-in → HTTP door block
   const bare = mkdtempSync(join(root, "bare-home-"));
   const fallback = build(DEF({ core_doors: true }), { CROW_BOT_CORE_DOORS: "1" }, bare);
   assert.ok(isStdio(fallback.json.mcpServers["crow-memory"]));
-  assert.ok(fallback.warnings.some((w) => /crow-memory.*stdio child.*core door/.test(w)), fallback.warnings.join("\n"));
+  assert.ok(isStdio(fallback.json.mcpServers["crow-projects"]), "one door unavailable: NO door blocks at all");
+  assert.equal(fallback.noDb, false);
+  assert.deepEqual(fallback.warnings.filter((w) => /\[core-doors\]/.test(w)),
+    [`[core-doors] ${BOT}: core doors stay off (door unavailable: crow-memory, crow-projects)`]);
+}, { timeout: TEST_TIMEOUT });
+
+test("D5a decision: doors only together with no database; anything else makes the whole opt-in inert", async () => {
+  const { writeBotMcp } = await import("../scripts/pi-bots/mcp_writer.mjs");
+  const { decideCoreDoors, DOOR_SERVED_SERVERS } = await import("../scripts/pi-bots/crow-server-catalog.mjs");
+  const session = mkdtempSync(join(root, "session-d5a-"));
+  const build = (def, env) => writeBotMcp(def, {
+    write: false, sessionDir: session, crowHome: CROW_HOME, canonical: { mcpServers: {} },
+    botId: BOT, threadId: "perch-1", gatewayType: "perch", env,
+  });
+  const ON = { CROW_BOT_CORE_DOORS: "1" };
+  const isDoor = (b) => !!(b && b.url && !b.command);
+  const bell = (r) => r.warnings.filter((w) => /\[core-doors\]/.test(w));
+
+  // All selected servers are door-served: noDb + doors, no warning.
+  const all = build(DEF({ core_doors: true }), ON);
+  assert.equal(all.noDb, true);
+  assert.ok(isDoor(all.json.mcpServers["crow-memory"]) && isDoor(all.json.mcpServers["crow-projects"]));
+  assert.deepEqual(bell(all), []);
+  assert.equal(all.coreDoorsDecision.noDb, true);
+
+  // One extra server that opens the database: inert, stdio everywhere, ONE warning naming it.
+  const extra = build(DEF({ core_doors: true, tools: { crow_mcp: ["crow-memory", "crow-projects", "crow-blog"] } }), ON);
+  assert.equal(extra.noDb, false);
+  for (const n of ["crow-memory", "crow-projects", "crow-blog"]) assert.ok(!isDoor(extra.json.mcpServers[n]), n + " stays stdio");
+  assert.equal(extra.coreDoors, null);
+  assert.deepEqual(bell(extra), [`[core-doors] ${BOT}: core doors stay off (still needs the database: crow-blog)`]);
+
+  // Flag off / opt-in off: today's behaviour, no decision line, never noDb.
+  for (const [def, env] of [[DEF({ core_doors: true }), {}], [DEF(), ON]]) {
+    const r = build(def, env);
+    assert.equal(r.noDb, false);
+    assert.deepEqual(bell(r), []);
+    assert.ok(!isDoor(r.json.mcpServers["crow-memory"]));
+  }
+
+  // The pure decision, and the reviewed list it reads.
+  assert.ok(DOOR_SERVED_SERVERS.includes("crow-memory") && !DOOR_SERVED_SERVERS.includes("crow-blog") && !DOOR_SERVED_SERVERS.includes("crow-storage"));
+  const PORT = process.env.CROW_GATEWAY_PORT || 3001;
+  const door = { url: `http://127.0.0.1:${PORT}/memory-bot/mcp`, headers: {} };
+  const stdio = { command: "node", args: [] };
+  assert.equal(decideCoreDoors({ requested: false, mcpServers: { a: stdio } }).noDb, false);
+  assert.equal(decideCoreDoors({ requested: true, mcpServers: { "crow-memory": door, off: { disabled: true } } }).noDb, true);
+  const bundle = decideCoreDoors({ requested: true, botLabel: "b", mcpServers: { "crow-memory": door, "some-bundle": { url: `http://127.0.0.1:${PORT}/some/mcp` } } });
+  assert.equal(bundle.noDb, false, "an http block that is not on the reviewed list still needs the database");
+  assert.deepEqual(bundle.blockers, ["some-bundle"]);
+  // L2: a listed NAME is not enough: its block must be that door (loopback, the gateway's port, the exact path).
+  for (const url of [`http://127.0.0.1:${PORT}/other/mcp`, `http://127.0.0.1:${Number(PORT) + 1}/memory-bot/mcp`,
+    `http://example.test:${PORT}/memory-bot/mcp`, `https://127.0.0.1:${PORT}/memory-bot/mcp`, `http://127.0.0.1:${PORT}/memory-bot/mcp?x=1`]) {
+    const c = decideCoreDoors({ requested: true, botLabel: "b", mcpServers: { "crow-memory": { url, headers: {} } } });
+    assert.equal(c.noDb, false, "name collision at " + url + " is not door-served");
+    assert.deepEqual(c.blockers, ["crow-memory"]);
+  }
+  assert.equal(decideCoreDoors({ requested: true, botLabel: "b", mcpServers: { "crow-memory": stdio } }).warning,
+    "[core-doors] b: core doors stay off (door unavailable: crow-memory)");
+}, { timeout: TEST_TIMEOUT });
+
+test("D5a: the one decision feeds both the MCP writer and the contain plan", async () => {
+  const { buildContainPlan } = await import("../scripts/pi-bots/pi_contain.mjs");
+  const { writeBotMcp } = await import("../scripts/pi-bots/mcp_writer.mjs");
+  const data = mkdtempSync(join(root, "plan-data-"));
+  const home = join(root, "homes", "me"); // the plan treats the home's parent as "other users' homes"
+  mkdirSync(home, { recursive: true });
+  const cache = mkdtempSync(join(root, "plan-cache-"));
+  const ses = mkdtempSync(join(root, "plan-ses-"));
+  for (const f of ["crow.db", "tasks.db", "crow.db-wal"]) writeFileSync(join(data, f), "");
+  const plan = (noDb) => buildContainPlan({ home, uid: process.getuid(), crowHome: CROW_HOME, dataDir: data, botCacheDir: cache,
+    sessionDir: ses, cwd: ses, nodeBin: process.execPath, noDb });
+  // P2: a withheld database is absent by construction: its folder (the data dir) is not bound at all.
+  const masked = (args, p) => !args.includes(p.slice(0, p.lastIndexOf("/")));
+  for (const [def, env] of [[DEF({ core_doors: true }), { CROW_BOT_CORE_DOORS: "1" }],
+    [DEF({ core_doors: true, tools: { crow_mcp: ["crow-memory", "crow-projects", "crow-blog"] } }), { CROW_BOT_CORE_DOORS: "1" }],
+    [DEF(), { CROW_BOT_CORE_DOORS: "1" }]]) {
+    const w = writeBotMcp(def, { write: false, sessionDir: ses, crowHome: CROW_HOME, canonical: { mcpServers: {} }, botId: BOT, threadId: "t", gatewayType: "perch", env });
+    const { args, refused } = plan(w.noDb);
+    assert.deepEqual(refused, []);
+    const doorBlocks = Object.values(w.json.mcpServers).filter((b) => b && b.url && /-bot\/mcp$/.test(b.url) && /memory|projects/.test(b.url)).length;
+    for (const f of ["crow.db", "tasks.db", "crow.db-wal"]) {
+      assert.equal(masked(args, join(data, f)), w.noDb, `${f}: masked exactly when the writer chose doors`);
+    }
+    assert.equal(doorBlocks > 0, w.noDb, "door blocks exist exactly when noDb");
+  }
 }, { timeout: TEST_TIMEOUT });
 
 test("the door paths are bot doors, the owner paths are not, and the writer allows the door urls", async () => {
@@ -578,4 +663,180 @@ test("flag off: the core doors are not mounted at all (the boot step throws befo
   const { coreDoorsFlagOn } = await import("../servers/shared/core-doors-flag.js");
   assert.equal(coreDoorsFlagOn({}), false);
   assert.equal(coreDoorsFlagOn({ CROW_BOT_CORE_DOORS: "1" }), true);
+});
+
+test("D5a final judgement: blocks merged after the writer re-decide noDb; a flip leaves NO core door", async () => {
+  const { buildContainPlan } = await import("../scripts/pi-bots/pi_contain.mjs");
+  const { writeBotMcp } = await import("../scripts/pi-bots/mcp_writer.mjs");
+  const { applyServiceBlocks } = await import("../scripts/pi-bots/service-blocks.mjs");
+  const { applySatelliteBlocks } = await import("../scripts/pi-bots/satellite-blocks.mjs");
+  const { finalizeCoreDoors } = await import("../scripts/pi-bots/crow-server-catalog.mjs");
+  const data = mkdtempSync(join(root, "fin-data-"));
+  const home = join(root, "homes", "fin");
+  mkdirSync(home, { recursive: true });
+  const cache = mkdtempSync(join(root, "fin-cache-"));
+  const ses = mkdtempSync(join(root, "fin-ses-"));
+  writeFileSync(join(data, "crow.db"), ""); writeFileSync(join(data, "tasks.db"), "");
+  const DBP = [join(data, "crow.db"), join(data, "tasks.db")];
+  // P2: a withheld database is absent by construction: its folder (the data dir) is not bound at all.
+  const masked = (args, p) => !args.includes(p.slice(0, p.lastIndexOf("/")));
+  const w = writeBotMcp(DEF({ core_doors: true }), { write: false, sessionDir: ses, crowHome: CROW_HOME, canonical: { mcpServers: {} },
+    botId: BOT, threadId: "t", gatewayType: "perch", env: { CROW_BOT_CORE_DOORS: "1" } });
+  assert.equal(w.noDb, true);
+  const inertBlocks = w.coreDoorsDecision.inertBlocks;
+  assert.deepEqual(Object.getOwnPropertyNames(inertBlocks).sort(), ["crow-memory", "crow-projects"]);
+  assert.ok(!JSON.stringify(w.coreDoorsDecision).includes("command"), "inert blocks are not enumerable on the decision");
+  const isDoor = (b) => !!(b && b.url && !b.command);
+  const planMasked = (config) => {
+    const f = finalizeCoreDoors({ mcpConfig: config, botLabel: BOT, inertBlocks, containedSpawn: true, dbPaths: DBP });
+    const { args, refused } = buildContainPlan({ home, uid: process.getuid(), crowHome: CROW_HOME, dataDir: data, botCacheDir: cache,
+      sessionDir: ses, cwd: ses, nodeBin: process.execPath, noDb: f.noDb });
+    assert.deepEqual(refused, []);
+    return { f, masked: masked(args, join(data, "crow.db")) };
+  };
+  const same = planMasked(w.json);
+  assert.deepEqual([same.f.noDb, same.f.warning, same.masked, same.f.mcpConfig], [true, null, true, w.json]);
+  const door = { url: `http://127.0.0.1:${process.env.CROW_GATEWAY_PORT || 3001}/board/mcp`, headers: {} };
+  const withDoor = planMasked({ ...w.json, mcpServers: { ...w.json.mcpServers, board: door } });
+  assert.deepEqual([withDoor.f.noDb, withDoor.masked], [true, true]);
+  // A later stdio satellite block flips it: stdio core blocks, crow.db bound, exactly one warning.
+  const sat = applySatelliteBlocks(w.json, { blocks: { "sat-x": { command: "node", args: ["x.js"] } }, replacing: [] });
+  const s = planMasked(sat);
+  assert.equal(s.f.noDb, false);
+  assert.equal(s.masked, false);
+  assert.equal(s.f.warning, `[core-doors] ${BOT}: core doors stay off (still needs the database: sat-x)`);
+  for (const n of ["crow-memory", "crow-projects"]) {
+    const b = s.f.mcpConfig.mcpServers[n];
+    assert.ok(b.command && !isDoor(b), n + " is the stdio block");
+    assert.deepEqual(b, inertBlocks[n]);
+  }
+  assert.ok(!JSON.stringify(s.f.mcpConfig).match(/(memory|projects)-bot\/mcp/), "no core door URL anywhere in the final config");
+  assert.equal(s.f.mcpConfig.mcpServers["sat-x"].command, "node");
+  // The delivered config (what the fd pipe / file rewrite serialises) is the finalized one.
+  assert.equal(JSON.stringify(s.f.mcpConfig), JSON.stringify(finalizeCoreDoors({ mcpConfig: sat, inertBlocks, containedSpawn: true, dbPaths: DBP }).mcpConfig));
+  // No inert block for a core door: dropped, and the warning says so.
+  const dropped = finalizeCoreDoors({ mcpConfig: sat, botLabel: BOT, inertBlocks: {}, containedSpawn: true, dbPaths: DBP });
+  assert.ok(!("crow-memory" in dropped.mcpConfig.mcpServers) && /dropped: crow-memory, crow-projects/.test(dropped.warning));
+  const svc = applyServiceBlocks(w.json, { blocks: { "github-x": { url: "http://127.0.0.1:1/svc" } }, byService: {} });
+  assert.equal(planMasked(svc).f.noDb, false);
+  // The incoming noDb is never read: a config that holds doors is judged on its own.
+  assert.equal(finalizeCoreDoors({ noDb: false, mcpConfig: w.json, botLabel: BOT, inertBlocks, containedSpawn: true, dbPaths: DBP }).noDb, true);
+}, { timeout: TEST_TIMEOUT });
+
+async function finalizeFixture() {
+  const { writeBotMcp } = await import("../scripts/pi-bots/mcp_writer.mjs");
+  const ses = mkdtempSync(join(root, "fx-ses-"));
+  const data = mkdtempSync(join(root, "fx-data-"));
+  const w = writeBotMcp(DEF({ core_doors: true }), { write: false, sessionDir: ses, crowHome: CROW_HOME, canonical: { mcpServers: {} },
+    botId: BOT, threadId: "t", gatewayType: "perch", env: { CROW_BOT_CORE_DOORS: "1" } });
+  assert.equal(w.noDb, true);
+  writeFileSync(join(data, "crow.db"), ""); writeFileSync(join(data, "tasks.db"), "");
+  return { w, data, dbPaths: [join(data, "crow.db"), join(data, "tasks.db")], inertBlocks: w.coreDoorsDecision.inertBlocks };
+}
+
+test("H1: a stale incoming noDb cannot yield doors with the database bound (key-less first turn, then a rebind)", async () => {
+  const { finalizeCoreDoors } = await import("../scripts/pi-bots/crow-server-catalog.mjs");
+  const { buildContainPlan } = await import("../scripts/pi-bots/pi_contain.mjs");
+  const { w, data, dbPaths, inertBlocks } = await finalizeFixture();
+  const isDoor = (b) => !!(b && b.url && !b.command);
+  const doors = (c) => ["crow-memory", "crow-projects"].filter((n) => isDoor(c.mcpServers[n]));
+  // The first, key-less build was inert (noDb false, no inert blocks); the rebuilt config HAS doors
+  // and piRpcOpts still says noDb:false. The judgement is of the config alone.
+  const clean = finalizeCoreDoors({ noDb: false, coreInertBlocks: null, mcpConfig: w.json, botLabel: BOT, inertBlocks, containedSpawn: true, dbPaths });
+  assert.equal(clean.noDb, true);
+  assert.equal(doors(clean.mcpConfig).length, 2);
+  // Not judged clean: swapped, never doors + database.
+  for (const bad of [{ containedSpawn: false }, { containedSpawn: undefined }, { dbPaths: undefined }]) {
+    const f = finalizeCoreDoors({ noDb: true, mcpConfig: w.json, botLabel: BOT, inertBlocks, containedSpawn: true, dbPaths, ...bad });
+    assert.equal(f.noDb, false);
+    assert.deepEqual(doors(f.mcpConfig), []);
+    assert.ok(/core doors stay off/.test(f.warning));
+  }
+  // No door block present: noDb false whatever the caller says.
+  const inert = finalizeCoreDoors({ noDb: true, mcpConfig: { mcpServers: { "crow-memory": inertBlocks["crow-memory"] } }, inertBlocks, containedSpawn: true, dbPaths });
+  assert.equal(inert.noDb, false);
+  assert.equal(inert.warning, null);
+  // The bridge hands the rebound world's noDb/inert blocks on (source check), and the plan follows the judgement.
+  const src = readFileSync(new URL("../scripts/pi-bots/bridge.mjs", import.meta.url), "utf8");
+  assert.match(src, /mcpConfig: world\.mcpConfig,\s*noDb: world\.noDb === true, coreInertBlocks: world\.coreInertBlocks \|\| null/);
+  const home = join(root, "homes", "h1"); mkdirSync(home, { recursive: true });
+  const { args } = buildContainPlan({ home, uid: process.getuid(), crowHome: CROW_HOME, dataDir: data, botCacheDir: mkdtempSync(join(root, "h1-c-")),
+    sessionDir: mkdtempSync(join(root, "h1-s-")), cwd: root, nodeBin: process.execPath, noDb: clean.noDb });
+  assert.ok(!args.includes(data), "the data dir is not bound under noDb");
+}, { timeout: TEST_TIMEOUT });
+
+test("H3: an uncontained spawn never keeps core doors", async () => {
+  const { finalizeCoreDoors } = await import("../scripts/pi-bots/crow-server-catalog.mjs");
+  const { w, dbPaths, inertBlocks } = await finalizeFixture();
+  const f = finalizeCoreDoors({ mcpConfig: w.json, botLabel: BOT, inertBlocks, containedSpawn: false, dbPaths });
+  assert.equal(f.noDb, false);
+  assert.equal(f.warning, `[core-doors] ${BOT}: core doors stay off (not contained)`);
+  for (const n of ["crow-memory", "crow-projects"]) assert.ok(f.mcpConfig.mcpServers[n].command, n + " is stdio");
+  const src = readFileSync(new URL("../scripts/pi-bots/bridge.mjs", import.meta.url), "utf8");
+  assert.match(src, /finalizeCoreDoors\(\{[^}]*containedSpawn/);
+});
+
+test("M1: a hard-linked database file keeps the doors off", async () => {
+  const { finalizeCoreDoors } = await import("../scripts/pi-bots/crow-server-catalog.mjs");
+  const { linkSync } = await import("node:fs");
+  const { w, data, dbPaths, inertBlocks } = await finalizeFixture();
+  const ok = finalizeCoreDoors({ mcpConfig: w.json, botLabel: BOT, inertBlocks, containedSpawn: true, dbPaths });
+  assert.equal(ok.noDb, true);
+  const ws = mkdtempSync(join(root, "m1-ws-"));
+  linkSync(join(data, "crow.db"), join(ws, "copy.db"));
+  const f = finalizeCoreDoors({ mcpConfig: w.json, botLabel: BOT, inertBlocks, containedSpawn: true, dbPaths });
+  assert.equal(f.noDb, false);
+  assert.equal(f.warning, `[core-doors] ${BOT}: core doors stay off (the database has another link)`);
+  // A -wal companion counts too.
+  const { w: w2, data: d2, dbPaths: p2, inertBlocks: i2 } = await finalizeFixture();
+  writeFileSync(join(d2, "crow.db-wal"), "");
+  linkSync(join(d2, "crow.db-wal"), join(ws, "wal-copy"));
+  assert.equal(finalizeCoreDoors({ mcpConfig: w2.json, botLabel: BOT, inertBlocks: i2, containedSpawn: true, dbPaths: p2 }).noDb, false);
+});
+
+test("L-a: databaseLinkProblem handles file: URIs, a missing base, symlinks and links through a symlink", async () => {
+  const { databaseLinkProblem } = await import("../scripts/pi-bots/crow-server-catalog.mjs");
+  const { linkSync, symlinkSync } = await import("node:fs");
+  const dir = mkdtempSync(join(root, "la-"));
+  const db = join(dir, "crow.db");
+  writeFileSync(db, "");
+  assert.equal(databaseLinkProblem([db]), null);
+  assert.equal(databaseLinkProblem(["file:" + db + "?mode=rw"]), null, "a file: URI is normalised");
+  // a hard link through a file: URI is still seen
+  linkSync(db, join(dir, "copy"));
+  assert.equal(databaseLinkProblem(["file:" + db]), "the database has another link");
+  assert.equal(databaseLinkProblem([join(dir, "missing.db")]), "the database could not be checked");
+  const real = join(dir, "real.db");
+  writeFileSync(real, "");
+  const sym = join(dir, "sym.db");
+  symlinkSync(real, sym);
+  assert.equal(databaseLinkProblem([sym]), "the database path is a link");
+  // hard link made to the symlink's target
+  linkSync(real, join(dir, "real-copy"));
+  assert.notEqual(databaseLinkProblem([sym]), null);
+  // an absent companion is fine
+  const ok = join(dir, "ok.db");
+  writeFileSync(ok, "");
+  assert.equal(databaseLinkProblem([ok]), null);
+});
+
+test("L2: a core-door name whose block is aimed elsewhere is not door-served", async () => {
+  const { finalizeCoreDoors } = await import("../scripts/pi-bots/crow-server-catalog.mjs");
+  const { w, dbPaths, inertBlocks } = await finalizeFixture();
+  const cfg = { ...w.json, mcpServers: { ...w.json.mcpServers, "crow-memory": { url: "http://127.0.0.1:1/elsewhere", headers: {} } } };
+  const f = finalizeCoreDoors({ mcpConfig: cfg, botLabel: BOT, inertBlocks, containedSpawn: true, dbPaths });
+  assert.equal(f.noDb, false);
+  assert.match(f.warning, /still needs the database: crow-memory/);
+  assert.ok(f.mcpConfig.mcpServers["crow-memory"].command);
+});
+
+test("L3: inert blocks are non-enumerable on every carrier, survive Object.assign, and never show in JSON", async () => {
+  const { w } = await finalizeFixture();
+  const inertBlocks = w.coreDoorsDecision.inertBlocks;
+  assert.equal(JSON.stringify(inertBlocks), "{}");
+  const opts = Object.assign({}, { mcpConfig: w.json, noDb: true, coreInertBlocks: inertBlocks }, { extra: 1 });
+  assert.ok(!JSON.stringify(opts).includes("command"), "no inert block in JSON of the opts");
+  assert.ok(opts.coreInertBlocks["crow-memory"].command, "still readable through the copied reference");
+  const { cloneSpawnOpts } = await import("../scripts/lib/eval-guard.mjs");
+  assert.ok(!JSON.stringify(cloneSpawnOpts(opts)).includes("command"), "the eval clone carries none");
 });

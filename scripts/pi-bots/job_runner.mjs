@@ -410,6 +410,8 @@ export async function runJob(job, { log = () => {}, bridge: injectedBridge = nul
     // /tmp/pibot-job-* dir — PiRpc pipes the built JSON to pi instead.
     const mcpDelivery = mcpConfigDelivery();
     let mcpConfig = null;
+    let coreInertBlocks = null;
+    let noDb = false; // core doors all-or-nothing decision (writeBotMcp), handed to the contain plan
     // Item 46 PR-B: a key-less host (the pibot-bridge@ tick drains jobs) asks
     // its gateway's loopback signing relay for this job's phone signature; the
     // key never reaches it. The gateway signs only for a running job of this
@@ -425,6 +427,9 @@ export async function runJob(job, { log = () => {}, bridge: injectedBridge = nul
         // (mcp-delivery.mjs) — hydrate there, never for a file.
         addonKeys: mcpDelivery === "fd" ? "hydrate" : "omit" });
       mcpConfig = (w && w.json) || null;
+      noDb = !!(w && w.noDb === true);
+      coreInertBlocks = (w && w.coreDoorsDecision && w.coreDoorsDecision.inertBlocks) || null;
+      if (w && w.coreDoorsDecision && w.coreDoorsDecision.warning) log(w.coreDoorsDecision.warning);
       // The shared-storage line a channel turn logs too (mcp_writer.mjs): a background job on a
       // file-delivery host must show its degraded storage, not bury it in a silent fallback.
       if (w && w.sharedStorage && w.sharedStorage.note) log(w.sharedStorage.note);
@@ -488,7 +493,7 @@ export async function runJob(job, { log = () => {}, bridge: injectedBridge = nul
     const pi = new bridge.PiRpc({
       def, sessionDir, resolved, piProvider, selfAuthoringDir: null,
       piSessionId: null, appendSystemPromptFile: sysFile,
-      projectWorkspaceDir, mcpDelivery, mcpConfig, botId: job.bot_id,
+      projectWorkspaceDir, mcpDelivery, mcpConfig, noDb, coreInertBlocks, botId: job.bot_id,
       // Share-derived file roots, fixed at this spawn (see the jobShares read above).
       // extraWritePaths only when a `read_write` share contributed one: a present-but-empty list
       // would rewrite write_paths and add the key to a def whose policy never carried it.

@@ -31,6 +31,15 @@
  *               UNCONDITIONALLY — the sharing identity holds the master seed
  *               every instance and bot key derives from, and no tier gives it
  *               back (there is no opt-out: `unmaskIdentity` was removed).
+ *               With `noDb` (core doors, all or nothing: every selected server is
+ *               a gateway door) the data dir is NOT bound at all, not even
+ *               read-only: the sandbox root is a fresh tmpfs, so crow.db,
+ *               tasks.db, identity.json, secrets/ and every other project are
+ *               absent by construction. Only the bot's workspace, its pi-bots
+ *               state/session dir and the usual non-data binds are mounted, each
+ *               at its own host path. DATA_KEEP is ignored. A bind at or under
+ *               the data dir other than the workspace (e.g. a write_path), or
+ *               one covering a database file or its folder, is a ContainRefused.
  *               CROW_HOME itself, its tokens, secrets/ and env/ are not bound.
  *               <crowHome>/skills read-only.
  *               Every OTHER entry of the data dir is masked with an empty
@@ -1369,8 +1378,21 @@ export function buildContainPlan(o) {
     else refused.push({ path: o.cloudTokenPath, reason: "the cloud door token does not exist; a consented cloud model would fail every request" });
   }
 
+  // noDb: every database file path (crow db, tasks db) and its companions, resolved.
+  const dbFiles = [];
+  if (o.noDb === true) {
+    for (const dp of Array.isArray(o.dbPaths) ? o.dbPaths : []) {
+      if (typeof dp !== "string" || !dp) continue;
+      const rdir = real(dirname(dp), exists);
+      const full = rdir ? join(rdir, basename(dp)) : dp;
+      for (const sfx of ["", "-wal", "-shm", "-journal"]) dbFiles.push(full + sfx);
+    }
+  }
+
   // instance data (read-write) + masks
-  if (o.dataDir) {
+  // noDb (core doors): the data dir is not bound at all (see the header); the tmpfs root has no
+  // such path, and the workspace / state dir are bound explicitly below at their own paths.
+  if (o.dataDir && o.noDb !== true) {
     add(rw, o.dataDir, { write: true, label: "data dir" });
     const rd = real(o.dataDir, exists);
     if (rd && rw.has(rd)) {
@@ -1543,6 +1565,42 @@ export function buildContainPlan(o) {
   // projects/ entry). Same dest: the bind first, the mask after.
   // readonlyDirMasks: a masked data folder is an empty READ-ONLY mount, so a
   // write into it FAILS loudly instead of being lost in scratch.
+  // noDb backstop: with no data dir in the sandbox, NO bind (rw or ro) may sit at, above or under
+  // the data dir other than the workspace itself (and paths under it), and none may cover a
+  // database file or companion or the folder of one. The spawn is refused, never silently
+  // trimmed: a configured write_path/read_path under the data dir is an operator mistake to see.
+  // The message names the kind, never a path. (A host bind-mount alias of the data dir is not
+  // detectable from here.)
+  if (o.noDb === true) {
+    const rdData = o.dataDir ? real(o.dataDir, exists) : null;
+    const rdWsRaw = o.workspaceDir ? real(o.workspaceDir, exists) : null;
+    // The workspace is exempt ONLY when its real path is strictly below <data>/projects/: the
+    // workspace_dir comes from a project_spaces row in crow.db, which a database-bound bot can
+    // write, so a row pointing at the data dir, an ancestor, projects/ itself or a reserved entry
+    // (backups, secrets, …) must never be bound here — on the database-bound path those are masked
+    // after the bind, but noDb has no masks. Anything else under the data dir is refused below.
+    // projects/ by its REAL path: an operator may have made it a symlink to another disk, and a
+    // workspace at (or above) that real root would otherwise sit outside the data dir and pass.
+    const rdProjects = rdData ? (real(join(rdData, "projects"), exists) || join(rdData, "projects")) : null;
+    const rdWs = rdWsRaw && rdProjects && rdWsRaw !== rdProjects && under(rdWsRaw, rdProjects) ? rdWsRaw : null;
+    if (rdWsRaw && rdData && !rdWs && (under(rdWsRaw, rdData) || under(rdData, rdWsRaw) || under(rdProjects, rdWsRaw))) {
+      throw new ContainRefused("contain refused: the workspace is not a project folder while the database is withheld (noDb)");
+    }
+    const kindOf = (w) => {
+      for (const f of dbFiles) if (under(f, w)) return f === w ? "a database file" : "the folder of a database file";
+      if (rdData && (under(rdData, w) || under(w, rdData))) {
+        if (rdWs && under(w, rdWs)) return null;
+        return w === rdData ? "the data dir" : under(rdData, w) ? "an ancestor of the data dir" : "a path under the data dir";
+      }
+      return null;
+    };
+    const dests = [...rw.keys(), ...ro.keys(), ...masks.map(([m]) => m)];
+    for (const e of agentEntries) if (typeof e[2] === "string") dests.push(e[2]);
+    for (const w of dests) {
+      const kind = kindOf(w);
+      if (kind) throw new ContainRefused("contain refused: a bind would cover " + kind + " while the database is withheld (noDb)");
+    }
+  }
   args.push(...assembleBindArgs({ ro, rw, masks, extraEntries: agentEntries, readonlyDirMasks: true }));
 
   args.push("--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try", "--cap-drop", "ALL");

@@ -304,6 +304,113 @@ test("C9: the data dir keeps only the DBs, the bot's own project and the keep-li
   assert.ok(iProjects > 0 && iWs > iProjects, "the tmpfs comes first, the workspace is bound inside it");
 });
 
+const dataBinds = (args, d) => pairs(args).filter((q) => ["--bind", "--ro-bind", "--tmpfs", "--bind-try", "--ro-bind-try"].includes(q[0]) && [q[1], q[2]].some((x) => x && (x === d || x.startsWith(d + "/"))));
+
+test("noDb: the data dir is not bound at all; only the workspace (and what is under it) and the pi-bots dir are", () => {
+  const top = mk(T, "nodb");
+  const d = mk(top, "data");
+  for (const f of ["crow.db", "crow.db-wal", "tasks.db", "identity.json"]) writeFileSync(join(d, f), "");
+  mk(d, "backups"); mk(d, "secrets"); mk(d, "projects", "theirs"); mk(d, "artifacts");
+  const ws = mk(d, "projects", "mine", "workspace");
+  const own = mk(crowHome, "pi-bots", "nodbbot");
+  const on = buildContainPlan(base({ dataDir: d, noDb: true, workspaceDir: ws, botStateDir: own, sessionDir: own, cwd: ws, dataKeep: ["crow.db", "artifacts"] }));
+  assert.deepEqual(on.refused, []);
+  const inData = dataBinds(on.args, d);
+  assert.ok(inData.length > 0 && inData.every((q) => (q[2] || q[1]) === ws || (q[2] || q[1]).startsWith(ws + "/")), "only the workspace (and things under it) touch the data dir: " + JSON.stringify(inData));
+  assert.ok(has(on.args, "--bind", ws, ws), "the workspace is bound read-write at its own path");
+  assert.ok(has(on.args, "--bind", own, own), "the pi-bots dir is bound read-write");
+  for (const f of ["crow.db", "identity.json", "backups", "secrets", "artifacts"]) assert.ok(dataBinds(on.args, join(d, f)).length === 0, f + " has no bind or mask (absent by construction)");
+  assert.deepEqual(on.mountPoints.filter((m) => m === d || m.startsWith(d + "/") && !(m === ws || m.startsWith(ws + "/"))), []);
+  // Without noDb the plan still binds the data root.
+  const off = buildContainPlan(base({ dataDir: d, workspaceDir: ws }));
+  assert.ok(has(off.args, "--bind", d));
+});
+
+test("noDb: a write/read path under the data dir (not the workspace), the data dir or an ancestor, or a database folder is a ContainRefused; the same inputs without noDb are not a noDb refusal", () => {
+  const top = mk(T, "h1");
+  const d = mk(top, "inst", "data");
+  writeFileSync(join(d, "crow.db"), "");
+  const tdir = mk(top, "tasks-elsewhere");
+  writeFileSync(join(tdir, "tasks.db"), "");
+  const dbPaths = [join(d, "crow.db"), join(tdir, "tasks.db")];
+  mk(d, "projects", "x"); mk(d, "other");
+  const ws = join(d, "projects", "x");
+  const cases = {
+    "workspace = data dir": { workspaceDir: d },
+    "workspace = <data>/projects/x/../..": { workspaceDir: join(d, "projects", "x", "..", "..") },
+    "write_paths = data dir": { writePaths: [d] },
+    "write_paths = a sibling folder under the data dir": { workspaceDir: ws, writePaths: [join(d, "other")] },
+    "read_paths under the data dir": { workspaceDir: ws, readPaths: [join(d, "other")] },
+    "session dir = data dir": { sessionDir: d },
+    "ancestor of the data dir": { writePaths: [join(top, "inst")] },
+    "tasks db folder via write_paths": { writePaths: [tdir] },
+    "tasks db folder via read_paths": { readPaths: [tdir] },
+  };
+  for (const [name, over] of Object.entries(cases)) {
+    assert.throws(() => buildContainPlan(base({ dataDir: d, noDb: true, dbPaths, ...over })), (e) => e instanceof ContainRefused && /noDb/.test(e.message) && !e.message.includes(top), name);
+    let off;
+    try { off = buildContainPlan(base({ dataDir: d, dbPaths, ...over })); } catch (e) { off = e; }
+    assert.ok(!(off instanceof ContainRefused && /noDb/.test(off.message)), name + " without noDb is not a noDb refusal");
+  }
+  // A path under the workspace is fine.
+  const sub = mk(ws, "out");
+  const ok = buildContainPlan(base({ dataDir: d, noDb: true, dbPaths, workspaceDir: ws, writePaths: [sub] }));
+  assert.ok(has(ok.args, "--bind", ws, ws));
+  assert.ok(!pairs(ok.args).some((q) => q[0] === "--bind" && (q[2] === d || d.startsWith(q[2] + "/"))), "no --bind at or above the data dir");
+});
+
+test("noDb: a workspace that is not strictly below <data>/projects/ (a reserved entry, projects/ itself, the data dir) refuses the spawn", () => {
+  const top = mk(T, "nodbws");
+  const d = mk(top, "data"); writeFileSync(join(d, "crow.db"), ""); writeFileSync(join(d, "identity.json"), "SEED");
+  const dbElsewhere = mk(top, "dbs"); writeFileSync(join(dbElsewhere, "crow.db"), "");
+  for (const name of ["backups", "secrets", "projects"]) {
+    const ws = mk(d, name);
+    assert.throws(() => buildContainPlan(base({ dataDir: d, noDb: true, dbPaths: [join(d, "crow.db")], workspaceDir: ws, cwd: ws })),
+      (e) => e instanceof ContainRefused && /not a project folder/.test(e.message) && !e.message.includes(top), name);
+  }
+  assert.throws(() => buildContainPlan(base({ dataDir: d, noDb: true, dbPaths: [join(dbElsewhere, "crow.db")], workspaceDir: d, cwd: d })),
+    (e) => e instanceof ContainRefused && /not a project folder/.test(e.message), "the data dir itself, databases elsewhere");
+  const ok = mk(d, "projects", "p1", "workspace");
+  const plan = buildContainPlan(base({ dataDir: d, noDb: true, dbPaths: [join(d, "crow.db")], workspaceDir: ok, cwd: ok }));
+  assert.ok(has(plan.args, "--bind", ok), "a real project workspace is bound");
+});
+
+test("noDb: with projects/ a symlink to another disk, a workspace at or above its real root refuses; one below it binds", () => {
+  const top = mk(T, "nodbsym");
+  const d = mk(top, "data"); writeFileSync(join(d, "crow.db"), "");
+  const big = mk(top, "big", "projects"); mk(big, "other", "workspace"); const mine = mk(big, "mine", "workspace");
+  symlinkSync(big, join(d, "projects"));
+  for (const ws of [big, join(top, "big"), join(d, "projects")]) {
+    assert.throws(() => buildContainPlan(base({ dataDir: d, noDb: true, dbPaths: [join(d, "crow.db")], workspaceDir: ws, cwd: ws })),
+      (e) => e instanceof ContainRefused && /not a project folder/.test(e.message), ws);
+  }
+  const plan = buildContainPlan(base({ dataDir: d, noDb: true, dbPaths: [join(d, "crow.db")], workspaceDir: join(d, "projects", "mine", "workspace"), cwd: mine }));
+  assert.ok(plan.args.includes(mine), "a workspace below the real projects root is bound");
+});
+
+test("noDb: DATA_KEEP is ignored (no keep folder bound)", () => {
+  const d = mk(T, "keep", "data");
+  mk(d, "artifacts"); mk(d, "knowledge-base-mcp");
+  const ws = mk(d, "projects", "mine", "ws");
+  const on = buildContainPlan(base({ dataDir: d, noDb: true, workspaceDir: ws, dataKeep: ["artifacts", "knowledge-base-mcp"] }));
+  for (const k of ["artifacts", "knowledge-base-mcp"]) assert.equal(dataBinds(on.args, join(d, k)).length, 0, k);
+});
+
+test("noDb: a database outside the data dir whose folder is bound refuses", () => {
+  const top = mk(T, "ma");
+  const d = mk(top, "data");
+  writeFileSync(join(d, "crow.db"), "");
+  const tdir = mk(top, "tasks-elsewhere");
+  writeFileSync(join(tdir, "tasks.db"), "");
+  assert.throws(() => buildContainPlan(base({ dataDir: d, noDb: true, dbPaths: [join(d, "crow.db"), join(tdir, "tasks.db")], readPaths: [tdir] })), ContainRefused);
+});
+
+test("M2: under noDb the tasks database's folder is never bound writable", () => {
+  const src = readFileSync(new URL("../scripts/pi-bots/bridge.mjs", import.meta.url), "utf8");
+  assert.match(src, /const extraRw = opts\.noDb !== true && dirname\(TASKS_DB\) !== dataDir/);
+  assert.match(src, /dbNames: \[basename\(CROW_DB\), basename\(TASKS_DB\)\]/);
+});
+
 test("C3: .env files in bound dirs and in the checkout's bundles are masked; a symlinked .env masks its bound target", () => {
   const appX = mk(T, "c3", "app");
   writeFileSync(join(appX, ".env"), "SECRET=1");

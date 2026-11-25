@@ -892,6 +892,8 @@ async function writeWorldMcp(a, sessionId) {
     if (!signed) a.log("actor signatures unavailable from the gateway; this turn's actor headers are unsigned");
   }
   let mcpConfig = null;
+  let coreInertBlocks = null; // in-memory stdio fallbacks for the core doors (finalizeCoreDoors)
+  let noDb = false; // core doors, all or nothing (mcp_writer.mjs writeBotMcp): the ONE decision, passed on to the contain plan
   try {
     // acceptance F2: a card-bound session (or a job turn) must be able to
     // call board_report_result — ensure the board entry is minted. A bot
@@ -919,6 +921,9 @@ async function writeWorldMcp(a, sessionId) {
       addonKeys: a.mcpDelivery === "fd" ? "hydrate" : "omit",
     });
     mcpConfig = w.json || null;
+    noDb = w.noDb === true;
+    coreInertBlocks = (w.coreDoorsDecision && w.coreDoorsDecision.inertBlocks) || null;
+    if (w.coreDoorsDecision && w.coreDoorsDecision.warning) a.log(w.coreDoorsDecision.warning);
     // Project services (Task 18, R6 vs PR-B): withServiceBlocks stored this turn's blocks here
     // before the tool-budget preflight; every rebuild (bindWorldSession) re-applies them, or the
     // child would be pinned with tools its config no longer carries. Only a blocks result whose
@@ -952,7 +957,7 @@ async function writeWorldMcp(a, sessionId) {
     // would not). The child then gets an empty bot layer, as a missing file did.
     if (a.mcpDelivery === "fd") removeStaleBotMcp(join(a.sessionDir, ".mcp.json"));
   }
-  return { mcpConfig, signedSessionId: signed && sid != null ? sid : null };
+  return { mcpConfig, noDb, coreInertBlocks, signedSessionId: signed && sid != null ? sid : null };
 }
 
 /**
@@ -969,8 +974,10 @@ export async function bindWorldSession(world, session) {
   if (!world || !world._mcpArgs || !session || session.id == null) return false;
   const id = Number(session.id);
   if (world.signedSessionId === id) return false;
-  const { mcpConfig, signedSessionId } = await writeWorldMcp(world._mcpArgs, id);
+  const { mcpConfig, noDb, coreInertBlocks, signedSessionId } = await writeWorldMcp(world._mcpArgs, id);
   world.mcpConfig = mcpConfig;
+  world.noDb = noDb;
+  world.coreInertBlocks = coreInertBlocks;
   world.sessionId = id;
   world.signedSessionId = signedSessionId;
   return true;
@@ -1158,7 +1165,7 @@ export async function buildBotWorld({ botId, threadId, gatewayType = null, log =
     // blocks) keeps every remote-proxy block out of this turn's config. projectShares above stays
     // the file-roots/reporting read; it is not what decides this.
     holdsShare };
-  const { mcpConfig, signedSessionId } = await writeWorldMcp(mcpArgs, session ? session.id : null);
+  const { mcpConfig, noDb, coreInertBlocks, signedSessionId } = await writeWorldMcp(mcpArgs, session ? session.id : null);
 
   // Install-approval gate (Phase 2.4): refuse non-allowlisted pi_extensions
   // that reached pi_bot_defs via an out-of-band DB edit (the GUI only offers
@@ -1186,7 +1193,7 @@ export async function buildBotWorld({ botId, threadId, gatewayType = null, log =
   // mcpDelivery: "fd" | "file" (S6-CROW).
   return { def, bot, crowHome, projectId, projectSpace, projectMembers, projectShares, sessionDir,
     cwd: resolvedCwd, mcpConfigPath: mcpDelivery === "file" ? join(sessionDir, ".mcp.json") : null,
-    mcpDelivery, mcpConfig, tasksDbPath, remoteEnabled, peerGatewayUrls, session, botClassifier,
+    mcpDelivery, mcpConfig, noDb, coreInertBlocks, tasksDbPath, remoteEnabled, peerGatewayUrls, session, botClassifier,
     narrowedTools, gatewayType, kitInstalled, houseStyle,
     // Item 46 PR-B: the session id the config's actor signatures bind, or
     // null when it binds none (no row yet, or a key-less host whose gateway
@@ -1338,6 +1345,9 @@ export async function prepareSpawn(world, { escalate = false, log = () => {}, pr
       // (test seams) => PiRpc's pre-S6 file env.
       mcpDelivery: world.mcpDelivery,
       mcpConfig: world.mcpConfig,
+      // Core doors, all or nothing: the contain plan binds no database when true (pi_contain.mjs).
+      noDb: world.noDb === true,
+      coreInertBlocks: world.coreInertBlocks || null,
     },
   };
 }

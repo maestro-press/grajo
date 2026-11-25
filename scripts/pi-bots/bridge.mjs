@@ -77,7 +77,7 @@ import { effectiveReadPaths } from "./bot-read-paths.mjs";
 import { MCP_CONFIG_FD, mcpConfigDelivery } from "./mcp-delivery.mjs";
 import { botSessionEnv } from "./actor-env.mjs";
 import { impliedServers, DRAFTING_TURN_TOOLS, isDraftingTurnTools, draftingTurnMcpConfig, resolvedMailDraftTurnDir } from "./mcp_writer.mjs";
-import { SECRETS_SERVER } from "./crow-server-catalog.mjs";
+import { SECRETS_SERVER, finalizeCoreDoors } from "./crow-server-catalog.mjs";
 import { gatewayHint as resolveGatewayHint } from "./gateways/index.mjs";
 // C-11: the per-turn world assembly (identity + spawn readiness) lives in
 // bot-world.mjs so P2's interactive engine can build the SAME world without
@@ -280,7 +280,8 @@ function containInputs({ nodeBin, cliPath, sessionDir, spawnCwd, piPolicy, opts,
     cloudTokenPath: containedCloudTokenPath(),
     modelRolesFile: roleSnapshotPath(),
   });
-  const extraRw = dirname(TASKS_DB) !== dataDir ? [dirname(TASKS_DB)] : [];
+  // With noDb nothing in the sandbox needs the tasks database, so its folder is never bound.
+  const extraRw = opts.noDb !== true && dirname(TASKS_DB) !== dataDir ? [dirname(TASKS_DB)] : [];
   // The bot's OWN pre-project world root — <crowHome>/pi-bots/<the id THIS SPAWNER was given>
   // (opts.botId, from the bot's own pi_bot_defs row). Self-authoring stages skill proposals
   // below it (def.session_dir/proposed-skills) and the Bot Builder's review UI scans exactly
@@ -319,6 +320,11 @@ function containInputs({ nodeBin, cliPath, sessionDir, spawnCwd, piPolicy, opts,
     appRoot: BRIDGE_APP_ROOT,
     piLabDir: findPiLabDir(), piAgentDir, shadowAgentDir: shadow.dir,
     crowHome, dataDir, botCacheDir,
+    // Core doors, all or nothing: opts.noDb was already re-judged against the FINAL config in the
+    // spawn (finalizeCoreDoors, before this plan and before serialisation); it is only read here.
+    noDb: opts.noDb === true,
+    dbNames: [basename(CROW_DB), basename(TASKS_DB)],
+    dbPaths: [CROW_DB, TASKS_DB],
     dataKeep: String(process.env.CROW_PI_CONTAIN_DATA_KEEP || "").split(",").map((x) => x.trim()).filter((x) => x && !x.includes("/")),
     sessionDir, cwd: spawnCwd, workspaceDir: opts.projectWorkspaceDir || null,
     botStateDir,
@@ -1114,6 +1120,26 @@ export class PiRpc {
     // secrets dirs are not bound at all: wrapPiSpawn reports each one either
     // over-mounted (a bound path really contains it) or absent from the empty
     // root (no bind covers it), and the `hidden` check below reads that report.
+    // Core doors, all or nothing, judged on the FINAL config (everything merged after the writer:
+    // services, satellites, eval override, drafting): this is before the contain plan AND before the
+    // config is serialised (fd pipe below / the file rewritten here), so what pi receives is exactly
+    // what was judged. A flip puts every core door back to its stdio block (finalizeCoreDoors).
+    {
+      const fin = finalizeCoreDoors({ mcpConfig: opts.mcpConfig, inertBlocks: opts.coreInertBlocks, containedSpawn,
+        dbPaths: [CROW_DB, TASKS_DB],
+        botLabel: String(opts.botId || (def && (def.bot_id || def.id)) || "bot") });
+      if (fin.warning && typeof opts.log === "function") opts.log(fin.warning);
+      opts = Object.assign({}, opts, { noDb: fin.noDb });
+      if (fin.flipped) {
+        opts = Object.assign({}, opts, { mcpConfig: fin.mcpConfig });
+        if (!fdMode) {
+          // File delivery: the writer already put a door config on disk; replace it (never through a link).
+          const cfgPath = join(sessionDir, ".mcp.json");
+          try { unlinkSync(cfgPath); } catch { /* absent */ }
+          writeFileSync(cfgPath, JSON.stringify(fin.mcpConfig, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+        }
+      }
+    }
     let contain = null;
     // Honest containment status (bot containment Phase 1, Task 8): the bot's own
     // closed-world servers and tools are what the status is about. ONE
@@ -2590,7 +2616,8 @@ export async function handleInbound(opts) {
   // stamped just above, at exactly the point it always was), so the config is
   // rebuilt now with its id, before anything is spawned. No-op otherwise.
   if (await bindWorldSession(world, session)) {
-    spawnPrep.piRpcOpts = Object.assign({}, spawnPrep.piRpcOpts, { mcpConfig: world.mcpConfig });
+    spawnPrep.piRpcOpts = Object.assign({}, spawnPrep.piRpcOpts, { mcpConfig: world.mcpConfig,
+      noDb: world.noDb === true, coreInertBlocks: world.coreInertBlocks || null });
   }
 
   // The eval MCP override, at the only point the config is final: after bindWorldSession's rebuild
