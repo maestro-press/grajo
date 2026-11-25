@@ -62,6 +62,8 @@ import { runBridgeTick as defaultRunBridgeTick } from "../../scripts/pi-bots/bri
 import { superviseProcess as defaultSuperviseProcess } from "./process-supervisor.js";
 import { setBreakerSource } from "./bot-engine-status.js";
 import { initGatewayActorKey } from "../../scripts/pi-bots/actor-sig.mjs";
+import { createDbClient } from "../db.js";
+import { createNotification } from "../shared/notifications.js";
 import { botDefEraConvertedSync, botDefRefusalAlarm, verifyBotDefSync } from "../shared/bot-def-mac.js";
 
 const DISCORD_GATEWAY_PATH = fileURLToPath(
@@ -74,6 +76,27 @@ function defaultDbFactory(path) {
   const d = new Database(path);
   d.pragma("busy_timeout = 10000");
   return d;
+}
+
+const DAY_MS = 86400000;
+
+/** Default owner notifier: one in-app bell notification. Fixed text only — no mail content. */
+async function defaultNotifyTurnFailure({ bot_id, kind }) {
+  let db;
+  try {
+    db = createDbClient();
+    await createNotification(db, {
+      type: "attention",
+      source: "pi-bots",
+      priority: "normal",
+      title: `${bot_id}'s turn failed`,
+      body: "A Gmail reply could not be sent: the bot's turn failed. The bot will try again on the next message in that thread.",
+      action_url: `/dashboard/bot-builder?bot=${encodeURIComponent(bot_id)}`,
+      metadata: { bot_id, kind },
+    });
+  } finally {
+    if (db) { try { db.close(); } catch { /* already closed */ } }
+  }
 }
 
 function freshBreaker() {
@@ -163,6 +186,10 @@ function discordSignature(configs) {
  *   owns its lifetime).
  * @param {Function} [opts._runBridgeTick] test seam, defaults to the real
  *   runBridgeTick from bridge_tick_lib.mjs.
+ * @param {(failure:{bot_id:string,thread_id:string,kind:string}) => Promise<void>} [opts._notifyTurnFailure]
+ *   test seam for the owner bell raised when a Gmail turn fails (gateway mode only;
+ *   externally supervised bridges do not get it). Defaults to a bell notification.
+ * @param {() => number} [opts._now] test seam: clock (ms) used for the once-per-day dedupe.
  * @param {Function} [opts._superviseProcess] test seam, defaults to the real
  *   superviseProcess from process-supervisor.js.
  * @param {Function} [opts._setIntervalFn]
@@ -181,6 +208,8 @@ export async function initBotRuntime({
   _conn = null,
   _runBridgeTick = defaultRunBridgeTick,
   _superviseProcess = defaultSuperviseProcess,
+  _notifyTurnFailure = defaultNotifyTurnFailure,
+  _now = Date.now,
   _setIntervalFn = setInterval,
   _clearIntervalFn = clearInterval,
   _setTimeoutFn = setTimeout,
@@ -223,6 +252,27 @@ export async function initBotRuntime({
     state.bridge.breaker = freshBreaker();
   }
 
+  // One bell per bot+thread per UTC day. In-memory; entries older than 2 days are dropped on insert.
+  const notifiedFailures = new Map();
+
+  async function notifyFailures(result) {
+    const failures = result && Array.isArray(result.failures) ? result.failures : [];
+    for (const f of failures) {
+      if (!f || !f.bot_id) continue;
+      const now = _now();
+      const key = `${f.bot_id}\u0000${f.thread_id}`;
+      const day = new Date(now).toISOString().slice(0, 10);
+      if (notifiedFailures.get(key)?.day === day) continue;
+      for (const [k, v] of notifiedFailures) if (now - v.at > 2 * DAY_MS) notifiedFailures.delete(k);
+      notifiedFailures.set(key, { day, at: now });
+      try {
+        await _notifyTurnFailure({ bot_id: f.bot_id, thread_id: f.thread_id, kind: f.kind });
+      } catch (e) {
+        console.warn("[bot-runtime] turn-failure notice failed (non-fatal):", (e && e.name) || "error");
+      }
+    }
+  }
+
   async function tick() {
     if (tickInFlight) return; // non-overlap busy guard
     const breaker = state.bridge.breaker;
@@ -248,6 +298,7 @@ export async function initBotRuntime({
       } else {
         recordSuccess();
       }
+      await notifyFailures(result);
     } finally {
       tickInFlight = false;
     }

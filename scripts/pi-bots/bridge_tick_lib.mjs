@@ -102,12 +102,16 @@ function acquireLock(lockPath) {
  *   test/gateway seam — defaults to `new Database(path)` + busy_timeout pragma.
  * @param {() => ({cliPath:string}|null)} [opts._resolvePiCli] test seam —
  *   defaults to the real resolvePiCli() from pi_resolver.mjs.
- * @returns {Promise<{ok:true, skipped?: "runtime_disabled"|"engine_missing"|"locked", bots?: number, handled?: number, errors?: string[]}>}
+ * @param {Function} [opts._handleInbound] test seam, defaults to bridge.mjs handleInbound.
+ * @param {Function} [opts._gio] test seam for the gmail_io subprocess runner.
+ * @returns {Promise<{ok:true, skipped?: "runtime_disabled"|"engine_missing"|"locked", bots?: number, handled?: number, errors?: string[], failures?: {bot_id:string, thread_id:string, kind:"turn-error"|"exception"}[]}>}
  */
 export async function runBridgeTick({
   log = (...a) => console.log(...a),
   _dbFactory = defaultDbFactory,
   _resolvePiCli = resolvePiCli,
+  _handleInbound = handleInbound,
+  _gio = gio,
 } = {}) {
   const CROW_DB = botsDbPath();
   const LOCK = lockPathFor(CROW_DB);
@@ -149,13 +153,16 @@ export async function runBridgeTick({
 
     const d = _dbFactory(CROW_DB);
     const errors = [];
+    // Owner-visible failures: ids and a kind only (never the error text, the
+    // mail body or the sender), so a consumer can raise a notice safely.
+    const failures = [];
     try {
       let defs = [];
       try {
         defs = d.prepare("SELECT bot_id, definition FROM pi_bot_defs WHERE enabled=1").all();
       } catch {
         log("[tick] pi_bot_defs missing — nothing to do");
-        return { ok: true, bots: 0, handled: 0, errors };
+        return { ok: true, bots: 0, handled: 0, errors, failures };
       }
 
       let processed = 0;
@@ -166,13 +173,13 @@ export async function runBridgeTick({
         const alias = gw.address;                         // e.g. user+<x>@example.com
         const plus = (alias.match(/\+([^@]+)@/) || [])[1]; // <x>
 
-        const srch = await gio(["search", "--query", `to:${alias} newer_than:2d`, "--max", "10"]);
+        const srch = await _gio(["search", "--query", `to:${alias} newer_than:2d`, "--max", "10"]);
         const sres = parseResult(srch.out);
         const threads = (sres && (sres.data?.threads || sres.threads)) || [];
         for (const th of threads) {
           const tid = th.id || th.thread_id || th.threadId;
           if (!tid) continue;
-          const tr = await gio(["thread", "--id", tid], 60000);
+          const tr = await _gio(["thread", "--id", tid], 60000);
           const tres = parseResult(tr.out);
           const msgs = (tres && (tres.data?.messages || tres.messages)) || [];
           if (!msgs.length) continue;
@@ -215,7 +222,7 @@ export async function runBridgeTick({
 
           log(`[tick] bot=${row.bot_id} thread=${tid} from=${replyTo} -> handleInbound (${body.slice(0, 50)})`);
           try {
-            const r = await handleInbound({
+            const r = await _handleInbound({
               bot_id: row.bot_id, gateway_thread_id: tid, user_message: body,
               sendReply: async (text) => {
                 // --reply-to <alias> sets the Reply-To: header on the outbound
@@ -224,7 +231,7 @@ export async function runBridgeTick({
                 // bot's bare From: address (which nothing monitors). Without
                 // this, the user's reply lands at the bot's bare From: address
                 // and the bot never sees the follow-up.
-                await gio(["reply", "--to", replyTo,
+                await _gio(["reply", "--to", replyTo,
                   "--reply-to", alias,
                   "--subject", "Re: " + (newest.subject || (newest.headers && newest.headers.subject) || "pibot"),
                   "--thread", tid, "--body", text]);
@@ -232,11 +239,13 @@ export async function runBridgeTick({
               log: (m) => log("  [bridge] " + m),
             });
             processed++;
-            log(`[tick] done thread=${tid} action=${r.action}`);
+            if (r && r.action === "error") failures.push({ bot_id: row.bot_id, thread_id: String(tid), kind: "turn-error" });
+            log(`[tick] done thread=${tid} action=${r && r.action}`);
           } catch (e) {
             const msg = `[tick] handleInbound failed thread=${tid}: ${e.message}`;
             log(msg);
             errors.push(msg);
+            failures.push({ bot_id: row.bot_id, thread_id: String(tid), kind: "exception" });
           }
         }
       }
@@ -262,7 +271,7 @@ export async function runBridgeTick({
       }
 
       log(`[tick] complete — processed ${processed} inbound`);
-      return { ok: true, bots: defs.length, handled: processed, errors };
+      return { ok: true, bots: defs.length, handled: processed, errors, failures };
     } finally {
       d.close();
     }

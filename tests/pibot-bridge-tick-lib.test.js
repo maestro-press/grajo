@@ -202,3 +202,62 @@ test("runBridgeTick: db handle opened via _dbFactory is closed on every path (op
     assert.equal(opens, closes, `every opened handle must be closed (opens=${opens} closes=${closes})`);
   });
 });
+
+// ---- failures list (owner bell input) --------------------------------------
+const SECRET_BODY = "SECRET-BODY-please-wire-money";
+const SENDER = "owner.person@example.com";
+
+function seedGmailBot(dbPath) {
+  const d = new Database(dbPath);
+  try {
+    d.prepare("INSERT INTO pi_bot_defs (bot_id, display_name, definition, enabled) VALUES (?,?,?,1)")
+      .run("mailbot", "mailbot", JSON.stringify({
+        gateways: [{ type: "gmail", address: "kh+mb@example.com", allowlist: [SENDER] }],
+      }));
+  } finally { d.close(); }
+}
+
+function stubGio() {
+  const thread = { messages: [{
+    to: "kh+mb@example.com", from: `Owner <${SENDER}>`, subject: "hello",
+    body_text: SECRET_BODY, date: new Date(Date.now() + 60000).toUTCString(),
+  }] };
+  return async (args) => {
+    if (args[0] === "search") return { code: 0, out: "RESULT " + JSON.stringify({ threads: [{ id: "th1" }] }), err: "" };
+    if (args[0] === "thread") return { code: 0, out: "RESULT " + JSON.stringify(thread), err: "" };
+    return { code: 0, out: "", err: "" };
+  };
+}
+
+async function driveTick(label, handleInbound) {
+  const dir = scratchDataDir(label);
+  const dbPath = join(dir, "crow.db");
+  setBotRuntime(dbPath, true);
+  seedGmailBot(dbPath);
+  return withDataDir(dir, () => runBridgeTick({
+    _resolvePiCli: engineOk, _gio: stubGio(), _handleInbound: handleInbound, log: () => {},
+  }));
+}
+
+test("runBridgeTick: a returned action 'error' is a turn-error failure and still counts as processed", async () => {
+  const r = await driveTick("fail-turn-error", async () => ({ action: "error", error: "boom-" + SECRET_BODY }));
+  assert.deepEqual(r.failures, [{ bot_id: "mailbot", thread_id: "th1", kind: "turn-error" }]);
+  assert.equal(r.handled, 1);
+  assert.equal(JSON.stringify(r.failures).includes("SECRET"), false);
+  assert.equal(JSON.stringify(r.failures).includes(SENDER), false);
+});
+
+test("runBridgeTick: a thrown handleInbound is an exception failure with one errors entry", async () => {
+  const r = await driveTick("fail-exception", async () => { throw new Error("kaboom " + SECRET_BODY); });
+  assert.deepEqual(r.failures, [{ bot_id: "mailbot", thread_id: "th1", kind: "exception" }]);
+  assert.equal(r.errors.length, 1);
+  assert.equal(r.handled, 0);
+  assert.equal(JSON.stringify(r.failures).includes("kaboom"), false);
+  assert.equal(JSON.stringify(r.failures).includes(SENDER), false);
+});
+
+test("runBridgeTick: a normal action produces no failures", async () => {
+  const r = await driveTick("fail-none", async () => ({ action: "asked" }));
+  assert.deepEqual(r.failures, []);
+  assert.equal(r.handled, 1);
+});
