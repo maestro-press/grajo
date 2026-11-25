@@ -124,6 +124,7 @@ import { claimRunRequests, pruneRunRequests } from "./run-requests.js";
 // hook takes it from there rather than keeping a second copy of it.
 import { SENDABLE_RUN_STATUSES } from "./send-log.js";
 import { sweepStaleSends, refusePendingSends } from "./send-sweep.js";
+import { pickupTick } from "./pickup.js";
 import { getReport, getRevision, recordAudit } from "./store.js";
 
 /** The hook id the gateway's scheduler knows this by. */
@@ -200,6 +201,7 @@ function resolveDeps(deps) {
     graceMs: fn("graceMs", defaultGraceMs),
     getSecrets: fn("getSecrets", defaultGetSecrets),
     lease: given.lease ?? {},
+    pickup: given.pickup ?? {},
   };
 }
 
@@ -985,6 +987,15 @@ export function registerReportsHook(database, deps = {}) {
     await dispatchDue(db);
     await drainRequests(db);
     await drainPendingSends(db);
+    // The comment pickup: never awaited past launching a turn (the turn runs detached), and a no-op
+    // unless the owner's switch is on. A failure here is a warning, never a failed tick.
+    if (!light) {
+      try {
+        await pickupTick(db, { now: d.now, notify: d.notify, instanceZone: d.instanceZone, ...d.pickup });
+      } catch (err) {
+        console.warn(`[reports] pickup tick failed: ${err?.code || "error"}`);
+      }
+    }
   }
 
   async function tick(database2) {

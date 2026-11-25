@@ -71,6 +71,7 @@
 
 import express from "express";
 import { Readable } from "node:stream";
+import { createHash } from "node:crypto";
 import dns from "node:dns";
 import { createDbClient } from "../../db.js";
 import { resolveProviderConfig } from "../ai/resolve-profile.js";
@@ -571,8 +572,39 @@ function incomingHop(req) {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
+/**
+ * THE LOCKED-TURN PIN (the writer is scripts/pi-bots/pi_contain_agent.mjs
+ * CONTAINED_PIN_HEADER / pinOfBaseUrl, which puts this header on the generated models.json entry of a
+ * report pickup's contained spawn).
+ *
+ * The bridge's local-model floor judged a provider row BEFORE the turn started, but `providers` is
+ * bot-writable in crow.db, so the row can be pointed at another address between that judgement and
+ * this dial — and the door forwards from the row it reads AT REQUEST TIME. A local-class flip (one
+ * lane/box instead of another) is not refused by any address rule, so the pin is the rule: the value
+ * is sha256 of the base URL the floor judged, the door hashes the row's CURRENT base URL the same way
+ * (both trim trailing slashes, exactly as the forward URL is built), and a mismatch is refused before
+ * any forward and before acquireFn. A request with no pin header — every caller but such a turn — is
+ * untouched.
+ */
+export const LOCKED_TURN_PIN_HEADER = "x-crow-pin-base";
+/** The pin value for a base URL (mirrored by pi_contain_agent.mjs pinOfBaseUrl; a test pins the two). */
+export function pinBaseValue(baseUrl) {
+  return createHash("sha256").update(String(baseUrl == null ? "" : baseUrl).replace(/\/+$/, "")).digest("hex");
+}
+
 /** Forward one door request and stream the response back. */
 async function forwardDoor(req, res, target, op, deps) {
+  // THE LOCKED-TURN PIN, first: a request that names the endpoint its turn was judged on is never
+  // forwarded to a different one (the row is bot-writable, so this is the only thing that keeps the
+  // floor's judgement true at dial time). Nothing is opened and nothing is acquired before this. A
+  // request that CARRIES the header must carry a matching value: an empty, duplicated or malformed one
+  // is refused too (fail closed), and only a request without the header at all keeps today's path.
+  if (Object.prototype.hasOwnProperty.call(req.headers, LOCKED_TURN_PIN_HEADER)) {
+    const pinned = req.headers[LOCKED_TURN_PIN_HEADER];
+    if (typeof pinned !== "string" || pinned !== pinBaseValue(target.url)) {
+      return res.status(409).json({ error: { code: "LOCKED_TURN_PIN_MISMATCH", message: `provider "${target.providerId}" is not the endpoint this turn was judged on; the door refuses the forward` } });
+    }
+  }
   if (target.keyState === "unreadable") {
     noteUnreadableProviderKey(target.providerId);
     return res.status(503).json({ error: unreadableKeyBody(target.providerId) });

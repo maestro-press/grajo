@@ -46,6 +46,10 @@
  * bot's identity and project scope come from that verified definition, never from the
  * request. They are NOT `/memory` and `/projects`, which stay the owner's surfaces.
  *
+ * A LOCKED TURN'S MOUNT adds one path per kind: `/mail-draft/mcp` for Crow Mail's drafting turn and
+ * `/report-pickup/mcp` for a report pickup. Each admits exactly one per-turn token of its own prefix
+ * and one signed actor of its own kind, and neither token opens the other's mount.
+ *
  * The doors are PATHS ONLY — isDoorPath never sees the request method, so a
  * door admits every method on its path. That is the whole of the upload door:
  * the route behind it is a PUT route, so any other method reaches no handler
@@ -68,6 +72,7 @@ export const BOT_DOOR_PREFIXES = Object.freeze([
   "/memory-bot/mcp",  // the core memory door (D2), under the memory-bot token, a signed `memory` actor and a verified, opted-in definition
   "/projects-bot/mcp",  // the core projects door (D2), under the projects-bot token, a signed `projects` actor and a verified, opted-in definition
   "/mail-draft/mcp",  // Crow Mail's drafting mount: a per-turn `mdt_` token and a `mail-draft` actor signature
+  "/report-pickup/mcp",  // a report pickup's mount: a per-turn `rpk_` token and a `report-pickup` actor signature
   "/peer-relay/",  // the relay to paired peers, under the relay token
 ]);
 

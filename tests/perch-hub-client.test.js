@@ -235,8 +235,9 @@ test("async continuations are guarded — a fast back button must not cross sess
   // continuation and mdraftLoad's own read, which must not draw into the next chat's transcript.
   // 54 with the message draft card (msg-draft-card.js, bot-door PR B): loadMsgDrafts' list
   // continuation and mmsgLoad's own read, by the same rule.
-  // 55 with the report card (report-card.js): its id-list continuation, its own card read and the
-  // id-list poll timer, none of which may draw into the next chat.
+  // 55-57 with the report card (report-card.js): THREE guards, none of which may draw into the next
+  // chat — the card's own read (rcardLoad), the id-list continuation (loadReports), and the 8 s
+  // id-list poll tick (rcardListArm), which re-checks the open chat before it refetches.
   assert.equal(guards, 57, "expected exactly 57 identity guards, found " + guards);
 });
 

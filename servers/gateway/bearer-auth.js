@@ -18,7 +18,7 @@
  * `localTokenAuthMiddleware` closes for the operator's full local token on a
  * relayed socket (`servers/gateway/local-token.js`). The same refusal must
  * therefore cover OAuth: only the path-scoped token families (board, phone,
- * artifacts, secrets, sharing-bot, reports, mail-draft, peer-relay, the `llm`
+ * artifacts, secrets, sharing-bot, reports, mail-draft, report-pickup, peer-relay, the `llm`
  * doors) — each with its own signed actor signature — admit a relayed caller.
  *
  * WHAT the refusal looks like: exactly what a relayed socket already gets today

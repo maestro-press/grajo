@@ -754,7 +754,7 @@ test("a valid stored preview artifact id is reused, with no second artifact made
 
 test("the bridge's state keys are reserved", () => {
   assert.deepEqual([...RESERVED_STATE_KEYS],
-    ["preview_artifact_id", "sender_seal", "recipient_comments_notice_day"]);
+    ["preview_artifact_id", "sender_seal", "recipient_comments_notice_day", "pickup_budget_notice_day"]);
   assert.equal(Object.isFrozen(RESERVED_STATE_KEYS), true);
   assert.equal(PREVIEW_ARTIFACT_STATE_KEY, "preview_artifact_id");
   assert.equal(isReservedStateKey("preview_artifact_id"), true);

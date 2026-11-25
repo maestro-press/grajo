@@ -39,13 +39,24 @@ function archivedClause(t) {
 
 // ── kanban (existing tasks_items) ──────────────────────────────────
 
+// A card a report's pickup made (tag `report-pickup`) carries text from people OUTSIDE Crow. A bot's normal
+// turn must not read it, so its board context leaves those cards out; the card is shown only when the bot
+// is dispatched on it, and then quoted as untrusted data (card-brief.mjs). The tag is written by
+// servers/gateway/reports/pickup-mcp.js (PICKUP_CARD_TAG).
+export const PICKUP_CARD_TAG = "report-pickup";
+export function isPickupCardTags(tags) {
+  return ("," + String(tags ?? "").replace(/\s/g, "") + ",").includes("," + PICKUP_CARD_TAG + ",");
+}
+
 export function kanbanText(projectId, tasksDbPath) {
   if (projectId == null) return "(no project linked)";
   const path = tasksDbPath || TASKS_DB;
   const t = db(path);
+  // Column-guarded like archivedClause: a store without `tags` has no pickup cards to leave out.
+  const hasTags = t.prepare("PRAGMA table_info(tasks_items)").all().some((c) => c.name === "tags");
   const rows = t.prepare(
-    "SELECT id,title,status FROM tasks_items WHERE project_id=? AND parent_id IS NULL" + archivedClause(t) + " ORDER BY id"
-  ).all(projectId);
+    "SELECT id,title,status," + (hasTags ? "tags" : "NULL AS tags") + " FROM tasks_items WHERE project_id=? AND parent_id IS NULL" + archivedClause(t) + " ORDER BY id"
+  ).all(projectId).filter((r) => !isPickupCardTags(r.tags));
   t.close();
   return rows.length ? rows.map((r) => "  #" + r.id + " [" + r.status + "] " + r.title).join("\n") : "  (no cards)";
 }
@@ -63,8 +74,12 @@ export function cardText(cardId, tasksDbPath) {
   const path = tasksDbPath || TASKS_DB;
   const t = db(path);
   try {
-    const r = t.prepare("SELECT title, description FROM tasks_items WHERE id=?").get(cardId);
-    return { title: r && r.title ? String(r.title) : "", description: r && r.description ? String(r.description) : null };
+    const r = t.prepare("SELECT title, description, tags FROM tasks_items WHERE id=?").get(cardId);
+    return {
+      title: r && r.title ? String(r.title) : "",
+      description: r && r.description ? String(r.description) : null,
+      tags: r && r.tags ? String(r.tags) : null,
+    };
   } finally { t.close(); }
 }
 
@@ -105,9 +120,10 @@ function taskListContext(projectId, tasksDbPath) {
   if (projectId == null) return "Task list: (no project linked)";
   const path = tasksDbPath || TASKS_DB;
   const t = db(path);
+  const hasTags = t.prepare("PRAGMA table_info(tasks_items)").all().some((c) => c.name === "tags");
   const rows = t.prepare(
-    "SELECT id,title,status,priority FROM tasks_items WHERE project_id=?" + archivedClause(t) + " ORDER BY priority ASC, id ASC"
-  ).all(projectId);
+    "SELECT id,title,status,priority," + (hasTags ? "tags" : "NULL AS tags") + " FROM tasks_items WHERE project_id=?" + archivedClause(t) + " ORDER BY priority ASC, id ASC"
+  ).all(projectId).filter((r) => !isPickupCardTags(r.tags));
   t.close();
   if (!rows.length) return "Task list: (empty)";
   const lines = rows.map((r) => {

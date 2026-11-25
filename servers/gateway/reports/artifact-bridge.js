@@ -115,11 +115,12 @@ export const PREVIEW_ARTIFACT_STATE_KEY = "preview_artifact_id";
  * trusts what it finds under `preview_artifact_id` to decide where a run writes, the approval rails
  * trust `sender_seal` to say which mail account the owner chose for the report, and the recipient
  * comments module trusts `recipient_comments_notice_day` to say the owner was already told that readers
- * cannot start a new thread, so a bot must not be able to name any of them. The block write path reads
+ * cannot start a new thread (and `pickup_budget_notice_day` to say the owner was already told the day's
+ * comment-answering time is spent), so a bot must not be able to name any of them. The block write path reads
  * this list and `RESERVED_STATE_PREFIXES` (below); a new reserved key is added here, once.
  */
 export const RESERVED_STATE_KEYS = Object.freeze([
-  PREVIEW_ARTIFACT_STATE_KEY, SENDER_SEAL_KEY, "recipient_comments_notice_day",
+  PREVIEW_ARTIFACT_STATE_KEY, SENDER_SEAL_KEY, "recipient_comments_notice_day", "pickup_budget_notice_day",
 ]);
 
 /**

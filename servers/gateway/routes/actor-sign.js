@@ -102,6 +102,12 @@ export const ACTOR_SIGN_PATH = "/internal/actor-sign";
  * that names the kind anyway would otherwise get a signature over whatever thread the checks above
  * resolved — so it is refused outright below (RELAY_REFUSED_KINDS), never signed.
  *
+ * "report-pickup" (Crow Recurring Reports' locked pickup turn) is refused for exactly the same
+ * reason: the pickup turn is spawned in the gateway process, beside the in-memory `rpk_` token its
+ * signature belongs to (reports/pickup-token.js), and signs in-process with
+ * signReportPickupActor. Its thread slot is text too (`<pickupId>:<turnId>`), so an off-process caller
+ * naming the kind must never get a signature over whatever thread was resolved above.
+ *
  * "sharing" (the bot sharing door, /sharing-bot/mcp) IS here: a key-less bot host runs channel and
  * job turns whose bots may draft messages, and it holds no key of its own, so the relay is its only
  * way to sign the (bot, thread, gateway) the door requires. Step 6 already binds the tuple to a live
@@ -124,7 +130,7 @@ export const ACTOR_SIGN_KINDS = Object.freeze(["bot", "board", "artifacts", "boa
  * whole request, never a signature and never a partial answer. Listed apart from ACTOR_SIGN_KINDS so
  * the refusal is explicit rather than an "unknown kind" 400.
  */
-export const RELAY_REFUSED_KINDS = Object.freeze(["mail-draft"]);
+export const RELAY_REFUSED_KINDS = Object.freeze(["mail-draft", "report-pickup"]);
 
 const REFUSE_LOG_WINDOW_MS = 3_600_000;
 const REFUSE_LOG_CAP = 64;

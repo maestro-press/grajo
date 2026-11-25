@@ -42,6 +42,8 @@ test("path spellings", () => {
     "/projects-bot/mcp/",
     "/mail-draft/mcp",
     "/mail-draft/mcp?x=1",
+    "/report-pickup/mcp",
+    "/report-pickup/mcp?x=1",
     "/peer-relay/i/m/mcp",
     "/peer-relay/",
   ]) assert.equal(isDoorPath(p), true, p);
@@ -76,6 +78,8 @@ test("path spellings", () => {
     "/reports/api",
     "/mail-draft/mcpx",
     "/mail-draft",
+    "/report-pickup/mcpx",
+    "/report-pickup",
     "/memory/mcp",
     "/projects/mcp",
     "/memory-bot/mcpx",
@@ -96,7 +100,7 @@ test("path spellings", () => {
 
 test("the door list is exactly the doors the operator's ruling fixed, frozen", () => {
   assert.deepEqual([...BOT_DOOR_PREFIXES],
-    ["/llm/v1/", "/llm/p/", "/llm/c/", "/board/mcp", "/phone/mcp", "/artifacts/mcp", "/artifacts/upload/", "/secrets/mcp", "/sharing-bot/mcp", "/reports/mcp", "/memory-bot/mcp", "/projects-bot/mcp", "/mail-draft/mcp", "/peer-relay/"]);
+    ["/llm/v1/", "/llm/p/", "/llm/c/", "/board/mcp", "/phone/mcp", "/artifacts/mcp", "/artifacts/upload/", "/secrets/mcp", "/sharing-bot/mcp", "/reports/mcp", "/memory-bot/mcp", "/projects-bot/mcp", "/mail-draft/mcp", "/report-pickup/mcp", "/peer-relay/"]);
   assert.equal(Object.isFrozen(BOT_DOOR_PREFIXES), true);
   assert.equal(RELAY_SOURCE_V4, "127.0.77.1");
 });

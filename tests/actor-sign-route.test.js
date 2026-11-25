@@ -199,6 +199,23 @@ test("the signing relay refuses kind 'mail-draft': the drafting turn signs in-pr
   assert.equal(job.json?.sigs, undefined);
 });
 
+test("the signing relay refuses kind 'report-pickup': a pickup turn signs in-process, never here", async () => {
+  // A report pickup's actor signature is minted beside its `rpk_` token, in the gateway process, for a
+  // tuple no session and no job carries (the thread slot is `<pickupId>:<turnId>`). A key-less host
+  // asking for one gets nothing, and never a partial answer.
+  const tuple = { ...LIVE(), threadId: "rpu-0123456789abcdef:mt-0123456789abcdef", gatewayType: null };
+  const r = await ask({ ...tuple, kinds: ["report-pickup"] });
+  assert.equal(r.status, 403, r.text);
+  assert.equal(r.json?.sigs, undefined, "no signature came back");
+  const mixed = await ask({ ...tuple, kinds: ["bot", "report-pickup"] });
+  assert.equal(mixed.status, 403, mixed.text);
+  assert.equal(mixed.json?.sigs, undefined, "never a partial answer");
+  // Both locked-turn kinds are refused the same way, and neither is a known-but-signable kind.
+  const both = await ask({ ...tuple, kinds: ["mail-draft", "report-pickup"] });
+  assert.equal(both.status, 403, both.text);
+  assert.equal(both.json?.sigs, undefined);
+});
+
 test("refused (404): a request that is not a plain loopback one", async () => {
   const r = await ask({ ...LIVE(), kinds: ["peer-relay"] }, { "X-Forwarded-For": "100.64.20.7" });
   assert.equal(r.status, 404, r.text);

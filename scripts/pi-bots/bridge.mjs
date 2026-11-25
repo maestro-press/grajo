@@ -61,11 +61,16 @@ import { resolveBackupDir } from "../../servers/shared/backup-naming.js";
 import { resolveCrowHome } from "../../servers/shared/crow-home.js";
 import { ENTRY_MARK } from "./pi_netns_entry.mjs";
 import { containSelected, containExcluded, prepareAgentShadow, sweepStaleContainDirs, containOwnWorldRoot, ContainRefused } from "./pi_contain.mjs";
-import { containedClassifierBlock, containedCloudTokenPath } from "./pi_contain_agent.mjs";
+import { containedClassifierBlock, containedCloudTokenPath, pinOfBaseUrl } from "./pi_contain_agent.mjs";
 import { botContainment, defToolNames, recordContainment, formatContainmentLine } from "./containment-status.mjs";
 import { gatewayListenPort } from "../../servers/gateway/listen-port.js";
 import { providerRowToObject } from "../../servers/shared/provider-row.js";
 import { CLOUD_CONSENT_KEY, CLOUD_CONSENT_SALT_KEY } from "../../servers/shared/cloud-consent.js";
+// The one locality predicate (shared code, the same one Crow Mail's drafting gate uses).
+import { isCloudKey, isRoleRef, chainRows } from "../../servers/shared/model-roles.js";
+// Door addressing (the same predicate the gateway's door uses). Reached through pi_contain_agent.mjs
+// already, so naming it here adds no new bot-reachable file.
+import { isDoorUrl } from "../../servers/gateway/models/door-resolve.js";
 import { findPiLabDir, piLabSupportsSecretValuesFd } from "./pi-lab-compat.mjs";
 import { refreshSecretValuesFile } from "../../servers/shared/secret-values-collect.js";
 import { installProviderKeyValuesSource } from "../../servers/gateway/keychain/provider-key-values.js";
@@ -76,7 +81,7 @@ import { createEgressRelay } from "./pi_egress.mjs";
 import { effectiveReadPaths } from "./bot-read-paths.mjs";
 import { MCP_CONFIG_FD, mcpConfigDelivery } from "./mcp-delivery.mjs";
 import { botSessionEnv } from "./actor-env.mjs";
-import { impliedServers, DRAFTING_TURN_TOOLS, isDraftingTurnTools, draftingTurnMcpConfig, resolvedMailDraftTurnDir } from "./mcp_writer.mjs";
+import { impliedServers, LOCKED_TURN_KINDS, lockedTurnKindOf, isLockedTurnTools, lockedTurnMcpConfig, resolvedLockedTurnDir } from "./mcp_writer.mjs";
 import { SECRETS_SERVER, finalizeCoreDoors } from "./crow-server-catalog.mjs";
 import { gatewayHint as resolveGatewayHint } from "./gateways/index.mjs";
 // C-11: the per-turn world assembly (identity + spawn readiness) lives in
@@ -206,28 +211,49 @@ const BRIDGE_APP_ROOT = resolvePath(dirname(fileURLToPath(import.meta.url)), "..
 let containSwept = false;
 
 /**
- * The providers rows and the cloud-door consent a contained spawn's generated
- * agent dir is built from, read once per contained spawn. Only the providers
- * this spawn NEEDS are carried (the turn's row, plus the pi provider id it
- * resolved to, which is the crow-c-* door id for a consented cloud row); a
- * provider with no door is reported by buildContainedAgentDir and the spawn is
- * refused.
+ * The instance's crow.db, opened READ-ONLY and only when the file is there, for
+ * `fn(conn)`. null when it cannot be opened: a spawn must never create
+ * crow.db, and a caller that needs proof treats null as "nothing proven".
  */
-function containModelInputs(resolved, piProvider) {
+function withCrowDbReadonly(fn) {
+  let conn = null;
+  try {
+    conn = new Database(resolveSqlitePath(CROW_DB), { readonly: true, fileMustExist: true });
+    conn.pragma("busy_timeout = 10000");
+    return fn(conn);
+  } catch { return null; }
+  finally { try { if (conn) conn.close(); } catch { /* closed */ } }
+}
+
+/**
+ * Every providers row as the objects servers/shared/model-roles.js walks, or
+ * null when the table cannot be read (the caller then fails closed).
+ */
+function readProviderRows() {
+  return withCrowDbReadonly((conn) => conn.prepare("SELECT * FROM providers").all().map(providerRowToObject));
+}
+
+/**
+ * The providers rows and the cloud-door consent a contained spawn's generated
+ * agent dir is built from. Only the providers this spawn NEEDS are carried (the
+ * turn's row, plus the pi provider id it resolved to, which is the crow-c-* door
+ * id for a consented cloud row); a provider with no door is reported by
+ * buildContainedAgentDir and the spawn is refused.
+ *
+ * `lockedPin` (a locked turn whose kind requires containment) carries the LOCAL-MODEL FLOOR's own
+ * rows. They are used INSTEAD of a second read of `providers`: the endpoint judged a moment ago is
+ * the one this spawn is built for, and the judged row is marked with the pin its generated
+ * models.json entry carries (pinSnapshotRows). A pinned spawn therefore never re-reads the row it
+ * was judged on, and the door refuses a request whose row no longer matches the pin.
+ */
+function containModelInputs(resolved, piProvider, lockedPin = null) {
   const providerIds = [];
   for (const id of [resolved && resolved.provider, piProvider]) {
     if (typeof id === "string" && id && !providerIds.includes(id)) providerIds.push(id);
   }
-  const rows = [];
   let consent = {};
   let consentSalt = null;
-  let conn = null;
-  try {
-    // Read-only and only if the file is there: a spawn must never create the
-    // instance's crow.db, and a missing one just means no provider has a door.
-    conn = new Database(resolveSqlitePath(CROW_DB), { readonly: true, fileMustExist: true });
-    conn.pragma("busy_timeout = 10000");
-    for (const r of conn.prepare("SELECT * FROM providers").all()) rows.push(providerRowToObject(r));
+  const rowsFromDb = withCrowDbReadonly((conn) => {
     const setting = (k) => {
       try { const row = conn.prepare("SELECT value FROM dashboard_settings WHERE key = ?").get(k); return row ? row.value : null; } catch { return null; }
     };
@@ -236,9 +262,99 @@ function containModelInputs(resolved, piProvider) {
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) consent = parsed;
     } catch { consent = {}; }
     consentSalt = setting(CLOUD_CONSENT_SALT_KEY);
-  } catch { /* no DB read: every needed provider is reported as having no door */ }
-  finally { try { if (conn) conn.close(); } catch { /* closed */ } }
+    // The floor's snapshot wins: no second read of the rows it judged.
+    if (lockedPin) return null;
+    return conn.prepare("SELECT * FROM providers").all().map(providerRowToObject);
+  });
+  // No DB read at all (every needed provider is then reported as having no door) gives no rows.
+  const rows = lockedPin ? pinSnapshotRows(lockedPin) : (rowsFromDb || []);
   return { providerIds, rows, consent, consentSalt };
+}
+
+/**
+ * The floor's rows, with the JUDGED row marked so its generated models.json entry carries the pin
+ * (pi_contain_agent.mjs buildContainedAgentDir). Every other row is passed through untouched, so no
+ * other provider entry is ever pinned. `pinBase` is a hash of a base URL: no key, no credential.
+ */
+export function pinSnapshotRows(lockedPin) {
+  const rows = Array.isArray(lockedPin && lockedPin.rows) ? lockedPin.rows : [];
+  const id = lockedPin && lockedPin.providerId;
+  const pinBase = lockedPin && lockedPin.pinBase;
+  return rows.map((r) => (r && r.id === id ? { ...r, pinBase } : r));
+}
+
+/**
+ * The local-model floor: is `key` a model this box can PROVE is local, and on WHICH rows was that
+ * judged? Returns `{ local, rows }`.
+ *
+ * The codebase's one rule (servers/shared/model-roles.js isCloudKey, the rule
+ * servers/gateway/mail/drafts/turn.js admits a drafting model with): a non-empty
+ * key that is not a role ref and whose provider row walks to this box or the
+ * local network. Anything unproven — a role ref, a provider with no row, a
+ * public or unresolvable host, an unreadable providers table — is not local.
+ * ONE MORE REFUSAL, for the floor that guards a turn whose prompt carries
+ * outside people's text: a key whose door chain visits a row the operator's own
+ * store records as `host: "cloud"` is refused too, whatever its base URL says
+ * (the rule whereItRuns uses for the Models page: a stored cloud host is cloud).
+ * That matters because a row can carry a loopback-looking base URL and still be
+ * the operator's declaration that the model runs elsewhere.
+ *
+ * `rows` is the SNAPSHOT the judgement was made on, returned so a caller that must
+ * PIN the judged endpoint takes the same rows instead of reading the table again
+ * (lockedTurnPin below): the table is bot-writable, so a second read could
+ * already describe a different endpoint. `opts.rows` is a test/caller seam: the
+ * snapshot read with no argument is this instance's `providers` table.
+ *
+ * Imported from SHARED code only: this is a bot entry and may not import a
+ * gateway mail/reports module.
+ */
+export function judgeLocalModelFloor(key, opts = {}) {
+  const trimmed = typeof key === "string" ? key.trim() : "";
+  const rows = Array.isArray(opts.rows) ? opts.rows : readProviderRows();
+  if (!trimmed || isRoleRef(trimmed)) return { local: false, rows };
+  if (!Array.isArray(rows)) return { local: false, rows: null };   // nothing proven: fail closed
+  // `chainRows` carries `host` through providerRowToObject, so the door walk sees it per hop.
+  if (chainRows(trimmed, { providers: rows }).some((row) => row && row.host === "cloud")) return { local: false, rows };
+  return { local: isCloudKey(trimmed, { providers: rows }) === false, rows };
+}
+
+/**
+ * The judged endpoint a locked turn that REQUIRES containment hands its spawn, or null.
+ *
+ * `rows` is the floor's own snapshot (judgeLocalModelFloor's second return value) and `key` the model
+ * it admitted. The provider is the part before the first `/` — the same split the door uses when the
+ * path names no provider. The pin is a sha256 of that row's base URL as the door normalises it
+ * (pi_contain_agent.mjs pinOfBaseUrl); the generated models.json entry for the provider carries it,
+ * pi sends it on every request, and the gateway's door refuses a row whose base URL no longer hashes
+ * to it. So a row flipped to ANOTHER local-class address between the floor and the dial is refused
+ * instead of dialled.
+ *
+ * A PIN FITS ONE HOP TO A DIRECT SERVER, and nothing else, because what it names is the only endpoint
+ * it can hold still: the door forwards a pinned request to that row's base URL, so a pin on a row that
+ * is itself a door leaves every hop BEHIND that URL to be decided per request — a chain of two or more
+ * rows (this row's base URL is another gateway's `/llm/p/<id>/v1` door) could be re-pointed after the
+ * floor judged it, and the pin would match the first hop anyway. A single row whose base URL is a door
+ * URL is refused for the same reason even when its upstream cannot be named, which is exactly the case
+ * a chain walk reports as ONE row (an unresolvable door ends the walk): the check on the URL is
+ * explicit, not inferred from the chain's length. Everything else is a direct server the pin can hold:
+ * a row that is not a door and whose walk visits no other row. A key that names no row of the snapshot
+ * (or no chain, or a multi-hop one) has no pin, and the caller fails closed — no pin, no turn.
+ *
+ * @returns {{providerId: string, baseUrl: string, pinBase: string, rows: object[]}|null}
+ */
+export function lockedTurnPin(rows, key) {
+  const text = typeof key === "string" ? key.trim() : "";
+  const at = text.indexOf("/");
+  const list = Array.isArray(rows) ? rows : [];
+  if (at <= 0) return null;
+  const providerId = text.slice(0, at);
+  const row = list.find((r) => r && r.id === providerId) || null;
+  if (!row || typeof row.baseUrl !== "string" || !row.baseUrl) return null;
+  // One hop only: the judged row is the row the door dials (see the doc comment above).
+  if (chainRows(text, { providers: list }).length !== 1) return null;
+  // …and that row must be a direct server, not a door URL whose upstream nobody pinned.
+  if (isDoorUrl(row.baseUrl)) return null;
+  return { providerId, baseUrl: row.baseUrl, pinBase: pinOfBaseUrl(row.baseUrl), rows: list };
 }
 
 /**
@@ -515,15 +631,27 @@ export function canonicalToolOrder(csv) {
  * which feed PI_BOT_PERMISSION_POLICY.
  * @returns {{csv: string, maOptIn: boolean, maCapable: boolean}}
  */
-export function buildToolsCsv(def, { resolved, remoteEnabled = false, interactive = false, narrowedTools = null, serviceBlocks = null, serviceSkippedTools = [], satelliteBlocks = null, bareServerTools, exactTools = null } = {}) {
-  // Crow Mail's drafting turn (plan 3, Task 8b): `exactTools` names the whole csv, so the bot's
-  // envelope, the interactive appends, the secrets append, the subagent belt and per-session narrowing
-  // are all skipped — a drafting turn gets the three draft tools and nothing else. Absent (the default
-  // for every other caller) leaves every line below byte-identical.
+export function buildToolsCsv(def, { resolved, remoteEnabled = false, interactive = false, narrowedTools = null, serviceBlocks = null, serviceSkippedTools = [], satelliteBlocks = null, bareServerTools, exactTools = null, exactToolsKind } = {}) {
+  // A LOCKED TURN (Crow Mail's drafting turn, plan 3 Task 8b; a report pickup): `exactTools` names the
+  // whole csv for the kind `exactToolsKind` names, so the bot's envelope, the interactive appends, the
+  // secrets append, the subagent belt and per-session narrowing are all skipped — a locked turn gets
+  // exactly its kind's tools and nothing else. Absent (the default for every other caller) leaves every
+  // line below byte-identical. NO KIND IS GUESSED: a caller that names none is accepted only when the
+  // list IS exactly one kind's frozen set (the sets are disjoint, so the inference cannot be ambiguous);
+  // a list that matches no kind, or somehow more than one, is refused rather than pinned to a guess.
   if (exactTools !== null && exactTools !== undefined) {
-    if (!isDraftingTurnTools(exactTools)) throw new Error("buildToolsCsv refused: exactTools is not the drafting tool set");
+    let entry;
+    if (exactToolsKind === undefined || exactToolsKind === null) {
+      const matches = Object.keys(LOCKED_TURN_KINDS).filter((kind) => isLockedTurnTools(kind, exactTools));
+      if (matches.length !== 1) throw new Error("buildToolsCsv refused: exactTools names no locked-turn kind");
+      entry = LOCKED_TURN_KINDS[matches[0]];
+    } else {
+      entry = lockedTurnKindOf(exactToolsKind);
+      if (!entry) throw new Error("buildToolsCsv refused: unknown locked-turn kind");
+      if (!isLockedTurnTools(entry.kind, exactTools)) throw new Error("buildToolsCsv refused: " + entry.refusals.tools);
+    }
     // No envelope, so nothing for the subagent gate to open: pi-lab's permission gate reads these.
-    return { csv: canonicalToolOrder(DRAFTING_TURN_TOOLS.join(",")), maOptIn: false, maCapable: false };
+    return { csv: canonicalToolOrder(entry.exactTools.join(",")), maOptIn: false, maCapable: false };
   }
   const maOptIn = !!(def.permission_policy && def.permission_policy.multi_agent === true);
   const maCapable = isMultiAgentCapable(resolved.provider, resolved.model);
@@ -701,6 +829,30 @@ export function homeMatchesResolved(homeReal, resolvedReal) {
   return Boolean(homeReal) && Boolean(resolvedReal) && homeReal === resolvedReal;
 }
 
+/**
+ * TEST-ONLY seam over the ONE launch step of a pi spawn, and nothing else.
+ *
+ * `wrapPiSpawn` (pi_sandbox.mjs) decides the tier by probing THIS host: it can answer the contain
+ * tier only where bubblewrap with a PID namespace really exists, and where it does, the child runs
+ * inside an empty root — so a test stub pi cannot write its captures from there, and a test that
+ * wants to assert what the product does AROUND a contained launch has no host-independent way to get
+ * one. That is the whole reason this exists.
+ *
+ * When set, PiRpc calls this function instead of `wrapPiSpawn`, with the same arguments
+ * `(nodeBin, args, opts)`, and uses the launch object it returns. Every rule below the call stays the
+ * product's own code: the contained-only belt (`isContainTier(launch.tier)`), the `hidden` / masked
+ * computation, the card-values fd gate (`!lockedSpawn && hidden && piLabSupportsSecretValuesFd()`),
+ * the env and the pipes. A forced launch must therefore carry every field PiRpc reads — `cmd`,
+ * `args`, `env` (the SAME env object, PiRpc keeps mutating it), `tier`, `sandboxed`, `wrapper`,
+ * `pidNamespace`, `masked`, `maskedFiles`, `unreachable`, `exposed`, `droppedWrites` — and it is the
+ * test's job to keep them coherent, because the product still judges them (a launch that claims the
+ * contain tier while reporting no secrets dir masked or unreachable is not `hidden`, and gets no card
+ * set). Null is the default and restores the real launcher; nothing but a test ever sets this.
+ */
+let wrapPiSpawnForTest = null;
+/** Test-only: replace (or, with null, restore) the launch step PiRpc uses. */
+export function _setWrapPiSpawnForTest(fn) { wrapPiSpawnForTest = typeof fn === "function" ? fn : null; }
+
 export class PiRpc {
   constructor(opts) {
     const def = opts.def, sessionDir = opts.sessionDir;
@@ -768,6 +920,7 @@ export class PiRpc {
       satelliteBlocks: opts.satelliteBlocks || null,
       bareServerTools: opts.bareServerTools || undefined,
       exactTools: opts.exactTools,
+      exactToolsKind: opts.exactToolsKind,
     });
     // Wave 2: the FINAL csv, exposed so the interactive engine's Session-tab
     // facts can report the tool count the child was actually pinned with
@@ -854,7 +1007,7 @@ export class PiRpc {
     // the generated agent dir.
     const sandboxBotId = opts.botId || (def && (def.bot_id || def.id)) || null;
     const containedSpawn = piSandboxMode(process.env) !== "off" && containSelected(process.env, sandboxBotId);
-    const containModels = containedSpawn ? containModelInputs(resolved, piProvider) : null;
+    const containModels = containedSpawn ? containModelInputs(resolved, piProvider, opts.lockedPin || null) : null;
     if (piPolicy.bash === "auto") {
       let block = classifierPolicyBlock(opts.botClassifier);
       // A contained bot reaches only its own gateway's doors, so the raw
@@ -900,11 +1053,12 @@ export class PiRpc {
     // before merging; every other spawn_env key still passes through
     // unchanged.
     //
-    // A DRAFTING TURN GETS NO def.spawn_env AT ALL (Crow Mail plan 3, Task 8b): the def was written
-    // for a chat bot the owner talks to, and this child reads a person's mail and writes a revision.
-    // Nothing a def asks for is worth handing it, so the skip is total rather than a filtered subset.
-    const draftingSpawn = opts.draftingSpawn === true;
-    const { spawnEnv, stripped: strippedSpawnEnv } = draftingSpawn
+    // A LOCKED TURN GETS NO def.spawn_env AT ALL (Crow Mail plan 3 Task 8b; a report pickup): the def
+    // was written for a chat bot the owner talks to, and this child reads a person's untrusted words
+    // and answers inside one report. Nothing a def asks for is worth handing it, so the skip is total
+    // rather than a filtered subset.
+    const lockedSpawn = opts.lockedSpawn === true;
+    const { spawnEnv, stripped: strippedSpawnEnv } = lockedSpawn
       ? { spawnEnv: {}, stripped: [] }
       : filterSpawnEnvWithReport(def);
     if (strippedSpawnEnv.length) {
@@ -1300,7 +1454,7 @@ export class PiRpc {
         try { mkdirSync(sshDir, { mode: 0o700 }); } catch (e) { if (e && e.code !== "EEXIST") throw new Error("A bot could not start: Crow could not create " + sshDir + " to keep it hidden."); }
         hiddenCandidates.sshDir = sshDir;
       }
-      launch = wrapPiSpawn(nodeBin, args, { env, infoFd: 3, botId: sandboxBotId, contain,
+      launch = (wrapPiSpawnForTest || wrapPiSpawn)(nodeBin, args, { env, infoFd: 3, botId: sandboxBotId, contain,
         hideDirs: [secretsHere, ...others, ...(contain ? [] : [sshDir, ...(gcloudDir ? [gcloudDir] : []), ...instanceSecretDirs])], hideFiles, hideFileRoots, hidePinDirs, seccompFd: contain ? SECCOMP_FD : null, passFds,
         // The bot's OWN key dir, bound back inside the secrets tmpfs from the
         // already-open fd (null unless every check in gitPreSpawn passed).
@@ -1319,6 +1473,16 @@ export class PiRpc {
       }
       this._runContainCleanup();
       throw e;
+    }
+    // THE CONTAINED-ONLY BELT (a locked turn whose kind carries `requiresContained`).
+    // handleInbound already refused such a turn from the SPAWNER's env, before it wrote or spawned
+    // anything, and hands the kind's own sentence down here; this reads the tier the launch REALLY got
+    // (wrapPiSpawn decides it, and a contain request it cannot honour throws above rather than
+    // downgrading). Checked before pi exists, and cleaned up like the refusal below, so no such turn
+    // can run uncontained.
+    if (typeof opts.lockedRequiresContained === "string" && opts.lockedRequiresContained !== "" && !isContainTier(launch.tier)) {
+      this._runContainCleanup();
+      throw new Error("lockedTurn refused: " + opts.lockedRequiresContained);
     }
     // An identity file exists and this launch cannot hold its mask (the setpriv
     // or plain fallback masks nothing, and bwrap without a PID namespace leaves
@@ -1464,9 +1628,9 @@ export class PiRpc {
     // text, to pi processes running turns the owner did not start: that breaks
     // "only my own turns" (connections reach only the owner's own turns).
     //
-    // A drafting turn gets NO card set: it has one credential (its own turn token, in its MCP block)
-    // and must not be able to spend an approval-card secret on a turn no person started.
-    const valuesPayload = !draftingSpawn && hidden && piLabSupportsSecretValuesFd() ? secretValuesPayload(getCardValues()) : null;
+    // A LOCKED TURN gets NO card set: it has one credential (its own turn token, in its MCP block) and
+    // must not be able to spend an approval-card secret on a turn no person started.
+    const valuesPayload = !lockedSpawn && hidden && piLabSupportsSecretValuesFd() ? secretValuesPayload(getCardValues()) : null;
     if (valuesPayload != null) launch.env.PI_BOT_SECRET_VALUES_FD = String(SECRET_VALUES_FD);
     this.sandboxed = launch.sandboxed;
     this.sandboxWrapper = launch.wrapper;
@@ -1531,7 +1695,11 @@ export class PiRpc {
       }
       // Contain tier: every bind source is mounted from an fd opened and verified right here
       // (a swap since the plan refuses the spawn); a no-op for every other tier.
-      bindFds = openBindFds(launch);
+      // Under the test-only launch seam the "bubblewrap" is a stub command with no help text to
+      // probe, so the capability answer is supplied; every bind source the launch really lists is
+      // still opened and verified by openBindFds (a forced launch lists none). Null seam (always,
+      // in production) = the real probe.
+      bindFds = openBindFds(launch, wrapPiSpawnForTest ? { bwrapHelp: "--bind-fd --ro-bind-fd" } : {});
       for (const b of bindFds.fds) {
         while (stdio.length < b.childFd) stdio.push("ignore");
         stdio[b.childFd] = b.fd;
@@ -2105,7 +2273,9 @@ export function projectContextBlock(space, members, shares = []) {
 // Interfaces note). Sync, never throws — probes for board_plans first (the
 // PRAGMA idiom at tracker.mjs's column guards) so a pre-0004 store degrades
 // to "no plan" instead of a crashed turn.
-export function planForCard(cardId) {
+// `approvedOnly` (a pickup card's brief, card-brief.mjs): only an owner-approved plan counts. Any bot can
+// save a draft, so a draft must never reach a brief whose card text came from outside Crow.
+export function planForCard(cardId, { approvedOnly = false } = {}) {
   try {
     const t = db(resolveTasksDbPath());
     try {
@@ -2115,6 +2285,7 @@ export function planForCard(cardId) {
         "SELECT body_md FROM board_plans WHERE item_id=? AND status='approved' ORDER BY version DESC LIMIT 1"
       ).get(Number(cardId));
       if (approved) return approved.body_md;
+      if (approvedOnly) return null;
       const draft = t.prepare(
         "SELECT body_md FROM board_plans WHERE item_id=? AND status='draft' ORDER BY version DESC LIMIT 1"
       ).get(Number(cardId));
@@ -2184,44 +2355,71 @@ async function recordStagedDrafts({ calls, mcpConfig, log, session, threadId, bo
 }
 
 /**
- * `handleInbound`'s `draftingTurn` option (Crow Mail plan 3, Task 8b), or null when absent.
+ * `handleInbound`'s locked-turn option — `draftingTurn` (Crow Mail plan 3, Task 8b) or `lockedTurn`
+ * (a report pickup), or null when neither is given.
  *
- * This is the ONLY way a turn may be pinned to the three draft tools and to a single MCP server, and
- * its shape is checked here, before `buildBotWorld` writes anything or pi is spawned:
- *   - `exactTools` is an array whose sorted contents are exactly DRAFTING_TURN_TOOLS (mcp_writer.mjs);
- *   - `mcpBlock` is this box's own `/mail-draft/mcp` with a `mdt_` bearer and a `mail-draft` actor
- *     signature — a url block with headers and nothing else;
+ * This is the ONLY way a turn may be pinned to one kind's exact tools and to a single MCP server, and
+ * its shape is checked here, before `buildBotWorld` writes anything or pi is spawned. Every check is
+ * driven by the kind's LOCKED_TURN_KINDS row (mcp_writer.mjs), so a second kind is a row and not a
+ * second code path:
+ *   - `kind` (on `lockedTurn` only) is an OWN key of LOCKED_TURN_KINDS; `draftingTurn` means kind
+ *     `mail-draft` and nothing else;
+ *   - `exactTools` is an array whose sorted contents are exactly that kind's frozen tool set;
+ *   - `mcpBlock` is this box's own loopback mount for that kind — `<kind urlPath>`, the kind's bearer
+ *     shape, its actor kind and a signature — a url block with headers and nothing else;
  *   - `checkModel` is the model gate, run below on the model the resolver actually produced;
- *   - `sessionDir` is EXACTLY `<CROW_HOME>/mail-draft-turns/<botId>/<draftId>` (mcp_writer.mjs's
- *     `resolvedMailDraftTurnDir`, built from the home's REAL path so a linked home is not a mismatch),
+ *   - `sessionDir` is EXACTLY `<CROW_HOME>/<kind dirname>/<botId>/<id>` (mcp_writer.mjs's
+ *     `resolvedLockedTurnDir`, built from the home's REAL path so a linked home is not a mismatch),
  *     under this instance's home and outside every bot-writable world root, so a chat thread of the
  *     same bot can never resume this turn and a bot cannot plant its config path.
  *     An absolute path is not enough: the whole point is that this one path, and no other.
- * The caller builds the block (mcp_writer.mjs `mailDraftBlock`) in the process that minted the token
- * and holds the actor key; a key-less bot host must not start a drafting turn at all.
+ * The caller builds the block (mcp_writer.mjs `mailDraftBlock` / `reportPickupBlock`) in the process
+ * that minted the token and holds the actor key; a key-less bot host must not start one at all.
  *
- * @returns {{exactTools: string[], mcpBlock: {url: string, headers: Record<string, string>},
+ * Two options at once are refused: a turn cannot be two kinds (two doors, two tool sets, two dirs).
+ *
+ * @returns {{kind: string, exactTools: string[], mcpBlock: {url: string, headers: Record<string, string>},
  *   sessionDir: string, checkModel: Function}|null}
  */
-function draftingTurnOf(opts) {
-  if (!Object.hasOwn(opts, "draftingTurn") || opts.draftingTurn == null) return null;
-  const refuse = (why) => { throw new Error("draftingTurn refused: " + why); };
-  const value = opts.draftingTurn;
-  if (typeof value !== "object" || Array.isArray(value)) refuse("not an object");
-  if (!isDraftingTurnTools(value.exactTools)) refuse("exactTools is not the drafting tool set");
+function lockedTurnOf(opts) {
+  // Object.hasOwn, not a plain read: an inherited (or `__proto__`-injected) value is not an option
+  // this caller passed, and the prototype chain is not a place a locked turn may hide.
+  const viaDrafting = Object.hasOwn(opts, "draftingTurn") && opts.draftingTurn != null;
+  const viaLocked = Object.hasOwn(opts, "lockedTurn") && opts.lockedTurn != null;
+  if (!viaDrafting && !viaLocked) return null;
+  if (viaDrafting && viaLocked) throw new Error("lockedTurn refused: a turn cannot be two kinds");
+  let kind = "mail-draft";
+  if (viaLocked) {
+    const named = opts.lockedTurn;
+    if (named === null || typeof named !== "object" || Array.isArray(named)) {
+      throw new Error("lockedTurn refused: not an object");
+    }
+    // The table's OWN keys are the only kinds: `__proto__`, `constructor`, `prototype` and every other
+    // prototype name is refused rather than resolved into something a caller could steer.
+    const name = Object.hasOwn(named, "kind") ? named.kind : undefined;
+    if (typeof name !== "string" || !Object.hasOwn(LOCKED_TURN_KINDS, name)) {
+      throw new Error("lockedTurn refused: unknown turn kind");
+    }
+    kind = name;
+  }
+  const entry = LOCKED_TURN_KINDS[kind];
+  // The prefix is the KIND's, whatever option carried it: a mail-draft refusal is the same sentence
+  // whether it arrived as `draftingTurn` or as `lockedTurn` of kind `mail-draft`.
+  const refuse = (why) => { throw new Error(entry.refusalLabel + " refused: " + why); };
+  const value = viaDrafting ? opts.draftingTurn : opts.lockedTurn;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) refuse("not an object");
+  if (!isLockedTurnTools(entry.kind, value.exactTools)) refuse(entry.refusals.tools);
   if (typeof value.checkModel !== "function") refuse("no model check");
   const block = value.mcpBlock;
   if (!block || typeof block !== "object" || Array.isArray(block)) refuse("no mcpBlock");
   for (const key of Object.keys(block)) if (key !== "url" && key !== "headers") refuse("the block carries " + key);
-  if (typeof block.url !== "string" || !/^http:\/\/127\.0\.0\.1:[0-9]{1,5}\/mail-draft\/mcp$/.test(block.url)) {
-    refuse("the block is not this box's /mail-draft/mcp");
-  }
+  if (typeof block.url !== "string" || !lockedTurnUrlRe(entry).test(block.url)) refuse(entry.refusals.blockUrl);
   const headers = block.headers;
   if (!headers || typeof headers !== "object" || Array.isArray(headers)) refuse("the block has no headers");
-  if (typeof headers.Authorization !== "string" || !/^Bearer mdt_[0-9a-f]{64}$/.test(headers.Authorization)) {
-    refuse("the block's bearer is not a turn token");
-  }
-  if (headers["X-Crow-Actor-Kind"] !== "mail-draft") refuse("the block's actor kind is not mail-draft");
+  const bearer = typeof headers.Authorization === "string" && headers.Authorization.startsWith("Bearer ")
+    ? headers.Authorization.slice("Bearer ".length) : null;
+  if (bearer === null || !entry.tokenRe.test(bearer)) refuse("the block's bearer is not a turn token");
+  if (headers["X-Crow-Actor-Kind"] !== entry.actorKind) refuse(entry.refusals.actorKind);
   if (typeof headers["X-Crow-Actor-Id"] !== "string" || !/^[^\s:]+$/.test(headers["X-Crow-Actor-Id"])) refuse("the block names no bot");
   if (typeof headers["X-Crow-Actor-Sig"] !== "string" || !/^[0-9a-f]{64}$/.test(headers["X-Crow-Actor-Sig"])) {
     refuse("the block carries no actor signature");
@@ -2230,16 +2428,16 @@ function draftingTurnOf(opts) {
   // let one bot's turn run in another bot's folder.
   if (opts.bot_id !== headers["X-Crow-Actor-Id"]) refuse("the block's actor is not the bot of this turn");
   const thread = typeof opts.gateway_thread_id === "string" ? opts.gateway_thread_id : "";
-  const threadPrefix = "mail-draft:";
-  if (!thread.startsWith(threadPrefix)) refuse("the thread is not a drafting thread");
-  const expected = resolvedMailDraftTurnDir(resolveCrowHome(), headers["X-Crow-Actor-Id"], thread.slice(threadPrefix.length));
-  if (!expected) refuse("the thread names no draft");
+  if (!thread.startsWith(entry.threadPrefix)) refuse(entry.refusals.thread);
+  const expected = resolvedLockedTurnDir(entry.kind, resolveCrowHome(), headers["X-Crow-Actor-Id"], thread.slice(entry.threadPrefix.length));
+  if (!expected) refuse(entry.refusals.id);
   const sessionDir = value.sessionDir == null ? "" : String(value.sessionDir);
-  // String equality, not resolve(): a path that only normalises to the expected one ("…/x/..")
+  // String equality, not resolve(): a path that only normalises to the expected one (“…/x/..”)
   // is not the expected one.
-  if (sessionDir !== expected) refuse("the session dir is not <CROW_HOME>/mail-draft-turns/<botId>/<draftId>");
+  if (sessionDir !== expected) refuse(entry.refusals.sessionDir);
   return {
-    exactTools: [...DRAFTING_TURN_TOOLS],
+    kind: entry.kind,
+    exactTools: [...entry.exactTools],
     mcpBlock: { url: block.url, headers: { ...headers } },
     sessionDir,
     checkModel: value.checkModel,
@@ -2247,13 +2445,21 @@ function draftingTurnOf(opts) {
 }
 
 /**
- * A drafting turn's world root, verified before anything is created or written in it: a real
- * directory whose real path is the path itself. `sessionDir` was already checked to be the expected
- * `<CROW_HOME>/mail-draft-turns/<botId>/<draftId>`; this refuses a link planted AT it, or on any
- * ancestor between the home and it.
+ * The ONE url a locked turn's block may name: this box's loopback gateway, at the kind's own mount.
+ * The kind's `urlPath` is code in this repo (a frozen table field), so it is matched as written.
  */
-function ensureDraftingWorldDir(dir) {
-  const refuse = () => { throw new Error("draftingTurn refused: the session dir is a symlink or not its real path"); };
+function lockedTurnUrlRe(entry) {
+  return new RegExp("^http://127\\.0\\.0\\.1:[0-9]{1,5}" + entry.urlPath + "$");
+}
+
+/**
+ * A locked turn's world root, verified before anything is created or written in it: a real directory
+ * whose real path is the path itself. `sessionDir` was already checked to be the expected
+ * `<CROW_HOME>/<kind dirname>/<botId>/<id>`; this refuses a link planted AT it, or on any ancestor
+ * between the home and it.
+ */
+function ensureLockedTurnWorldDir(dir, entry) {
+  const refuse = () => { throw new Error(entry.refusalLabel + " refused: " + entry.refusals.symlink); };
   try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch (err) { if (!err || err.code !== "EEXIST") throw err; }
   let st;
   try { st = lstatSync(dir); } catch { refuse(); }
@@ -2263,12 +2469,13 @@ function ensureDraftingWorldDir(dir) {
 }
 
 /**
- * Refuse a drafting turn on a host whose MCP config delivery is not the fd (mcp-delivery.mjs).
+ * Refuse a locked turn on a host whose MCP config delivery is not the fd (mcp-delivery.mjs).
  *
- * A drafting turn's single server block carries the turn's live `mdt_` token. The `file` mode writes
- * a config to `<world>/.mcp.json`, which would put that token on disk for the length of the turn;
- * the fd mode is the only one a drafting turn may run in. Thrown before `buildBotWorld` writes
- * anything and before anything is spawned, so a file-mode host cannot run a drafting turn at all.
+ * A locked turn's single server block carries the turn's live per-turn token (`mdt_`, `rpk_`). The
+ * `file` mode writes a config to `<world>/.mcp.json`, which would put that token on disk for the
+ * length of the turn; the fd mode is the only one a locked turn may run in. Thrown before
+ * `buildBotWorld` writes anything and before anything is spawned, so a file-mode host cannot run one
+ * at all.
  *
  * The error is MailError-shaped with the code `delivery_unsupported`, which is what the caller and the
  * owner route switch on; the caller's `finally` revokes the token it minted for this attempt.
@@ -2304,13 +2511,25 @@ export async function handleInbound(opts) {
   // makes it an own key, and the rest spread keeps it) would put mcpOverrides on the prototype and
   // this line would still take it.
   const mcpOverridesOpt = Object.hasOwn(opts, "mcpOverrides") ? opts.mcpOverrides : undefined; // read once
-  // Crow Mail's drafting turn (plan 3, Task 8b): validated here, before buildBotWorld writes a config
-  // or anything is spawned, so a malformed option can never reach a child half-applied.
-  const drafting = draftingTurnOf(opts);
-  // A drafting turn is fd-only: its server block carries the turn's live token, and the file mode
+  // A LOCKED TURN (Crow Mail's drafting turn, plan 3 Task 8b; a report pickup): validated here,
+  // before buildBotWorld writes a config or anything is spawned, so a malformed option can never
+  // reach a child half-applied. The kind — and every check on it — comes from LOCKED_TURN_KINDS.
+  const locked = lockedTurnOf(opts);
+  // A locked turn is fd-only: its server block carries the turn's live token, and the file mode
   // would write that token to `<world>/.mcp.json`. Refused here, ahead of buildBotWorld's own config
   // write and of the spawn.
-  if (drafting !== null && mcpConfigDelivery() === "file") throw refuseFileModeDelivery();
+  if (locked !== null && mcpConfigDelivery() === "file") throw refuseFileModeDelivery();
+  // A locked turn whose KIND requires the contained tier runs there or not at all, refused here —
+  // before buildBotWorld writes anything and before anything is spawned — so a host that cannot
+  // contain the turn never starts it. The signal is the SAME one PiRpc decides containment with
+  // (its `containedSpawn`): the operator's sandbox mode, less an exemption, for the bot of this turn.
+  // PiRpc repeats the check against the tier the launch really got (the belt there), so a launch that
+  // somehow came back uncontained dies before pi exists.
+  if (locked !== null && LOCKED_TURN_KINDS[locked.kind].requiresContained === true
+    && !(piSandboxMode(process.env) !== "off" && containSelected(process.env, opts.bot_id))) {
+    const row = LOCKED_TURN_KINDS[locked.kind];
+    throw new Error(row.refusalLabel + " refused: " + row.refusals.contained);
+  }
   let evalMcp = null;
   if (mcpOverridesOpt !== undefined && mcpOverridesOpt !== null) {
     const guard = await import("../lib/eval-guard.mjs");
@@ -2326,12 +2545,13 @@ export async function handleInbound(opts) {
   // `!escalate` token. Detect on the RAW inbound, then strip it so it never
   // reaches the model prompt or persists in the pi session transcript.
   //
-  // A DRAFTING TURN NEVER ESCALATES (Crow Mail plan 3, Task 8b): its prompt carries a person's own
-  // instruction, so a `!escalate` in their words (or injected into a comment they paste) would move
-  // mail text onto a cloud model the account may forbid. Escalation is forced off here, and the
-  // model that IS resolved is checked against the drafting gate further below. The token is still
-  // stripped, so it cannot reach the prompt either way.
-  const escalate = drafting === null ? escalateRequested(user_message) : false;
+  // A LOCKED TURN NEVER ESCALATES (Crow Mail plan 3, Task 8b; a report pickup): its prompt carries a
+  // person's own instruction — or, for a pickup, a recipient's comment — so a `!escalate` in their
+  // words (or injected into a comment they paste) would move private text onto a cloud model the
+  // owner may forbid. Escalation is forced off here, and the model that IS resolved is checked
+  // against the kind's model gate further below. The token is still stripped, so it cannot reach the
+  // prompt either way.
+  const escalate = locked === null ? escalateRequested(user_message) : false;
   const cleanMsg = stripEscalateToken(user_message);
   // C-11 Phase A — identity. This is the code that used to be inline here,
   // moved verbatim into bot-world.mjs: loadBot → crowHome → project space +
@@ -2349,14 +2569,14 @@ export async function handleInbound(opts) {
     // match a job-dispatched turn against its OWN bot_jobs row.
     jobId: opts.job_id || null,
   });
-  // A drafting turn runs in its OWN world root, handed in by the caller
-  // (`<CROW_HOME>/mail-draft-turns/<botId>/<draftId>`, checked against that one path in
-  // draftingTurnOf): pi's --session-dir, the world root and the per-turn .mcp.json all move with it, so
-  // a chat thread of the same bot neither resumes this turn nor shares its config. Set before the
-  // destructuring below, which every later use follows. The dir is verified (a real directory, not a
-  // symlink, and its own real path) before anything is created in it.
-  if (drafting !== null) {
-    world.sessionDir = ensureDraftingWorldDir(drafting.sessionDir);
+  // A locked turn runs in its OWN world root, handed in by the caller
+  // (`<CROW_HOME>/<kind dirname>/<botId>/<id>`, checked against that one path in lockedTurnOf): pi's
+  // --session-dir, the world root and the per-turn .mcp.json all move with it, so a chat thread of the
+  // same bot neither resumes this turn nor shares its config. Set before the destructuring below, which
+  // every later use follows. The dir is verified (a real directory, not a symlink, and its own real
+  // path) before anything is created in it.
+  if (locked !== null) {
+    world.sessionDir = ensureLockedTurnWorldDir(locked.sessionDir, LOCKED_TURN_KINDS[locked.kind]);
     mkdirSync(join(world.sessionDir, "sessions"), { recursive: true, mode: 0o700 });
   }
   const def = world.def;
@@ -2426,32 +2646,68 @@ export async function handleInbound(opts) {
   }
   const resolved = spawnPrep.resolved;
 
-  // A DRAFTING TURN'S MODEL GATE (Crow Mail plan 3, Task 8b): the model `prepareSpawn` actually
-  // produced — not the bot def's default, which escalation or a role could have moved — must pass the
-  // same rule turn.js used to admit the turn. Run here, after resolution and BEFORE warmModel, the
-  // tool-budget refusal and the spawn, so a refused model costs nothing and starts nothing. The
-  // refusal names a code only: never the prompt, never a person's words.
-  if (drafting !== null) {
+  // A LOCKED TURN'S MODEL GATE (Crow Mail plan 3, Task 8b; a report pickup): the model `prepareSpawn`
+  // actually produced — not the bot def's default, which escalation or a role could have moved — must
+  // pass the same rule the kind's launcher used to admit the turn, and a kind whose row names a
+  // `modelFloor` must pass that floor too. Run here, after resolution and
+  // BEFORE warmModel, the tool-budget refusal and the spawn, so a refused model costs nothing and
+  // starts nothing. The refusal names a code only: never the prompt, never a person's words.
+  if (locked !== null) {
+    const entry = LOCKED_TURN_KINDS[locked.kind];
+    // Mail keeps its own sentences byte for byte; every other kind gets a neutral one built from it.
+    const drafting = entry.kind === "mail-draft";
     let verdict = null;
-    try { verdict = drafting.checkModel(resolved); } catch { verdict = null; }
+    // The floor's own SNAPSHOT of the rows it judged: a kind that requires containment PINS the
+    // endpoint from exactly these rows (lockedTurnPin), so nothing here reads `providers` again.
+    let floorRows = null;
+    // A kind whose row carries `modelFloor: "local-only"` (a report pickup: its prompt is text written
+    // by people OUTSIDE this instance) must ALSO run on a model this box can prove local, whatever the
+    // caller's checkModel says. The floor runs FIRST and BOTH must say yes; a floor that refuses does
+    // not consult the caller's check at all. The floor names a code only, never a prompt or a comment.
+    if (entry.modelFloor === "local-only") {
+      const floor = judgeLocalModelFloor(resolved && resolved.key);
+      floorRows = floor.rows;
+      if (!floor.local) verdict = { ok: false, code: "model_not_local" };
+    }
+    if (verdict === null) {
+      try { verdict = locked.checkModel(resolved); } catch { verdict = null; }
+    }
     if (!verdict || verdict.ok !== true) {
       const code = verdict && typeof verdict.code === "string" && /^[a-z_]{1,40}$/.test(verdict.code)
         ? verdict.code : "model_refused";
-      log("drafting turn refused: model not allowed (" + code + ")");
+      log((drafting ? "drafting turn" : "locked turn (" + entry.kind + ")") + " refused: model not allowed (" + code + ")");
       appendAuditBridge(projectId, {
         actor_type: "bot", actor_id: bot_id, action: "bot.error",
         target: "thread:" + gateway_thread_id,
-        payload: { error: "drafting model refused", code, model: resolved.key },
+        payload: { error: drafting ? "drafting model refused" : "locked turn model refused", code, model: resolved.key },
       });
-      return { action: "error", error: "drafting model not allowed: " + code };
+      return {
+        action: "error",
+        error: drafting ? "drafting model not allowed: " + code
+          : "locked turn (" + entry.kind + ") model not allowed: " + code,
+      };
+    }
+    // A kind that REQUIRES containment pins the endpoint the floor just judged, and fails closed when
+    // it cannot: the generated models.json entry for the judged provider carries sha256 of the base
+    // URL the floor's own row snapshot held, and the gateway's door refuses a request whose row no
+    // longer hashes to it (servers/gateway/routes/llm-router.js). Without a pin the turn would run on
+    // an endpoint decided per request, which is the flip race this closes — so: no pin, no turn.
+    if (entry.requiresContained === true) {
+      const pin = lockedTurnPin(floorRows, resolved && resolved.key);
+      if (!pin) throw new Error(entry.refusalLabel + " refused: " + entry.refusals.pin);
+      spawnPrep.piRpcOpts = Object.assign({}, spawnPrep.piRpcOpts, { lockedPin: pin });
     }
   }
 
   // The same csv reaches the tool-budget preflight below AND the spawn (PiRpc reads opts.exactTools),
-  // so the count and the child can never disagree about what a drafting turn may call.
-  if (drafting !== null) {
+  // so the count and the child can never disagree about what a locked turn may call. The kind rides
+  // along too, so the preflight and the spawn validate the list against the SAME kind's set, and a kind
+  // that requires the contained tier hands PiRpc the sentence its late belt throws.
+  if (locked !== null) {
+    const row = LOCKED_TURN_KINDS[locked.kind];
     spawnPrep.piRpcOpts = Object.assign({}, spawnPrep.piRpcOpts,
-      { exactTools: drafting.exactTools, draftingSpawn: true });
+      { exactTools: locked.exactTools, exactToolsKind: locked.kind, lockedSpawn: true,
+        lockedRequiresContained: row.requiresContained === true ? row.refusals.contained : null });
   }
 
   // Project services (Task 18): the owner's connected accounts, as labelled blocks, BEFORE the
@@ -2500,6 +2756,7 @@ export async function handleInbound(opts) {
       satelliteBlocks: po.satelliteBlocks || null,
       bareServerTools: po.bareServerTools || undefined,
       exactTools: po.exactTools,
+      exactToolsKind: po.exactToolsKind,
     });
     const budget = checkToolBudget(csv, capFor(resolved));
     if (!budget.ok) {
@@ -2542,7 +2799,13 @@ export async function handleInbound(opts) {
     + gatewayHint;
 
   let promptText;
-  if (cardId != null) {
+  // A locked turn whose kind row says `barePrompt` (report-pickup) is handed the caller's message exactly:
+  // the generic gateway framing below tells the model to "reply on the gateway thread", which a pickup
+  // discards. No header, hint, tracker block, tail or [Dates] line.
+  const barePrompt = locked !== null && LOCKED_TURN_KINDS[locked.kind].barePrompt === true;
+  if (barePrompt) {
+    promptText = cleanMsg;
+  } else if (cardId != null) {
     // Explicit card reference — full work-the-card workflow.
     // D-T1.5: the terminal-state signal is board_report_result, an explicit
     // tool call with an outcome — never inferred from a status write. This no
@@ -2578,8 +2841,11 @@ export async function handleInbound(opts) {
   // Dates (follow-up to queue item 17a): pi's system prompt carries no date and is cached per session, so a turn
   // whose USER words name a relative day ("move my dentist to Monday") gets the computed [Dates] line at the end of
   // the prompt. Triggered on cleanMsg only: a card brief or project header can name weekdays. Server zone.
-  const dated = appendDates(promptText, cleanMsg, { now: opts.now ?? Date.now(), tz: null });
-  promptText = dated.text;
+  let dated = { text: promptText, line: null };
+  if (!barePrompt) {
+    dated = appendDates(promptText, cleanMsg, { now: opts.now ?? Date.now(), tz: null });
+    promptText = dated.text;
+  }
 
   // Phase 3.0 (R4): if an escalation flips the model vs the session's recorded
   // one, force a FRESH pi session — resuming a session created under a
@@ -2637,15 +2903,15 @@ export async function handleInbound(opts) {
     mcpOverridden = changed;
   }
 
-  // A drafting turn's config is exactly ONE enabled server (Crow Mail plan 3, Task 8b): this box's
-  // `/mail-draft/mcp` with the turn's token and actor signature, and every name in the operator's
-  // global mcp.json disabled (pi-lab's mcp-client loads that file in both delivery modes). No bot
-  // server, implied service block, satellite, extension or remote block is enabled. Placed where the
-  // eval seam replaces the config (after bindWorldSession, before warmModel). A drafting turn only
-  // ever runs in fd mode (refused above), so this config reaches pi on MCP_CONFIG_FD and nothing of it
-  // is written anywhere.
-  if (drafting !== null) {
-    const config = draftingTurnMcpConfig(drafting.mcpBlock);
+  // A locked turn's config is exactly ONE enabled server (Crow Mail plan 3 Task 8b; a report pickup):
+  // the kind's own mount (`/mail-draft/mcp`, `/report-pickup/mcp`) with the turn's token and actor
+  // signature, and every name in the operator's global mcp.json disabled (pi-lab's mcp-client loads
+  // that file in both delivery modes). No bot server, implied service block, satellite, extension or
+  // remote block is enabled. Placed where the eval seam replaces the config (after bindWorldSession,
+  // before warmModel). A locked turn only ever runs in fd mode (refused above), so this config reaches
+  // pi on MCP_CONFIG_FD and nothing of it is written anywhere.
+  if (locked !== null) {
+    const config = lockedTurnMcpConfig(locked.kind, locked.mcpBlock);
     spawnPrep.piRpcOpts = Object.assign({}, spawnPrep.piRpcOpts, { mcpConfig: config });
     world.mcpConfig = config;
   }
@@ -2804,11 +3070,12 @@ export async function handleInbound(opts) {
   // skill_learning mode + the idle-only countLivePi()===0 check, so a no-op turn
   // costs nothing. pi is already closed, so on an otherwise-idle node the gate
   // sees 0 live pi. Errors are swallowed inside runSkillReview.
-  // A locked drafting turn never reviews itself: its transcript carries untrusted outside text
-  // (inbound mail), and the review resolves its own model and gets the bot's spawn_env, so the
-  // drafting turn's model gate does not cover the review's own pi spawn — in `skill_learning: auto`
-  // mode that would turn outside text into standing instructions.
-  if (drafting === null && postTurn && (result.action === "asked" || result.action === "executed")) {
+  // A LOCKED TURN OF ANY KIND never reviews itself: its transcript carries untrusted outside text
+  // (inbound mail, and a pickup turn's outside people's comments), and the review resolves its own
+  // model and gets the bot's spawn_env, so the locked turn's model gate does not cover the review's
+  // own pi spawn — in `skill_learning: auto` mode that would turn outside text into standing
+  // instructions.
+  if (locked === null && postTurn && (result.action === "asked" || result.action === "executed")) {
     skillReviewImpl({ bot_id, def, crowHome, sessionDir, transcript: postTurn,
       log: (m) => log("[skill-review] " + m) }).catch(() => {});
   }
@@ -2883,6 +3150,9 @@ if (import.meta.url === "file://" + process.argv[1]) {
     if (Object.hasOwn(payload, k)) { console.error(`bridge.mjs --inject refuses a payload with a ${k} key`); process.exit(2); }
   }
   const { mcpOverrides: _mcpOverrides, evalSpawnTransform: _evalSpawnTransform, draftingTurn: _draftingTurn, ...rest } = payload;
+  // `lockedTurn` is the generic form of the same option, so a shell payload must not select it either.
+  // A `delete` on the spread's own fresh object, not a prototype write.
+  delete rest.lockedTurn;
   // A spread, not Object.assign: it defines own properties, so no prototype setter can run.
   handleInbound({ ...rest,
     log: (m) => console.error("[bridge] " + m),

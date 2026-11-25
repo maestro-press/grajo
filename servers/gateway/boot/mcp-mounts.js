@@ -26,7 +26,7 @@ import { ensureBoardToken, ensurePhoneToken, ensureModelsToken, ensureArtifactsT
 import { peerRelayRouter } from "../routes/peer-relay.js";
 import { addonDoorsRouter } from "../routes/addon-doors.js";
 import { actorSignRouter } from "../routes/actor-sign.js";
-import { initGatewayActorKey, verifyActorSig, verifyBoardActorSig, verifyArtifactsActorSig, verifyBoardThreadActorSig, verifySecretsActorSig, verifySharingActorSig, verifyReportsActorSig, verifyMemoryActorSig, verifyProjectsActorSig } from "../../../scripts/pi-bots/actor-sig.mjs";
+import { initGatewayActorKey, verifyActorSig, verifyBoardActorSig, verifyArtifactsActorSig, verifyBoardThreadActorSig, verifySecretsActorSig, verifySharingActorSig, verifyReportsActorSig, verifyMemoryActorSig, verifyProjectsActorSig, verifyReportPickupActorSig } from "../../../scripts/pi-bots/actor-sig.mjs";
 import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -529,6 +529,32 @@ export async function mountMcpServers(app, deps) {
     console.log("[gateway] core bot doors mounted at /memory-bot/mcp and /projects-bot/mcp");
   } catch (err) {
     console.warn(`[gateway] core bot doors skipped: ${err.message}`);
+  }
+
+  // A report pickup's door: /report-pickup/mcp, the THREE tools a pickup turn may call — a reply in one
+  // thread of its own comment batch, a card, and one suggested change. It follows the /reports mount (NOT the mail flag: a report pickup
+  // is reports' own turn) and is behind its own guard: a live per-turn `rpk_` token AND a signed
+  // `report-pickup` actor over the same pickup and turn, or 401 before any handler. It is not a second
+  // surface on any owner route: the report, artifact, bot and thread set are the token's claims, never
+  // an argument. A failure never blocks boot.
+  //
+  // THIS MOUNT IS SIGNED, AND IT SAYS SO WHERE IT IS WRITTEN DOWN. The guard and the server factory are
+  // handed the same deps, `verifyActor: verifyReportPickupActorSig` among them: the guard is what runs
+  // the signature check, and naming the verifier on the mount factory here is what makes a SIGNED bot
+  // door readable from this file — a source-level audit of every mount McpServer publishes
+  // (scripts/pi-bots/mcp_writer.mjs's owner-mount rule, pinned by
+  // tests/mcp-writer-owner-mounts.test.js) reads a factory that names a verifier as signed, so it must
+  // stay allowed for a bot and never be classed as an owner-capable mount.
+  try {
+    const { createPickupMcpServer, pickupMountAuth } = await import("../reports/pickup-mcp.js");
+    // The card and the suggested change are done through functions loaded HERE and handed to the door:
+    // the door's own import closure must not reach the board service or the approvals module.
+    const { pickupActions } = await import("../reports/pickup-actions.js");
+    app.use("/report-pickup", pickupMountAuth({ verifyActor: verifyReportPickupActorSig }));
+    mountMcpServer(app, "/report-pickup", () => createPickupMcpServer({ createDb: createDbClient, verifyActor: verifyReportPickupActorSig, actions: pickupActions }), sessionManager, authMiddleware, peerExposureGate);
+    console.log("[gateway] report pickup MCP mounted at /report-pickup/mcp");
+  } catch (err) {
+    console.warn(`[gateway] report pickup mount skipped: ${err.message}`);
   }
   // Phone bundle (plan A): core-mounted like /board, but only when the bundle
   // is installed. The server factory is imported by PATH from the installed

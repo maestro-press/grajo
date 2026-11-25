@@ -233,3 +233,77 @@ test("B1: a generic job's board block carries X-Crow-Job-Id and a board signatur
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+// A report pickup's locked turn has its own actor kind ("report-pickup"), signed over the v1 tuple with
+// `<pickupId>:<turnId>` in the thread slot and a null gateway type, like "mail-draft". The replay matrix
+// below pins that the two locked-turn kinds are separate MAC domains: neither signature verifies as the
+// other, and neither verifies as any of the other kinds' tuple.
+test("a report-pickup signature is its own domain: it replays as no other kind, and no other kind replays as it", async () => {
+  const {
+    signReportPickupActor, verifyReportPickupActorSig, reportPickupActorThread,
+    signMailDraftActor, verifyMailDraftActorSig, signArtifactsActor, verifyArtifactsActorSig,
+    signReportsActor, verifyReportsActorSig, signSharingActor, verifySharingActorSig,
+    verifyBoardThreadActorSig,
+  } = await import("../scripts/pi-bots/actor-sig.mjs");
+  const pickup = { botId: "hank", pickupId: "rpu-0123456789abcdef", turnId: "mt-0123456789abcdef" };
+
+  _resetActorKeyForTest();
+  assert.equal(signReportPickupActor(pickup), null, "no key -> no signature");
+  assert.equal(verifyReportPickupActorSig({ ...pickup, sig: "a".repeat(64) }), false, "no key -> nothing verifies");
+
+  initGatewayActorKey();
+  const sig = signReportPickupActor(pickup);
+  assert.match(sig, /^[0-9a-f]{64}$/);
+  assert.equal(reportPickupActorThread(pickup), "rpu-0123456789abcdef:mt-0123456789abcdef",
+    "the v1 thread slot carries <pickupId>:<turnId>");
+  assert.equal(verifyReportPickupActorSig({ ...pickup, sig }), true);
+
+  // Bound to every half: another pickup, another turn of the same pickup, another bot.
+  assert.equal(verifyReportPickupActorSig({ ...pickup, pickupId: "rpu-fedcba9876543210", sig }), false, "bound to the pickup");
+  assert.equal(verifyReportPickupActorSig({ ...pickup, turnId: "mt-fedcba9876543210", sig }), false, "bound to the turn");
+  assert.equal(verifyReportPickupActorSig({ ...pickup, botId: "other-bot", sig }), false, "bound to the bot");
+  assert.equal(verifyReportPickupActorSig({ ...pickup, sig: undefined }), false);
+  // The null gateway type is part of the MAC, so the same ids under a gateway do not verify.
+  assert.equal(verifyActorSig({
+    kind: "report-pickup", botId: pickup.botId, threadId: reportPickupActorThread(pickup),
+    gatewayType: "gmail", sig,
+  }), false, "gatewayType null is bound");
+
+  // A half that cannot be one (a colon or whitespace of its own) is no tuple at all.
+  for (const bad of [{ ...pickup, pickupId: "rpu:1" }, { ...pickup, turnId: "mt 1" }, { ...pickup, pickupId: "" }]) {
+    assert.equal(reportPickupActorThread(bad), null, JSON.stringify(bad));
+    assert.equal(signReportPickupActor(bad), null);
+    assert.equal(verifyReportPickupActorSig({ ...bad, sig }), false);
+  }
+
+  // Report-pickup <-> mail-draft: the SAME ids in the thread slot, two MAC domains.
+  const asDraft = { botId: pickup.botId, draftId: pickup.pickupId, turnId: pickup.turnId };
+  assert.equal(reportPickupActorThread(pickup), `${asDraft.draftId}:${asDraft.turnId}`,
+    "the two kinds join their ids the same way, so only the kind field separates them");
+  assert.equal(verifyMailDraftActorSig({ ...asDraft, sig }), false, "a report-pickup signature is not a mail-draft one");
+  const mailSig = signMailDraftActor(asDraft);
+  assert.equal(verifyReportPickupActorSig({ ...pickup, sig: mailSig }), false, "a mail-draft signature is not a report-pickup one");
+  assert.equal(verifyMailDraftActorSig({ ...asDraft, sig: mailSig }), true, "control: it is a valid mail-draft signature");
+
+  // Report-pickup <-> every other v1 kind.
+  assert.equal(verifyActorSig({
+    kind: "bot", botId: pickup.botId, threadId: reportPickupActorThread(pickup), gatewayType: null, sig,
+  }), false, "not a phone signature");
+  assert.equal(verifyBoardActorSig({ botId: pickup.botId, jobId: pickup.pickupId, sig }), false, "not a board signature");
+  assert.equal(verifyBoardThreadActorSig({
+    botId: pickup.botId, threadId: reportPickupActorThread(pickup), gatewayType: null, sig,
+  }), false, "not a board-thread signature");
+  assert.equal(verifyArtifactsActorSig({
+    botId: pickup.botId, threadId: reportPickupActorThread(pickup), gatewayType: null, sig,
+  }), false, "not an artifacts signature");
+  assert.equal(verifyReportsActorSig({
+    botId: pickup.botId, threadId: reportPickupActorThread(pickup), gatewayType: null, sig,
+  }), false, "not a reports signature");
+  assert.equal(verifySharingActorSig({
+    botId: pickup.botId, threadId: reportPickupActorThread(pickup), gatewayType: null, sig,
+  }), false, "not a sharing signature");
+  const other = { botId: pickup.botId, threadId: reportPickupActorThread(pickup), gatewayType: null };
+  assert.equal(verifyReportPickupActorSig({ ...pickup, sig: signArtifactsActor(other) }), false);
+  assert.equal(verifyReportPickupActorSig({ ...pickup, sig: signReportsActor(other) }), false);
+  assert.equal(verifyReportPickupActorSig({ ...pickup, sig: signSharingActor(other) }), false);
+});

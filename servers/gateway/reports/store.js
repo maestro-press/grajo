@@ -295,7 +295,7 @@ export async function listReports(db, { projectId } = {}) {
  * An answer that is not `{nonce: 32 hex, seal: 64 hex}` writes no seal rather than a broken one.
  *
  * @param {object} db
- * @param {{reportId: string, recipe: object, authorKind: "owner"|"bot",
+ * @param {{reportId: string, recipe: object, authorKind: "owner"|"bot", expectedRev?: number,
  *   registry?: Record<string, {sourceBearing?: boolean}>|null, now?: number,
  *   authorSeal?: ((fields: {reportId: string, rev: number, recipeHash: string,
  *     authorKind: "owner"}) => Promise<{nonce: string, seal: string}|null>)|null}} fields
@@ -303,7 +303,7 @@ export async function listReports(db, { projectId } = {}) {
  *   `authorSealed` is true only when this save wrote a revision author seal
  * @throws {Error} `bad_input`, `bad_author_kind`, `bad_recipe`, `not_found`, `conflict`
  */
-export async function saveRecipe(db, { reportId, recipe, authorKind, registry = blockRegistry, now, authorSeal } = {}) {
+export async function saveRecipe(db, { reportId, recipe, authorKind, registry = blockRegistry, now, authorSeal, expectedRev } = {}) {
   idOf(reportId);
   if (!REPORT_AUTHOR_KINDS.includes(authorKind)) throw fail("bad_author_kind", "authorKind");
   // The stamp is read from the head revision's own recipe, so it needs that row before the transaction.
@@ -316,6 +316,9 @@ export async function saveRecipe(db, { reportId, recipe, authorKind, registry = 
   });
   if (!headRow.rows[0]) throw fail("not_found", "report");
   const headRev = Number(headRow.rows[0].recipe_rev) || 0;
+  // A caller that merged its change from a head it read earlier says which one: if the head has moved
+  // since, nothing is saved (`conflict`), so a concurrent save is never reverted by a merge of stale text.
+  if (expectedRev !== undefined && Number(expectedRev) !== headRev) throw fail("conflict", "recipe_rev");
   const previousRevision = headRev > 0 ? await getRevision(db, reportId, headRev) : null;
   const stamped = stampAuthoredBy(recipe, previousRecipeOf(previousRevision), authorKind);
   // Before the transaction: a refused recipe leaves the row and the revision table exactly as they

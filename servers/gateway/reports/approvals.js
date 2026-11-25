@@ -1221,11 +1221,12 @@ export async function ownerSaveRecipe(db, deps, { reportId, recipe, actor } = {}
  *
  * @param {object} db
  * @param {object} deps
- * @param {{reportId: string, recipe: object}} input
+ * @param {{reportId: string, recipe: object, expectedRev?: number}} input `expectedRev`, when given, is the
+ *   head revision the recipe was built from: a head that has moved is `conflict` and nothing is saved
  * @returns {Promise<{rev: number, hash: string, sourcesHash: string, pendingFreeChange: boolean,
  *   needsGoLive: boolean, authorSealed: boolean}>}
  */
-export async function botSaveRecipe(db, deps, { reportId, recipe } = {}) {
+export async function botSaveRecipe(db, deps, { reportId, recipe, expectedRev } = {}) {
   const d = resolveDeps(deps);
   const report = await requireReport(db, reportId);
   const saved = await saveRecipe(db, {
@@ -1233,6 +1234,7 @@ export async function botSaveRecipe(db, deps, { reportId, recipe } = {}) {
     recipe,
     authorKind: "bot",
     registry: d.registry,
+    expectedRev,
   });
   const after = await getReport(db, report.id);
   if (!after) throw fail("not_found", "report");

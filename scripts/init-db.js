@@ -15,7 +15,7 @@ import { SATELLITE_DDL } from "../servers/shared/satellite-schema.js";
 import { MAIL_DDL, MAIL_ACCOUNT_SEND_COLUMNS, MAIL_DRAFTS_DDL } from "../servers/shared/mail-schema.js";
 import {
   REPORTS_DDL, REPORTS_RUNS_DDL, REPORTS_VERSIONS_DDL, REPORTS_SEND_DDL, REPORTS_STEPS_DDL,
-  REPORTS_LINKS_DDL, REPORTS_COMMENT_WINDOW_COLUMN,
+  REPORTS_LINKS_DDL, REPORTS_COMMENT_WINDOW_COLUMN, REPORTS_PICKUP_DDL,
 } from "../servers/shared/reports-schema.js";
 import {
   MESSAGE_DRAFTS_LATE_COLUMNS, MESSAGE_DRAFTS_DDL, MESSAGE_DRAFTS_CHAT_THREAD_INDEX_DDL,
@@ -3199,6 +3199,17 @@ await initTable("reports links tables", REPORTS_LINKS_DDL);
 // adds a column. This is the same ALTER 0039 runs, from the one constant, and it gives an existing row
 // its default of 4 without a backfill.
 await ensureSchemaColumn(REPORTS_COMMENT_WINDOW_COLUMN);
+
+// reports pickup tables: one row per pickup, the bot turn that works through a batch of new comments on a
+// report (the batch's thread and comment ids as JSON arrays, when it started and ended, the minutes its
+// turn spent and how it ended). Epoch-ms times; outcomes are validated in the reports modules (no CHECK,
+// no FK). LOCAL ONLY (instance-sync LOCAL_ONLY_TABLES): a pickup names the comments a report's readers
+// left, and a report never leaves its instance. A pickup row id uses `rpu-`, never `rpk_`: that is the
+// per-turn token's prefix (servers/gateway/reports/pickup-token.js).
+// Same DDL as REPORTS_PICKUP_DDL in servers/shared/reports-schema.js, which
+// scripts/migrations/0042-reports-pickup.mjs also runs, one shape, two rails; additive, no
+// SCHEMA_GENERATION bump.
+await initTable("reports pickup tables", REPORTS_PICKUP_DDL);
 
 // message draft tables (Crow Messages): the draft of a message to one conversation — a contact or a
 // room — with the body, the version an autosave compares against and the sealed recipient set, plus

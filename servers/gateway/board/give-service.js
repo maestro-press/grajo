@@ -177,14 +177,16 @@ export function giveAudit(db, row, cardId, extra) {
  * the bot's project with its assigned_bot (one create row, the builtin gated autonomy), then one
  * card_given audit row. `tdb` is the tasks client, or a getter called only once the bot passes
  * (so a refused bot never opens the tasks store, as before). `audit` adds payload fields ahead
- * of `created`. A failure after the create carries `err.cardId`, so a caller can tell a card was
- * made.
+ * of `created`. `actor` is who the card's create row names (default: the dashboard operator, a human; a
+ * caller that is not one passes its own, e.g. a bot), and `autonomy`, when given, is passed to the create
+ * (absent: the builtin gated default). A failure after the create carries `err.cardId`, so a caller can
+ * tell a card was made.
  */
-export async function createTaskForBot(db, tdb, botId, { title, description = null, tags = null, audit = {} } = {}) {
+export async function createTaskForBot(db, tdb, botId, { title, description = null, tags = null, audit = {}, actor = DASHBOARD_ACTOR, autonomy } = {}) {
   const row = await loadGiveTarget(db, botId);
   await assertBotUnblocked(db, botId); // the one guard every assignment path shares
   const t = typeof tdb === "function" ? tdb() : tdb;
-  const { id: cardId } = await createCard(t, { title, description, project_id: Number(row.project_id), assigned_bot: botId, tags }, DASHBOARD_ACTOR);
+  const { id: cardId } = await createCard(t, { title, description, project_id: Number(row.project_id), assigned_bot: botId, tags, ...(autonomy === undefined ? {} : { autonomy }) }, actor);
   try {
     await giveAudit(db, row, cardId, { ...audit, created: true });
   } catch (err) {

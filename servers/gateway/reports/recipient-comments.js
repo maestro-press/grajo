@@ -248,7 +248,7 @@ let cachedComments = null;
  * @returns {Promise<object>} `{addThread, addComment, setThreadStatus, listThreads}`
  * @throws {Error} `artifacts_missing`
  */
-async function commentsRuntime(deps = {}) {
+export async function commentsRuntime(deps = {}) {
   const given = deps == null ? {} : deps;
   if (given.comments) return given.comments;
   const runtime = await loadArtifactsRuntime(given);
@@ -511,13 +511,13 @@ function bound(value, max) {
  * and the fold is small enough that duplicating it is better than making the recipient path import the
  * whole delivery stack).
  */
-function noticeTitleOf(report) {
+export function noticeTitleOf(report) {
   const flat = oneLine(report == null ? "" : report.title);
   return bound(flat, NOTICE_TITLE_MAX).trim() || "This report";
 }
 
 /** The owner's dashboard language, read from the setting the bundle alerts read, else English. */
-async function ownerLanguage(db) {
+export async function ownerLanguage(db) {
   try {
     const { rows } = await db.execute({
       sql: "SELECT value FROM dashboard_settings WHERE key = 'language'",

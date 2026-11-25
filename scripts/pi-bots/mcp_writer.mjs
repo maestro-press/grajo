@@ -50,7 +50,7 @@ import { crowServerCatalog, instanceBinding, rebindBlock, SECRETS_SERVER, addonK
 import { isStorageEnvConsumer } from "../../servers/gateway/addon-env.js";
 import { mcpConfigDelivery } from "./mcp-delivery.mjs";
 import { applyActorEnv, actorEnvFor } from "./actor-env.mjs";
-import { signMailDraftActor } from "./actor-sig.mjs";
+import { signMailDraftActor, signReportPickupActor } from "./actor-sig.mjs";
 // Task 2.2: the ONLY place on the bot-config path that unseals — and only for an fd turn.
 // readAddonSecretsSync is all-or-throw (a name with no active row is ROWS_MISSING), so it is
 // never handed another add-on's shared names: those are read through their OWN entry.
@@ -130,17 +130,23 @@ export function impliedServers(def) {
   return SECRETS_GRANTING_SERVERS.some((n) => sel.has(n)) ? [SECRETS_SERVER] : [];
 }
 
-// ---- Crow Mail's drafting turn (plan 3, Task 8b) ----------------------------
+// ---- locked turns: mail-drafting, report pickup (plan 3 Task 8b; Task 7) ---
 //
-// A drafting turn is not a channel turn: it gets three tools and ONE MCP server, and that server is
-// this instance's own `/mail-draft/mcp` mount, reached with a per-turn `mdt_` token and a
-// `mail-draft` actor signature (servers/gateway/mail-draft-mcp.js). Nothing else is in its config —
-// no bot's selected servers, no implied secrets block, no service, satellite, extension or remote
-// block — so a pi spawned for a drafting turn never starts a credential-bearing child it could not
-// call anyway.
+// A locked turn is not a channel turn: it gets an EXACT tool set and ONE MCP server, and that server
+// is this instance's own door for the turn's kind, reached with a per-turn bearer token and an actor
+// signature (servers/gateway/mail-draft-mcp.js for `mail-draft`). Nothing else is in its config — no
+// bot's selected servers, no implied secrets block, no service, satellite, extension or remote block
+// — so a pi spawned for a locked turn never starts a credential-bearing child it could not call
+// anyway.
 //
-// The three names are the whole surface, and they exist only for this spawn: `toolAllowlist` never
-// builds them, and `buildToolsCsv` takes them through the separate `exactTools` option.
+// Every kind is one row of LOCKED_TURN_KINDS below: its block name, its exact tool set, its mount
+// path, its bearer shape, its actor kind, its `gateway_thread_id` prefix, its own turns folder, its
+// local-model floor, and the sentences a refusal uses. bridge.mjs takes every locked-turn check from
+// that row, so a second kind is a row rather than a second code path — and no kind can borrow another
+// kind's door.
+//
+// The tool names exist only for these spawns: `toolAllowlist` never builds them, and `buildToolsCsv`
+// takes them through the separate `exactTools` option.
 
 /** The block name pi-lab turns into `mcp__<name>__<tool>`, and the single server of a drafting turn. */
 export const MAIL_DRAFT_SERVER = "crow-mail-draft";
@@ -152,24 +158,48 @@ export const DRAFTING_TURN_TOOLS = Object.freeze([
   `mcp__${MAIL_DRAFT_SERVER}__mail_draft_read_thread`,
 ]);
 
+/** The block name of a report pickup's turn, and the single server block in its config. */
+export const REPORT_PICKUP_SERVER = "crow-report-pickup";
+
 /**
- * Is `value` exactly the drafting tool set — the same three names, no more and no less? Order does not
- * matter: both sides are compared sorted, so an added name, a missing one, a renamed one or a repeat
- * (which must drop one of the three) is refused. The bridge refuses anything else before a turn starts.
+ * A pickup turn's whole surface: THREE tools, each confined to the pickup's own report and comment set
+ * (servers/gateway/reports/pickup-mcp.js): a reply, a card, and one suggested change the owner must
+ * apply. Nothing may be added to this list: a person's comment is untrusted text, so the turn must not
+ * be able to send, schedule or fetch anything.
  */
-export function isDraftingTurnTools(value) {
-  if (!Array.isArray(value) || value.length !== DRAFTING_TURN_TOOLS.length) return false;
+export const REPORT_PICKUP_TURN_TOOLS = Object.freeze([
+  `mcp__${REPORT_PICKUP_SERVER}__report_reply`,
+  `mcp__${REPORT_PICKUP_SERVER}__report_make_card`,
+  `mcp__${REPORT_PICKUP_SERVER}__report_propose_change`,
+]);
+
+/**
+ * Is `value` exactly `want` — the same names, no more and no less? Order does not matter: both sides
+ * are compared sorted, so an added name, a missing one, a renamed one or a repeat (which must drop
+ * one of the set) is refused.
+ */
+function isExactToolSet(value, want) {
+  if (!Array.isArray(value) || value.length !== want.length) return false;
   const got = [];
   for (const name of value) {
     if (typeof name !== "string") return false;
     got.push(name);
   }
-  const want = [...DRAFTING_TURN_TOOLS].sort();
+  const sorted = [...want].sort();
   got.sort();
-  return got.every((name, at) => name === want[at]);
+  return got.every((name, at) => name === sorted[at]);
+}
+
+/**
+ * Is `value` exactly the drafting tool set — the same three names, no more and no less? The bridge
+ * refuses anything else before a turn starts.
+ */
+export function isDraftingTurnTools(value) {
+  return isExactToolSet(value, DRAFTING_TURN_TOOLS);
 }
 
 const MAIL_DRAFT_TURN_TOKEN_RE = /^mdt_[0-9a-f]{64}$/;
+const REPORT_PICKUP_TURN_TOKEN_RE = /^rpk_[0-9a-f]{64}$/;
 /** An id half of the actor tuple: non-empty, and neither whitespace nor a colon (actor-sig.mjs). */
 const MAIL_DRAFT_ID_RE = /^[^\s:]+$/;
 
@@ -179,8 +209,11 @@ const MAIL_DRAFT_ID_RE = /^[^\s:]+$/;
  */
 export const MAIL_DRAFT_TURNS_DIRNAME = "mail-draft-turns";
 
+/** The same for a pickup turn: `<CROW_HOME>/report-pickup-turns/<botId>/<pickupId>`. */
+export const REPORT_PICKUP_TURNS_DIRNAME = "report-pickup-turns";
+
 /**
- * One path segment of a drafting turn's own directory: a leading letter or digit (so `..` and a
+ * One path segment of a locked turn's own directory: a leading letter or digit (so `..` and a
  * hidden name are refused) and then only characters that cannot be a separator. `/` and `\` are
  * outside it by construction, so neither id can move the turn's world root anywhere else.
  */
@@ -192,15 +225,140 @@ export function isMailDraftDirSegment(value) {
 }
 
 /**
- * The ONE path a drafting turn's world root may be: `<CROW_HOME>/mail-draft-turns/<botId>/<draftId>`.
- * `null` when either id cannot be one path segment or no home was resolved — the caller refuses.
- * turn.js builds its dir with this and bridge.mjs checks the sessionDir it is handed against it, so
+ * EVERY locked-turn kind, and everything that differs between them. Frozen, and keyed by the kind a
+ * caller names in `handleInbound`'s `lockedTurn` option. The mail-draft row is built from the same
+ * constants turn.js and bridge.mjs already used, so their values are unchanged.
+ *
+ * `refusals` holds the exact sentence each check throws (after `<refusalLabel> refused: `), because a
+ * mail-draft refusal is operator- and test-visible text that must not change by one byte.
+ *
+ * `modelFloor` is the LOCAL-MODEL floor the bridge enforces before the caller's own `checkModel`: `null`
+ * for no floor (mail behaves exactly as before), `"local-only"` when the turn's prompt carries text
+ * written by people OUTSIDE this instance (a report pickup), so the model must be provably local
+ * whatever the launcher's check answered. It is a value, never a function: the table stays data.
+ *
+ * `requiresContained` is the TIER a kind may run in: `true` when the turn must run in the contained
+ * (sandboxed) tier or not at all, `false` when the tier is the operator's business as it always was.
+ * A pickup is `true` because its prompt is written by outside people AND its local-model floor is
+ * judged from a row a bot can rewrite: only the contained tier reaches the model through this
+ * gateway's door, where the judged endpoint can be pinned (servers/gateway/routes/llm-router.js).
+ * The bridge refuses a kind that requires containment when the spawn is not contained — before
+ * anything is written or spawned — and then again once the launch is built. Also a value, never a
+ * function.
+ */
+export const LOCKED_TURN_KINDS = Object.freeze({
+  "mail-draft": Object.freeze({
+    kind: "mail-draft",
+    server: MAIL_DRAFT_SERVER,
+    exactTools: DRAFTING_TURN_TOOLS,
+    urlPath: "/mail-draft/mcp",
+    tokenRe: MAIL_DRAFT_TURN_TOKEN_RE,
+    tokenPrefix: "mdt_",
+    actorKind: "mail-draft",
+    threadPrefix: "mail-draft:",
+    dirname: MAIL_DRAFT_TURNS_DIRNAME,
+    /** The name the thread prefix is read for: `mail-draft:<draftId>`. */
+    idField: "draftId",
+    turnLabel: "drafting turn",
+    /** No local-model floor: Crow Mail's own gate (the caller's checkModel) is unchanged. */
+    modelFloor: null,
+    /** Mail runs in whichever tier the operator gave this bot: unchanged in both. */
+    requiresContained: false,
+    /** The refusal prefix: unchanged for a drafting turn, whatever option carried it. */
+    refusalLabel: "draftingTurn",
+    refusals: Object.freeze({
+      tools: "exactTools is not the drafting tool set",
+      blockUrl: "the block is not this box's /mail-draft/mcp",
+      actorKind: "the block's actor kind is not mail-draft",
+      thread: "the thread is not a drafting thread",
+      id: "the thread names no draft",
+      sessionDir: "the session dir is not <CROW_HOME>/mail-draft-turns/<botId>/<draftId>",
+      symlink: "the session dir is a symlink or not its real path",
+    }),
+    sign: signMailDraftActor,
+    blockBuilder: "mailDraftBlock",
+  }),
+  "report-pickup": Object.freeze({
+    kind: "report-pickup",
+    server: REPORT_PICKUP_SERVER,
+    exactTools: REPORT_PICKUP_TURN_TOOLS,
+    urlPath: "/report-pickup/mcp",
+    tokenRe: REPORT_PICKUP_TURN_TOKEN_RE,
+    tokenPrefix: "rpk_",
+    actorKind: "report-pickup",
+    threadPrefix: "report-pickup:",
+    dirname: REPORT_PICKUP_TURNS_DIRNAME,
+    idField: "pickupId",
+    turnLabel: "pickup turn",
+    /** A pickup's prompt is written by outside people: it must run on a provably local model. */
+    modelFloor: "local-only",
+    /** ...and only the contained tier can hold that judgement (see the table's own comment). */
+    requiresContained: true,
+    /**
+     * The turn's prompt is EXACTLY the caller's message: the bridge adds no project header, gateway hint,
+     * tracker block, generic reply tail or [Dates] line (they contradict the locked turn's own prompt).
+     */
+    barePrompt: true,
+    refusalLabel: "lockedTurn",
+    refusals: Object.freeze({
+      /** The tier refusal: the same sentence the bridge's early check and its late belt throw. */
+      contained: "this kind runs only in the contained tier",
+      /** The pin could not be made: fail closed rather than run an unpinnable turn. */
+      pin: "the local model could not be pinned to a provider row",
+      tools: "exactTools is not the pickup turn's tool set",
+      blockUrl: "the block is not this box's /report-pickup/mcp",
+      actorKind: "the block's actor kind is not report-pickup",
+      thread: "the thread is not a pickup thread",
+      id: "the thread names no pickup",
+      sessionDir: "the session dir is not <CROW_HOME>/report-pickup-turns/<botId>/<pickupId>",
+      symlink: "the session dir is a symlink or not its real path",
+    }),
+    sign: signReportPickupActor,
+    blockBuilder: "reportPickupBlock",
+  }),
+});
+
+/** The LOCKED_TURN_KINDS row for `kind`, or null. Own keys only: the prototype is not a kind. */
+export function lockedTurnKindOf(kind) {
+  if (typeof kind !== "string") return null;
+  return Object.hasOwn(LOCKED_TURN_KINDS, kind) ? LOCKED_TURN_KINDS[kind] : null;
+}
+
+/** Throwing form of lockedTurnKindOf, for the helpers that cannot do anything with an unknown kind. */
+function requireLockedTurnKind(kind, fnName) {
+  const entry = lockedTurnKindOf(kind);
+  if (!entry) throw new TypeError(fnName + ": unknown locked-turn kind");
+  return entry;
+}
+
+/**
+ * Is `value` exactly `kind`'s tool set — the same names, no more and no less, in any order? False for
+ * an unknown kind, so a caller that never checked the kind refuses rather than widens.
+ */
+export function isLockedTurnTools(kind, value) {
+  const entry = lockedTurnKindOf(kind);
+  return entry ? isExactToolSet(value, entry.exactTools) : false;
+}
+
+/**
+ * The ONE path a locked turn's world root may be: `<CROW_HOME>/<dirname>/<botId>/<id>`. `null` when
+ * either id cannot be one path segment or no home was resolved — the caller refuses. The kind's
+ * launcher builds its dir with this and bridge.mjs checks the sessionDir it is handed against it, so
  * the two cannot drift into two different paths.
  */
-export function mailDraftTurnDir(crowHome, botId, draftId) {
+export function lockedTurnDir(kind, crowHome, botId, id) {
+  const entry = requireLockedTurnKind(kind, "lockedTurnDir");
   if (typeof crowHome !== "string" || crowHome === "") return null;
-  if (!isMailDraftDirSegment(botId) || !isMailDraftDirSegment(draftId)) return null;
-  return join(crowHome, MAIL_DRAFT_TURNS_DIRNAME, botId, draftId);
+  if (!isMailDraftDirSegment(botId) || !isMailDraftDirSegment(id)) return null;
+  return join(crowHome, entry.dirname, botId, id);
+}
+
+/**
+ * The ONE path a drafting turn's world root may be: `<CROW_HOME>/mail-draft-turns/<botId>/<draftId>`.
+ * turn.js builds its dir with this and bridge.mjs checks the sessionDir it is handed against it.
+ */
+export function mailDraftTurnDir(crowHome, botId, draftId) {
+  return lockedTurnDir("mail-draft", crowHome, botId, draftId);
 }
 
 /** `p` with the links of its deepest existing ancestor resolved (a path that does not exist yet stays a path). */
@@ -235,42 +393,65 @@ function realHomePath(p) {
  * @returns {string|null} null when the home or an id cannot be one path segment
  */
 export function resolvedMailDraftTurnDir(crowHome, botId, draftId) {
-  const home = crowHome == null ? resolveCrowHome() : crowHome;
-  if (typeof home !== "string" || home === "") return null;
-  return mailDraftTurnDir(realHomePath(home), botId, draftId);
+  return resolvedLockedTurnDir("mail-draft", crowHome, botId, draftId);
 }
 
 /**
- * The `crow-mail-draft` block for one drafting turn: this instance's gateway, the turn's own bearer,
- * and the actor headers the mount verifies. The signature is made HERE, in this process — the same
- * way the board entry gets its own (crow-server-catalog.mjs) — so the caller must be a process that
- * holds the gateway's per-boot actor key (`initGatewayActorKey`). A process without it gets a
- * refusal, never an unsigned block: an unsigned block would only fail at the mount, after a spawn.
+ * The same path for ANY locked-turn kind, with the home's links resolved:
+ * `<realpath(CROW_HOME)>/<dirname>/<botId>/<id>`.
  *
- * @param {{botId: string, draftId: string, turnId: string, token: string, port?: number|string}} opts
- * @returns {{url: string, headers: Record<string, string>}}
+ * A Crow home linked onto another disk is a supported layout, and so is a link on an ancestor of it.
+ * The turn's dirs are therefore created at the home's REAL path — every directory below it is checked
+ * for being its own real path — so the expected path has to be built from that same real path. Built
+ * from the unresolved home instead, the two disagree on a linked install and every locked turn is
+ * refused. The kind's launcher and bridge.mjs both take the path from here, so they cannot drift.
+ *
+ * @param {string} kind the LOCKED_TURN_KINDS key
+ * @param {string|null|undefined} crowHome this instance's home (default: the resolved CROW_HOME)
+ * @param {string} botId the bot the turn runs as
+ * @param {string} id the kind's own id (a draft id, a pickup id)
+ * @returns {string|null} null when the home or an id cannot be one path segment
  */
-export function mailDraftBlock({ botId, draftId, turnId, token, port } = {}) {
+export function resolvedLockedTurnDir(kind, crowHome, botId, id) {
+  const entry = requireLockedTurnKind(kind, "resolvedLockedTurnDir");
+  const home = crowHome == null ? resolveCrowHome() : crowHome;
+  if (typeof home !== "string" || home === "") return null;
+  return lockedTurnDir(entry.kind, realHomePath(home), botId, id);
+}
+
+/**
+ * The server block for one locked turn: this instance's gateway, the turn's own bearer, and the actor
+ * headers the kind's mount verifies. The signature is made HERE, in this process — the same way the
+ * board entry gets its own (crow-server-catalog.mjs) — so the caller must be a process that holds the
+ * gateway's per-boot actor key (`initGatewayActorKey`). A process without it gets a refusal, never an
+ * unsigned block: an unsigned block would only fail at the mount, after a spawn.
+ *
+ * The kind decides every value: its block name, its mount path, its bearer shape, its actor kind and
+ * its signer. A `mdt_` token can therefore never board a `report-pickup` block, and vice versa.
+ */
+function lockedTurnBlock(kind, { botId, secondId, turnId, token, port } = {}) {
+  const entry = requireLockedTurnKind(kind, "lockedTurnBlock");
+  const fn = entry.blockBuilder;
   const id = (value, field) => {
     const text = value == null ? "" : String(value);
-    if (!MAIL_DRAFT_ID_RE.test(text)) throw new TypeError(`mailDraftBlock needs a ${field}`);
+    if (!MAIL_DRAFT_ID_RE.test(text)) throw new TypeError(`${fn} needs a ${field}`);
     return text;
   };
   const bot = id(botId, "botId");
-  const draft = id(draftId, "draftId");
+  const second = id(secondId, entry.idField);
   const turn = id(turnId, "turnId");
   const bearer = token == null ? "" : String(token);
-  if (!MAIL_DRAFT_TURN_TOKEN_RE.test(bearer)) throw new TypeError("mailDraftBlock needs a turn token (mdt_ and 32 bytes as hex)");
-  const sig = signMailDraftActor({ botId: bot, draftId: draft, turnId: turn });
-  if (!sig) throw new Error("mailDraftBlock: this process holds no actor key, so the drafting turn's block cannot be signed");
+  if (!entry.tokenRe.test(bearer)) throw new TypeError(`${fn} needs a turn token (${entry.tokenPrefix} and 32 bytes as hex)`);
+  const sig = entry.sign({ botId: bot, [entry.idField]: second, turnId: turn });
+  if (!sig) throw new Error(`${fn}: this process holds no actor key, so the ${entry.turnLabel}'s block cannot be signed`);
   // The same loopback-gateway convention as the board entry (crow-server-catalog.mjs).
   const gatewayPort = Number(port || process.env.CROW_GATEWAY_PORT || 3001);
-  if (!Number.isInteger(gatewayPort) || gatewayPort <= 0 || gatewayPort > 65535) throw new TypeError("mailDraftBlock needs a gateway port");
+  if (!Number.isInteger(gatewayPort) || gatewayPort <= 0 || gatewayPort > 65535) throw new TypeError(`${fn} needs a gateway port`);
   return {
-    url: `http://127.0.0.1:${gatewayPort}/mail-draft/mcp`,
+    url: `http://127.0.0.1:${gatewayPort}${entry.urlPath}`,
     headers: {
       Authorization: "Bearer " + bearer,
-      "X-Crow-Actor-Kind": "mail-draft",
+      "X-Crow-Actor-Kind": entry.actorKind,
       "X-Crow-Actor-Id": bot,
       "X-Crow-Actor-Sig": sig,
     },
@@ -278,7 +459,26 @@ export function mailDraftBlock({ botId, draftId, turnId, token, port } = {}) {
 }
 
 /**
- * The WHOLE config a drafting turn hands pi: this box's `/mail-draft/mcp` and nothing else ACTIVE.
+ * The `crow-mail-draft` block for one drafting turn (see lockedTurnBlock).
+ * @param {{botId: string, draftId: string, turnId: string, token: string, port?: number|string}} opts
+ * @returns {{url: string, headers: Record<string, string>}}
+ */
+export function mailDraftBlock({ botId, draftId, turnId, token, port } = {}) {
+  return lockedTurnBlock("mail-draft", { botId, secondId: draftId, turnId, token, port });
+}
+
+/**
+ * The `crow-report-pickup` block for one pickup turn: the same shape, keyed on the pickup, signed with
+ * the `report-pickup` actor kind.
+ * @param {{botId: string, pickupId: string, turnId: string, token: string, port?: number|string}} opts
+ * @returns {{url: string, headers: Record<string, string>}}
+ */
+export function reportPickupBlock({ botId, pickupId, turnId, token, port } = {}) {
+  return lockedTurnBlock("report-pickup", { botId, secondId: pickupId, turnId, token, port });
+}
+
+/**
+ * The WHOLE config a locked turn of `kind` hands pi: that kind's own mount and nothing else ACTIVE.
  *
  * pi-lab's mcp-client loads the operator's global `~/.pi/agent/mcp.json` in BOTH delivery modes, so a
  * config that merely omits the operator's servers would still start every one of them as a child of
@@ -286,19 +486,31 @@ export function mailDraftBlock({ botId, draftId, turnId, token, port } = {}) {
  * unselected canonical name (buildBotMcp's closed-world pass); this one runs the same pass with an
  * empty selection, so the only enabled block is the turn's own.
  *
- * @param {{url: string, headers: Record<string, string>}} block mailDraftBlock's result
+ * @param {string} kind the LOCKED_TURN_KINDS key
+ * @param {{url: string, headers: Record<string, string>}} block the kind's block builder's result
  * @returns {{mcpServers: Record<string, object>}}
  */
-export function draftingTurnMcpConfig(block, { canonical, canonicalPath } = {}) {
+export function lockedTurnMcpConfig(kind, block, { canonical, canonicalPath } = {}) {
+  const entry = lockedTurnKindOf(kind);
+  if (!entry) throw new TypeError("lockedTurnMcpConfig: unknown locked-turn kind");
   if (!block || typeof block !== "object" || Array.isArray(block)) {
-    throw new TypeError("draftingTurnMcpConfig needs the turn's server block");
+    throw new TypeError(entry.refusalLabel + "McpConfig needs the turn's server block");
   }
   const canon = canonical || canonicalOrEmpty(canonicalPath);
   const out = { mcpServers: {} };
-  forEachUnselectedServer(canon, new Set([MAIL_DRAFT_SERVER]), (name) => { out.mcpServers[name] = { disabled: true }; });
+  forEachUnselectedServer(canon, new Set([entry.server]), (name) => { out.mcpServers[name] = { disabled: true }; });
   // Set last, so the turn's own server is enabled even if the global file happens to name it.
-  out.mcpServers[MAIL_DRAFT_SERVER] = { ...block };
+  out.mcpServers[entry.server] = { ...block };
   return out;
+}
+
+/**
+ * The WHOLE config a drafting turn hands pi: this box's `/mail-draft/mcp` and nothing else ACTIVE.
+ * @param {{url: string, headers: Record<string, string>}} block mailDraftBlock's result
+ * @returns {{mcpServers: Record<string, object>}}
+ */
+export function draftingTurnMcpConfig(block, opts = {}) {
+  return lockedTurnMcpConfig("mail-draft", block, opts);
 }
 
 // The gateway mounts that serve the project tools with a gateway token's authority: routes/mcp.js

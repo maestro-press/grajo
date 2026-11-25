@@ -20,6 +20,7 @@ import { join, dirname } from "node:path";
 import { ensureSecretsDir, migrateLegacySecretFile } from "../shared/peer-credentials.js";
 import { isRelayedSocket } from "../shared/bot-doors.js";
 import { verifyTurnToken } from "./mail/drafts/turn-token.js";
+import { verifyPickupToken } from "./reports/pickup-token.js";
 import {
   readSetting, writeSetting, deleteLocalSetting,
 } from "./dashboard/settings/registry.js";
@@ -118,7 +119,8 @@ export function localOperatorAuth(tokenScope, claims = null) {
   // token). Lets /phone/mcp tell a bot's shared token from the operator's full
   // local token; the full token carries no scope, exactly as before.
   // `claims` carries what a scoped token proved (Crow Mail's mail-draft mount
-  // passes the draft, the turn and the head hash the turn started from), so a
+  // passes the draft, the turn and the head hash the turn started from; a report pickup's turn
+  // passes the report and the pickup), so a
   // tool handler reads them off `authInfo.extra` and never from its arguments.
   // `tokenScope` is written LAST: it is the caller's own scope, never something a
   // claims object may restate (a claims object carrying `tokenScope` cannot widen
@@ -140,8 +142,11 @@ export function applyLocalTokenAuth(req) {
   // A scoped auth only: the full local token carries no scope, and an absent scope must never match
   // an absent tokenScope (that would leave `req.auth` unset for the operator's own token).
   if (req.localTokenAuth.scope && req.auth?.extra?.tokenScope === req.localTokenAuth.scope) return true;
-  const { scope, draftId, turnId } = req.localTokenAuth;
-  req.auth = localOperatorAuth(scope, scope === "mail-draft" ? { draftId, turnId } : null);
+  const { scope, draftId, turnId, reportId, pickupId } = req.localTokenAuth;
+  const claims = scope === "mail-draft" ? { draftId, turnId }
+    : scope === "report-pickup" ? { reportId, pickupId }
+      : null;
+  req.auth = localOperatorAuth(scope, claims);
   return true;
 }
 
@@ -721,6 +726,16 @@ function isMcpPath(p) {
 // relayed, and the token's per-draft, per-turn scope is what limits it.
 const MAIL_DRAFT_PATH_RE = /^\/mail-draft\/(?:mcp|sse|messages)$/;
 
+// Crow Recurring Reports' pickup turn: the same shape as the drafting mount above, with its own prefix.
+// Its ONLY credential is the per-turn `rpk_` token a pickup turn mints in this process's memory
+// (servers/gateway/reports/pickup-token.js) — see the early branch in localTokenAuthMiddleware. The full
+// local token is deliberately not tried on this path either (it is tried first on every MCP path, so it
+// has to be skipped by name), no other family's token authenticates here, and an `rpk_` token
+// authenticates nowhere else. An `mdt_` token is not accepted here, nor an `rpk_` token on the mail
+// mount: the two prefixes name two different doors. A relayed socket may present one: bots are relayed,
+// and the token's per-report, per-pickup scope is what limits it.
+const REPORT_PICKUP_PATH_RE = /^\/report-pickup\/(?:mcp|sse|messages)$/;
+
 /** Express middleware. Mounted globally right after instanceAuthMiddleware, but
  *  it only reads the DB for MCP-path requests (cost guard). Sets
  *  req.localTokenAuth on a valid local token. Yields to instance auth, never
@@ -744,6 +759,20 @@ export function localTokenAuthMiddleware(db) {
           if (turn) {
             req.localTokenAuth = {
               token: "local-mcp", scope: "mail-draft", draftId: turn.draftId, turnId: turn.turnId,
+            };
+          }
+        }
+        return next();
+      }
+      // A report pickup's turn: the `rpk_` token and nothing else, and only on this path. Verified
+      // against this process's in-memory map; a value it does not know sets nothing, and the request
+      // falls through to OAuth (401) like any other unrecognized bearer.
+      if (REPORT_PICKUP_PATH_RE.test(req.path)) {
+        if (token.startsWith("rpk_")) {
+          const pickup = verifyPickupToken(token);
+          if (pickup) {
+            req.localTokenAuth = {
+              token: "local-mcp", scope: "report-pickup", reportId: pickup.reportId, pickupId: pickup.pickupId,
             };
           }
         }

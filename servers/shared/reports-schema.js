@@ -36,6 +36,8 @@
  * and recipient, stored only as its hash) and the comments that reader leaves through it.
  * REPORTS_COMMENT_WINDOW_COLUMN is the one late column on `reports` (how many runs back a reader may
  * comment), added by ALTER on both rails because 0031 already executes REPORTS_DDL as it is.
+ * REPORTS_PICKUP_DDL is the pickup half: one row per pickup, the bot turn that works through a batch of
+ * new comments on a report. Its own comment below spells out why the row id never uses the token prefix.
  */
 export const REPORTS_DDL = `
   CREATE TABLE IF NOT EXISTS reports (
@@ -486,3 +488,41 @@ export const REPORTS_COMMENT_WINDOW_COLUMN = Object.freeze({
   column: "comment_window_runs",
   ddl: "ALTER TABLE reports ADD COLUMN comment_window_runs INTEGER NOT NULL DEFAULT 4",
 });
+
+/**
+ * The pickup half: one row per pickup, the bot turn that works through a batch of new comments on a
+ * report.
+ *
+ * `report_pickups` is that row. `thread_ids_json` and `comment_ids_json` are the batch the pickup is
+ * about (arrays of strings, so the turn and the mount can check a reply against the exact set the row
+ * names, never a set a caller supplied); `started_at` is written when the pickup starts and `ended_at`
+ * when it finishes, so a row with no `ended_at` is one still running; `bot_ms` is the minutes that turn
+ * spent, added to the day's `report_usage.bot_ms`; `outcome` says how it ended.
+ *
+ * ROW IDS ARE NEVER THE TOKEN PREFIX. A pickup's row id uses `rpu-`, because `rpk_` is the per-turn
+ * bearer token's prefix (servers/gateway/reports/pickup-token.js): a row id that looked like a token
+ * would be a value an operator could paste somewhere a credential goes, and a token that looked like a
+ * row id would invite the reverse. The two id spaces stay visibly apart.
+ *
+ * Epoch-ms times; outcomes (`answered`, `carded`, `proposed`, `mixed`, `no_action`, `skipped_budget`, `failed`) are
+ * validated in the modules, never by a CHECK. No foreign keys: the reports store removes one report's
+ * rows itself. LOCAL ONLY (instance-sync LOCAL_ONLY_TABLES): a pickup names the comments a report's
+ * readers left, and a report never leaves the instance holding it. Additive, no SCHEMA_GENERATION bump.
+ */
+export const REPORTS_PICKUP_DDL = `
+  CREATE TABLE IF NOT EXISTS report_pickups (
+    id TEXT PRIMARY KEY,
+    report_id TEXT NOT NULL,
+    thread_ids_json TEXT NOT NULL DEFAULT '[]',
+    comment_ids_json TEXT NOT NULL DEFAULT '[]',
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    bot_ms INTEGER NOT NULL DEFAULT 0,
+    outcome TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_report_pickups_report
+    ON report_pickups(report_id, started_at);
+`;
+
+export const REPORTS_PICKUP_TABLES = Object.freeze(["report_pickups"]);

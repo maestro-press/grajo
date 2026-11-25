@@ -49,6 +49,7 @@
  * (providerDoorUrl/cloudDoorUrl, doorKindOf, consentVerdict, piCompatFor).
  */
 import { chmodSync, copyFileSync, lstatSync, mkdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import { resolveCrowHome } from "../../servers/shared/crow-home.js";
 import { providerDoorUrl, cloudDoorUrl } from "../../servers/gateway/models/door.js";
@@ -64,6 +65,31 @@ import { isDoorPath } from "../../servers/shared/bot-doors.js";
 export const AGENT_COPIED_FILES = Object.freeze(["settings.json", "keybindings.json"]);
 /** The role snapshot's name inside the generated dir. */
 export const CONTAINED_ROLES_FILE = "model-roles.json";
+
+/**
+ * The header a LOCKED TURN's generated models.json entry carries: `X-Crow-Pin-Base`, a sha256 of the
+ * base URL the bridge's local-model floor judged. pi sends a provider entry's `headers` on every
+ * request, and the gateway's provider door (`/llm/p/<row>/v1`, routes/llm-router.js) compares the pin
+ * with the row it would forward to AT REQUEST TIME, refusing when they disagree. That is what closes
+ * the flip race: crow.db is bot-writable, so the row can be pointed at another (still local-class)
+ * address between the floor's judgement and the dial; the pinned request then names an endpoint the
+ * turn was never judged on and is refused instead of dialled.
+ *
+ * Every other spawn's entries carry no pin, and a request with no pin header keeps the door's
+ * behaviour byte for byte.
+ */
+export const CONTAINED_PIN_HEADER = "X-Crow-Pin-Base";
+
+/**
+ * The pin for one base URL: sha256, hex, of the URL with its trailing slashes trimmed — the same
+ * normalisation models/door-resolve.js applies when it builds the URL a forward dials, so the door and
+ * this file hash the same string. The gateway's door repeats this over the row's CURRENT base URL
+ * (routes/llm-router.js pinBaseValue); the two must agree or a legitimate pinned turn would be
+ * refused, which is why buildContainedAgentDir and that door are covered by one test.
+ */
+export function pinOfBaseUrl(baseUrl) {
+  return createHash("sha256").update(String(baseUrl == null ? "" : baseUrl).replace(/\/+$/, "")).digest("hex");
+}
 
 /** <CROW_HOME>/llm-cloud-token — the same file servers/gateway/local-token.js
  *  rotates every boot (llmCloudTokenPath). Not imported from there: that
@@ -255,7 +281,9 @@ function cloudDoorEntry(r, { gatewayPort, cloudTokenPath, consent, consentSalt }
  * @param {string} a.piAgentDir       the operator's agent dir (settings/keybindings source)
  * @param {string} a.dir              the dir to fill (a fresh per-spawn dir)
  * @param {string[]} [a.providerIds]  the providers this spawn needs (pi ids: a row id, or crow-c-<row>)
- * @param {object[]} [a.rows]         this instance's providers rows (providerRowToObject shape)
+ * @param {object[]} [a.rows]         this instance's providers rows (providerRowToObject shape). A row
+ *   carrying `pinBase` (a LOCKED TURN whose kind requires containment: bridge.mjs pinSnapshotRows) has
+ *   that pin written as the header of ITS provider-door entry (CONTAINED_PIN_HEADER).
  * @param {object|null} [a.consent]   dashboard_settings.llm_cloud_door_rows
  * @param {string|null} [a.consentSalt]
  * @param {number} a.gatewayPort      the spawner's own gateway port
@@ -311,6 +339,18 @@ export function buildContainedAgentDir({
     if (!entry || !isContainedDoorUrl(entry.baseUrl, gatewayPort)) {
       missing.push({ provider: label, reason: "provider " + label + " has no door" });
       continue;
+    }
+    // A LOCKED TURN's judged endpoint: the pin rides the provider door entry's headers, and ONLY that
+    // kind of entry can carry it (the gateway's /llm/c cloud door does not check a pin, so a pinned row
+    // that resolves to a cloud-door entry is refused here rather than run unpinned — the spawn then
+    // fails closed in wrapPiSpawn instead of dialling an endpoint nothing pinned).
+    if (row && typeof row.pinBase === "string" && row.pinBase) {
+      const atProviderDoor = typeof entry.baseUrl === "string" && entry.baseUrl.includes("/llm/p/");
+      if (!atProviderDoor) {
+        missing.push({ provider: label, reason: "provider " + label + " has no pinned door" });
+        continue;
+      }
+      entry = { ...entry, headers: { ...(entry.headers || {}), [CONTAINED_PIN_HEADER]: row.pinBase } };
     }
     providers[key] = entry;
   }

@@ -39,6 +39,10 @@ const REPORTS_DOOR = resolve(REPO, "servers/gateway/mail/reports-door.js");
 const REPORTS_DELIVERY = resolve(REPO, "servers/gateway/reports/delivery.js");
 const REPORTS_RUN = resolve(REPO, "servers/gateway/reports/run.js");
 const REPORTS_DIR = resolve(REPO, "servers/gateway/reports");
+// A pickup's door answers outside people's comments: it must reach no sharing identity and no secret
+// box, the two modules that can open an instance's stored credentials.
+const SHARING_IDENTITY = resolve(REPO, "servers/sharing/identity.js");
+const SECRET_BOX = resolve(REPO, "servers/sharing/secret-box.js");
 const REPORTS_MCP_DOORS = ["servers/gateway/reports/mcp.js", "servers/gateway/reports/pickup-mcp.js"];
 
 /** A tool name that could send or schedule mail, in any spelling a def might use. */
@@ -412,6 +416,47 @@ test("(d) reports/mcp closure has no door, delivery, run, send or schedule servi
   ]) {
     assert.equal(closure.files.has(forbidden), false,
       `servers/gateway/reports/mcp.js reaches ${rel(forbidden)}`);
+  }
+});
+
+test("(d) reports/pickup-mcp closure has no door, delivery, run, send or schedule service, or bridge", () => {
+  // A pickup's door answers comments from people outside Crow, so its reach is one verb: a reply in a
+  // thread of its own batch. It may import the report's own store and the pickup token, and it must
+  // reach no seam that sends, delivers, runs, schedules, wires the run engine or spawns a bot turn — and
+  // no sharing identity or secret box either (see the constants above).
+  const APPROVALS_DEPS = resolve(REPORTS_DIR, "approvals-deps.js");
+  const SCHEDULE_HOOK = resolve(REPORTS_DIR, "schedule-hook.js");
+  const PICKUP_MCP = resolve(REPORTS_DIR, "pickup-mcp.js");
+  // The other half of the door's two credentials (the per-turn token), and the actor-signature module it
+  // verifies with: both must really be IN the walk, or this test could pass over a closure that never
+  // read them.
+  const PICKUP_TOKEN = resolve(REPORTS_DIR, "pickup-token.js");
+  const ACTOR_SIG = resolve(REPO, "scripts/pi-bots/actor-sig.mjs");
+  // A SECOND ROOT: the artifacts bundle's `comments.js` owns the thread/comment writes a reply makes,
+  // and pickup-mcp loads it by PATH at runtime (so a static import cannot reach it). Walked here with
+  // the same forbidden list, because a reachable bundle module is just as reachable at run time.
+  const ARTIFACT_COMMENTS = resolve(REPO, "bundles/artifacts/server/comments.js");
+  assert.ok(statSync(PICKUP_MCP).isFile(), "the pickup door is a real module");
+  assert.ok(statSync(ARTIFACT_COMMENTS).isFile(), "the artifacts bundle's comments module is a real module");
+
+  const closure = importClosure([PICKUP_MCP, ARTIFACT_COMMENTS]);
+  assert.ok(closure.files.size > 5,
+    `the pickup door's imports were really walked (${closure.files.size} modules)`);
+  assert.equal(closure.files.has(PICKUP_TOKEN), true,
+    "the walk reaches servers/gateway/reports/pickup-token.js (the door's own credential)");
+  assert.equal(closure.files.has(ACTOR_SIG), true,
+    "the walk reaches scripts/pi-bots/actor-sig.mjs (the door's actor signature)");
+  assert.equal(closure.files.has(ARTIFACT_COMMENTS), true, "and the bundle module the reply is written through");
+  const chainTo = (target) => {
+    const back = closure.edges.find((edge) => edge.file === target);
+    return back ? ` (via ${rel(back.from)})` : "";
+  };
+  for (const forbidden of [
+    REPORTS_DOOR, REPORTS_DELIVERY, REPORTS_RUN, SEND_SERVICE, SCHEDULE_SERVICE, APPROVALS_DEPS,
+    SCHEDULE_HOOK, BRIDGE, SHARING_IDENTITY, SECRET_BOX,
+  ]) {
+    assert.equal(closure.files.has(forbidden), false,
+      `the pickup door's closure (door + bundles/artifacts/server/comments.js) reaches ${rel(forbidden)}${chainTo(forbidden)}`);
   }
 });
 

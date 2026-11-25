@@ -969,7 +969,7 @@ test("migration 0040 runs the pass through the real registry; a refusal is a def
   assert.equal(openKey({ slotId: "prov-a", stored: providerRow(inst.dbPath, "prov-a").api_key, key }), plain);
   assert.deepEqual(again.applied, [], "third call applied");
   assert.ok(again.skipped.includes("0040-seal-provider-keys"), "once recorded, the pass is skipped");
-  assert.equal(again.skipped.length, 41, "every migration but the one this run applied is skipped (0041-bot-def-mac is the newest)");
+  assert.equal(again.skipped.length, 42, "every migration but the one this run applied is skipped (0042-reports-pickup is the newest)");
 
   // The module's own contract: id equals the file name, and a rollback is unsafe.
   const mod = await import("../scripts/migrations/0040-seal-provider-keys.mjs");

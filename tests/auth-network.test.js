@@ -419,6 +419,51 @@ test("rejectFunneled middleware: the draft MCP mount is never funnel-exposed", a
   assert.ok(!PUBLIC_FUNNEL_PREFIXES.some((p) => "/mail-draft".startsWith(p)), "/mail-draft is not public");
 });
 
+// Crow Recurring Reports' pickup turn takes the same shape of credential (a per-turn token scoped to one
+// pickup of one report), so its mount is never reachable from Funnel and is never a public prefix either.
+test("rejectFunneled middleware: the pickup MCP mount is never funnel-exposed", async () => {
+  const server = await startTestApp();
+  const paths = ["/report-pickup/mcp", "/report-pickup/sse", "/report-pickup/messages"];
+  try {
+    const port = server.address().port;
+    for (const path of paths) {
+      const r = await request(port, path, { "tailscale-funnel-request": "?1" });
+      assert.equal(r.status, 403, `expected 403 on ${path}, got ${r.status}`);
+    }
+  } finally {
+    server.close();
+  }
+  const { isFunnelPublicPath, PUBLIC_FUNNEL_PREFIXES } = await import("../servers/gateway/funnel.js");
+  for (const path of [...paths, "/report-pickup"]) {
+    assert.equal(isFunnelPublicPath(path), false, path);
+    assert.ok(!PUBLIC_FUNNEL_PREFIXES.some((p) => path.startsWith(p)), path);
+  }
+  assert.ok(!PUBLIC_FUNNEL_PREFIXES.some((p) => "/report-pickup".startsWith(p)), "/report-pickup is not public");
+});
+
+// The pickup mount itself is not built in this round, so the 401 an unauthenticated caller would get
+// from it is asserted at the middleware level instead: localTokenAuthMiddleware sets no local-token auth
+// on /report-pickup/mcp for an unknown `rpk_` bearer, for a mail-draft `mdt_` bearer, or for the
+// operator's full local token — the request falls through to OAuth, which refuses it.
+test("localTokenAuthMiddleware: nothing authenticates /report-pickup/mcp but a live rpk_ token", async () => {
+  const { createHash } = await import("node:crypto");
+  const { localTokenAuthMiddleware } = await import("../servers/gateway/local-token.js");
+  const full = "test-full-local-token";
+  const db = {
+    execute: async ({ args }) => (args && args[0] === "mcp_local_token_hash"
+      ? { rows: [{ value: createHash("sha256").update(full).digest("hex") }] }
+      : { rows: [] }),
+  };
+  for (const token of [full, "mdt_" + "a".repeat(64), "rpk_" + "0".repeat(64)]) {
+    const req = { socket: { remoteAddress: "127.0.0.1" }, path: "/report-pickup/mcp",
+      headers: { authorization: `Bearer ${token}` } };
+    let nexted = 0;
+    await localTokenAuthMiddleware(db)(req, {}, () => { nexted++; });
+    assert.equal(nexted, 1, "the middleware always yields");
+    assert.equal(req.localTokenAuth, undefined, `${token.slice(0, 4)}… authenticates nothing on /report-pickup/mcp`);
+  }
+});
+
 // The same mount rule as the Perch / apps / widgets APIs: the router installs
 // dashboardAuth on its own prefix, so it is closed wherever it is mounted. This
 // case proves the NETWORK GATE: a bare loopback socket is refused (403) before the

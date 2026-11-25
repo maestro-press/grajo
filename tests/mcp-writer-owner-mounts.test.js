@@ -14,7 +14,9 @@
  * so the factory carries no `verify…Actor` — but its credential is a per-turn
  * token scoped to one draft and one turn (local-token.js), not the owner's, so
  * it is NOT an owner mount either. It is listed by name below and must stay out
- * of the regex.
+ * of the regex. A report pickup's mount (`/report-pickup`) is the same kind of
+ * door and stays out of the regex for the same reason; it is asserted by name
+ * below, because this round does not mount it yet.
  *
  * The gateway's root mount ("") is not listed: the loopback rule in
  * isOwnerProjectUrl already covers it.
@@ -102,6 +104,12 @@ test("every unsigned gateway mount prefix is an owner mount, every signed one is
 
   // The drafting turn's door is not the operator's: its token opens exactly one draft.
   assert.equal(isOwnerProjectUrl("http://127.0.0.1:3001/mail-draft/mcp"), false);
+  // A report pickup's door is the same kind: a per-turn token scoped to one report and one comment
+  // batch, never the owner's. It is not mounted yet, so it is named here rather than derived.
+  for (const suffix of SUFFIXES) {
+    assert.equal(isOwnerProjectUrl(`http://127.0.0.1:3001/report-pickup/${suffix}`), false,
+      `the pickup door is never classified as an owner mount (${suffix})`);
+  }
 });
 
 test("the writer's own mounting of a disallowed url block still disables it", async () => {

@@ -3,7 +3,7 @@
  *
  * Kinds signed with the one per-boot key (each its own MAC domain, so none
  * replays as another): "bot" (phone), "board", "board-thread", "artifacts", "secrets",
- * "mail-draft", "sharing", "reports", "memory", "projects"
+ * "mail-draft", "report-pickup", "sharing", "reports", "memory", "projects"
  * over the v1 tuple below, and the session-bound (v2) kind "peer-relay"
  * (the loopback relay to paired peers, item 46 PR-B, below).
  *
@@ -291,6 +291,45 @@ export function verifyMailDraftActorSig({ botId, draftId, turnId, sig } = {}) {
   return verifyActorSig({ kind: "mail-draft", botId, threadId, gatewayType: null, sig });
 }
 
+// ---- report-pickup actor headers (Crow Recurring Reports, locked pickup turns) ----
+//
+// /report-pickup/mcp is a pickup turn's door: the rpk_ turn token names one report, one pickup and the
+// comment batch, and these headers bind the CALLER to the same pickup and turn. Same key and MAC as the
+// kinds above; kind "report-pickup", so no phone, board, artifacts, secrets, mail-draft or sharing
+// signature replays here, nor this one there. The v1 tuple has no slot for two ids, so the threadId field
+// carries `<pickupId>:<turnId>`, the same shape "mail-draft" uses for `<draftId>:<turnId>`. Neither half
+// may hold a colon or whitespace of its own, so no pair of ids can be spelled two ways.
+
+/** An id half of the report-pickup tuple, or null when it cannot be one. */
+function reportPickupField(v) {
+  const text = v == null ? "" : String(v).trim();
+  return text !== "" && !/[\s:]/.test(text) ? text : null;
+}
+
+/**
+ * The v1 thread field a report-pickup signature binds: `<pickupId>:<turnId>`. Two public helpers build it
+ * so signer and verifier can never join differently; null when either id cannot be one half.
+ */
+export function reportPickupActorThread({ pickupId, turnId } = {}) {
+  const pickup = reportPickupField(pickupId);
+  const turn = reportPickupField(turnId);
+  return pickup && turn ? `${pickup}:${turn}` : null;
+}
+
+/** Signature for a pickup turn's actor headers, or null without a key / bot id / the two ids. */
+export function signReportPickupActor({ botId, pickupId, turnId } = {}) {
+  const threadId = reportPickupActorThread({ pickupId, turnId });
+  if (!threadId) return null;
+  return signActor({ kind: "report-pickup", botId, threadId, gatewayType: null });
+}
+
+/** Constant-time check of a presented report-pickup signature. False without a key. */
+export function verifyReportPickupActorSig({ botId, pickupId, turnId, sig } = {}) {
+  const threadId = reportPickupActorThread({ pickupId, turnId });
+  if (!threadId) return false;
+  return verifyActorSig({ kind: "report-pickup", botId, threadId, gatewayType: null, sig });
+}
+
 // ---- session-bound actor headers, v2 (item 46 PR-B) ----
 //
 // The v1 tuple names no bot session, and a thread lookup can be ambiguous, so
@@ -478,6 +517,8 @@ function messageFor(kind, { botId, sessionId, threadId, gatewayType, jobId, work
   if (kind === "board") return v1Message({ kind, botId, threadId: jobId, gatewayType: null });
   // mail-draft: the thread slot carries `<draftId>:<turnId>`, gatewayType null (signMailDraftActor).
   if (kind === "mail-draft") return v1Message({ kind, botId, threadId, gatewayType: null });
+  // report-pickup: the same shape over `<pickupId>:<turnId>`, gatewayType null (signReportPickupActor).
+  if (kind === "report-pickup") return v1Message({ kind, botId, threadId, gatewayType: null });
   if (kind === "bot" || kind === "artifacts" || kind === "board-thread" || kind === "sharing" || kind === "reports" || kind === "memory" || kind === "projects") return v1Message({ kind, botId, threadId, gatewayType });
   return null;
 }
