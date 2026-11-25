@@ -269,7 +269,11 @@ test("a gmail turn: the spawned research, memory and storage servers refuse an u
   const world = await (await import("../scripts/pi-bots/bot-world.mjs"))
     .buildBotWorld({ botId: BOT, threadId: "gmail:1", gatewayType: "gmail", log: (m) => logs.push(String(m)) });
   assert.ok(world.mcpConfig, "the world built an MCP config: " + logs.join(" | "));
-  for (const name of ["crow-memory", "crow-projects", "crow-storage"]) {
+  // This file runs file delivery, and a bot never gets shared storage over a file (no credential may
+  // sit on disk): the crow-storage block is disabled (not spawnable) by design. Its share gate is covered where the
+  // block is delivered over fd (tests/bot-storage-key.test.js, tests/pibot-shared-storage-hydrate.test.js).
+  assert.deepEqual(world.mcpConfig.mcpServers["crow-storage"], { disabled: true }, "no spawnable crow-storage block over file delivery");
+  for (const name of ["crow-memory", "crow-projects"]) {
     const b = blockOf(world.mcpConfig, name);
     assert.equal(b.env.CROW_ACTOR_KIND, "bot", name);
     assert.equal(b.env.CROW_ACTOR_BOT_ID, BOT, name);
@@ -281,29 +285,18 @@ test("a gmail turn: the spawned research, memory and storage servers refuse an u
 
   const research = await spawnBlock(blockOf(world.mcpConfig, "crow-projects"));
   const memory = await spawnBlock(blockOf(world.mcpConfig, "crow-memory"));
-  const storage = await spawnBlock(blockOf(world.mcpConfig, "crow-storage"));
   const search = { query: "share-spawn-channel", project_id: x, semantic: false };
   try {
     // Every server refuses the unshared project first — one grant would otherwise let the next
     // server through.
     await expectRefused("gmail turn", research, "crow_list_sources", { project_id: x }, x);
     await expectRefused("gmail turn", memory, "crow_search_memories", search, x);
-    await expectRefused("gmail turn", storage, "crow_list_files", { project_id: x }, x);
 
     await expectAllowed("gmail turn", research, "crow_list_sources", { project_id: x }, x);
     await expectAllowed("gmail turn", memory, "crow_search_memories", search, x);
-    // No storage backend on this instance: the gate is what the assertion reads — a share lets the
-    // call through to the availability probe, and the refusal is no longer the share rule.
-    await expectAllowed("gmail turn", storage, "crow_list_files", { project_id: x }, x, {
-      success: (r, label) => {
-        assert.doesNotMatch(r.text, NO_SHARE, label);
-        assert.match(r.text, /Storage is not configured/, label);
-      },
-    });
   } finally {
     await research.close();
     await memory.close();
-    await storage.close();
   }
 
   // The discord turn runs the same builder with its own thread; the block still carries the bot.

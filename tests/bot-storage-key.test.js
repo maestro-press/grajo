@@ -227,7 +227,7 @@ const W = await import(new URL("scripts/pi-bots/mcp_writer.mjs", "file://" + pro
 const res = W.writeBotMcp({ tools: { crow_mcp: ["crow-storage/tool"] } }, {
   sessionDir, canonicalPath, crowHome, write: false, addonKeys: "hydrate",
 });
-writeFileSync(report, JSON.stringify({ env: res.json.mcpServers["crow-storage"].env, note: res.sharedStorage && res.sharedStorage.note }));
+writeFileSync(report, JSON.stringify({ block: res.json.mcpServers["crow-storage"], env: res.json.mcpServers["crow-storage"].env || {}, note: res.sharedStorage && res.sharedStorage.note }));
 process.exit(0);
 `;
 
@@ -319,7 +319,7 @@ test("no key file: storage off, marker 0, no S3_* name, and the exact boot line"
   const world = botWorld({ withKey: false });
   const r = buildViaThrowingLoader(world);
   assert.equal(r.status, 0, r.stderr.slice(0, 1200));
-  assert.equal(r.report.env.CROW_STORAGE_FROM_HOST, "0");
+  assert.deepEqual(r.report.block, { disabled: true }, "the core storage block is dropped, not left erroring");
   for (const name of Object.keys(r.report.env)) assert.equal(isStorageShaped(name), false, "not " + name);
   assert.equal(r.report.note, "shared storage: off (no bot storage key on this instance)");
 });
@@ -337,7 +337,7 @@ test("an unusable key file: storage off with the 'could not be read' boot line a
     breakIt(path);
     const r = buildViaThrowingLoader(world);
     assert.equal(r.status, 0, why + ": " + r.stderr.slice(0, 1200));
-    assert.equal(r.report.env.CROW_STORAGE_FROM_HOST, "0", why);
+    assert.deepEqual(r.report.block, { disabled: true }, why);
     for (const name of Object.keys(r.report.env)) assert.equal(isStorageShaped(name), false, why + ": not " + name);
     assert.match(r.report.note, /^shared storage: off \(the bot storage key file could not be read: /, why + ": " + r.report.note);
     assert.match(r.report.note, pattern, why + ": " + r.report.note);

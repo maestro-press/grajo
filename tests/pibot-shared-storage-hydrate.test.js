@@ -160,6 +160,12 @@ writeBotKey();
 
 // The storage-using servers a bot may select: the core one (registry `needs`) and the three
 // bundles whose manifests declare `needs: ["shared-storage"]`.
+/** The core storage server is absent (not erroring) for a bot with no usable storage. */
+function assertCoreStorageAbsent(res) {
+  assert.deepEqual(res.json.mcpServers["crow-storage"], { disabled: true }, "crow-storage block is dropped");
+  assert.equal(res.servers.includes("crow-storage"), false);
+  assert.ok(res.disabled.includes("crow-storage"));
+}
 const STORAGE_SERVERS = ["crow-storage", "studio", "sunvox-studio", "data-dashboard"];
 const ADDON_ENTRY = { command: "node", args: ["server/index.js"] };
 mkdir(join(CROW_HOME, "bundles"));
@@ -318,6 +324,7 @@ test("file mode: no credentials at all, the marker is off, and ONE warning per s
   const res = build();
   for (const id of STORAGE_SERVERS) {
     const block = res.json.mcpServers[id];
+    if (id === "crow-storage") { assertCoreStorageAbsent(res); assert.ok(res.warnings.includes(W.WARN_SHARED_STORAGE_FILE_MODE(id))); continue; }
     assert.equal(block.env.CROW_STORAGE_FROM_HOST, "0", id + " runs with no shared storage");
     for (const name of Object.keys(HYDRATION_ENV).filter((n) => n !== "CROW_STORAGE_FROM_HOST")) {
       assert.equal(block.env[name], undefined, id + " must not carry " + name);
@@ -436,9 +443,7 @@ test("file mode + a repo .env with MINIO_*/S3_*: no credential and not even a cr
     assert.equal(text.includes(secret), false, "the operator's storage credential is nowhere in the file");
   }
   assert.equal(text.includes("MINIO_"), false, "not even the name of a MinIO credential");
-  const block = JSON.parse(text).mcpServers["crow-storage"];
-  assert.equal(block.env.CROW_STORAGE_FROM_HOST, "0", "a file turn decides: no shared storage");
-  for (const name of Object.keys(block.env)) assert.equal(isStorageShaped(name), false, "crow-storage lost " + name);
+  assert.deepEqual(JSON.parse(text).mcpServers["crow-storage"], { disabled: true }, "a file turn drops the core storage block");
   assert.ok(res.warnings.includes(W.WARN_STORAGE_CREDENTIALS_STRIPPED("crow-storage")));
   // An add-on whose OWN entry lists MINIO_* loses them too, and keeps its plain setting.
   const addon = withRepoEnv(() => build({ ids: ["env-addon"] }));
@@ -481,6 +486,7 @@ test("fd + hydrate with no bot storage key: off with one warning, never the shar
   try {
     const res = build({ write: false, addonKeys: "hydrate" });
     for (const id of STORAGE_SERVERS) {
+      if (id === "crow-storage") { assertCoreStorageAbsent(res); assert.ok(res.warnings.includes(W.WARN_SHARED_STORAGE_NO_BOT_KEY(id))); continue; }
       assert.equal(res.json.mcpServers[id].env.CROW_STORAGE_FROM_HOST, "0", id + " has no shared storage");
       for (const name of Object.keys(res.json.mcpServers[id].env)) {
         assert.equal(isStorageShaped(name), false, id + " must not carry " + name);
@@ -555,9 +561,7 @@ test("an instance with no bot storage key and no shared settings: a bot gets NO 
       sessionDir: SESSION, canonicalPath: CANONICAL, crowHome: join(other, ".crow"),
       write: false, addonKeys: "hydrate",
     });
-    const env = res.json.mcpServers["crow-storage"].env;
-    assert.equal(env.CROW_STORAGE_FROM_HOST, "0", "no key file: no shared storage at all");
-    for (const name of Object.keys(env)) assert.equal(isStorageShaped(name), false, "not " + name + " either");
+    assertCoreStorageAbsent(res);
     assert.equal(JSON.stringify(res).includes("env-secret-not-for-bots"), false, "the operator's credential is never piped to a bot");
     assert.ok(res.warnings.includes(W.WARN_SHARED_STORAGE_NO_BOT_KEY("crow-storage")));
     assert.deepEqual(res.sharedStorage, { servers: ["crow-storage"], note: W.SHARED_STORAGE_NOTE_OFF_NO_BOT_KEY });
@@ -593,7 +597,9 @@ test("a bot storage key file that cannot be used is a fault, not 'no key': its o
       const res = build({ write: false, addonKeys: "hydrate" });
       for (const id of STORAGE_SERVERS) {
         const block = res.json.mcpServers[id];
-        assert.equal(block.env.CROW_STORAGE_FROM_HOST, "0", why + ": storage is off either way");
+        if (id === "crow-storage") assertCoreStorageAbsent(res);
+        else assert.equal(block.env.CROW_STORAGE_FROM_HOST, "0", why + ": storage is off either way");
+        if (id === "crow-storage") { assert.ok(res.warnings.some((w) => w.startsWith(`${id}: the bot storage key file could not be read (`))); continue; }
         for (const name of Object.keys(block.env)) assert.equal(isStorageShaped(name), false, why + ": " + id + " must not carry " + name);
         const prefix = `${id}: the bot storage key file could not be read (`;
         const warned = res.warnings.find((w) => w.startsWith(prefix));

@@ -1145,6 +1145,19 @@ export function writeBotMcp(def, opts = {}) {
   for (const id of storageUnreviewed) built.warnings.push(WARN_SHARED_STORAGE_NOT_REVIEWED(id));
   /** Leave `id` with NO shared storage: the marker with no settings, plus its one warning. */
   const sharedStorageOff = (id, warning) => {
+    // The core storage server is ABSENT for a bot with no usable storage (its tools vanish rather
+    // than every call erroring), the same shape as any other dropped block. A reviewed bundle
+    // keeps its block with the marker: its other tools still work.
+    if (id === "crow-storage") {
+      built.json.mcpServers[id] = { disabled: true };
+      for (const list of [built.servers, built.journalGuarded, built.minted]) {
+        const i = list.indexOf(id);
+        if (i >= 0) list.splice(i, 1);
+      }
+      if (!built.disabled.includes(id)) built.disabled.push(id);
+      if (warning) built.warnings.push(warning);
+      return;
+    }
     const block = built.json.mcpServers[id];
     block.env = { ...block.env, [STORAGE_FROM_HOST_ENV]: "0" };
     if (warning) built.warnings.push(warning);
