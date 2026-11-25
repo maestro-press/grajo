@@ -296,6 +296,8 @@ import { isOwnHostAddress, gatewayListenPorts, targetAddresses, targetHost, targ
 
 /** How long a vouch snapshot (this module's own cache) stays usable. */
 export const VOUCH_TTL_MS = 30_000;
+/** A snapshot younger than this is not re-read on a vouch miss (thrash guard). */
+export const VOUCH_MISS_REFRESH_MIN_AGE_MS = 2_000;
 /** The pin file: `<CROW_HOME>/secrets/local-model-endpoints.json`. */
 export const PIN_FILE = "local-model-endpoints.json";
 /**
@@ -1203,14 +1205,32 @@ export async function primeLocalModelVouch(deps = {}) {
  * leaves the cache as it was, so the decision fails closed exactly as before, and a
  * turn never hangs on it. Never throws.
  */
-export async function ensureLocalModelVouch({ timeoutMs = 4_000, deps = {} } = {}) {
-  if (_dockerCache.ok && _dockerCache.at) return;
+export async function ensureLocalModelVouch({ timeoutMs = 4_000, deps = {}, targets = null } = {}) {
   let timer = null;
+  const bound = new Promise((resolve) => { timer = setTimeout(resolve, Math.max(0, Number(timeoutMs) || 0)); });
   try {
-    await Promise.race([
-      dockerSnapshot(resolveDeps(deps)).catch(() => {}),
-      new Promise((resolve) => { timer = setTimeout(resolve, Math.max(0, Number(timeoutMs) || 0)); }),
-    ]);
+    const d = resolveDeps(deps);
+    if (!(_dockerCache.ok && _dockerCache.at)) {
+      // Cold (or last read failed): a bounded wait, as before.
+      await Promise.race([dockerSnapshot(d).catch(() => {}), bound]);
+      return;
+    }
+    // REFRESH ON A MISS, never on age alone. A snapshot in hand predates any container
+    // started or pinned after it (an on-demand model start, the nightly rotation, a fresh
+    // `local-model-pin add-container`), and the sync door decision would read that as
+    // not-vouched and refuse the first contained turn. Judge each target with the SAME sync
+    // predicate the door uses; only a not-vouched LOCAL target (own host) pays for a read.
+    if (!Array.isArray(targets) || !targets.length) return;
+    const missed = targets.some((url) => {
+      if (typeof url !== "string" || !url) return false;
+      const r = isKnownLocalModelTargetCached(url, deps);
+      return r.local === false && r.reason === "not-vouched";
+    });
+    if (!missed) return;
+    if (d.now() - _dockerCache.at < VOUCH_MISS_REFRESH_MIN_AGE_MS) return; // thrash guard
+    if (!_dockerFlight && d.now() < _dockerBackoffUntil) return;            // failure backoff
+    // dockerSnapshot joins an in-flight read instead of starting a second one.
+    await Promise.race([dockerSnapshot(d, { force: true }).catch(() => {}), bound]);
   } catch { /* docker is optional */ } finally {
     if (timer) clearTimeout(timer);
   }

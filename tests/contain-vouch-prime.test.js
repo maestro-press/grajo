@@ -85,27 +85,28 @@ test("a Docker that fails is not an error: the wait returns and the decision fai
   resetLocalModelVouchCache();
 });
 
-test("both spawners await the prime before new PiRpc (and the bridge before its eval-seam checks)", () => {
+test("every spawner goes through bridge.spawnPiRpc, and the bridge primes BEFORE its eval-seam checks", () => {
   const bridge = readFileSync(join(REPO, "scripts/pi-bots/bridge.mjs"), "utf8");
-  const prime = bridge.indexOf("await ensureLocalModelVouch()");
-  assert.ok(prime > 0, "the bridge awaits the prime");
+  const prime = bridge.indexOf("await primeSpawnVouch(spawnPrep.piRpcOpts)");
+  assert.ok(prime > 0, "handleInbound primes the vouch cache");
   assert.ok(prime < bridge.indexOf("if (evalSeam !== null) {"), "before the eval-seam checks (nothing async may follow them)");
-  assert.ok(prime < bridge.indexOf("const pi = new PiRpc(Object.assign({}, spawnPrep.piRpcOpts"), "before the turn's PiRpc");
+  const spawn = bridge.indexOf("const pi = await spawnPiRpc(Object.assign({}, spawnPrep.piRpcOpts");
+  assert.ok(spawn > bridge.indexOf("if (evalSeam !== null) {"), "the spawn follows the checks");
+  assert.match(bridge.slice(spawn, spawn + 400), /primed: true/, "and does not await anything before constructing");
   const review = readFileSync(join(REPO, "scripts/pi-bots/skill_review.mjs"), "utf8");
-  const rp = review.indexOf("await ensureLocalModelVouch()");
-  assert.ok(rp > 0 && rp < review.indexOf("const pi = new PiRpc("), "skill review awaits it before its PiRpc");
+  assert.match(review, /await spawnPiRpc\(/);
   const jobs = readFileSync(join(REPO, "scripts/pi-bots/job_runner.mjs"), "utf8");
-  const jp = jobs.indexOf("await ensureLocalModelVouch()");
-  assert.ok(jp > 0 && jp < jobs.indexOf("const pi = new bridge.PiRpc("), "a scheduled (goal) job awaits it before its own PiRpc");
+  assert.match(jobs, /await bridge\.spawnPiRpc\(/);
   const perch = readFileSync(join(REPO, "servers/gateway/perch-interactive.js"), "utf8");
-  const pp = perch.indexOf("await ensureLocalModelVouch()");
-  assert.ok(pp > 0 && pp < perch.indexOf("const pi = new S.PiRpc("), "Perch awaits it before its PiRpc");
+  assert.match(perch, /S\.spawnPiRpc \? await S\.spawnPiRpc\(piOpts, \{ always: true/);
 });
 
-test("every production PiRpc construction is one of the four that await the prime", () => {
+test("no PiRpc is constructed directly outside the spawnPiRpc helper (scripts/ and servers/)", () => {
   const { execFileSync } = require("node:child_process");
-  const out = execFileSync("grep", ["-rln", "--include=*.mjs", "--include=*.js", "PiRpc(", "scripts", "servers", "bundles"], { cwd: REPO, encoding: "utf8" })
-    .split("\n").filter((f) => f && !f.includes("node_modules"));
-  const spawners = out.filter((f) => /new (?:[A-Za-z_$][\w$]*\.)?PiRpc\(/.test(readFileSync(join(REPO, f), "utf8"))).sort();
-  assert.deepEqual(spawners, ["scripts/pi-bots/bridge.mjs", "scripts/pi-bots/job_runner.mjs", "scripts/pi-bots/skill_review.mjs", "servers/gateway/perch-interactive.js"]);
+  const out = execFileSync("grep", ["-rlE", "--include=*.mjs", "--include=*.js", "--exclude-dir=node_modules", "PiRpc", "scripts", "servers", "bundles"], { cwd: REPO, encoding: "utf8" })
+    .split("\n").filter(Boolean);
+  const direct = out.filter((f) => /new (?:[A-Za-z_$][\w$]*\.)?PiRpc\(/.test(readFileSync(join(REPO, f), "utf8")));
+  assert.deepEqual(direct, [], "construct through spawnPiRpc (scripts/pi-bots/bridge.mjs)");
+  const bridge = readFileSync(join(REPO, "scripts/pi-bots/bridge.mjs"), "utf8");
+  assert.equal([...bridge.matchAll(/new PiRpcClass\(/g)].length, 1, "the helper is the one construction site");
 });

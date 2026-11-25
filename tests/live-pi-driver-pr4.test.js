@@ -612,8 +612,8 @@ test("bridge.mjs: the evalSpawnTransform block opens with the guard, and nothing
   assert.match(src, /const next = await evalSeam\.transform\(clone\);/);
   assert.match(src, /spawnPrep\.piRpcOpts = evalSeam\.guard\.evalSpawnOpts\(original, f\);/);
   // Nothing async between the env check and new PiRpc (which reads the live process.env).
-  const gap = src.slice(src.indexOf("evalSeam.guard.checkEnvUnchanged(envBefore);"), src.indexOf("const pi = new PiRpc("));
-  assert.ok(gap.length > 0 && src.indexOf("const pi = new PiRpc(") > src.indexOf("checkEnvUnchanged"), "the env check precedes the spawn");
+  const gap = src.slice(src.indexOf("evalSeam.guard.checkEnvUnchanged(envBefore);"), src.indexOf("const pi = await spawnPiRpc("));
+  assert.ok(gap.length > 0 && src.indexOf("const pi = await spawnPiRpc(") > src.indexOf("checkEnvUnchanged"), "the env check precedes the spawn");
   assert.doesNotMatch(gap, /\bawait\b|\.then\(|setTimeout|setImmediate/, "no async gap before new PiRpc");
   assert.doesNotMatch(src, /piRpcOpts = next\b|Object\.assign\([^)]*\bnext\b/, "the transform's object is never used");
 });

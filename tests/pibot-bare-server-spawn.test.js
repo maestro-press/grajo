@@ -136,6 +136,7 @@ test("runJob hands its PiRpc the same listing snapshot", async () => {
   const bridge = {
     loadBot: () => ({ bot_id: "jobbot", display_name: "Job", def: def(), project_id: null }),
     PiRpc: FakePiRpc,
+    spawnPiRpc: async (o) => new FakePiRpc(o),
   };
   const repoSkillsDir = mkdtempSync(join(DIR, "repo-skills-"));
   const r = await runJob({ job_id: "j1", bot_id: "jobbot", goal: "work", escalate: 0 },

@@ -187,16 +187,40 @@ function rowFor(rows, id) {
  *  doorKindOf's "unmanaged" rows (a plain LAN/tailnet endpoint nothing routes
  *  for) are exactly the ones `/llm/p` refuses with NOT_FORWARDABLE. */
 export function doorRow(r) {
-  if (!r || typeof r.baseUrl !== "string" || !r.baseUrl) return null;
-  if (isForbiddenTarget(r.baseUrl) || !isLocalClassTarget(r.baseUrl)) return null;
-  if (doorKindOf(r) === "unmanaged") return null;
+  const c = doorCandidate(r);
+  if (!c) return null;
   // The row's OWN address must be one a model server vouches for, or /llm/p would
   // refuse the spawn's every turn (a bot can write this row): an own-host port
   // with no docker/compose/native/pin vouch is the "unverified-local" class, and
   // a contained spawn is not offered it. The cached (vouch-only) predicate is the
   // right one here — generating an agent dir must never dial anything.
-  if (!isKnownLocalModelTargetCached(r.baseUrl).local) return null;
+  if (!isKnownLocalModelTargetCached(c.baseUrl).local) return null;
+  return c;
+}
+
+/** Everything `doorRow` requires EXCEPT the vouch (shared so the two cannot drift). */
+function doorCandidate(r) {
+  if (!r || typeof r.baseUrl !== "string" || !r.baseUrl) return null;
+  if (isForbiddenTarget(r.baseUrl) || !isLocalClassTarget(r.baseUrl)) return null;
+  if (doorKindOf(r) === "unmanaged") return null;
   return r;
+}
+
+/** The base URLs a contained spawn will judge with `doorRow`'s vouch check, for the
+ *  provider ids it will build doors for (the same id -> row mapping as the agent dir,
+ *  including the crow-c-* spelling). `ensureLocalModelVouch({targets})` uses it to
+ *  refresh the vouch cache before that SYNC decision when one of them is not vouched. */
+export function doorVouchTargets(rows, providerIds) {
+  const list = Array.isArray(rows) ? rows : [];
+  const out = [];
+  for (const raw of Array.isArray(providerIds) ? providerIds : []) {
+    if (typeof raw !== "string" || !raw) continue;
+    const id = raw.toLowerCase().startsWith(DOOR_ID_PREFIX) ? raw.slice(DOOR_ID_PREFIX.length) : raw;
+    const row = rowFor(list, id);
+    const c = doorCandidate(row);
+    if (c && !out.includes(c.baseUrl)) out.push(c.baseUrl);
+  }
+  return out;
 }
 
 /** The line one contained spawn logs when the bash `auto` classifier cannot be

@@ -34,8 +34,6 @@ import { mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { countLivePi } from "./pi_lifecycle.mjs";
-import { piSandboxMode } from "./pi_sandbox.mjs";
-import { ensureLocalModelVouch } from "../../servers/gateway/models/local-model-servers.js";
 import { resolveModel } from "./model_resolver.mjs";
 import { resolveSkills } from "./skill_resolver.mjs";
 import { proposalsDir, normalizeSkillName, flagGuardrailPhrases } from "./skill_proposals.mjs";
@@ -210,11 +208,10 @@ export async function runSkillReview(opts) {
       spawn_env: def.spawn_env,
     };
 
-    const { PiRpc } = await import("./bridge.mjs"); // lazy — avoids static import cycle
+    const { spawnPiRpc } = await import("./bridge.mjs"); // lazy — avoids static import cycle
     // A contained review spawn decides its provider door from the vouch cache, which starts
     // empty in this process: fill it first, bounded (see ensureLocalModelVouch).
-    if (piSandboxMode(process.env) !== "off") await ensureLocalModelVouch();
-    const pi = new PiRpc({ def: reviewDef, sessionDir: reviewDir, resolved, selfAuthoringDir: null,
+    const pi = await spawnPiRpc({ def: reviewDef, sessionDir: reviewDir, resolved, selfAuthoringDir: null,
       piSessionId: null, appendSystemPromptFile: sysFile, noGit: true });
     try {
       await pi.getState().catch(() => null);

@@ -99,7 +99,7 @@ test("channels (handleInbound): an over-cap surface is refused right after prepa
   const check = fn.indexOf("checkToolBudget(");
   const active = fn.indexOf('status: "active"');
   const warm = fn.indexOf("await warmModel(resolved.provider");
-  const spawn = fn.indexOf("new PiRpc(");
+  const spawn = fn.indexOf("spawnPiRpc(");
   assert.ok(prep > 0 && check > prep, "checked after the model is resolved");
   assert.ok(check < active && check < warm && check < spawn, "and before any side effect");
   const block = fn.slice(check, active);

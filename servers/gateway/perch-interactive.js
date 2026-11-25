@@ -178,7 +178,6 @@ import { createTakeOver as createBrowserTakeOver, createAppTakeOvers } from "./b
 import { appTileInfo, desktopApp, takeOverOffered, appLeaseDir } from "./apps/app-tile.js";
 import { getSecretRequest, expireSessionRequests, forgetSession as forgetSecretSession } from "./secrets/request-store.js";
 import { isGatewayStopping } from "../shared/gateway-stopping.js";
-import { ensureLocalModelVouch } from "./models/local-model-servers.js";
 
 /** Lease file name under CROW_HOME. Consumed by C-14's reaper exemption. */
 export const LEASE_FILENAME = "perch-interactive-leases.json";
@@ -786,6 +785,10 @@ export function createInteractiveEngine({
       import("../../scripts/pi-bots/tracker.mjs"),
       import("../../scripts/pi-bots/tool-budget.mjs"),
     ]);
+    // The production spawn MUST go through bridge.mjs's spawnPiRpc (it awaits the own-host vouch
+    // before PiRpc decides its doors): a renamed or missing export fails here, at load, rather than
+    // quietly constructing PiRpc without the wait.
+    if (typeof br.spawnPiRpc !== "function") throw new Error("perch: bridge.mjs has no spawnPiRpc export");
     seams = {
       buildBotWorld: world.buildBotWorld,
       prepareSpawn: world.prepareSpawn,
@@ -797,6 +800,7 @@ export function createInteractiveEngine({
       // Strand 2: a model's tool cap, from provider data (null = none).
       capFor: budget.capFor,
       PiRpc: br.PiRpc,
+      spawnPiRpc: br.spawnPiRpc,
       warmModel: warm.warmModel,
       countLivePi: life.countLivePi,
       LIFECYCLE_DEFAULTS: life.LIFECYCLE_DEFAULTS,
@@ -2942,8 +2946,7 @@ export function createInteractiveEngine({
     const withBlocks = servicesFor === "owner" ? await serviceBlocksForChild(S, s, world, prep, slog) : false;
     // The gateway fills the vouch cache at boot; this is a no-op then, and covers a boot
     // whose Docker read had not answered (bounded, fails closed as before).
-    await ensureLocalModelVouch();
-    const pi = new S.PiRpc(Object.assign({}, prep.piRpcOpts, {
+    const piOpts = Object.assign({}, prep.piRpcOpts, {
       piSessionId: resume,
       // Open-anywhere B3/B4: pi's process cwd is the operator's chosen dir.
       // Undefined when a test seam returns no world.cwd — PiRpc then falls back
@@ -2989,7 +2992,11 @@ export function createInteractiveEngine({
           : [outputsDir]),
         ...(Array.isArray(world.extraWritePaths) ? world.extraWritePaths : []),
       ],
-    }));
+    });
+    // The bridge's spawnPiRpc primes (and on a miss refreshes) the vouch cache first; Perch
+    // always primed, so `always`. A test seam without it constructs its own PiRpc directly.
+    const PiRpcClass = S.PiRpc;
+    const pi = S.spawnPiRpc ? await S.spawnPiRpc(piOpts, { always: true, PiRpcClass }) : new PiRpcClass(piOpts);
     s.pi = pi;
     s.piSessionId = resume;
     s.childPrincipal = servicesFor;

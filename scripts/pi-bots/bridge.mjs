@@ -61,7 +61,7 @@ import { resolveBackupDir } from "../../servers/shared/backup-naming.js";
 import { resolveCrowHome } from "../../servers/shared/crow-home.js";
 import { ENTRY_MARK } from "./pi_netns_entry.mjs";
 import { containSelected, containExcluded, prepareAgentShadow, sweepStaleContainDirs, containOwnWorldRoot, ContainRefused } from "./pi_contain.mjs";
-import { containedClassifierBlock, containedCloudTokenPath, pinOfBaseUrl } from "./pi_contain_agent.mjs";
+import { containedClassifierBlock, containedCloudTokenPath, pinOfBaseUrl, doorVouchTargets } from "./pi_contain_agent.mjs";
 import { botContainment, defToolNames, recordContainment, formatContainmentLine } from "./containment-status.mjs";
 import { gatewayListenPort } from "../../servers/gateway/listen-port.js";
 import { providerRowToObject } from "../../servers/shared/provider-row.js";
@@ -852,6 +852,48 @@ export function homeMatchesResolved(homeReal, resolvedReal) {
 let wrapPiSpawnForTest = null;
 /** Test-only: replace (or, with null, restore) the launch step PiRpc uses. */
 export function _setWrapPiSpawnForTest(fn) { wrapPiSpawnForTest = typeof fn === "function" ? fn : null; }
+
+/**
+ * The own-host base URLs a spawn of `opts` will judge for provider doors: the provider rows
+ * `new PiRpc` builds doors for (the turn's row, its pi provider id, the bash classifier's
+ * row), mapped by pi_contain_agent.mjs's own helper so this cannot drift from `doorRow`.
+ * Empty for an uncontained spawn. Never throws.
+ */
+export function vouchTargetsFor(opts) {
+  try {
+    if (!opts || !opts.resolved) return [];
+    const botId = opts.botId || (opts.def && (opts.def.bot_id || opts.def.id)) || null;
+    if (piSandboxMode(process.env) === "off" || !containSelected(process.env, botId)) return [];
+    const piProvider = typeof opts.piProvider === "string" && opts.piProvider ? opts.piProvider : piProviderIdHere(opts.resolved.provider);
+    const inputs = containModelInputs(opts.resolved, piProvider, opts.lockedPin || null);
+    const ids = inputs.providerIds.slice();
+    const cls = opts.botClassifier && opts.botClassifier.providerId;
+    if (typeof cls === "string" && cls && !ids.includes(cls)) ids.push(cls);
+    return doorVouchTargets(inputs.rows, ids);
+  } catch { return []; }
+}
+
+/**
+ * Fill/refresh the local-model vouch cache for a spawn (bounded, fail-closed, never throws).
+ * A contained spawn decides its doors synchronously inside `new PiRpc`; see
+ * ensureLocalModelVouch. `always` skips the sandbox gate (Perch's historical behaviour).
+ */
+export async function primeSpawnVouch(opts, { always = false } = {}) {
+  if (!always && piSandboxMode(process.env) === "off") return;
+  await ensureLocalModelVouch({ targets: vouchTargetsFor(opts) });
+}
+
+/**
+ * THE way to construct a PiRpc outside this file: primes the vouch cache (refreshing it when a
+ * target is not vouched), then constructs. `primed: true` is for the ONE caller (handleInbound)
+ * that already awaited `primeSpawnVouch` BEFORE its eval-seam checks: nothing may be awaited
+ * between those checks and the construction, and an async function runs synchronously up to its
+ * first await, so a primed call constructs in the caller's own tick. `PiRpcClass` is the test seam.
+ */
+export async function spawnPiRpc(opts, { primed = false, always = false, PiRpcClass = PiRpc } = {}) {
+  if (!primed) await primeSpawnVouch(opts, { always });
+  return new PiRpcClass(opts);
+}
 
 export class PiRpc {
   constructor(opts) {
@@ -2923,11 +2965,11 @@ export async function handleInbound(opts) {
   await warmModel(resolved.provider, log);
 
   // A contained spawn decides its provider doors SYNCHRONOUSLY inside new PiRpc, from the
-  // vouch cache. In this process (never the gateway) that cache starts empty, so the first
-  // turn after a restart found a Docker-run model "not vouched" and was refused. Fill it
-  // first, bounded (a Docker that does not answer in time fails closed as before). It sits
-  // BEFORE the eval-seam checks: nothing async may run between those and new PiRpc.
-  if (piSandboxMode(process.env) !== "off") await ensureLocalModelVouch();
+  // vouch cache. Fill it first (bounded, fails closed), and REFRESH it when a provider this spawn
+  // will judge is not vouched in the snapshot we hold (a container started or pinned after it).
+  // It sits BEFORE the eval-seam checks: nothing async may run between those and the PiRpc
+  // construction (spawnPiRpc is called `primed`, so it constructs synchronously).
+  await primeSpawnVouch(spawnPrep.piRpcOpts);
 
   // The eval-only spawn transform (guarded at the top of this function), right before pi. What
   // is checked: the options' key set and values (the transform works on a deep clone and the
@@ -2949,8 +2991,8 @@ export async function handleInbound(opts) {
   // piRpcOpts carries {def, sessionDir, resolved, selfAuthoringDir,
   // remoteEnabled, narrowedTools, appendSystemPromptFile, bareServerTools}; the
   // resume decision is channel policy, so the caller adds piSessionId.
-  const pi = new PiRpc(Object.assign({}, spawnPrep.piRpcOpts, {
-    piSessionId: effectiveResume ? session.pi_session_id : null }));
+  const pi = await spawnPiRpc(Object.assign({}, spawnPrep.piRpcOpts, {
+    piSessionId: effectiveResume ? session.pi_session_id : null }), { primed: true });
   let result;
   // Staged sends: this turn's draft calls, captured before close() and recorded after it.
   let stagedCalls = null;

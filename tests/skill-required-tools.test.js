@@ -310,7 +310,7 @@ test("background jobs get the union too", async () => {
     toolCalls() { return []; }
     async close() {}
   }
-  const bridge = { loadBot: () => ({ bot_id: "jobbot", display_name: "Job", def, project_id: null }), PiRpc };
+  const bridge = { loadBot: () => ({ bot_id: "jobbot", display_name: "Job", def, project_id: null }), PiRpc, spawnPiRpc: async (o) => new PiRpc(o) };
   const r = await runJob({ job_id: "j1", bot_id: "jobbot", goal: "work", escalate: 0 }, { bridge, repoSkillsDir });
   assert.equal(r.result, "done");
   assert.ok(seen.def.tools.crow_mcp.includes(ADD), JSON.stringify(seen.def.tools));
