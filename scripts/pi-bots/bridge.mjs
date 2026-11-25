@@ -49,6 +49,7 @@ import { getTrackerContext, kanbanText, cardStatus, resolveTrackerType, boardVoc
 import { cardBriefBlock } from "./card-brief.mjs";
 import { resolveNodeBin, requirePiCli } from "./pi_resolver.mjs";
 import { wrapPiSpawn, piSandboxMode, probePiSandbox, openBindFds } from "./pi_sandbox.mjs";
+import { ensureLocalModelVouch } from "../../servers/gateway/models/local-model-servers.js";
 import { gitPreSpawn, gitPostLaunch, countEnabledPiBots } from "./bot_git_spawn.mjs";
 import { BOT_GIT_DIRNAME, checkKeyDir, gitAllowedForInstance, isSafeKeyPath, isValidGitBotId } from "../../servers/shared/bot-git/paths.js";
 import { botGitMeta, writeSpawnFiles } from "../../servers/shared/bot-git/store.js";
@@ -2627,6 +2628,13 @@ export async function handleInbound(opts) {
   // POST /llm/acquire; without this a cold on-demand model (:8003) makes pi
   // return "Connection error" → "(no reply)" on Discord/Gmail. Non-fatal.
   await warmModel(resolved.provider, log);
+
+  // A contained spawn decides its provider doors SYNCHRONOUSLY inside new PiRpc, from the
+  // vouch cache. In this process (never the gateway) that cache starts empty, so the first
+  // turn after a restart found a Docker-run model "not vouched" and was refused. Fill it
+  // first, bounded (a Docker that does not answer in time fails closed as before). It sits
+  // BEFORE the eval-seam checks: nothing async may run between those and new PiRpc.
+  if (piSandboxMode(process.env) !== "off") await ensureLocalModelVouch();
 
   // The eval-only spawn transform (guarded at the top of this function), right before pi. What
   // is checked: the options' key set and values (the transform works on a deep clone and the

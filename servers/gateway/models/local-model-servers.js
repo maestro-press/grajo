@@ -1189,6 +1189,33 @@ export async function primeLocalModelVouch(deps = {}) {
   try { await dockerSnapshot(resolveDeps(deps), { force: true }); } catch { /* docker is optional */ }
 }
 
+/**
+ * Make the Docker half of the vouch cache READY before a sync decision reads it, in
+ * a process that is not the gateway (the pi-bots spawner, skill review). The sync
+ * predicate never spawns a process, so its FIRST call in a fresh process found an
+ * empty cache, started the read in the background and answered "not-vouched": the
+ * first contained turn after every bridge restart lost its door to a Docker-run
+ * model and was refused. Awaited before that decision, this closes the window.
+ *
+ * Bounded: a good snapshot already in hand (fresh or stale; the sync path serves a
+ * stale one and revalidates it in the background) returns at once; otherwise the
+ * read is awaited for at most `timeoutMs`. A Docker that cannot answer in time
+ * leaves the cache as it was, so the decision fails closed exactly as before, and a
+ * turn never hangs on it. Never throws.
+ */
+export async function ensureLocalModelVouch({ timeoutMs = 4_000, deps = {} } = {}) {
+  if (_dockerCache.ok && _dockerCache.at) return;
+  let timer = null;
+  try {
+    await Promise.race([
+      dockerSnapshot(resolveDeps(deps)).catch(() => {}),
+      new Promise((resolve) => { timer = setTimeout(resolve, Math.max(0, Number(timeoutMs) || 0)); }),
+    ]);
+  } catch { /* docker is optional */ } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** Every vouch source, already parsed. Tests inject this shape via `deps.snapshot`. */
 export function buildSyncVouch(d = {}) {
   const docker = Array.isArray(d.dockerEntries) ? { ok: true, entries: d.dockerEntries } : _dockerCache;

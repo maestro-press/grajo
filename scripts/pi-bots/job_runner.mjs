@@ -50,6 +50,8 @@ import { mcpConfigDelivery } from "./mcp-delivery.mjs";
 import { botsDbPath, botsProjectsRoot } from "./instance-paths.mjs";
 import { BOT_JOBS_DDL, missingBotJobsColumns } from "./bot-jobs-schema.mjs";
 import { warmModel } from "./warm.mjs";
+import { piSandboxMode } from "./pi_sandbox.mjs";
+import { ensureLocalModelVouch } from "../../servers/gateway/models/local-model-servers.js";
 import { meterBotTurn } from "./metering.mjs";
 import { isVoiceBotId, isVoiceBotDef } from "../../servers/shared/voice-bot.js";
 import { betterSqliteDb, credConfigFromOperatorConfig, isDraftTool, recordDrafts, redactMcpConfig } from "../../servers/gateway/staged/recorder.js";
@@ -479,6 +481,10 @@ export async function runJob(job, { log = () => {}, bridge: injectedBridge = nul
     // --tools csv is built from exactly the listing taken here. Never throws: an unlistable
     // server keeps today's spelling. `probe` is the test seam.
     const bareServerTools = await primeBareServerTools(def, { crowHome, log, probe });
+    // A contained job decides its provider doors synchronously inside PiRpc, from the vouch
+    // cache, which starts empty in this process: a scheduled job that is the first spawn
+    // after a restart lost its door to a Docker-run model. Fill it first, bounded.
+    if (piSandboxMode(process.env) !== "off") await ensureLocalModelVouch();
     const pi = new bridge.PiRpc({
       def, sessionDir, resolved, piProvider, selfAuthoringDir: null,
       piSessionId: null, appendSystemPromptFile: sysFile,

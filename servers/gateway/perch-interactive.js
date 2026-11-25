@@ -178,6 +178,7 @@ import { createTakeOver as createBrowserTakeOver, createAppTakeOvers } from "./b
 import { appTileInfo, desktopApp, takeOverOffered, appLeaseDir } from "./apps/app-tile.js";
 import { getSecretRequest, expireSessionRequests, forgetSession as forgetSecretSession } from "./secrets/request-store.js";
 import { isGatewayStopping } from "../shared/gateway-stopping.js";
+import { ensureLocalModelVouch } from "./models/local-model-servers.js";
 
 /** Lease file name under CROW_HOME. Consumed by C-14's reaper exemption. */
 export const LEASE_FILENAME = "perch-interactive-leases.json";
@@ -2939,6 +2940,9 @@ export function createInteractiveEngine({
     // when a turn from someone else reaches one that holds blocks.
     const servicesFor = s.servicesPrincipal === "owner" ? "owner" : "other";
     const withBlocks = servicesFor === "owner" ? await serviceBlocksForChild(S, s, world, prep, slog) : false;
+    // The gateway fills the vouch cache at boot; this is a no-op then, and covers a boot
+    // whose Docker read had not answered (bounded, fails closed as before).
+    await ensureLocalModelVouch();
     const pi = new S.PiRpc(Object.assign({}, prep.piRpcOpts, {
       piSessionId: resume,
       // Open-anywhere B3/B4: pi's process cwd is the operator's chosen dir.
