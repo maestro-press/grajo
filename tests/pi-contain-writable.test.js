@@ -99,7 +99,7 @@ test("the fixture plan is the shape the two probes assume (checked on every host
   const remountOf = (f) => p.args.some((a, i) => a === "--remount-ro" && p.args[i + 1] === f);
   assert.equal(roDest(join(data, "crow.db")), false, "B1: the DB named in an MCP block's env is not re-bound read-only");
   assert.ok(p.args.some((a, i) => a === "--bind" && p.args[i + 2] === data), "the data dir itself is writable");
-  assert.ok(remountOf(theirs), "B4: another project's folder is masked read-only");
+  assert.ok(remountOf(join(data, "projects")), "B4: `projects` is masked read-only wholesale (the own workspace is bound back inside it)");
   assert.equal(remountOf(mine), false, "the bot's own workspace is not masked");
   // Creation is closed for every trusted name, present or not: an installed add-on's data
   // folder and each reserved name that did not exist at spawn get an empty read-only mount.
@@ -210,7 +210,8 @@ test("B1/B4 in a real sandbox: crow.db is writable, a masked project folder is N
 
   // B4: a write into ANOTHER project's folder fails loudly (read-only mask),
   // and nothing was created there.
-  assert.equal(out.otherProject, "EROFS");
+  // H1: another project is not even present now (`projects` is one read-only empty mount holding only the own workspace).
+  assert.equal(out.otherProject, "ENOENT");
   assert.throws(() => statSync(join(theirs, "planted.txt")), /ENOENT/);
   // A masked FILE (identity.json) refuses the write too.
   assert.notEqual(out.maskedFile, "ok");

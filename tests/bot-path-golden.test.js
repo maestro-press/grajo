@@ -72,13 +72,19 @@
 // directly by tests/pi-contain-plan.test.js (which asserts `runtimes` is reserved,
 // masked and not a FILE-shaped name), so it is not only golden-derived.
 //
+// A FIFTH recorded exception (H1, structural masks): `<data>/projects` is masked wholesale (one
+// `--tmpfs` + one `--remount-ro`) and the bot's own workspace is bound back inside it, replacing
+// the per-project masks (`<data>/projects/<other>`) the fixtures carried. Only contain-plans.json
+// moved; egress-transcripts.json is byte-identical. Pinned directly by
+// tests/pi-contain-plan.test.js (C9, B4) and tests/contain-structural-masks.test.js (real bwrap).
+//
 // The count, so a reviewer knows the `--tmpfs` volume is the intended one and
 // not a leak: 33 masks per case that binds a data dir (35 reserved names minus
 // the two FILE-shaped ones — `identity.json` and `instance-id` are never
-// created), 32 in the cases whose fixture keeps one (`projects`, re-exposed down
-// to the bot's own workspace, and the C9 keep-list), and NOT ONE
+// created), 32 in the one case whose fixture keeps one (the C9 keep-list); `projects`
+// is one of the 33 and is masked whole with the bot's own workspace bound back inside it. NOT ONE
 // installed-bundle-id mask, because none of these fixture instances records an
-// absent installed id. 1119 data-dir masks in total; nothing in the plan reads
+// absent installed id. 1121 data-dir masks in total (33 cases of 33, one of 32); nothing in the plan reads
 // the repository's `registry/add-ons.json`. tests/pi-contain-plan.test.js (B11c)
 // asserts that source rule directly.
 import { test } from "node:test";

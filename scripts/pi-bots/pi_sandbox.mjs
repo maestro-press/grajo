@@ -365,12 +365,12 @@ export function bwrapHasBindFd(bwrap, help) {
  * Anything else, or a bwrap without --bind-fd, refuses the spawn (ContainRefused); no path is
  * in the message.
  *
- * DEST (NOT fully covered, known follow-up H1, no fix claimed here): sources are pinned, but a
- * destination is still resolved by bwrap by name inside the new root. A mask nested below a
- * non-mount-point parent inside a bot-writable bind (a masked <data>/projects/<other>, a nested
- * .env from scanEnvMasks) can be sidestepped: the bot renames the parent (`mv projects p2`,
- * allowed because the dir holds no mount point) and plants a decoy, and a later spawn's nested
- * mask lands on the decoy while the real content sits at the new name.
+ * DEST (H1): a destination is resolved by bwrap by name inside the new root, so a mask is only
+ * sound when its parent is a mount point a bot cannot rename. The plan (pi_contain.mjs) makes that
+ * hold for: `projects` (masked whole, own workspace bound back inside it from an fd); a `.env`
+ * (and a symlinked `.env`'s target) nested under a writable bind (every folder above it is its own
+ * bind root, or the first-level folder is masked whole past the cap); direct children of a bind
+ * root. Nothing else about destinations is claimed here.
  *
  * @param {{args: string[], tier?: string, judged?: object}} launch  a wrapPiSpawn result
  * @param {{firstFd?: number, bwrapHelp?: string, bwrap?: string}} [o]

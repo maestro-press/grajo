@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import {
   buildContainPlan, containSelected, containExcluded, containExcludeIds, containExemptedBots,
   _resetPiContainExcludeWarningsForTest, ContainRefused, neverBound, installedBundleIds,
-  ensureContainMountPoints, ensureContainOwnWorldRoot, containOwnWorldRoot, RESERVED_DATA_ENTRIES, RESERVED_DATA_FILES, isReservedDataEntry,
+  ensureContainMountPoints, ensureContainOwnWorldRoot, containOwnWorldRoot, RESERVED_DATA_ENTRIES, RESERVED_DATA_FILES, isReservedDataEntry, ENV_CHAIN_MAX,
 } from "../scripts/pi-bots/pi_contain.mjs";
 import { wrapPiSpawn } from "../scripts/pi-bots/pi_sandbox.mjs";
 import { RESERVED_DATA_NAMES } from "../servers/gateway/compose-guard.js";
@@ -290,14 +290,18 @@ test("C9: the data dir keeps only the DBs, the bot's own project and the keep-li
   const ws = join(d, "projects", "mine", "workspace");
   const { args } = buildContainPlan(base({ dataDir: d, workspaceDir: ws, dataKeep: ["artifacts"] }));
   const masked = (p) => has(args, "--tmpfs", p) || has(args, "--ro-bind", "/dev/null", p);
-  for (const p of ["crow.db.CORRUPT-1", "identity.json", "notes.txt", "backups", "peers", "instance-sync", join("projects", "theirs")]) {
+  for (const p of ["crow.db.CORRUPT-1", "identity.json", "notes.txt", "backups", "peers", "instance-sync", "projects"]) {
     assert.ok(masked(join(d, p)), p + " masked");
   }
-  for (const p of ["crow.db", "crow.db-wal", "tasks.db", "artifacts", join("projects", "mine")]) assert.ok(!masked(join(d, p)), p + " kept");
+  for (const p of ["crow.db", "crow.db-wal", "tasks.db", "artifacts"]) assert.ok(!masked(join(d, p)), p + " kept");
+  // H1: `projects` is masked WHOLESALE (a mount point a bot cannot rename away) and the bot's own
+  // workspace is bound back inside it at its usual path; no per-project mask remains.
+  assert.ok(has(args, "--tmpfs", join(d, "projects")));
+  assert.ok(!masked(join(d, "projects", "theirs")) && !masked(join(d, "projects", "mine")), "no per-project mask");
   const ps = pairs(args);
-  const iMaskTheirs = ps.findIndex((q) => q[0] === "--tmpfs" && q[1] === join(d, "projects", "theirs"));
-  const iWs = ps.findIndex((q) => q[0] === "--bind" && q[1] === ws);
-  assert.ok(iWs > 0 && iMaskTheirs > 0);
+  const iProjects = ps.findIndex((q) => q[0] === "--tmpfs" && q[1] === join(d, "projects"));
+  const iWs = ps.findIndex((q) => q[0] === "--bind" && q[1] === ws && q[2] === ws);
+  assert.ok(iProjects > 0 && iWs > iProjects, "the tmpfs comes first, the workspace is bound inside it");
 });
 
 test("C3: .env files in bound dirs and in the checkout's bundles are masked; a symlinked .env masks its bound target", () => {
@@ -592,7 +596,7 @@ test("B4: every masked data folder is an empty mount remounted READ-ONLY, after 
     dataDir: d, workspaceDir: mine,
     mcpServers: [{ command: "node", cwd: addon, env: { GOOGLE_TOKEN_FILE: token } }],
   }));
-  for (const p of [join(d, "projects", "theirs"), join(d, "backups"), bundle]) {
+  for (const p of [join(d, "projects"), join(d, "backups"), bundle]) {
     assert.ok(has(args, "--tmpfs", p), p + " masked");
     assert.ok(remounts(args, p) >= 0, p + " remounted read-only");
   }
@@ -1539,4 +1543,153 @@ test("a def listing reports/* gets the door block and identity.json masked, neve
   } finally {
     _resetActorKeyForTest();
   }
+});
+
+// H1 (.env masks): a mask is placed by DESTINATION path, so it is only sound when the .env's parent
+// is a mount point. A .env that is a direct child of a bind root is; one nested deeper inside a
+// bot-writable bind is not (the bot renames a plain folder above it, a concurrent spawn's mask
+// lands on a decoy). The plan binds every folder between the root and such a .env as a bind root of
+// its own (a chain of mount roots); read-only binds cannot be renamed in and stay as they were.
+test("H1: nested .env under a writable bind: every folder above it becomes its own bind root, bind before mask", () => {
+  const d = mk(T, "h1env", "data");
+  writeFileSync(join(d, "crow.db"), "");
+  writeFileSync(join(d, ".env"), "S=1"); // direct child of the data root: already a mount point
+  const kept = mk(d, "pm-workspace", "a"); writeFileSync(join(kept, ".env"), "S=1"); writeFileSync(join(d, "pm-workspace", ".env"), "S=1");
+  const { args: a } = buildContainPlan(base({ dataDir: d, dataKeep: ["pm-workspace"] }));
+  const idx = (f, s1, s2) => pairs(a).findIndex((q) => q[0] === f && q[1] === s1 && (s2 === undefined || q[2] === s2));
+  assert.ok(has(a, "--ro-bind", "/dev/null", join(d, ".env")), "the data root's own .env is masked in place");
+  assert.equal(pairs(a).filter((q) => q[0] === "--bind" && q[1] === d).length, 1, "no extra bind for the root");
+  for (const dir of [join(d, "pm-workspace"), kept]) assert.ok(has(a, "--bind", dir), dir + " is a bind root of its own");
+  for (const [dir, env] of [[join(d, "pm-workspace"), join(d, "pm-workspace", ".env")], [kept, join(kept, ".env")]]) {
+    const iB = idx("--bind", dir); const iM = idx("--ro-bind", "/dev/null", env);
+    assert.ok(iB >= 0 && iM > iB, "bind before mask: " + env);
+  }
+  assert.ok(idx("--bind", join(d, "pm-workspace")) < idx("--bind", kept), "parents first");
+  // An unkept folder is masked whole and never walked: nothing is bound for its .env.
+  const none = buildContainPlan(base({ dataDir: d })).args;
+  assert.ok(!has(none, "--bind", kept) && !has(none, "--bind", join(d, "pm-workspace")));
+  // A read-only read path: the nested .env is masked as before, its folders are not bound writable.
+  const rd = mk(T, "h1env", "rd"); mk(rd, "a", "b"); writeFileSync(join(rd, "a", "b", ".env"), "S=1");
+  const ro = buildContainPlan(base({ readPaths: [rd] })).args;
+  assert.ok(has(ro, "--ro-bind", "/dev/null", join(rd, "a", "b", ".env")));
+  assert.ok(!has(ro, "--bind", join(rd, "a")), "a read-only bind's folders are not made writable");
+  // The bot's workspace gets the same chain, and `projects` is the one wholesale mask.
+  const ws = mk(d, "projects", "mine", "workspace"); mk(ws, "x"); writeFileSync(join(ws, "x", ".env"), "S=1");
+  const own = buildContainPlan(base({ dataDir: d, workspaceDir: ws })).args;
+  assert.ok(has(own, "--bind", join(ws, "x")) && has(own, "--ro-bind", "/dev/null", join(ws, "x", ".env")));
+  assert.ok(has(own, "--tmpfs", join(d, "projects")) && has(own, "--bind", ws));
+});
+
+test("H1: 65 packages with .env.example are masked, not chained, and never refuse", () => {
+  const d = mk(T, "h1tpl", "data"); writeFileSync(join(d, "crow.db"), "");
+  for (let i = 0; i < ENV_CHAIN_MAX + 1; i++) { const f = mk(d, "keep", "pkg" + i); writeFileSync(join(f, ".env.example"), ""); }
+  const { args } = buildContainPlan(base({ dataDir: d, dataKeep: ["keep"] }));
+  assert.ok(has(args, "--ro-bind", "/dev/null", join(d, "keep", "pkg7", ".env.example")), "the template is masked");
+  assert.ok(!has(args, "--bind", join(d, "keep", "pkg7")), "and not chained");
+});
+
+test("H1: 65 folders with a real .env: first-level folders masked whole, no refusal, one count-only log line", () => {
+  const d = mk(T, "h1cap", "data"); writeFileSync(join(d, "crow.db"), "");
+  for (let i = 0; i < ENV_CHAIN_MAX + 1; i++) { const f = mk(d, "keep", "d" + i, "x"); writeFileSync(join(f, ".env"), ""); }
+  const e = console.error; const lines = []; console.error = (m) => lines.push(String(m));
+  let r;
+  try { r = buildContainPlan(base({ dataDir: d, dataKeep: ["keep"] })); } finally { console.error = e; }
+  assert.ok(has(r.args, "--tmpfs", join(d, "keep")), "the first-level folder is masked whole");
+  assert.ok(!has(r.args, "--bind", join(d, "keep", "d3")), "nothing under it is chained or masked inside the mask");
+  assert.equal(lines.filter((l) => /\[contain\].*masked whole/.test(l)).length, 1);
+  assert.ok(!lines.join("").includes("d3"), "the log line names a count only");
+});
+
+test("H1: over the cap, a read path nested in a whole-masked folder keeps its .env mask (and after its bind)", () => {
+  const w = mk(T, "h1capnest", "w"); const ro = mk(w, "app", "ro");
+  writeFileSync(join(ro, ".env"), "SECRET=1");
+  for (let i = 0; i < ENV_CHAIN_MAX + 1; i++) { const f = mk(w, "d" + i); writeFileSync(join(f, ".env"), "x"); }
+  const e = console.error; console.error = () => {};
+  let args;
+  try { ({ args } = buildContainPlan(base({ writePaths: [w], readPaths: [ro] }))); } finally { console.error = e; }
+  assert.ok(has(args, "--tmpfs", join(w, "app")), "the over-cap folder is masked whole");
+  assert.ok(has(args, "--ro-bind", "/dev/null", join(ro, ".env")), "the nested read path's .env is still masked");
+  const bindAt = args.findIndex((a, i) => (a === "--ro-bind" || a === "--ro-bind-fd") && args[i + 2] === ro);
+  const maskAt = args.findIndex((a, i) => a === "--ro-bind" && args[i + 1] === "/dev/null" && args[i + 2] === join(ro, ".env"));
+  assert.ok(bindAt >= 0 && maskAt > bindAt, "the mask comes after the nested bind that brings the file back");
+});
+
+test("H1: over the cap, a chain under a writable bind nested directly in another is masked at its topmost folder, never left open", () => {
+  const w = mk(T, "h1capbind", "w"); const inner = mk(w, "inner");
+  for (let i = 0; i < ENV_CHAIN_MAX + 1; i++) { const f = mk(inner, "d" + i); writeFileSync(join(f, ".env"), "x"); }
+  const e = console.error; console.error = () => {};
+  let args;
+  try { ({ args } = buildContainPlan(base({ writePaths: [w, inner] }))); } finally { console.error = e; }
+  assert.ok(!has(args, "--tmpfs", inner), "the nested bind root itself is not masked");
+  for (const i of [0, 7, ENV_CHAIN_MAX]) {
+    const d = join(inner, "d" + i);
+    assert.ok(has(args, "--tmpfs", d) || has(args, "--bind", d), "d" + i + " is masked whole or pinned, never left open");
+  }
+});
+
+test("H1: over the cap below a deeply nested writable bind, the folders between the binds stay pinned", () => {
+  const w = mk(T, "h1capdeep", "w"); const inner = mk(w, "a", "b", "inner");
+  for (let i = 0; i < ENV_CHAIN_MAX + 1; i++) { const f = mk(inner, "d" + i); writeFileSync(join(f, ".env"), "x"); }
+  const e = console.error; console.error = () => {};
+  let args;
+  try { ({ args } = buildContainPlan(base({ writePaths: [w, inner] }))); } finally { console.error = e; }
+  assert.ok(has(args, "--bind", join(w, "a")) && has(args, "--bind", join(w, "a", "b")), "the folders between the two writable binds are pinned");
+  assert.ok(!has(args, "--tmpfs", join(w, "a")), "the folder above the nested bind is not masked (its mount would bring renameable folders back)");
+  assert.ok(has(args, "--tmpfs", join(inner, "d0")) && has(args, "--tmpfs", join(inner, "d" + ENV_CHAIN_MAX)), "over the cap, first-level folders under the INNER bind are masked whole");
+});
+
+test("H1: a folder between binds that sits inside a folder masked whole is not bound back over the mask", () => {
+  const w = mk(T, "h1caphigh", "w"); const inner = mk(w, "a", "b", "inner"); mk(inner, "x");
+  writeFileSync(join(inner, "x", ".env"), "x");
+  mk(w, "a", "q"); writeFileSync(join(w, "a", "q", ".env"), "x");
+  for (let i = 0; i < ENV_CHAIN_MAX + 1; i++) { const f = mk(w, "z" + i); writeFileSync(join(f, ".env"), "x"); }
+  const e = console.error; console.error = () => {};
+  let args;
+  try { ({ args } = buildContainPlan(base({ writePaths: [w, inner] }))); } finally { console.error = e; }
+  assert.ok(has(args, "--tmpfs", join(w, "a")), "the outer bind went over the cap: its first-level folder is masked whole");
+  assert.ok(!has(args, "--bind", join(w, "a", "b")), "a folder between the binds inside that mask is not bound back over it");
+  assert.ok(has(args, "--bind", join(inner, "x")), "the inner bind's own chain is still pinned");
+  assert.ok(has(args, "--ro-bind", "/dev/null", join(w, "a", "q", ".env")) && has(args, "--ro-bind", "/dev/null", join(inner, "x", ".env")));
+});
+
+test("H1: a symlinked .env pins its target and the folders above both; the link's own folder is read-only", () => {
+  const w = mk(T, "h1ln", "data", "keep"); const conf = mk(T, "h1ln", "data", "keep", "conf"); const wk = mk(w, "work");
+  writeFileSync(join(T, "h1ln", "data", "crow.db"), "");
+  writeFileSync(join(conf, "real.env"), "S=1");
+  symlinkSync(join(conf, "real.env"), join(wk, ".env"));
+  const { args } = buildContainPlan(base({ dataDir: join(T, "h1ln", "data"), dataKeep: ["keep"] }));
+  assert.ok(has(args, "--ro-bind", "/dev/null", join(conf, "real.env")), "the target is masked");
+  assert.ok(has(args, "--bind", conf), "the target's folder is a mount root");
+  assert.ok(has(args, "--ro-bind", wk), "the link's folder is a read-only bind root");
+});
+
+test("H1: an ro bind nested in a writable one chains from the writable root down to the ro bind", () => {
+  const rwr = mk(T, "h1nest", "rw"); const mid = mk(rwr, "mid"); const inner = mk(mid, "ro"); mk(inner, "sub");
+  writeFileSync(join(inner, "sub", ".env"), "S=1");
+  const { args } = buildContainPlan(base({ writePaths: [rwr], readPaths: [inner] }));
+  assert.ok(has(args, "--bind", mid), "the folder between the writable root and the ro bind is pinned");
+  assert.ok(has(args, "--ro-bind", "/dev/null", join(inner, "sub", ".env")));
+  assert.ok(!has(args, "--bind", join(inner, "sub")), "nothing is made writable below the ro bind");
+});
+
+test("H1: only a REGULAR .env.example/.env.sample is exempt; a symlink by that name and a regular .env.dist get the full treatment", () => {
+  const d = mk(T, "h1tpl2", "data"); writeFileSync(join(d, "crow.db"), "");
+  const conf = mk(d, "keep", "conf"); writeFileSync(join(conf, "secret"), "S=1");
+  const wk = mk(d, "keep", "work"); symlinkSync(join(conf, "secret"), join(wk, ".env.example"));
+  const reg = mk(d, "keep", "reg"); writeFileSync(join(reg, ".env.example"), ""); writeFileSync(join(reg, ".env.sample"), "");
+  const dist = mk(d, "keep", "dist"); writeFileSync(join(dist, ".env.dist"), "");
+  const { args } = buildContainPlan(base({ dataDir: d, dataKeep: ["keep"] }));
+  assert.ok(has(args, "--ro-bind", "/dev/null", join(conf, "secret")), "the link's target is masked");
+  assert.ok(has(args, "--bind", conf), "and chained");
+  assert.ok(has(args, "--ro-bind", wk), "the link's folder is a read-only bind root");
+  assert.ok(has(args, "--ro-bind", "/dev/null", join(reg, ".env.example")) && !has(args, "--bind", reg), "a regular template is masked, not chained");
+  assert.ok(has(args, "--bind", dist) && has(args, "--ro-bind", "/dev/null", join(dist, ".env.dist")), "a regular .env.dist is chained like a real .env");
+});
+
+test("H1: a writable bind nested in another writable root pins the folders between them too", () => {
+  const W = mk(T, "h1nw", "W"); const inner = mk(W, "a", "b", "inner"); mk(inner, "x");
+  writeFileSync(join(inner, "x", ".env"), "S=1");
+  const { args } = buildContainPlan(base({ writePaths: [W, inner] }));
+  for (const f of [join(W, "a"), join(W, "a", "b"), join(inner, "x")]) assert.ok(has(args, "--bind", f), f + " is a bind root");
+  assert.ok(has(args, "--ro-bind", "/dev/null", join(inner, "x", ".env")));
 });

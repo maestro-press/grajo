@@ -259,6 +259,13 @@ export const NET_RELAY_MOUNT = "/run/crow-net";
 export const ENV_NAME_RE = /^\.env(\..*)?$/;
 export const ENV_SCAN_SKIP = new Set(["node_modules", ".git", ".venv", "__pycache__"]);
 export const ENV_SCAN_MAX_DEPTH = 16;
+/** Most directories one bind root will have bound as mount roots to make nested .env masks structural;
+ *  past it, the first-level folders holding a real .env are masked whole instead (never a refusal). */
+export const ENV_CHAIN_MAX = 64;
+/** Template names: a REGULAR FILE with one of these names is masked like any .env but never chained or
+ *  counted (a misplaced mask on a template exposes only a template; a monorepo's many `.env.example` must
+ *  not cost mounts). A symlink never qualifies, and `.env.dist`/`.env.template` often hold real values. */
+export const ENV_TEMPLATE_RE = /^\.env\.(example|sample)$/;
 export const ENV_SCAN_MAX_ENTRIES = 50000;
 
 /** Data-dir entries a contained bot keeps: the DB files and their journals. */
@@ -274,7 +281,7 @@ export const BUNDLE_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
  * Top-level entries of the instance's data dir that belong to the INSTANCE, never to a
  * bundle. The data-dir mask below handles them BY NAME: the DB files are kept (SQLite
  * writes -wal/-shm/-journal beside them), `projects`
- * is re-exposed down to the bot's own workspace, and the rest — peers, instance-sync,
+ * is masked whole with only the bot's own workspace bound back inside it, and the rest — peers, instance-sync,
  * backups, pi-bots, secrets, env, history, previews, … — are masked wholesale. So no
  * bundle may claim one: a uv bind at <data>/<such a name>/… would sit OVER that mask and
  * re-open instance state (another project's files, a peer's feed, a backup, the
@@ -823,10 +830,32 @@ function tailBelow(base, p) {
  * `keep` is an optional Set of exact file paths (lexical or resolved) that stay
  * readable: an add-on's own `bundles/<id>/.env`, and nothing at all for a bot.
  */
-export function scanEnvMasks({ ro, rw, masks, policyDirs = new Set(), maxDepth = ENV_SCAN_MAX_DEPTH, maxEntries = ENV_SCAN_MAX_ENTRIES, exists = existsSync, home = null, refused = [], keep = null } = {}) {
+export function scanEnvMasks({ ro, rw, masks, policyDirs = new Set(), maxDepth = ENV_SCAN_MAX_DEPTH, maxEntries = ENV_SCAN_MAX_ENTRIES, exists = existsSync, home = null, refused = [], keep = null, chainParents = false } = {}) {
+  // H1 (a mask placed by DESTINATION path is only sound when the .env's parent is a mount point):
+  // a .env that is a DIRECT child of a bind root is safe in a running sandbox (its mask is a
+  // mount point, and the root itself cannot be renamed). One nested deeper under a bot-WRITABLE
+  // bind has plain directories above it a bot can rename (`mv a a2` moves the mounts along) while
+  // a concurrent spawn's mask lands on a planted decoy and the real file is readable at the new
+  // name. Under a READ-ONLY bind nothing can be renamed. With `chainParents` (the contain plan;
+  // add-on walls leave it off) every directory between the nearest enclosing WRITABLE bind root
+  // and such a .env (or, for a read-only bind nested in a writable one, and the ro bind's own
+  // position) is bound as a bind root of its own: a chain of mount roots, none renameable, the
+  // .env a direct child of the last one. Template names are masked but never chained.
+  // A SYMLINKED .env: bwrap follows a link when it mounts on it, so a mask "on the link" is a mask
+  // on the target and the link stays removable. So the TARGET is pinned the same way (masked, and
+  // chained when it sits under a writable root), and the folder that holds the link is bound
+  // READ-ONLY (so the link cannot be rm'd or swapped) when that folder is not itself a bind root.
+  // The cap counts per INNERMOST writable bind root (the only place a bot can create folders): past
+  // ENV_CHAIN_MAX chained folders under one, nothing is refused; its first-level folders holding a
+  // real .env are masked WHOLE. The folders between nested binds are always pinned (the operator's
+  // binds fix them, so they cannot run up the count), unless they sit inside a folder masked whole.
+  const pending = []; // [path, kind, link-folder|null] masks, filtered against whole-masked folders at the end
+  const wants = new Map(); // innermost writable root -> Map(low chain folder -> first-level folder under it)
+  const linkFolders = []; // folders that hold a symlinked .env
   const maskedDirs = new Set(masks.filter(([, k]) => k === "dir").map(([d]) => d));
   const boundDirs = () => [...ro.keys(), ...rw.keys()].filter((p) => { try { return statSync(p).isDirectory(); } catch { return false; } });
   const isBound = (p) => boundDirs().some((d) => under(p, d)) || ro.has(p) || rw.has(p);
+  const allFound = [];
   for (const d of boundDirs()) {
     const found = [];
     let seen = 0, capped = false;
@@ -859,12 +888,113 @@ export function scanEnvMasks({ ro, rw, masks, policyDirs = new Set(), maxDepth =
       }
       throw new ContainRefused(d + " is too large to scan for .env files (cap " + maxEntries + " entries / depth " + maxDepth + "); refusing to bind it unscanned");
     }
-    for (const [kind, p] of found) {
+    for (const f of found) allFound.push(f);
+  }
+  if (!chainParents) {
+    for (const [kind, p] of allFound) {
       if (keep && (keep.has(p) || keep.has(real(p, exists, home)))) continue;
       if (kind === "file") masks.push([p, "file"]);
       else { const t = real(p, exists, home); if (t && isBound(t)) masks.push([t, "file"]); }
     }
+    return;
   }
+  const rwSnap = [...rw.keys()];
+  const allSnap = [...ro.keys(), ...rw.keys()];
+  const deepest = (p, keys) => { let r = null; for (const k of keys) if (under(p, k) && (!r || k.length > r.length)) r = k; return r; };
+  // The folders to pin for `p`, split at the INNERMOST writable bind root above it (W):
+  //   low  — the folders between W and p (or between W and a read-only bind holding p). These
+  //          count toward W's cap: a bot can create any number of them.
+  //   high — the folders between W and every writable bind enclosing it. These are fixed by the
+  //          operator's binds (a bot cannot add a bind), so they are ALWAYS pinned, whatever the
+  //          cap does below W: an unpinned one could be renamed with W inside it.
+  // A folder is pinned only below a writable bind (inside a read-only bind nothing can be renamed,
+  // and a chain folder there would turn read-only content writable). `first` is the folder masked
+  // whole when W goes over the cap: the first-level folder under W on p's path.
+  const chainFor = (p) => {
+    const x = deepest(p, allSnap);
+    if (!x) return null;
+    const low = [], high = [];
+    let inner = null;
+    if (rwSnap.includes(x)) {
+      inner = x;
+      for (let c = dirname(p); c !== x && under(c, x); c = dirname(c)) low.push(c);
+    }
+    for (let cur = x; ;) {
+      const next = deepest(cur, allSnap.filter((k) => k !== cur));
+      if (!next) break;
+      if (rwSnap.includes(next)) {
+        const seg = [];
+        for (let c = dirname(cur); c !== next && under(c, next); c = dirname(c)) seg.push(c);
+        if (inner === null) { inner = next; low.push(...seg); } else high.push(...seg);
+      }
+      cur = next;
+    }
+    if (!inner || (!low.length && !high.length)) return null;
+    return { root: inner, low, high, first: join(inner, p.slice(inner.length + 1).split(sep)[0]) };
+  };
+  const alwaysPin = new Set();
+  const want = (p) => {
+    const c = chainFor(p);
+    if (!c) return null;
+    if (!wants.has(c.root)) wants.set(c.root, new Map());
+    for (const f of c.low) wants.get(c.root).set(f, c.first);
+    for (const f of c.high) alwaysPin.add(f);
+    return c;
+  };
+  for (const [kind, p] of allFound) {
+    if (keep && (keep.has(p) || keep.has(real(p, exists, home)))) continue;
+    // Only a regular file by that name is exempt; a symlink named like a template gets the full link treatment.
+    if (kind === "file") {
+      pending.push([p, "file"]);
+      if (!ENV_TEMPLATE_RE.test(basename(p))) want(p);
+    } else {
+      const t = real(p, exists, home);
+      if (t && isBound(t)) {
+        pending.push([t, "file"]);
+        want(t);
+        const c = want(p);
+        if (c && dirname(p) !== c.root) linkFolders.push(dirname(p));
+      }
+    }
+  }
+  let wholeCount = 0;
+  const pinned = new Set();
+  for (const [, folders] of wants) {
+    if (folders.size > ENV_CHAIN_MAX) {
+      for (const first of new Set(folders.values())) {
+        // A first-level folder that is itself a bind root is a read-only bind directly under W:
+        // nothing between it and W can be renamed, so there is nothing to mask.
+        if (rw.has(first) || ro.has(first)) continue;
+        masks.push([first, "dir"]); wholeCount++;
+      }
+      continue;
+    }
+    for (const f of folders.keys()) pinned.add(f);
+  }
+  for (const f of alwaysPin) pinned.add(f);
+  // A folder is pinned only where the NEAREST mount above it is a bind. Where it is a directory
+  // mask (`projects`, a bundle folder, a folder masked whole over the cap) or the folder is itself
+  // masked, binding the host folder there would bring it back over the mask: the other project
+  // beside a shared entry, read-write. Under a mask the folder is already safe: bwrap creates it
+  // in the tmpfs, and the tmpfs is remounted read-only last. A mask and a bind at the same path
+  // count as the mask (the mask is mounted after the bind).
+  const dirMasks = new Set(masks.filter(([, k]) => k === "dir").map(([d]) => d));
+  const underMask = (f) => {
+    if (dirMasks.has(f)) return true;
+    let r = null;
+    for (const k of [...dirMasks, ...allSnap]) if (k !== f && under(f, k) && (!r || k.length > r.length)) r = k;
+    return r !== null && dirMasks.has(r);
+  };
+  for (const f of [...pinned]) if (underMask(f)) pinned.delete(f);
+  for (const f of pinned) if (!rw.has(f) && !ro.has(f)) rw.set(f, f);
+  const readOnlyLinkFolders = linkFolders.filter((lf) => pinned.has(lf) && !rwSnap.includes(lf));
+  for (const f of readOnlyLinkFolders) { rw.delete(f); ro.set(f, f); }
+  if (wholeCount) console.error("[contain] " + wholeCount + " folder(s) holding a nested .env are masked whole (more than " + ENV_CHAIN_MAX + " would need their own mounts under one writable folder)");
+  // Every pending mask is kept, even inside a folder that is masked whole: another bind root nested
+  // in that folder (a read path under a write path) is mounted AFTER the folder's tmpfs and brings
+  // its files back, so dropping the masks under it would unmask them. A mask inside the tmpfs costs
+  // nothing where nothing is mounted (the remount-ro comes last).
+  for (const [path, kind] of pending) masks.push([path, kind]);
 }
 
 /**
@@ -1254,26 +1384,22 @@ export function buildContainPlan(o) {
       // for it back — and a keep-list naming it (`CROW_PI_CONTAIN_DATA_KEEP`)
       // cannot either.
       const keep = new Set((o.dataKeep || []).filter((n) => !isIdentityFileName(n)));
-      const wsReal = o.workspaceDir ? real(o.workspaceDir, exists) : null;
       let entries = [];
       try { entries = readdirSync(rd); } catch {}
       const present = new Set(entries);
       for (const e of entries) {
         const p = join(rd, e);
         // The instance's own state, by name (RESERVED_DATA_ENTRIES): the DB files
-        // and their journals stay (SQLite writes beside them), `projects` is
-        // re-exposed down to the bot's own workspace, and every other reserved
+        // and their journals stay (SQLite writes beside them), `projects` is masked
+        // WHOLESALE (a direct child of the bind root, so in every running sandbox it
+        // is a mount point and cannot be renamed away; the bot's own workspace is
+        // bound back inside it by an fd bind below — a mask nested below a plain
+        // directory of a writable bind could be redirected, H1), and every other reserved
         // entry — identity.json, peers, instance-sync, backups, pi-bots, secrets,
         // env, history, previews, … — is masked with the rest. Nothing reserved is
         // ever a bundle's data folder (isReservedDataEntry gates bundle ids too).
         if (isReservedDataEntry(e)) {
           if (DB_FILE_RE.test(e) || keep.has(e)) continue;
-          if (e === "projects" && wsReal && under(wsReal, p)) {
-            let segs = [];
-            try { segs = readdirSync(p); } catch {}
-            for (const g of segs) { const q = join(p, g); if (!under(wsReal, q)) maskPath(q); }
-            continue;
-          }
           maskPath(p);
           continue;
         }
@@ -1395,7 +1521,7 @@ export function buildContainPlan(o) {
     ro, rw, masks, policyDirs,
     maxDepth: o.envScanMaxDepth ?? ENV_SCAN_MAX_DEPTH,
     maxEntries: o.envScanMaxEntries ?? ENV_SCAN_MAX_ENTRIES,
-    exists, home, refused,
+    exists, home, refused, chainParents: true,
   });
 
   // binds, parents first (sorted by path), rw and ro interleaved by path
