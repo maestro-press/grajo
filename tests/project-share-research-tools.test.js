@@ -346,17 +346,26 @@ test("crow_workspace_dir follows the share level and crow_project_get is home-on
 
 test("member tools are refused on a project shared read_write: a share buys no member list", async () => {
   const bot = await botClient(BOT_RW);
-  for (const [name, args] of [
-    ["crow_list_members", { project_id: B }],
-    ["crow_add_member", { project_id: B, role: "viewer" }],
-  ]) {
-    const refused = await refuses(await call(bot, name, args));
-    assert.match(refused, /own project only/, `${name}: ${refused}`);
-    assert.ok(!refused.includes("Shared Bravo"), refused);
-  }
-  // The same tools work on the bot's own project.
+  const listed = await refuses(await call(bot, "crow_list_members", { project_id: B }));
+  assert.match(listed, /own project only/, listed);
+  assert.ok(!listed.includes("Shared Bravo"), listed);
+  // Reading the member list works on the bot's own project.
   const own = await call(bot, "crow_list_members", { project_id: A });
   assert.ok(!own.isError, text(own));
+});
+
+test("member writes are the operator's alone: a bot may not add or remove a member, not even at home", async () => {
+  const bot = await botClient(BOT_RW);
+  for (const project of [A, B]) {
+    for (const [name, args] of [
+      ["crow_add_member", { project_id: project, contact_id: 1, role: "viewer" }],
+      ["crow_remove_member", { project_id: project, contact_id: 1 }],
+    ]) {
+      const refused = await refuses(await call(bot, name, args));
+      assert.match(refused, /operator only/, `${name} on #${project}: ${refused}`);
+      assert.ok(!refused.includes("Shared Bravo") && !refused.includes("Home Alpha"), refused);
+    }
+  }
 });
 
 // --- listings -------------------------------------------------------------------------------

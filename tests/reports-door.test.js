@@ -723,3 +723,24 @@ test("a bot cannot approve, so an untouched proposal is never sent to", async ()
   assert.equal(stored.state, "proposed");
   assert.equal(stored.approval_seal, null);
 });
+test("reportsMountAuth: a disabled or unverifiable bot is refused 403 at admission", async () => {
+  const mod = await import("../servers/gateway/reports/mcp.js");
+  for (const read of [{ ok: true, row: { enabled: 0 } }, { ok: false, reason: "mac" }, { ok: true, row: { enabled: 1 } }]) {
+    const seen = [];
+    const res = { status(code) { seen.push(code); return res; }, json() { return res; } };
+    let nexted = false;
+    const guard = mod.reportsMountAuth({
+      createDb: () => ({ close() {} }),
+      validateToken: async () => true,
+      verifyActor: () => true,
+      readDef: async () => read,
+    });
+    const req = { headers: {
+      authorization: "Bearer t", "x-crow-actor-kind": mod.REPORTS_ACTOR_KIND,
+      "x-crow-actor-id": "b", "x-crow-actor-sig": "s",
+    } };
+    await guard(req, res, () => { nexted = true; });
+    if (read.ok && read.row.enabled === 1) assert.equal(nexted, true, "an enabled verified bot is admitted");
+    else { assert.deepEqual(seen, [403]); assert.equal(nexted, false); }
+  }
+});

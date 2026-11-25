@@ -44,6 +44,10 @@ const { createDbClient } = await import("../servers/db.js");
 const { SessionManager } = await import("../servers/gateway/session-manager.js");
 const { mountMcpServer } = await import("../servers/gateway/routes/mcp.js");
 const { localTokenAuthMiddleware, generateLocalToken, generateBoardToken, SHARING_BOT_TOKEN } = await import("../servers/gateway/local-token.js");
+const botDefStore = await import("../servers/shared/bot-def-store.js");
+const botDefMac = await import("../servers/shared/bot-def-mac.js");
+const tokenMac = await import("../servers/shared/token-mac.js");
+const settingsRegistry = await import("../servers/gateway/dashboard/settings/registry.js");
 const door = await import("../servers/gateway/sharing-bot-mcp.js");
 const acl = await import("../servers/gateway/sharing-bot/acl.js");
 const store = await import("../servers/gateway/messages/drafts-store.js");
@@ -133,10 +137,15 @@ async function setup() {
     args: [PEER.crowId, PEER.name, PEER.pubkey, "e".repeat(64)],
   });
   const contactId = Number(contact.lastInsertRowid);
-  await db.execute({
-    sql: "INSERT INTO pi_bot_defs (bot_id, display_name, definition, enabled) VALUES (?, 'Hank', '{}', 1)",
-    args: [BOT],
+  // Seed the bot the way real code does: through the bot-def store's writer (a sealed row), then mark
+  // the bot:def era converted, so the door's readVerifiedBotDef admits an enabled, verified bot.
+  const sealed = await botDefStore.writeBotDef(db, {
+    bot_id: BOT, display_name: "Hank", enabled: 1, mode: "insert",
+    definition: { system_prompt: "you help", models: { default: "provider/model-a" }, tools: { crow_mcp: ["crow-sharing"] } },
   });
+  assert.equal(sealed.rowsAffected, 1);
+  await tokenMac.markConverted(botDefMac.BOT_DEF_FAMILY, { writeSetting: (k, v, o) => settingsRegistry.writeSetting(db, k, v, o) });
+  assert.equal((await botDefStore.readVerifiedBotDef(db, BOT)).ok, true, "the bot verifies");
   const written = acl.setSharingBotAclEntry(process.env.CROW_HOME, BOT, {
     contacts: [{ crow_id: PEER.crowId, secp256k1_pubkey: PEER.pubkey }],
     groups: [],

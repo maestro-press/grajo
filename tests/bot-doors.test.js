@@ -36,6 +36,10 @@ test("path spellings", () => {
     "/reports/mcp",
     "/reports/mcp?x=1",
     "/reports/mcp/",
+    "/memory-bot/mcp",
+    "/memory-bot/mcp?x=1",
+    "/projects-bot/mcp",
+    "/projects-bot/mcp/",
     "/mail-draft/mcp",
     "/mail-draft/mcp?x=1",
     "/peer-relay/i/m/mcp",
@@ -73,6 +77,11 @@ test("path spellings", () => {
     "/mail-draft/mcpx",
     "/mail-draft",
     "/memory/mcp",
+    "/projects/mcp",
+    "/memory-bot/mcpx",
+    "/memory-bot",
+    "/projects-bot/mcpx",
+    "/projects-bot/sse",
     "/dashboard",
     // any percent-escape at all, not only the traversal ones
     "/llm/v1/x%41",
@@ -87,7 +96,7 @@ test("path spellings", () => {
 
 test("the door list is exactly the doors the operator's ruling fixed, frozen", () => {
   assert.deepEqual([...BOT_DOOR_PREFIXES],
-    ["/llm/v1/", "/llm/p/", "/llm/c/", "/board/mcp", "/phone/mcp", "/artifacts/mcp", "/artifacts/upload/", "/secrets/mcp", "/sharing-bot/mcp", "/reports/mcp", "/mail-draft/mcp", "/peer-relay/"]);
+    ["/llm/v1/", "/llm/p/", "/llm/c/", "/board/mcp", "/phone/mcp", "/artifacts/mcp", "/artifacts/upload/", "/secrets/mcp", "/sharing-bot/mcp", "/reports/mcp", "/memory-bot/mcp", "/projects-bot/mcp", "/mail-draft/mcp", "/peer-relay/"]);
   assert.equal(Object.isFrozen(BOT_DOOR_PREFIXES), true);
   assert.equal(RELAY_SOURCE_V4, "127.0.77.1");
 });

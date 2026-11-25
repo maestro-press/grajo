@@ -74,7 +74,7 @@ import {
   TokenMacKeyError, ensureKey, legacyAlarm, macFromLegacy, markConverted, noteEraEvidence, tokenMacKeyPath,
 } from "../../shared/token-mac.js";
 import {
-  MAIL_HOOK_TOKEN, REPORTS_TOKEN, SATELLITE_TOOLS_TOKEN, SECRETS_TOKEN, SERVICES_TOKEN, SHARING_BOT_TOKEN, rotateLlmCloudToken,
+  MAIL_HOOK_TOKEN, MEMORY_BOT_TOKEN, PROJECTS_BOT_TOKEN, REPORTS_TOKEN, SATELLITE_TOOLS_TOKEN, SECRETS_TOKEN, SERVICES_TOKEN, SHARING_BOT_TOKEN, rotateLlmCloudToken,
 } from "../local-token.js";
 import { ensureSecretsDir } from "../../shared/peer-credentials.js";
 import { writeSetting } from "../dashboard/settings/registry.js";
@@ -110,6 +110,8 @@ export const BOOT_ROTATORS = Object.freeze({
   mcp_secrets_token_hash: (db) => SECRETS_TOKEN.rotate(db),
   mcp_sharing_bot_token_hash: (db) => SHARING_BOT_TOKEN.rotate(db),
   mcp_reports_token_hash: (db) => REPORTS_TOKEN.rotate(db),
+  mcp_memory_bot_token_hash: (db) => MEMORY_BOT_TOKEN.rotate(db),
+  mcp_projects_bot_token_hash: (db) => PROJECTS_BOT_TOKEN.rotate(db),
   mcp_mail_hook_token_hash: (db) => MAIL_HOOK_TOKEN.rotate(db),
 });
 

@@ -42,7 +42,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { botsDbPath } from "./instance-paths.mjs";
 import { mintRemoteBlocks } from "./remote-blocks.mjs";
-import { crowServerCatalog, instanceBinding, rebindBlock, SECRETS_SERVER, addonKeychainNeeds, manifestNeeds, SHARED_STORAGE_NEED, withoutKeychainValues, isBotExcludedServer, isSharingDoorBlock } from "./crow-server-catalog.mjs";
+import { crowServerCatalog, instanceBinding, rebindBlock, SECRETS_SERVER, addonKeychainNeeds, manifestNeeds, SHARED_STORAGE_NEED, withoutKeychainValues, isBotExcludedServer, isSharingDoorBlock, coreDoorsWanted } from "./crow-server-catalog.mjs";
 // The reviewed, code-held storage-consumer table (STORAGE_ENV_CONSUMERS): a bundle manifest's
 // `needs` only ASKS — the grant also needs the id on this list, so a store add-on can never
 // take this instance's storage credentials by declaring a need in its (operator-writable)
@@ -954,8 +954,14 @@ export function writeBotMcp(def, opts = {}) {
   // the headers only with the X-Crow-Actor-Sig the catalog adds when this
   // process holds the actor key; anything else on the board token resolves
   // to an unattributed bot (never 'session').
-  const { servers: catalog, unconfigured, needsKeys: catalogNeedsKeys, needsSharedStorage: catalogSharedStorage, sharedStorageUnreviewed: catalogStorageUnreviewed } = crowServerCatalog(crowHome, {
+  // Core bot doors (design D2): the instance flag CROW_BOT_CORE_DOORS AND the def's own
+  // `core_doors: true` make the catalog emit crow-memory / crow-projects as HTTP door blocks
+  // (/memory-bot/mcp, /projects-bot/mcp) instead of stdio children. Either half off: exactly
+  // today's stdio blocks. `opts.env` is the test seam for the flag.
+  const wantDoors = coreDoorsWanted(def, opts.env || process.env);
+  const { servers: catalog, unconfigured, needsKeys: catalogNeedsKeys, needsSharedStorage: catalogSharedStorage, sharedStorageUnreviewed: catalogStorageUnreviewed, coreDoors } = crowServerCatalog(crowHome, {
     binding, botId: opts.botId, jobId: opts.jobId, threadId: opts.threadId, gatewayType: opts.gatewayType,
+    coreDoors: wantDoors,
   });
   const built = buildBotMcp(def, canonical, {
     extraServers: extra.servers, catalog, unconfigured, binding, crowHome,
@@ -963,6 +969,13 @@ export function writeBotMcp(def, opts = {}) {
     interactive: opts.interactive === true,
     actor: actorOf(opts) || undefined,
   });
+  // A requested door that could not be minted kept its stdio block: say so, only for a server
+  // this bot actually has active (a def that never selected crow-memory needs no line about it).
+  if (coreDoors && coreDoors.requested) {
+    for (const [name, reason] of Object.entries(coreDoors.fellBack || {})) {
+      if (built.servers.includes(name)) built.warnings.push(`server '${name}' runs as a stdio child, not through its core door: ${reason}`);
+    }
+  }
   // F4a L2b: merge cross-instance forward-proxy blocks when the caller has
   // confirmed feature_flags.remote_invocation is on (the DB read is done by the
   // caller — bridge/panel/CLI — since this module is DB-agnostic). Default
@@ -1233,6 +1246,9 @@ export function writeBotMcp(def, opts = {}) {
     rebound: built.rebound,
     disabled: built.disabled,
     remoteWarnings,
+    // Core bot doors (D2): which of crow-memory / crow-projects the catalog served as door blocks
+    // this build, and why any requested door kept its stdio block. null when not requested.
+    coreDoors: coreDoors && coreDoors.requested ? coreDoors : null,
   };
 }
 

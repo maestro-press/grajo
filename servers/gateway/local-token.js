@@ -670,6 +670,19 @@ const SHARING_BOT_PATH_RE = /^\/sharing-bot\/(?:mcp|sse|messages)$/;
 export const REPORTS_TOKEN = pathScopedToken({ name: "reports", hashKey: "mcp_reports_token_hash", createdKey: "mcp_reports_token_created" });
 const REPORTS_PATH_RE = /^\/reports\/(?:mcp|sse|messages)$/;
 
+// Core bot doors (design D2): the bots' tokens for the narrow /memory-bot/(mcp|sse|messages) and
+// /projects-bot/(mcp|sse|messages) mounts ONLY (servers/gateway/core-bot-doors.js), one family each,
+// so neither token opens the other door. Same family shape as the sharing-bot and reports tokens:
+// <crowHome>/secrets/<name>-token, 0600 in the 0700 dir the pi sandbox masks, rotated at every boot
+// (a bot's config is rebuilt every turn). On its mount a token proves only "a bot's config", never
+// who: the mount guard also requires a signed `memory` / `projects` actor and a VERIFIED bot
+// definition that opted in, so a token alone reads and writes nothing. The raw values are read by
+// the bot catalog (scripts/pi-bots/crow-server-catalog.mjs) when it mints the door blocks.
+export const MEMORY_BOT_TOKEN = pathScopedToken({ name: "memory-bot", hashKey: "mcp_memory_bot_token_hash", createdKey: "mcp_memory_bot_token_created" });
+const MEMORY_BOT_PATH_RE = /^\/memory-bot\/(?:mcp|sse|messages)$/;
+export const PROJECTS_BOT_TOKEN = pathScopedToken({ name: "projects-bot", hashKey: "mcp_projects_bot_token_hash", createdKey: "mcp_projects_bot_token_created" });
+const PROJECTS_BOT_PATH_RE = /^\/projects-bot\/(?:mcp|sse|messages)$/;
+
 // Mail sync hook (Crow Mail, CLI add): the token the terminal's `crow mail add` presents to the
 // running gateway so its sync supervisor starts the account it just stored, instead of waiting for a
 // restart. Raw at <crowHome>/secrets/mail-hook-token (0600) in the 0700 secrets dir the pi sandbox
@@ -787,6 +800,16 @@ export function localTokenAuthMiddleware(db) {
       // this branch is the transport-level half, not the decision.
       if (!req.localTokenAuth && REPORTS_PATH_RE.test(req.path) && await REPORTS_TOKEN.validate(db, token)) {
         req.localTokenAuth = { token: "local-mcp", scope: "reports" };
+      }
+      // The core bot doors' tokens (design D2): one path-scoped family per door, so each
+      // authenticates on its own /memory-bot or /projects-bot transport paths and nowhere else. The
+      // mount's own guard (servers/gateway/core-bot-doors.js) re-validates it AND requires a signed
+      // actor of the door's kind plus a verified bot definition, so this is the transport half only.
+      if (!req.localTokenAuth && MEMORY_BOT_PATH_RE.test(req.path) && await MEMORY_BOT_TOKEN.validate(db, token)) {
+        req.localTokenAuth = { token: "local-mcp", scope: "memory-bot" };
+      }
+      if (!req.localTokenAuth && PROJECTS_BOT_PATH_RE.test(req.path) && await PROJECTS_BOT_TOKEN.validate(db, token)) {
+        req.localTokenAuth = { token: "local-mcp", scope: "projects-bot" };
       }
     } catch (err) {
       // Treat a DB/read error as non-fatal: log and fall through to the other

@@ -16,7 +16,7 @@ import { applyLocalTokenAuth } from "../local-token.js";
 import { verifyRemoteActor, noteRemoteActorResult } from "../../shared/remote-actor.js";
 import { defaultPairKey } from "../../shared/sync-pair-binding.js";
 import { getOrCreateLocalInstanceId } from "../instance-registry.js";
-import { callerContext } from "../caller-context.js";
+import { withCallerContext } from "../caller-context.js";
 
 /**
  * The caller context every handler on this mount runs inside (spec §9.2). Read back by
@@ -80,6 +80,17 @@ function sessionOwner(req) {
 }
 
 /**
+ * The session `id` as THIS request may use it: one opened by a different owner is invisible (same
+ * answer as an unknown id). Enforced here, on the exact id each handler uses, so a guard that read a
+ * different id source can never be steered onto another caller's session. Owner-less sessions pass.
+ */
+function visibleSession(sessions, id, req) {
+  if (!id || !sessions.has(id)) return undefined;
+  const session = sessions.get(id);
+  return session.owner && session.owner !== sessionOwner(req) ? undefined : session;
+}
+
+/**
  * Item 46 PR-B: the remote actor a paired peer's GATEWAY signed for this tools/call, verified against the
  * pair key of the bearer-authenticated peer (servers/shared/remote-actor.js). Returns the record for
  * req.auth.extra.remoteActor, or null. Every outcome is handed to noteRemoteActorResult (its rate-limited
@@ -115,8 +126,8 @@ export function createMcpHandler(sessions, createServer, serverName, { resumable
   const postHandler = async (req, res) => {
     const sessionId = req.headers["mcp-session-id"];
     try {
-      if (sessionId && sessions.has(sessionId)) {
-        const session = sessions.get(sessionId);
+      const session = visibleSession(sessions, sessionId, req);
+      if (session) {
         await session.transport.handleRequest(req, res, req.body);
       } else if (!sessionId && isInitializeRequest(req.body)) {
         // resumable: false keeps no event store (nothing replayable, no result
@@ -162,21 +173,21 @@ export function createMcpHandler(sessions, createServer, serverName, { resumable
 
   const getHandler = async (req, res) => {
     const sessionId = req.headers["mcp-session-id"];
-    if (!sessionId || !sessions.has(sessionId)) {
+    const session = visibleSession(sessions, sessionId, req);
+    if (!session) {
       res.status(400).send("Invalid or missing session ID");
       return;
     }
-    const session = sessions.get(sessionId);
     await session.transport.handleRequest(req, res);
   };
 
   const deleteHandler = async (req, res) => {
     const sessionId = req.headers["mcp-session-id"];
-    if (!sessionId || !sessions.has(sessionId)) {
+    const session = visibleSession(sessions, sessionId, req);
+    if (!session) {
       res.status(400).send("Invalid or missing session ID");
       return;
     }
-    const session = sessions.get(sessionId);
     await session.transport.handleRequest(req, res);
   };
 
@@ -213,7 +224,8 @@ function createSseHandler(sessions, createServer, messagesPath, serverName) {
 
   const messagesHandler = async (req, res) => {
     const sessionId = req.query.sessionId;
-    if (!sessionId || !sessions.has(sessionId)) {
+    const session = visibleSession(sessions, sessionId, req);
+    if (!session) {
       res.status(400).send("Invalid or missing sessionId query parameter");
       return;
     }
@@ -223,7 +235,6 @@ function createSseHandler(sessions, createServer, messagesPath, serverName) {
       if (toolName) recordToolCall(sessionId, toolName);
     }
     try {
-      const session = sessions.get(sessionId);
       await session.transport.handlePostMessage(req, res, req.body);
     } catch (error) {
       console.error("Error handling SSE message:", error);
@@ -245,8 +256,12 @@ function createSseHandler(sessions, createServer, messagesPath, serverName) {
  * @param {import("../session-manager.js").SessionManager} sessionManager
  * @param {Function|null} authMiddleware - Optional auth middleware
  * @param {Function} [peerGate] - Optional default-deny peer-exposure gate: async (prefix, req, res) => boolean. Returns false (and writes its own JSON-RPC error) to reject a peer-instance call to a non-exposed capability.
+ * @param {{callerFor?: (req: object) => object}} [opts] - `callerFor` replaces the default caller
+ *   context for this mount (a bot door: servers/gateway/core-bot-doors.js, whose guard verified the
+ *   bot before this mount runs). A caller with a `botId` also opens the version-history write
+ *   context (withCallerContext), so a write that bot's tool call causes is attributed to it.
  */
-export function mountMcpServer(router, prefix, createServer, sessionManager, authMiddleware, peerGate) {
+export function mountMcpServer(router, prefix, createServer, sessionManager, authMiddleware, peerGate, opts = {}) {
   const serverName = prefix.replace("/", "");
   const streamableSessions = sessionManager.getStore(serverName, "streamable");
   const sseSessions = sessionManager.getStore(serverName, "sse");
@@ -259,7 +274,8 @@ export function mountMcpServer(router, prefix, createServer, sessionManager, aut
   const messagesPath = `${prefix}/messages`;
   // Every handler of this mount runs inside the caller context (see callerFor). ALS propagates
   // through the SDK's own dispatch, so a tool handler sees the store its request set.
-  const withCaller = (handler) => (req, res, next) => callerContext.run(callerFor(req, authMiddleware), () => handler(req, res, next));
+  const callerOf = typeof opts?.callerFor === "function" ? opts.callerFor : (req) => callerFor(req, authMiddleware);
+  const withCaller = (handler) => (req, res, next) => withCallerContext(callerOf(req), () => handler(req, res, next));
 
   // Tool call tracking middleware for Streamable HTTP
   const toolTrackMiddleware = (req, res, next) => {

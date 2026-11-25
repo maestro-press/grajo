@@ -104,3 +104,24 @@ test("the guard the mount installs refuses an unsigned request before any handle
   assert.deepEqual(seen, [401]);
   assert.equal(nexted, false, "nothing downstream ran");
 });
+test("sharingBotMountAuth: a disabled or unverifiable bot is refused 403 at admission", async () => {
+  const mod = await import("../servers/gateway/sharing-bot-mcp.js");
+  for (const read of [{ ok: true, row: { enabled: 0 } }, { ok: false, reason: "mac" }, { ok: true, row: { enabled: 1 } }]) {
+    const seen = [];
+    const res = { status(code) { seen.push(code); return res; }, json() { return res; } };
+    let nexted = false;
+    const guard = mod.sharingBotMountAuth({
+      createDb: () => ({ close() {} }),
+      validateToken: async () => true,
+      verifyActor: () => true,
+      readDef: async () => read,
+    });
+    const req = { headers: {
+      authorization: "Bearer t", "x-crow-actor-kind": mod.SHARING_BOT_ACTOR_KIND,
+      "x-crow-actor-id": "b", "x-crow-actor-sig": "s",
+    } };
+    await guard(req, res, () => { nexted = true; });
+    if (read.ok && read.row.enabled === 1) assert.equal(nexted, true, "an enabled verified bot is admitted");
+    else { assert.deepEqual(seen, [403]); assert.equal(nexted, false); }
+  }
+});

@@ -22,11 +22,11 @@ import { mountMcpServer } from "../routes/mcp.js";
 import { enforcePeerExposure } from "../peer-exposure.js";
 import { connectedServers } from "../proxy.js";
 import { createBoardMcpServer } from "../board-mcp.js";
-import { ensureBoardToken, ensurePhoneToken, ensureModelsToken, ensureArtifactsToken, ensurePeerRelayToken, rotateLlmCloudToken, SERVICES_TOKEN, SATELLITE_TOOLS_TOKEN, SECRETS_TOKEN, SHARING_BOT_TOKEN, REPORTS_TOKEN, MAIL_HOOK_TOKEN } from "../local-token.js";
+import { ensureBoardToken, ensurePhoneToken, ensureModelsToken, ensureArtifactsToken, ensurePeerRelayToken, rotateLlmCloudToken, SERVICES_TOKEN, SATELLITE_TOOLS_TOKEN, SECRETS_TOKEN, SHARING_BOT_TOKEN, REPORTS_TOKEN, MEMORY_BOT_TOKEN, PROJECTS_BOT_TOKEN, MAIL_HOOK_TOKEN } from "../local-token.js";
 import { peerRelayRouter } from "../routes/peer-relay.js";
 import { addonDoorsRouter } from "../routes/addon-doors.js";
 import { actorSignRouter } from "../routes/actor-sign.js";
-import { initGatewayActorKey, verifyActorSig, verifyBoardActorSig, verifyArtifactsActorSig, verifyBoardThreadActorSig, verifySecretsActorSig, verifySharingActorSig, verifyReportsActorSig } from "../../../scripts/pi-bots/actor-sig.mjs";
+import { initGatewayActorKey, verifyActorSig, verifyBoardActorSig, verifyArtifactsActorSig, verifyBoardThreadActorSig, verifySecretsActorSig, verifySharingActorSig, verifyReportsActorSig, verifyMemoryActorSig, verifyProjectsActorSig } from "../../../scripts/pi-bots/actor-sig.mjs";
 import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -97,7 +97,7 @@ export async function rotateCloudDoorTokenAtBoot({
  */
 export async function rotateFamilyTokensAtBoot({
   createDb = createDbClient, log = console,
-  tokens = [[SERVICES_TOKEN, "services-tools"], [SATELLITE_TOOLS_TOKEN, "satellite-tools"], [SECRETS_TOKEN, "secrets"], [SHARING_BOT_TOKEN, "sharing-bot"], [REPORTS_TOKEN, "reports"], [MAIL_HOOK_TOKEN, "mail-hook"]],
+  tokens = [[SERVICES_TOKEN, "services-tools"], [SATELLITE_TOOLS_TOKEN, "satellite-tools"], [SECRETS_TOKEN, "secrets"], [SHARING_BOT_TOKEN, "sharing-bot"], [REPORTS_TOKEN, "reports"], [MEMORY_BOT_TOKEN, "memory-bot"], [PROJECTS_BOT_TOKEN, "projects-bot"], [MAIL_HOOK_TOKEN, "mail-hook"]],
 } = {}) {
   for (const [tok, label] of tokens) {
     try {
@@ -503,6 +503,32 @@ export async function mountMcpServers(app, deps) {
     console.log("[gateway] reports MCP mounted at /reports/mcp");
   } catch (err) {
     console.warn(`[gateway] reports mount skipped: ${err.message}`);
+  }
+  // Core bot doors (design D2): /memory-bot/mcp and /projects-bot/mcp, the memory and project tools
+  // served HERE to a bot, so the bot reaches them without opening crow.db. Mounted core (like
+  // /sharing-bot and /reports) behind each door's own guard: that door's path-scoped token (rotated
+  // above with the families), a signed actor of that door's kind, and a VERIFIED bot definition that
+  // opted in (`core_doors: true`), or 401/403 before any handler. The server is the owner's own
+  // factory with the verified bot as its base actor (core-bot-doors.js), so every existing bot rule
+  // applies. They are NOT /memory and /projects — those stay the owner's. A failure never blocks boot.
+  //
+  // THESE MOUNTS ARE SIGNED, AND SAY SO WHERE THEY ARE WRITTEN DOWN: the factories name the door's
+  // verifier (`verifyActor: verifyMemoryActorSig` / `verifyProjectsActorSig`), which is what the
+  // owner-mount audit (tests/mcp-writer-owner-mounts.test.js) reads as a signed bot door.
+  try {
+    const {
+      coreBotDoorMountAuth, coreBotDoorCaller, createMemoryBotServer, createProjectsBotServer,
+    } = await import("../core-bot-doors.js");
+    const { coreDoorsFlagOn } = await import("../../shared/core-doors-flag.js");
+    if (!coreDoorsFlagOn()) throw new Error("the core-doors flag is off");
+    const storesOf = (name) => () => [sessionManager.getStore(name, "streamable"), sessionManager.getStore(name, "sse")];
+    app.use("/memory-bot", coreBotDoorMountAuth("memory", { createDb: createDbClient, verifyActor: verifyMemoryActorSig, sessionStores: storesOf("memory-bot") }));
+    mountMcpServer(app, "/memory-bot", () => createMemoryBotServer({ instructions, syncManager, verifyActor: verifyMemoryActorSig }), sessionManager, authMiddleware, peerExposureGate, { callerFor: coreBotDoorCaller("memory") });
+    app.use("/projects-bot", coreBotDoorMountAuth("projects", { createDb: createDbClient, verifyActor: verifyProjectsActorSig, sessionStores: storesOf("projects-bot") }));
+    mountMcpServer(app, "/projects-bot", () => createProjectsBotServer({ instructions, verifyActor: verifyProjectsActorSig }), sessionManager, authMiddleware, peerExposureGate, { callerFor: coreBotDoorCaller("projects") });
+    console.log("[gateway] core bot doors mounted at /memory-bot/mcp and /projects-bot/mcp");
+  } catch (err) {
+    console.warn(`[gateway] core bot doors skipped: ${err.message}`);
   }
   // Phone bundle (plan A): core-mounted like /board, but only when the bundle
   // is installed. The server factory is imported by PATH from the installed

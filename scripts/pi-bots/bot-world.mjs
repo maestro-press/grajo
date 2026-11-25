@@ -42,6 +42,7 @@ import { tmpdir, homedir } from "node:os";
 import { join, dirname, relative, sep } from "node:path";
 import { writeBotMcp, removeStaleBotMcp } from "./mcp_writer.mjs";
 import { hasActorKey, presignActors, scopeRefFor } from "./actor-sig.mjs";
+import { coreDoorsRequested as coreDoorsWanted } from "../../servers/shared/core-doors-flag.js";
 import { validateExtensions } from "./pi_extensions_allowlist.mjs";
 import { resolveModel } from "./model_resolver.mjs";
 import { checkPiModel, PiModelUnavailableError } from "./pi-model-catalog.mjs";
@@ -205,6 +206,9 @@ export function houseStylePromptBlock(hs) {
 
 /** The kinds a turn's config carries signatures for (crow-server-catalog.mjs + remote-blocks.mjs). */
 const PRESIGN_KINDS = ["bot", "board", "artifacts", "board-thread"];
+// The core bot doors' actor kinds (design D2), presigned only for a def the catalog will serve
+// through the doors (the instance flag AND the def's own opt-in, coreDoorsWanted).
+const CORE_DOOR_KINDS = ["memory", "projects"];
 
 /**
  * True when the bot works a project board: it is linked to a project and its
@@ -883,7 +887,7 @@ async function writeWorldMcp(a, sessionId) {
     signed = await presignActors({
       gatewayUrl: "http://127.0.0.1:" + port, botId: a.botId, sessionId: sid, threadId: a.threadId,
       gatewayType: a.gatewayType, jobId: a.jobId,
-      kinds: sid != null ? [...PRESIGN_KINDS, "peer-relay"] : PRESIGN_KINDS,
+      kinds: [...PRESIGN_KINDS, ...(sid != null ? ["peer-relay"] : []), ...(coreDoorsWanted(a.def) ? CORE_DOOR_KINDS : [])],
     });
     if (!signed) a.log("actor signatures unavailable from the gateway; this turn's actor headers are unsigned");
   }

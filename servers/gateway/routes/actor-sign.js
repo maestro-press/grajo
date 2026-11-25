@@ -110,8 +110,14 @@ export const ACTOR_SIGN_PATH = "/internal/actor-sign";
  * "reports" (the reports door, /reports/mcp) IS here for the same reason: those turns run on the
  * separate bot hosts too, they hold no key, and the door admits only a signed actor. Step 6 binds
  * the tuple to a live session (or a job) of that bot on this host, exactly as for "sharing".
+ *
+ * "memory" and "projects" (the core bot doors, /memory-bot/mcp and /projects-bot/mcp, design D2)
+ * ARE here for the same reason again: a key-less host's channel and job turns reach the memory and
+ * project tools through those doors when the bot opted in, and the doors admit only a signed actor.
+ * Step 6 binds the tuple exactly as for "sharing"; the door itself also requires the verified
+ * definition's opt-in, so a signature alone opens nothing.
  */
-export const ACTOR_SIGN_KINDS = Object.freeze(["bot", "board", "artifacts", "board-thread", "sharing", "reports", ...SESSION_ACTOR_KINDS, ...SCOPE_ACTOR_KINDS]);
+export const ACTOR_SIGN_KINDS = Object.freeze(["bot", "board", "artifacts", "board-thread", "sharing", "reports", "memory", "projects", ...SESSION_ACTOR_KINDS, ...SCOPE_ACTOR_KINDS]);
 
 /**
  * Kinds a caller may name that this relay must never sign, whatever tuple it presents: 403 for the

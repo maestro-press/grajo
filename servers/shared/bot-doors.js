@@ -39,6 +39,13 @@
  * project derived from the verified bot, and nothing there approves, goes live or
  * reads a credential.
  *
+ * THE CORE BOT DOORS (design D2) add `/memory-bot/mcp` and `/projects-bot/mcp`: the
+ * memory and project tools served by the gateway, so a bot reaches them without opening
+ * crow.db itself. Each has its own path-scoped token family and its own signed actor kind
+ * (`memory`, `projects`), and admits only a bot whose VERIFIED definition opted in; the
+ * bot's identity and project scope come from that verified definition, never from the
+ * request. They are NOT `/memory` and `/projects`, which stay the owner's surfaces.
+ *
  * The doors are PATHS ONLY — isDoorPath never sees the request method, so a
  * door admits every method on its path. That is the whole of the upload door:
  * the route behind it is a PUT route, so any other method reaches no handler
@@ -58,6 +65,8 @@ export const BOT_DOOR_PREFIXES = Object.freeze([
   "/secrets/mcp",  // the bot-only credential-card mount, under the secrets token and a signed Perch actor
   "/sharing-bot/mcp",  // the bot sharing door (saved message drafts only), under the sharing-bot token and a signed `sharing` actor
   "/reports/mcp",  // the reports door (report proposals only), under the reports token and a signed `reports` actor
+  "/memory-bot/mcp",  // the core memory door (D2), under the memory-bot token, a signed `memory` actor and a verified, opted-in definition
+  "/projects-bot/mcp",  // the core projects door (D2), under the projects-bot token, a signed `projects` actor and a verified, opted-in definition
   "/mail-draft/mcp",  // Crow Mail's drafting mount: a per-turn `mdt_` token and a `mail-draft` actor signature
   "/peer-relay/",  // the relay to paired peers, under the relay token
 ]);

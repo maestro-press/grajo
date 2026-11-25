@@ -29,7 +29,9 @@ import {
   resolveEnvValue,
 } from "../server-registry.js";
 import { botsDbPath, resolveSqlitePath } from "./instance-paths.mjs";
-import { signActor, signBoardActor, signArtifactsActor, signBoardThreadActor, signSecretsActor, signSharingActor, signReportsActor } from "./actor-sig.mjs";
+import { signActor, signBoardActor, signArtifactsActor, signBoardThreadActor, signSecretsActor, signSharingActor, signReportsActor, signMemoryActor, signProjectsActor } from "./actor-sig.mjs";
+// Leaf module (no imports): the core bot doors' rollout rule, shared with the gateway's door guard.
+import { coreDoorsRequested } from "../../servers/shared/core-doors-flag.js";
 // Leaf module (registry read only): no path back to ext_registry.mjs or mcp_writer.mjs.
 import { isLegacyConfiguredAddon, addonDerivedEnv } from "../../servers/gateway/services/legacy-sources.js";
 // Leaf module (no imports): loader/injection names a child must never inherit from the
@@ -377,6 +379,61 @@ function reportsBlock(crowHome, { botId, threadId, gatewayType, port } = {}) {
   return { url: `http://127.0.0.1:${gatewayPort}/reports/mcp`, headers };
 }
 
+/**
+ * The core bot doors (design D2): the catalog names a bot's memory and project selections keep
+ * (`crow-memory`, `crow-projects`), the door each maps to, its token file (in <crowHome>/secrets, the
+ * 0700 dir the pi sandbox masks for bots) and its signed actor kind.
+ */
+export const CORE_DOOR_SERVERS = Object.freeze({
+  "crow-memory": Object.freeze({ path: "/memory-bot/mcp", tokenFile: "memory-bot-token", kind: "memory", sign: signMemoryActor }),
+  "crow-projects": Object.freeze({ path: "/projects-bot/mcp", tokenFile: "projects-bot-token", kind: "projects", sign: signProjectsActor }),
+});
+
+/** The paths a core door block may point at. */
+export const CORE_DOOR_PATHS = Object.freeze(Object.values(CORE_DOOR_SERVERS).map((d) => d.path));
+
+/**
+ * One core door block: `{url, headers}` for the door's path at THIS instance's loopback gateway,
+ * signed with the door's own actor kind. Returned only when it can be COMPLETE — the token file
+ * exists, a bot is named, and this process holds the actor key (or a presigned tuple) — and
+ * otherwise `{block: null, reason}`, so the caller keeps the stdio block and says why.
+ */
+function coreDoorBlock(crowHome, name, { botId, threadId, gatewayType, port } = {}) {
+  const door = CORE_DOOR_SERVERS[name];
+  if (!door) return { block: null, reason: "is not a core door" };
+  if (botId == null || String(botId).trim() === "") return { block: null, reason: "no bot was named for its door" };
+  let token;
+  try {
+    token = readFileSync(join(crowHome, "secrets", door.tokenFile), "utf8").trim();
+  } catch {
+    return { block: null, reason: "its door has no token on this instance yet" };
+  }
+  if (!token) return { block: null, reason: "its door has no token on this instance yet" };
+  const sig = door.sign({ botId, threadId, gatewayType });
+  if (!sig) return { block: null, reason: "this build holds no signed actor for its door" };
+  const gatewayPort = port || process.env.CROW_GATEWAY_PORT || 3001;
+  const headers = {
+    Authorization: "Bearer " + token,
+    "X-Crow-Actor-Kind": door.kind,
+    "X-Crow-Actor-Id": String(botId),
+    "X-Crow-Actor-Sig": sig,
+  };
+  if (threadId) headers["X-Crow-Actor-Thread"] = String(threadId);
+  if (gatewayType) headers["X-Crow-Actor-Gateway"] = String(gatewayType);
+  return { block: { url: `http://127.0.0.1:${gatewayPort}${door.path}`, headers }, reason: null };
+}
+
+/**
+ * Should THIS bot's catalog serve memory and projects through the doors? The instance flag
+ * (`CROW_BOT_CORE_DOORS`) AND the definition's own `core_doors: true` (core-doors-flag.js). The
+ * definition handed here may be a raw read: an opt-in a bot forged into its own row only routes it
+ * to a door that re-reads the VERIFIED definition and refuses it, and an opt-in it removed only
+ * returns it to today's stdio path, so neither direction widens anything.
+ */
+export function coreDoorsWanted(def, env = process.env) {
+  return coreDoorsRequested(def, env);
+}
+
 function applyJournalGuard(env) {
   // The WAL-unlink scar: every server touching a crow.db runs journal DELETE.
   if (env && env.CROW_DB_PATH) env.CROW_JOURNAL_MODE = "DELETE";
@@ -624,8 +681,28 @@ export function crowServerCatalog(crowHome = process.env.CROW_HOME || join(homed
   const reports = reportsBlock(crowHome, { botId: opts.botId, threadId: opts.threadId, gatewayType: opts.gatewayType, port: opts.gatewayPort });
   if (reports) { servers[REPORTS_SERVER] = reports; coreNames.push(REPORTS_SERVER); }
 
+  // The core bot doors (design D2): with `opts.coreDoors` (the caller decided the flag AND the
+  // bot's opt-in, coreDoorsWanted), `crow-memory` and `crow-projects` are emitted as HTTP door
+  // blocks under their own names, so a def's existing selection resolves to the doors and the bot
+  // never spawns them as stdio children. A door block that cannot be complete leaves the stdio
+  // block in place (today's behaviour) and says why in `coreDoors.fellBack`.
+  const coreDoors = { requested: opts.coreDoors === true, served: [], fellBack: {} };
+  const doorBlocks = {};
+  if (coreDoors.requested) {
+    for (const name of Object.keys(CORE_DOOR_SERVERS)) {
+      const { block, reason } = coreDoorBlock(crowHome, name, { botId: opts.botId, threadId: opts.threadId, gatewayType: opts.gatewayType, port: opts.gatewayPort });
+      if (block) { doorBlocks[name] = block; coreDoors.served.push(name); }
+      else coreDoors.fellBack[name] = reason;
+    }
+  }
+
   for (const spec of CORE_SERVERS) {
     if (isBotExcludedServer(spec.name)) continue; // never in a bot's config (BOT_EXCLUDED_SERVERS)
+    if (doorBlocks[spec.name]) {
+      servers[spec.name] = doorBlocks[spec.name];
+      coreNames.push(spec.name);
+      continue;
+    }
     const { block } = coreBlock(spec, binding, repoEnv, node);
     servers[spec.name] = block;
     coreNames.push(spec.name);
@@ -729,5 +806,5 @@ export function crowServerCatalog(crowHome = process.env.CROW_HOME || join(homed
       }
     }
   }
-  return { servers, unconfigured, coreNames, needsKeys, needsSharedStorage, sharedStorageUnreviewed };
+  return { servers, unconfigured, coreNames, needsKeys, needsSharedStorage, sharedStorageUnreviewed, coreDoors };
 }

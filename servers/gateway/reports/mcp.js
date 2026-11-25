@@ -238,6 +238,10 @@ function bearerOf(req) {
   return token || null;
 }
 
+function forbidden(res) {
+  res.status(403).json({ jsonrpc: "2.0", id: null, error: { code: -32003, message: "forbidden" } });
+}
+
 function unauthorized(res) {
   res.status(401).json({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "unauthorized" } });
 }
@@ -263,6 +267,7 @@ function unauthorized(res) {
 export function reportsMountAuth(deps = {}) {
   const createDb = typeof deps.createDb === "function" ? deps.createDb : createDbClient;
   const verifyActor = typeof deps.verifyActor === "function" ? deps.verifyActor : verifyReportsActorSig;
+  const readDef = typeof deps.readDef === "function" ? deps.readDef : readVerifiedBotDef;
 
   return async (req, res, next) => {
     const token = bearerOf(req);
@@ -297,6 +302,18 @@ export function reportsMountAuth(deps = {}) {
       signed = false;
     }
     if (!signed) return unauthorized(res);
+
+    // Admission reads the VERIFIED definition: a bot that is gone, unverifiable or disabled is refused.
+    let read = null;
+    const defDb = createDb();
+    try {
+      read = await readDef(defDb, botId);
+    } catch {
+      read = null;
+    } finally {
+      try { defDb.close(); } catch { /* already closed */ }
+    }
+    if (!read || read.ok !== true || Number(read.row?.enabled) !== 1) return forbidden(res);
 
     const claims = { botId, threadId, gatewayType, tokenScope: REPORTS_TOKEN_SCOPE };
     req.localTokenAuth = { token: "local-mcp", scope: REPORTS_TOKEN_SCOPE };

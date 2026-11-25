@@ -3,7 +3,7 @@
  *
  * Kinds signed with the one per-boot key (each its own MAC domain, so none
  * replays as another): "bot" (phone), "board", "board-thread", "artifacts", "secrets",
- * "mail-draft", "sharing", "reports"
+ * "mail-draft", "sharing", "reports", "memory", "projects"
  * over the v1 tuple below, and the session-bound (v2) kind "peer-relay"
  * (the loopback relay to paired peers, item 46 PR-B, below).
  *
@@ -187,6 +187,34 @@ export function signSharingActor({ botId, threadId, gatewayType } = {}) {
 /** Constant-time check of a presented sharing-door signature. False without a key. */
 export function verifySharingActorSig({ botId, threadId, gatewayType, sig } = {}) {
   return verifyActorSig({ kind: "sharing", botId, threadId, gatewayType, sig });
+}
+
+// ---- core bot door actor headers (design D2: /memory-bot/mcp and /projects-bot/mcp) ----
+//
+// The two core bot doors serve the memory and project tools to a bot over HTTP, so the bot never
+// opens crow.db for them. Each door admits only a signed (bot, thread, gateway) of ITS OWN kind:
+// "memory" and "projects" are two MAC domains, so a memory-door signature never replays on the
+// projects door, nor either on any other door (phone, board, artifacts, board-thread, secrets,
+// mail-draft, sharing, reports), nor any of those here.
+
+/** Signature for the memory door's actor headers, or null without a key / bot id. */
+export function signMemoryActor({ botId, threadId, gatewayType } = {}) {
+  return signActor({ kind: "memory", botId, threadId, gatewayType });
+}
+
+/** Constant-time check of a presented memory door signature. False without a key. */
+export function verifyMemoryActorSig({ botId, threadId, gatewayType, sig } = {}) {
+  return verifyActorSig({ kind: "memory", botId, threadId, gatewayType, sig });
+}
+
+/** Signature for the projects door's actor headers, or null without a key / bot id. */
+export function signProjectsActor({ botId, threadId, gatewayType } = {}) {
+  return signActor({ kind: "projects", botId, threadId, gatewayType });
+}
+
+/** Constant-time check of a presented projects door signature. False without a key. */
+export function verifyProjectsActorSig({ botId, threadId, gatewayType, sig } = {}) {
+  return verifyActorSig({ kind: "projects", botId, threadId, gatewayType, sig });
 }
 
 // ---- reports actor headers (reports door, /reports/mcp) ----
@@ -450,7 +478,7 @@ function messageFor(kind, { botId, sessionId, threadId, gatewayType, jobId, work
   if (kind === "board") return v1Message({ kind, botId, threadId: jobId, gatewayType: null });
   // mail-draft: the thread slot carries `<draftId>:<turnId>`, gatewayType null (signMailDraftActor).
   if (kind === "mail-draft") return v1Message({ kind, botId, threadId, gatewayType: null });
-  if (kind === "bot" || kind === "artifacts" || kind === "board-thread" || kind === "sharing" || kind === "reports") return v1Message({ kind, botId, threadId, gatewayType });
+  if (kind === "bot" || kind === "artifacts" || kind === "board-thread" || kind === "sharing" || kind === "reports" || kind === "memory" || kind === "projects") return v1Message({ kind, botId, threadId, gatewayType });
   return null;
 }
 

@@ -132,8 +132,6 @@ export const HOME_ONLY_TOOLS = Object.freeze([
   "crow_project_get",
   "crow_project_capabilities",
   "crow_list_members",
-  "crow_add_member",
-  "crow_remove_member",
   "crow_audit_log",
   "crow_register_backend",
   "crow_list_backends",
@@ -179,9 +177,17 @@ export const SCOPED_LISTING_PROJECT_TOOLS = Object.freeze([
  * titles, and dismissing one clears the operator's own alerts. `crow_notification_settings` belongs
  * here too: its `set` action rewrites instance-wide notification preferences, so a bot could
  * silence the operator's alerts.
+ *
+ * The two member WRITES are here (and not home-only) because a membership is a grant: adding or
+ * re-roling a member hands a person access to the project, and revoking one takes it away. Who may
+ * reach a project is the operator's decision — the same rule the sharing surface applies to every
+ * tool that changes who can reach something (servers/sharing/bot-owner-only.js). Reading the
+ * member list stays home-only.
  */
 export const OWNER_ONLY_TOOLS = Object.freeze([
   "crow_create_project",
+  "crow_add_member",
+  "crow_remove_member",
   "crow_regenerate_embeddings",
   "crow_dream",
   "crow_create_schedule",
