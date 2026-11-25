@@ -27,6 +27,8 @@
  */
 import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from "node:crypto";
 import {
+  isValidProfileId,
+  parseProfileEnvelope,
   parseStoredKey,
   providerKeyFp,
 } from "../../shared/provider-key-shape.js";
@@ -35,9 +37,18 @@ import { keychainKeyState, loadKeychainKey } from "./key.js";
 
 /** The HKDF info string; also the first element of every AAD. */
 export const PROVIDER_KEY_HKDF_INFO = "crow-provider-key-v1";
-/** The only purpose implemented here. Another purpose has no prefix and no AAD. */
+/** The provider purpose (`pk1:`). */
 export const PROVIDER_KEY_PURPOSE = "provider";
-const PURPOSE_PREFIX = Object.freeze({ provider: "pk1" });
+/**
+ * The profile purpose (`sk1:`, profile-key sync design §2.1): the at-rest seal of a
+ * profile's API key, slot `<kind>/<profileId>`. Same HKDF key as `pk1:`; the PREFIX is
+ * inside the AAD (associatedData), so a `pk1:` never opens as `sk1:` or the reverse.
+ * Only servers/gateway/ai/profile-keys.js (and tests) may call it with this purpose.
+ */
+export const PROFILE_KEY_PURPOSE = "profile";
+/** The profile kinds a slot id may name. */
+export const PROFILE_KINDS = Object.freeze(["ai", "tts", "stt", "vision"]);
+const PURPOSE_PREFIX = Object.freeze({ provider: "pk1", profile: "sk1" });
 const NONCE_LEN = 12;
 const TAG_LEN = 16;
 
@@ -50,8 +61,22 @@ function refuse(code, message) {
 /** The one implemented purpose, or a refusal naming no key material. */
 function purposePrefix(purpose) {
   const prefix = PURPOSE_PREFIX[purpose];
-  if (!prefix) throw refuse("PROVIDER_KEY_PURPOSE_UNSUPPORTED", "provider-key-box: only the provider purpose is implemented");
+  if (!prefix) throw refuse("PROVIDER_KEY_PURPOSE_UNSUPPORTED", "provider-key-box: unsupported purpose");
   return prefix;
+}
+
+/** `<kind>/<profileId>` with kind in PROFILE_KINDS and a non-empty profile id. */
+export function isProfileSlotId(slotId) {
+  if (typeof slotId !== "string") return false;
+  const i = slotId.indexOf("/");
+  if (i <= 0) return false;
+  return PROFILE_KINDS.includes(slotId.slice(0, i)) && isValidProfileId(slotId.slice(i + 1));
+}
+
+/** The slot-id rule of a purpose: any non-empty string for a provider, kind/id for a profile. */
+function slotAllowed(purpose, slotId) {
+  if (typeof slotId !== "string" || slotId === "") return false;
+  return purpose === PROFILE_KEY_PURPOSE ? isProfileSlotId(slotId) : true;
 }
 
 /** A usable keychain key: `{ id: 16 hex, seed: 32 bytes }`. */
@@ -82,6 +107,7 @@ export function seal({ purpose = PROVIDER_KEY_PURPOSE, slotId, plaintext, key } 
   const k = usableKey(key);
   if (!k) throw refuse("PROVIDER_KEY_NO_KEY", "provider-key-box: a keychain key is required to seal a provider key");
   if (typeof slotId !== "string" || slotId === "") throw new TypeError("provider-key-box: a slot id is required");
+  if (!slotAllowed(purpose, slotId)) throw new TypeError("provider-key-box: a profile slot id is <kind>/<profileId>");
   if (typeof plaintext !== "string" || plaintext === "") throw refuse("PROVIDER_KEY_EMPTY", "provider-key-box: nothing to seal");
   const fp = providerKeyFp(plaintext);
   if (!fp) throw refuse("PROVIDER_KEY_EMPTY", "provider-key-box: nothing to seal");
@@ -108,8 +134,8 @@ export function seal({ purpose = PROVIDER_KEY_PURPOSE, slotId, plaintext, key } 
  */
 export function open({ purpose = PROVIDER_KEY_PURPOSE, slotId, stored, key } = {}) {
   const prefix = purposePrefix(purpose);
-  if (typeof slotId !== "string" || slotId === "") return null;
-  const parsed = parseStoredKey(stored);
+  if (!slotAllowed(purpose, slotId)) return null;
+  const parsed = purpose === PROFILE_KEY_PURPOSE ? parseProfileEnvelope(stored) : parseStoredKey(stored);
   if (parsed.kind !== "envelope" || !stored.startsWith(prefix + ":")) return null;
   // The key id FIRST, before the seed is even read: a crow.db restored onto a
   // machine with another key file must not derive, let alone decrypt, and never
@@ -138,7 +164,24 @@ export function open({ purpose = PROVIDER_KEY_PURPOSE, slotId, stored, key } = {
   return plaintext;
 }
 
-/** sha256 over a string's bytes (never exported, never logged). */
+/**
+ * A `{ open(slotId, stored), seal(slotId, plaintext) }` keyring for the PROFILE
+ * purpose, bound to one keychain key. It is NOT installed anywhere: the gateway's
+ * wiring (a later PR) hands it to servers/gateway/ai/profile-keys.js. A key that is
+ * not usable yields a refusing keyring (open null, seal throws), never a null one.
+ *
+ * @param {{id:string, seed:Buffer}|null} key
+ */
+export function makeProfileKeyring(key) {
+  const k = usableKey(key);
+  return {
+    open: (slotId, stored) => (k ? open({ purpose: PROFILE_KEY_PURPOSE, slotId, stored, key: k }) : null),
+    seal: (slotId, plaintext) => {
+      if (!k) throw refuse("PROVIDER_KEY_NO_KEY", "provider-key-box: a keychain key is required to seal a profile key");
+      return seal({ purpose: PROFILE_KEY_PURPOSE, slotId, plaintext, key: k });
+    },
+  };
+}
 
 /**
  * Install this box into the shared provider-keyring seam, bound to the

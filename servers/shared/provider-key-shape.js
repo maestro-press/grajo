@@ -91,6 +91,48 @@ export function providerKeyFp(plaintext) {
 }
 
 /**
+ * The PROFILE purpose's envelope (`sk1:`), the at-rest seal of a speech/AI/vision
+ * profile key (profile-key sync design §2.1). Same grammar as `pk1:` under its own
+ * prefix. It is a SEPARATE parser on purpose: `parseStoredKey` / `hasProviderKey`
+ * above are the PROVIDER cell's and never learn this prefix (an `sk1:` there is just
+ * an unrelated string), so no provider caller changes behaviour.
+ */
+export const PROFILE_KEY_ENVELOPE_PREFIX = "sk1:";
+export const PROFILE_KEY_ENVELOPE_RE = /^sk1:([0-9a-f]{16}):([0-9a-f]{16}):([A-Za-z0-9_-]+)$/;
+
+/** The longest profile id (and envelope text) the profile boxes accept. */
+export const PROFILE_ID_MAX_LENGTH = 256;
+export const PROFILE_ENVELOPE_MAX_LENGTH = 8192;
+
+/** A usable profile id: a non-empty, well-formed UTF-16 string of at most 256 chars. */
+export function isValidProfileId(id) {
+  return typeof id === "string" && id !== "" && id.length <= PROFILE_ID_MAX_LENGTH && id.isWellFormed();
+}
+
+/**
+ * Parse an `sk1:` envelope WITHOUT returning a value. `envelope` for a well-formed
+ * one, `malformed` for anything that claims `sk1:` and is not, `none` otherwise
+ * (including a `pk1:` value: it is not a profile envelope).
+ *
+ * @param {unknown} stored
+ * @returns {{kind: "none"} | {kind: "malformed"} |
+ *           {kind: "envelope", keyId: string, fp: string, payload: string}}
+ */
+export function parseProfileEnvelope(stored) {
+  if (typeof stored !== "string") return { kind: "none" };
+  if (stored.length > PROFILE_ENVELOPE_MAX_LENGTH) return stored.startsWith(PROFILE_KEY_ENVELOPE_PREFIX) ? { kind: "malformed" } : { kind: "none" };
+  const m = PROFILE_KEY_ENVELOPE_RE.exec(stored);
+  if (m) return { kind: "envelope", keyId: m[1], fp: m[2], payload: m[3] };
+  if (stored.startsWith(PROFILE_KEY_ENVELOPE_PREFIX)) return { kind: "malformed" };
+  return { kind: "none" };
+}
+
+/** True when `stored` is a well-formed `sk1:` envelope. */
+export function isProfileKeyEnvelope(stored) {
+  return parseProfileEnvelope(stored).kind === "envelope";
+}
+
+/**
  * The tag that keeps the sealed-key consent fingerprint from ever colliding with
  * the legacy one (HMAC over the plaintext key itself).
  */

@@ -131,14 +131,15 @@ test("seal/open: the RAW bytes round trip — trimming is only the fingerprint's
 
 test("seal: HKDF info is the documented one, and a wrong purpose refuses", () => {
   assert.equal(PROVIDER_KEY_HKDF_INFO, "crow-provider-key-v1");
-  for (const purpose of ["profile", "PROVIDER", "", null]) {
+  for (const purpose of ["PROVIDER", "other", "", null]) {
     assert.throws(() => seal({ purpose, slotId: SLOT, plaintext: sentinel(), key: keyA }),
       (err) => err.code === "PROVIDER_KEY_PURPOSE_UNSUPPORTED");
   }
   const envelope = seal({ slotId: SLOT, plaintext: sentinel(), key: keyA });
-  // Only the provider purpose is implemented, so an open for any other purpose
-  // refuses as well rather than guessing at a prefix.
-  assert.throws(() => open({ purpose: "profile", slotId: SLOT, stored: envelope, key: keyA }),
+  // Only the provider and profile purposes are implemented, so an open for any other
+  // purpose refuses as well rather than guessing at a prefix (the profile purpose has
+  // its own tests in tests/profile-key-transport.test.js).
+  assert.throws(() => open({ purpose: "other", slotId: SLOT, stored: envelope, key: keyA }),
     (err) => err.code === "PROVIDER_KEY_PURPOSE_UNSUPPORTED");
 });
 

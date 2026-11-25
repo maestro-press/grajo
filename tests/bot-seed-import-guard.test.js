@@ -106,6 +106,10 @@ const GUARDED_MODULES = [
   // read either could open every saved provider key and every add-on secret.
   "servers/gateway/keychain/key.js",
   "servers/gateway/keychain/provider-key-box.js",
+  // Profile-key sync (the `ps1:` transit box and the one helper that calls the box for
+  // the `profile` purpose): gateway-only, never bot-reachable.
+  "servers/gateway/keychain/profile-key-transport.js",
+  "servers/gateway/ai/profile-keys.js",
 ].map((p) => resolve(ROOT, p));
 
 /** Where those modules live: not a ROOT of the walk, see the header. */
