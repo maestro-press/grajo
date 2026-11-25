@@ -279,19 +279,50 @@ export async function findPeerByBearer(db, bearer, opts = {}) {
   // (which is also when its refusal + alarm is the right verdict).
   const keyedRows = found.filter((row) => isKeyedStored(row?.auth_token_hash));
   const legacyRows = found.filter((row) => !isKeyedStored(row?.auth_token_hash));
-  for (const row of [...keyedRows, ...legacyRows]) {
+  const verify = (row) => verifyStored(PEER_INBOUND_FAMILY, bearer, row.auth_token_hash, {
     // By construction the row's value is one of the two candidates, so it is the value to verify —
     // and `verifyStored` decides (the legacy form only while the family is not converted).
-    const verdict = verifyStored(PEER_INBOUND_FAMILY, bearer, row.auth_token_hash, {
-      converted,
-      rowRef: row.id ?? row.rowid ?? null,
-      audit: (eventType, details) => auditLog(db, eventType, {
-        details: opts.channel ? { ...details, channel: opts.channel } : details,
-      }),
-    });
-    if (verdict.ok) return row;
+    converted,
+    rowRef: row.id ?? row.rowid ?? null,
+    audit: (eventType, details) => auditLog(db, eventType, {
+      details: opts.channel ? { ...details, channel: opts.channel } : details,
+    }),
+  });
+  // AMBIGUITY IS A REFUSAL (L-D). Genuine writers give one peer one verifier, so when MORE THAN ONE
+  // keyed row verifies for a bearer, something copied a keyed value onto a second row: either could be
+  // the impostor, so neither is accepted, and the ids (never a value) are alarmed.
+  const verifiedKeyed = keyedRows.filter((row) => verify(row).ok);
+  if (verifiedKeyed.length > 1) {
+    alarmAmbiguous(db, verifiedKeyed.map((row) => String(row.id ?? row.rowid ?? "")), opts.channel);
+    return null;
+  }
+  if (verifiedKeyed.length === 1) return verifiedKeyed[0];
+  for (const row of legacyRows) {
+    if (verify(row).ok) return row;
   }
   return null;
+}
+
+/** ambiguity-key → last alarm time: one audit row per distinct id set per minute. */
+const ambiguousSeen = new Map();
+
+function alarmAmbiguous(db, ids, channel) {
+  const key = ids.slice().sort().join(",");
+  const at = Date.now();
+  const last = ambiguousSeen.get(key);
+  if (last !== undefined && at - last < 60_000) return;
+  if (ambiguousSeen.size > 200) ambiguousSeen.clear();
+  ambiguousSeen.set(key, at);
+  console.warn(
+    `[token-mac] refused an ambiguous paired-instance bearer for ${PEER_INBOUND_FAMILY}: ${ids.length} rows verify, `
+    + "so a keyed value was copied onto another row. Nothing was changed.",
+  );
+  try {
+    const pending = auditLog(db, "token_legacy_form", {
+      details: { family: PEER_INBOUND_FAMILY, ambiguous: true, count: ids.length, rows: ids, ...(channel ? { channel } : {}) },
+    });
+    if (pending && typeof pending.catch === "function") pending.catch(() => {});
+  } catch { /* best effort; the refusal already happened */ }
 }
 
 /**

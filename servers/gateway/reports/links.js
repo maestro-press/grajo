@@ -93,8 +93,9 @@
  * secret-free base URL) and one string; the public path adds one setting read, the token's own row and,
  * on a click, the checks `resolveLinkToken` makes.
  */
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { resolveDashboardBase } from "../dashboard-link-base.js";
+import { findLinkRowByToken, mintReportLinkHash } from "./link-token.js";
 
 /** The link kinds a recipient may get. */
 export const LINK_KINDS = Object.freeze(["dashboard", "public-view", "public-comment"]);
@@ -177,25 +178,17 @@ function segment(value) {
 /* ------------------------------------------------------------------- the token model */
 
 /**
- * A raw token as the only form that is ever stored: its sha256, hex.
- *
- * The hash is what `report_link_tokens.token_hash` holds, so a reader of this database cannot turn a row
- * back into a working link. Nothing else in this module ever writes, logs or returns a raw token after
- * the mint that made it hands it to the caller.
+ * A raw token's sha256, hex. NO LONGER what `report_link_tokens.token_hash` stores (that is the keyed
+ * `report:link` verifier of `link-token.js`); it stays as the input the public door binds its comment-form
+ * nonce to (sha256 of the RAW token from the URL), and as the legacy stored form a lookup also tries.
+ * Nothing else in this module ever writes, logs or returns a raw token after the mint that made it hands it
+ * to the caller.
  *
  * @param {*} raw the raw token a mail carried
  * @returns {string} 64 lowercase hex characters
  */
 export function hashToken(raw) {
   return createHash("sha256").update(text(raw), "utf8").digest("hex");
-}
-
-/** Two hashes compared without an early exit. A length mismatch is a `false`, never a throw. */
-function sameHash(left, right) {
-  const a = Buffer.from(text(left), "utf8");
-  const b = Buffer.from(text(right), "utf8");
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
 }
 
 let bridgeModule = null;
@@ -418,12 +411,21 @@ export async function mintLinkToken(db, deps, {
   const now = Number.isFinite(asked) ? asked : Date.now();
   const expiresAt = now + (await linkDaysOf(db)) * DAY_MS;
 
+  // The STORED verifier is computed FIRST: a key problem is a failed mint (null) that leaves the send's
+  // current link alive, and never falls back to sha256.
+  let storedHash;
+  try {
+    storedHash = await mintReportLinkHash(db, token);
+  } catch {
+    return null;
+  }
+
   // One live token per SEND, stamped and unheld before the new one is written.
   await revokeLinkTokens(db, d, { reportId, sendId: send });
 
   const tokenId = await writeTokenRow(db, {
     reportId, runId, recipientId, sendId: send, artifactId: version.artifactId,
-    versionN: version.versionN, scope, hash: hashToken(token), approvalNonce, expiresAt, now,
+    versionN: version.versionN, scope, hash: storedHash, approvalNonce, expiresAt, now,
   });
   if (!tokenId) return null;
 
@@ -562,22 +564,18 @@ export async function resolveLinkToken(db, deps, rawToken) {
   const d = resolveDeps(db, deps);
   const unknown = { status: "unknown" };
   if (typeof rawToken !== "string" || !TOKEN_RE.test(rawToken.trim())) return unknown;
-  const hash = hashToken(rawToken.trim());
+  const raw = rawToken.trim();
 
   let row;
   try {
-    const { rows } = await db.execute({
-      sql: `SELECT id, report_id, run_id, recipient_id, send_id, artifact_id, version_n, scope,
-                   token_hash, approval_nonce, expires_at, revoked_at, created_at
-              FROM report_link_tokens WHERE token_hash = ?`,
-      args: [hash],
+    row = await findLinkRowByToken(db, raw, {
+      columns: `id, report_id, run_id, recipient_id, send_id, artifact_id, version_n, scope,
+                   token_hash, approval_nonce, expires_at, revoked_at, created_at`,
     });
-    row = rows[0] ?? null;
   } catch {
     return unknown;
   }
   if (!row) return unknown;
-  if (!sameHash(row.token_hash, hash)) return unknown;
   if (row.revoked_at != null) return unknown;
 
   const tokenId = text(row.id);

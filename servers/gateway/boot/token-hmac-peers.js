@@ -55,6 +55,7 @@ import {
 import { ensureSecretsDir, getPeerCreds, setInboundBearerSha256Many } from "../../shared/peer-credentials.js";
 import { writeSetting } from "../dashboard/settings/registry.js";
 import { auditLog } from "../../db.js";
+import { adoptMirrorOnlyEra, hostEraRecorded } from "./token-hmac-era-adopt.js";
 import {
   PEER_INBOUND_FAMILY, forceRefusePeerLegacy, h1ValuesExist, isLegacyStored, peerFamilyConverted,
 } from "../peer-inbound-token.js";
@@ -328,10 +329,18 @@ async function scanConvertedFamily(db, { audit }) {
  *          converted peers with no usable `secrets/peer-tokens.json` entry (reported, never
  *          refused).
  */
-export async function runPeerTokenHmacBoot({ db, now = new Date(), audit, runTransaction, writeSnapshot } = {}) {
+export async function runPeerTokenHmacBoot({
+  db, now = new Date(), audit, runTransaction, writeSnapshot, adoptEra = adoptMirrorOnlyEra,
+} = {}) {
   if (!db) throw new TypeError("runPeerTokenHmacBoot needs a crow.db client");
   const auditFn = typeof audit === "function" ? audit : (eventType, details) => auditLog(db, eventType, { details });
   const keyPath = tokenMacKeyPath();
+
+  // H1: an era recorded ONLY in the (bot-writable) database is adopted into the host state file
+  // before anything decides between converting and scanning.
+  await adoptEra(PEER_INBOUND_FAMILY, {
+    db, audit: auditFn, now, hasPendingSnapshot: (keyId) => Boolean(pendingSnapshot(keyId)),
+  });
 
   // The evidence flags are REQUIRED by ensureKey({allowCreate:true}) — an explicit scan.
   let mirrorConverted = false;
@@ -374,7 +383,8 @@ export async function runPeerTokenHmacBoot({ db, now = new Date(), audit, runTra
 
   let result;
   try {
-    const isConverted = await peerFamilyConverted(db);
+    // The DECISION is the host state file alone; the validators keep the fail-closed check.
+    const isConverted = hostEraRecorded(PEER_INBOUND_FAMILY);
     result = isConverted
       ? await scanConvertedFamily(db, { audit: auditFn })
       : await convertFamily(db, {

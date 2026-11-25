@@ -625,7 +625,7 @@ export async function familyConverted(family, { readSetting, ...location } = {})
 }
 
 /** The mirror's value is any non-empty epoch marker; "0"/"false"/"" mean "not converted". */
-function eraValueIsConverted(value) {
+export function eraValueIsConverted(value) {
   if (value === null || value === undefined) return false;
   const v = String(value).trim();
   return v !== "" && v !== "0" && v.toLowerCase() !== "false";

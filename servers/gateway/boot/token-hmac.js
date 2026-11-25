@@ -50,6 +50,7 @@ import { ensureSecretsDir } from "../../shared/peer-credentials.js";
 import { writeSetting } from "../dashboard/settings/registry.js";
 import { auditLog } from "../../db.js";
 import { FAMILY_PREDICATE, TOKEN_STORE_FAMILIES, forceRefuseLegacy, isLegacyStored, tokenFamilyConverted } from "../token-store.js";
+import { adoptMirrorOnlyEra, hostEraRecorded } from "./token-hmac-era-adopt.js";
 
 /** Snapshot file name prefix inside `secrets/` (§3.2 step 1). */
 export const ROLLBACK_PREFIX = "token-hmac-rollback-";
@@ -202,19 +203,53 @@ async function convertFamily(db, family, { key, audit, now, runTransaction, writ
 
   const inSnapshot = new Set(snapshotRows.map((r) => r.token));
   let count = 0;
+  const copies = [];
+  const convertedHere = new Set();
   await inTransaction((run) => {
     for (const entry of snapshotRows) {
       const h1 = macFromLegacy(family, entry.token);
+      // M1: `token` is the PRIMARY KEY, so an `h1.` value that already sits on another row (a copy a
+      // bot made, or the twin of an uppercase/lowercase legacy pair converted a moment ago) would
+      // abort this whole transaction on every boot. Only a row that still holds its snapshot value
+      // is converted, and only then can it collide; the other row is a copy, so it is revoked
+      // (oauth: deleted, which is how a grant is revoked) and reported.
+      const still = run({
+        sql: `SELECT rowid AS rowid FROM oauth_tokens WHERE token = ? AND (${predicate})`,
+        args: [entry.token],
+      });
+      if (!still?.rows?.length) continue;
+      const holder = run({ sql: "SELECT rowid AS rowid FROM oauth_tokens WHERE token = ?", args: [h1] })?.rows?.[0];
+      if (holder) {
+        // A holder that is not a row converted a moment ago is a copy: it goes. For a TWIN (an
+        // uppercase/lowercase pair) the LOWERCASE row is the genuine one — writers only ever store
+        // lowercase — so an uppercase entry that finds its twin already converted is the copy itself.
+        const holderIsTwin = convertedHere.has(h1);
+        if (holderIsTwin && entry.token !== entry.token.toLowerCase()) {
+          run({ sql: "DELETE FROM oauth_tokens WHERE token = ?", args: [entry.token] });
+          copies.push(String(still.rows[0].rowid));
+          continue;
+        }
+        run({ sql: "DELETE FROM oauth_tokens WHERE token = ?", args: [h1] });
+        copies.push(String(holder.rowid));
+        if (convertedHere.delete(h1)) count -= 1; // a deleted row is not a converted one
+      }
       const res = run({
         sql: `UPDATE oauth_tokens SET token = ? WHERE token = ? AND (${predicate})`,
         args: [h1, entry.token],
       });
-      if ((Number(res?.rowsAffected) || 0) > 0) count += 1;
+      if ((Number(res?.rowsAffected) || 0) > 0) {
+        count += 1;
+        convertedHere.add(h1);
+      }
     }
   });
 
   // A row not in the snapshot is a post-snapshot write: NOT converted (§3.2).
   let alarms = 0;
+  for (const rowRef of copies) {
+    legacyAlarm(family, rowRef, { audit });
+    alarms += 1;
+  }
   for (const row of await legacyRows(db, family)) {
     if (inSnapshot.has(row.token)) continue;
     legacyAlarm(family, row.rowid, { audit });
@@ -259,7 +294,7 @@ async function scanConvertedFamily(db, family, { audit }) {
  *          Never throws for a key problem: the gateway must still start.
  */
 export async function runTokenHmacBoot({
-  db, now = new Date(), audit, retryDelaysMs, sleep, runTransaction, writeSnapshot,
+  db, now = new Date(), audit, retryDelaysMs, sleep, runTransaction, writeSnapshot, adoptEra = adoptMirrorOnlyEra,
 } = {}) {
   if (!db) throw new TypeError("runTokenHmacBoot needs a crow.db client");
   const auditFn = typeof audit === "function" ? audit : (eventType, details) => auditLog(db, eventType, { details });
@@ -267,6 +302,15 @@ export async function runTokenHmacBoot({
   const retryDelays = Array.isArray(retryDelaysMs) ? retryDelaysMs : FAMILY_RETRY_DELAYS_MS;
   const wait = typeof sleep === "function" ? sleep : (ms) => new Promise((done) => { setTimeout(done, ms); });
   const transactionFor = typeof runTransaction === "function" ? runTransaction : null;
+
+  // H1: an era recorded ONLY in the (bot-writable) database is adopted into the host state file
+  // before anything decides between converting and scanning.
+  for (const family of TOKEN_STORE_FAMILIES) {
+    // eslint-disable-next-line no-await-in-loop -- three families, once at boot
+    await adoptEra(family, {
+      db, audit: auditFn, now, hasPendingSnapshot: (keyId) => Boolean(pendingSnapshot(family, keyId)),
+    });
+  }
 
   // The evidence flags are REQUIRED by ensureKey({allowCreate:true}) — an explicit scan.
   let mirrorConverted = false;
@@ -321,7 +365,9 @@ export async function runTokenHmacBoot({
     for (let attempt = 0; attempt <= retryDelays.length; attempt += 1) {
       try {
         // eslint-disable-next-line no-await-in-loop -- one family at a time, by design
-        const converted = await tokenFamilyConverted(family, db);
+        // The DECISION is the host state file alone (adoptMirrorOnlyEra above); the validators keep
+        // the fail-closed state-OR-mirror check.
+        const converted = hostEraRecorded(family);
         // eslint-disable-next-line no-await-in-loop
         result = converted
           ? await scanConvertedFamily(db, family, { audit: auditFn })

@@ -594,6 +594,26 @@ try {
   console.error("[token-hmac] peer-token boot conversion failed:", err.message);
 }
 
+// Keyed token verifiers, the REPORT LINK family (§8 PR 5a): convert every legacy (bare sha256)
+// `report_link_tokens.token_hash` to its `h1.` form before listen, so the public door only ever sees
+// values the converter has visited. A lost or invalid key never stops the boot: every link then
+// answers `unknown`. A failed conversion refuses old-style values in this process
+// (forceRefuseReportLinkLegacy) and the next boot resumes it.
+try {
+  const { runReportLinkTokenHmacBoot } = await import("./boot/token-hmac-reports.js");
+  const _linkDb = createDbClient();
+  try {
+    const _linkHmac = await runReportLinkTokenHmacBoot({ db: _linkDb });
+    if (_linkHmac.key !== "ok") {
+      console.error(`[token-hmac] boot is running WITHOUT a usable key (${_linkHmac.key}): ${_linkHmac.keyPath}`);
+    }
+  } finally {
+    _linkDb.close();
+  }
+} catch (err) {
+  console.error("[token-hmac] report-link boot conversion failed:", err.message);
+}
+
 // Stamp the moment the new/classic shell first existed on this instance, before
 // listen, so a device whose session predates it opens classic (shell/mode.js).
 try {

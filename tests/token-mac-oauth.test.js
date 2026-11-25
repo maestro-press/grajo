@@ -1651,3 +1651,186 @@ test("token-mac refuses a legacy row in a converted family and accepts it before
     s.close();
   }
 });
+// ─── round 2 (H1, M1) ─────────────────────────────────────────────────────
+
+test("H1: an era recorded ONLY in the database is adopted into the state file; a sha256 row planted after the mirror is deleted stays refused and is never converted", async () => {
+  const s = scratch();
+  try {
+    ensureKey({ allowCreate: true, mirrorConverted: false, h1ValuesExist: false });
+    const { eraSettingKey } = await import("../servers/shared/token-mac.js");
+    const { writeSetting } = await import("../servers/gateway/dashboard/settings/registry.js");
+    const { findTokenRow } = await import("../servers/gateway/token-store.js");
+    for (const family of [OAUTH_ACCESS_FAMILY, OAUTH_REFRESH_FAMILY, DASHBOARD_SESSION_FAMILY]) {
+      // eslint-disable-next-line no-await-in-loop -- three families
+      await writeSetting(s.db, eraSettingKey(family), new Date().toISOString(), { scope: "local" });
+    }
+    assert.equal(readState().families[OAUTH_ACCESS_FAMILY], undefined, "precondition: the state file has no era");
+    const first = await runTokenHmacBoot({ db: s.db });
+    assert.equal(first.key, "ok");
+    for (const family of [OAUTH_ACCESS_FAMILY, OAUTH_REFRESH_FAMILY, DASHBOARD_SESSION_FAMILY]) {
+      assert.ok(readState().families[family]?.converted_at, `${family}: the era is now in the state file`);
+      assert.equal(readState().families[family].count, 0);
+      assert.equal(readState().families[family].rollback_file, null);
+    }
+    assert.deepEqual(rollbackFiles(s), [], "adopted, not converted: no snapshot");
+    assert.ok((await auditRows(s.db, "token_legacy_form")).some((r) => JSON.parse(r.details).mirror === true));
+
+    // The bot deletes the mirror and inserts a sha256 row.
+    await s.db.execute({ sql: "DELETE FROM dashboard_settings_overrides WHERE key LIKE 'token_hmac_era:%'", args: [] });
+    forgetTokenMacAlarms();
+    await insertToken(s.db, { token: sha256Hex("bot-after-mirror-delete"), client: "bot-client", scopes: "mcp:tools", expires: "+30 days" });
+    assert.equal(await findTokenRow(s.db, OAUTH_ACCESS_FAMILY, "bot-after-mirror-delete"), null, "refused at runtime");
+    const second = await runTokenHmacBoot({ db: s.db });
+    assert.equal(await storedFor(s.db, "bot-after-mirror-delete", OAUTH_ACCESS_FAMILY), sha256Hex("bot-after-mirror-delete"), "not converted");
+    assert.ok(second.alarms >= 1, "and alarmed");
+    assert.equal(await findTokenRow(s.db, OAUTH_ACCESS_FAMILY, "bot-after-mirror-delete"), null);
+  } finally {
+    s.close();
+  }
+});
+
+test("M1: a keyed value a bot copied onto another row no longer aborts the conversion; the copy is revoked and the era recorded", async () => {
+  const s = scratch(seedLegacy([{ token: ACCESS_RAW, client: "c1", scopes: "mcp:tools" }]));
+  try {
+    const failing = await runTokenHmacBoot({
+      db: s.db, retryDelaysMs: [], runTransaction: async () => { throw new Error("simulated crash"); },
+    });
+    assert.equal(failing.families.find((f) => f.family === OAUTH_ACCESS_FAMILY).state, "failed");
+    // The bot copies the keyed value A WILL get onto a new row.
+    await insertToken(s.db, { token: macFromLegacy(OAUTH_ACCESS_FAMILY, sha256Hex(ACCESS_RAW)), client: "bot-client", scopes: "mcp:tools", expires: "+30 days" });
+    forgetForcedLegacyRefusal();
+    forgetTokenMacAlarms();
+    const rerun = await runTokenHmacBoot({ db: s.db });
+    assert.equal(rerun.families.find((f) => f.family === OAUTH_ACCESS_FAMILY).state, "converted", "no abort");
+    assert.ok(readState().families[OAUTH_ACCESS_FAMILY]?.converted_at, "the era is recorded");
+    assert.equal(await rowCount(s.db), 1, "the copy was revoked (deleted); the real row converted");
+    assert.equal(await storedFor(s.db, ACCESS_RAW, OAUTH_ACCESS_FAMILY), macToken(OAUTH_ACCESS_FAMILY, ACCESS_RAW));
+    const { rows } = await s.db.execute({ sql: "SELECT client_id FROM oauth_tokens", args: [] });
+    assert.equal(rows[0].client_id, "c1", "the survivor is the genuine row, not the copy");
+  } finally {
+    s.close();
+  }
+});
+
+test("M1: an uppercase and a lowercase legacy twin of one token convert without aborting", async () => {
+  const lower = sha256Hex("twin-raw");
+  const s = scratch((raw) => {
+    for (const token of [lower, lower.toUpperCase()]) {
+      raw.prepare(
+        "INSERT INTO oauth_tokens (token, token_type, client_id, scopes, expires_at) VALUES (?, 'access', 'c1', 'mcp:tools', datetime('now', '+1 hour'))",
+      ).run(token);
+    }
+  });
+  try {
+    const boot = await runTokenHmacBoot({ db: s.db });
+    assert.equal(boot.families.find((f) => f.family === OAUTH_ACCESS_FAMILY).state, "converted");
+    assert.ok(readState().families[OAUTH_ACCESS_FAMILY]?.converted_at);
+    assert.equal(await storedFor(s.db, "twin-raw", OAUTH_ACCESS_FAMILY), macToken(OAUTH_ACCESS_FAMILY, "twin-raw"));
+    assert.equal(await rowCount(s.db), 1, "one survivor");
+  } finally {
+    s.close();
+  }
+});
+
+// ─── round 3 ──────────────────────────────────────────────────────────────
+
+/** A db whose reads of the era mirror throw a NON-"no such table" error (the bot's "unreadable mirror"). */
+function withUnreadableMirror(db) {
+  return new Proxy(db, {
+    get(target, prop) {
+      if (prop !== "execute") return target[prop];
+      return (statement) => {
+        const sql = String(typeof statement === "string" ? statement : statement?.sql ?? "");
+        const args = Array.isArray(statement?.args) ? statement.args : [];
+        if (/^\s*SELECT/i.test(sql) && args.some((a) => String(a).startsWith("token_hmac_era:"))) {
+          throw new Error("disk I/O error (simulated)");
+        }
+        return target.execute(statement);
+      };
+    },
+  });
+}
+
+async function plantOauthMirrors(db) {
+  const { eraSettingKey } = await import("../servers/shared/token-mac.js");
+  const { writeSetting } = await import("../servers/gateway/dashboard/settings/registry.js");
+  for (const family of [OAUTH_ACCESS_FAMILY, OAUTH_REFRESH_FAMILY, DASHBOARD_SESSION_FAMILY]) {
+    // eslint-disable-next-line no-await-in-loop -- three families
+    await writeSetting(db, eraSettingKey(family), new Date().toISOString(), { scope: "local" });
+  }
+}
+
+test("M-B: an unreadable mirror does not postpone the era: with no marker the boot converts and records it", async () => {
+  const s = scratch(seedLegacy([{ token: ACCESS_RAW, client: "c1", scopes: "mcp:tools" }]));
+  try {
+    ensureKey({ allowCreate: true, mirrorConverted: false, h1ValuesExist: false });
+    const boot = await runTokenHmacBoot({ db: withUnreadableMirror(s.db) });
+    assert.equal(boot.families.find((f) => f.family === OAUTH_ACCESS_FAMILY).state, "converted");
+    assert.ok(readState().families[OAUTH_ACCESS_FAMILY]?.converted_at, "the state file has the marker");
+    assert.equal(await storedFor(s.db, ACCESS_RAW, OAUTH_ACCESS_FAMILY), macToken(OAUTH_ACCESS_FAMILY, ACCESS_RAW));
+  } finally {
+    s.close();
+  }
+});
+
+test("M-B: a failed adoption write still takes the conversion path", async () => {
+  const s = scratch(seedLegacy([{ token: ACCESS_RAW, client: "c1", scopes: "mcp:tools" }]));
+  try {
+    ensureKey({ allowCreate: true, mirrorConverted: false, h1ValuesExist: false });
+    await plantOauthMirrors(s.db);
+    const { adoptMirrorOnlyEra } = await import("../servers/gateway/boot/token-hmac-era-adopt.js");
+    const boot = await runTokenHmacBoot({
+      db: s.db,
+      adoptEra: (family, opts) => adoptMirrorOnlyEra(family, { ...opts, mark: async () => { throw new Error("state write failed (simulated)"); } }),
+    });
+    assert.equal(boot.families.find((f) => f.family === OAUTH_ACCESS_FAMILY).count, 1, "converted, not scanned");
+    assert.ok(readState().families[OAUTH_ACCESS_FAMILY]?.converted_at);
+    assert.equal(await storedFor(s.db, ACCESS_RAW, OAUTH_ACCESS_FAMILY), macToken(OAUTH_ACCESS_FAMILY, ACCESS_RAW));
+  } finally {
+    s.close();
+  }
+});
+
+test("L-B: a pending snapshot beats adoption: its rows convert and the real count and file are recorded", async () => {
+  const s = scratch(seedLegacy([{ token: ACCESS_RAW, client: "c1", scopes: "mcp:tools" }]));
+  try {
+    const failing = await runTokenHmacBoot({
+      db: s.db, retryDelaysMs: [], runTransaction: async () => { throw new Error("simulated crash"); },
+    });
+    assert.equal(failing.families.find((f) => f.family === OAUTH_ACCESS_FAMILY).state, "failed");
+    const snapshot = rollbackFiles(s).find((n) => n.includes("oauth-access"));
+    assert.ok(snapshot);
+    await plantOauthMirrors(s.db);
+    forgetForcedLegacyRefusal();
+    const boot = await runTokenHmacBoot({ db: s.db });
+    assert.equal(boot.families.find((f) => f.family === OAUTH_ACCESS_FAMILY).count, 1);
+    const era = readState().families[OAUTH_ACCESS_FAMILY];
+    assert.equal(era.count, 1);
+    assert.equal(era.rollback_file, snapshot);
+    assert.equal(await storedFor(s.db, ACCESS_RAW, OAUTH_ACCESS_FAMILY), macToken(OAUTH_ACCESS_FAMILY, ACCESS_RAW));
+  } finally {
+    s.close();
+  }
+});
+
+for (const [name, lowerFirst] of [["the copy has the later rowid", true], ["the copy has the earlier rowid", false]]) {
+  test(`L-C: of an upper/lowercase twin pair the LOWERCASE row survives (${name})`, async () => {
+    const lower = sha256Hex("twin-raw-2");
+    const order = lowerFirst ? [[lower, "genuine"], [lower.toUpperCase(), "bot"]] : [[lower.toUpperCase(), "bot"], [lower, "genuine"]];
+    const s = scratch((raw) => {
+      for (const [token, client] of order) {
+        raw.prepare(
+          "INSERT INTO oauth_tokens (token, token_type, client_id, scopes, expires_at) VALUES (?, 'access', ?, 'mcp:tools', datetime('now', '+1 hour'))",
+        ).run(token, client);
+      }
+    });
+    try {
+      const boot = await runTokenHmacBoot({ db: s.db });
+      assert.equal(boot.families.find((f) => f.family === OAUTH_ACCESS_FAMILY).count, 1, "the deleted twin is not counted");
+      const { rows } = await s.db.execute({ sql: "SELECT client_id FROM oauth_tokens", args: [] });
+      assert.deepEqual(rows.map((r) => r.client_id), ["genuine"], "the genuine (lowercase) row is the survivor");
+    } finally {
+      s.close();
+    }
+  });
+}

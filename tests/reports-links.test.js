@@ -15,6 +15,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { macToken } from "../servers/shared/token-mac.js";
 
 const root = mkdtempSync(join(tmpdir(), "reports-links-"));
 process.env.CROW_DATA_DIR = join(root, "master");
@@ -589,8 +590,8 @@ test("a stored token_hash sent as the token is unknown", async () => {
   const w = await world();
   const minted = await mintFor(w);
   const [row] = await tokenRows(w.db);
-  assert.match(row.token_hash, /^[0-9a-f]{64}$/);
-  assert.equal(row.token_hash, hashToken(minted.token));
+  assert.match(row.token_hash, /^h1\.[0-9a-f]{16}\.[0-9a-f]{64}$/, "the stored verifier is the keyed form");
+  assert.equal(row.token_hash, macToken("report:link", minted.token));
   assert.deepEqual(await resolveLinkToken(w.db, linksDeps(), row.token_hash), { status: "unknown" },
     "a hash is not a token: it hashes to something else");
   assert.deepEqual(await resolveLinkToken(w.db, linksDeps(), minted.token.slice(0, 42)), { status: "unknown" });
@@ -629,7 +630,7 @@ test("raw token is never stored", async () => {
     }
   }
   const [row] = await tokenRows(w.db);
-  assert.equal(row.token_hash, hashToken(minted.token), "the token column is the hash and nothing else");
+  assert.equal(row.token_hash, macToken("report:link", minted.token), "the token column is the keyed verifier and nothing else");
 });
 
 test("mint is per send: a second mint for the same send revokes the first", async () => {

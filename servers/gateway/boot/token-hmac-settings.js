@@ -80,6 +80,7 @@ import {
 } from "../local-token.js";
 import { ensureSecretsDir } from "../../shared/peer-credentials.js";
 import { writeSetting } from "../dashboard/settings/registry.js";
+import { adoptMirrorOnlyEra, hostEraRecorded } from "./token-hmac-era-adopt.js";
 import { auditLog } from "../../db.js";
 import {
   ROTATED_AT_BOOT, SETTINGS_TOKEN_FAMILIES, deleteStoredForm, forceRefuseSettingsLegacy, h1ValuesExist,
@@ -526,11 +527,20 @@ async function convertFamily(db, family, {
  *          settings row a per-instance token key is never read from.
  */
 export async function runSettingsTokenHmacBoot({
-  db, now = new Date(), audit, writeSnapshot: writeSnapshotSeam, rotateAtBoot,
+  db, now = new Date(), audit, writeSnapshot: writeSnapshotSeam, rotateAtBoot, adoptEra = adoptMirrorOnlyEra,
 } = {}) {
   if (!db) throw new TypeError("runSettingsTokenHmacBoot needs a crow.db client");
   const auditFn = typeof audit === "function" ? audit : (eventType, details) => auditLog(db, eventType, { details });
   const keyPath = tokenMacKeyPath();
+
+  // H1: an era recorded ONLY in the (bot-writable) database is adopted into the host state file
+  // before anything decides between converting and scanning.
+  for (const family of SETTINGS_TOKEN_FAMILIES) {
+    // eslint-disable-next-line no-await-in-loop -- thirteen families, once at boot
+    await adoptEra(family, {
+      db, audit: auditFn, now, hasPendingSnapshot: (keyId) => Boolean(pendingSnapshot(family, keyId)),
+    });
+  }
 
   // The evidence flags are REQUIRED by ensureKey({allowCreate:true}) — an explicit scan.
   let mirrorConverted = false;
@@ -584,7 +594,8 @@ export async function runSettingsTokenHmacBoot({
     let result;
     try {
       // eslint-disable-next-line no-await-in-loop -- one family at a time, by design
-      const isConverted = await settingsFamilyConverted(family, db);
+      // The DECISION is the host state file alone; the validators keep the fail-closed check.
+      const isConverted = hostEraRecorded(family);
       // eslint-disable-next-line no-await-in-loop
       result = isConverted
         ? await scanConvertedFamily(db, family, { audit: auditFn })

@@ -62,6 +62,8 @@
  *   node scripts/token-hmac.mjs --reset --yes    # no prompt (scripts, runbooks)
  *
  * ─── --rollback: the deploy-day undo of the oauth_tokens conversion ─────────
+ * (After a rollback the settings, peer and report-link DB mirrors are adopted at the next boot unless the
+ * operator deletes them; a later re-upgrade then refuses legacy rows in those families.)
  *
  * Rolling the RELEASE back does not roll the ROWS back: once the pre-listen boot has converted
  * `oauth_tokens`, every row holds an `h1.` verifier, and the previous release's
@@ -185,6 +187,8 @@ import { FAMILY_PREDICATE, TOKEN_STORE_FAMILIES, tokenFamilyConverted } from "..
 import { SETTINGS_TOKEN_FAMILIES } from "../servers/gateway/token-settings.js";
 import { PEER_INBOUND_FAMILY } from "../servers/gateway/peer-inbound-token.js";
 import { ROLLBACK_PREFIX } from "../servers/gateway/boot/token-hmac.js";
+import { REPORT_LINK_FAMILY } from "../servers/gateway/reports/link-token.js";
+import { REPORT_LINK_ROLLBACK_PREFIX } from "../servers/gateway/boot/token-hmac-reports.js";
 
 /** The health probe's budget: a live gateway answers long before this. */
 const HEALTH_PROBE_TIMEOUT_MS = 1500;
@@ -216,7 +220,7 @@ const RESTORABLE = new Set(TOKEN_STORE_FAMILIES);
  * would CONVERT a bare sha256 something without the key planted while the gateway was stopped.
  */
 const CONVERTED_FAMILIES = Object.freeze([
-  ...TOKEN_STORE_FAMILIES, ...SETTINGS_TOKEN_FAMILIES, PEER_INBOUND_FAMILY,
+  ...TOKEN_STORE_FAMILIES, ...SETTINGS_TOKEN_FAMILIES, PEER_INBOUND_FAMILY, REPORT_LINK_FAMILY,
 ]);
 
 /**
@@ -369,6 +373,29 @@ async function clearPeerBearers(db) {
   }
 }
 
+/**
+ * Revoke every report link (`--reset` step 2d).
+ *
+ * Link verifiers keyed under the retired key would read as FOREIGN and be refused anyway. The column
+ * is NOT NULL UNIQUE, so the rows are not cleared: `revoked_at` is stamped on every row that is not
+ * already revoked (an already-revoked row keeps its own stamp). This SENDS NOTHING: recipients get
+ * new links on the next normal scheduled run, the way they always do. An absent table is skipped.
+ *
+ * @returns {Promise<number>} rows revoked
+ */
+async function revokeReportLinks(db) {
+  try {
+    const res = await db.execute({
+      sql: "UPDATE report_link_tokens SET revoked_at = ? WHERE revoked_at IS NULL",
+      args: [Date.now()],
+    });
+    return Number(res?.rowsAffected ?? 0) || 0;
+  } catch (err) {
+    if (/no such table/i.test(String(err?.message || ""))) return 0;
+    throw err;
+  }
+}
+
 async function reset({ yes, force }) {
   const keyPath = tokenMacKeyPath();
 
@@ -400,6 +427,7 @@ async function reset({ yes, force }) {
     console.log("  - revoke EVERY OAuth grant and dashboard session (all oauth_tokens rows)");
     console.log("  - delete the stored verifiers of every static token, and clear every paired instance's");
     console.log("    inbound bearer verifier (each peer then has to re-pair)");
+    console.log("  - revoke every report link (nothing is sent; recipients get new links on the next scheduled run)");
     console.log("  - move the token HMAC key aside and create a new one");
     console.log("  - keep the dashboard password (you sign in again afterwards)");
     const ok = await confirm("Continue? [y/N] ");
@@ -436,6 +464,7 @@ async function reset({ yes, force }) {
   let droppedStatic = 0;
   let resealed = { resealed: 0, failed: 0, refused: [] };
   let droppedPeers = 0;
+  let revokedLinks = 0;
   let key;
   let mirrored = 0;
   try {
@@ -459,6 +488,10 @@ async function reset({ yes, force }) {
     //     peer's own re-pair proof still works from the `inbound_bearer_sha256` the credential
     //     store keeps. Revoked rows hold NULL already and are left alone.
     droppedPeers = await clearPeerBearers(db);
+
+    // 2d. Every report link is revoked (stamped, never deleted): its verifier is keyed under the key
+    //     this run retires. Nothing is sent from here; the next scheduled run mails new links.
+    revokedLinks = await revokeReportLinks(db);
 
     // 3. A fresh key, so the box is immediately coherent (no login has to mint it). This is
     //    the one place a key may be created over an existing state file: the operator retired
@@ -514,6 +547,7 @@ async function reset({ yes, force }) {
   console.log(`  peers:         ${droppedPeers} paired-instance verifier(s) cleared — every peer has to re-pair;`);
   console.log("                 its own `crow instance pair` can prove the old pairing (secrets/peer-tokens.json");
   console.log("                 keeps the record the re-pair proof is keyed by), so no --allow-re-pair is needed");
+  console.log(`  report links:  ${revokedLinks} report link(s) revoked; recipients get new links on the next scheduled run`);
   console.log(`  era mirror:    ${mirrored} family marker(s) written to the DB as converted (no rows behind them)`);
   console.log(
     `  bot defs:      ${resealed.resealed} definition(s) re-sealed under the new key`
@@ -947,6 +981,14 @@ async function rollback({ yes, force }) {
       + "different token-hmac key, so its rows cannot be computed back)",
     );
   }
+  try {
+    const reportSnaps = readdirSync(dir).filter((n) => n.startsWith(REPORT_LINK_ROLLBACK_PREFIX) && n.endsWith(".json")).length;
+    if (reportSnaps) {
+      console.log(
+        `  ${REPORT_LINK_FAMILY.padEnd(18)} ${reportSnaps} snapshot file(s) left in place: not restored by this tool yet`,
+      );
+    }
+  } catch { /* an unreadable secrets/ was already reported above */ }
   console.log(`  era mirror:        ${mirrored} marker row(s) deleted, so the next deploy converts again`);
   console.log(`  moved aside:       ${moved.length ? "" : "nothing (already absent)"}`);
   for (const path of moved) console.log(`    ${path}`);

@@ -1032,3 +1032,142 @@ test("source: the gateway installs the seam and runs the peer converter before l
     "instance-registry must not import the key module (tests/bot-seed-import-guard.test.js)");
   assert.ok(tokenMacKeyPath().endsWith("token-hmac.key"));
 });
+// ─── round 2 (H1) ─────────────────────────────────────────────────────────
+
+test("H1: an era recorded ONLY in the database is adopted into the state file; a sha256 row planted after the mirror is deleted stays refused and is never converted", async () => {
+  const s = scratch();
+  try {
+    ensureKey({ allowCreate: true, mirrorConverted: false, h1ValuesExist: false });
+    const { eraSettingKey } = await import("../servers/shared/token-mac.js");
+    const { writeSetting } = await import("../servers/gateway/dashboard/settings/registry.js");
+    await writeSetting(s.db, eraSettingKey(PEER_INBOUND_FAMILY), new Date().toISOString(), { scope: "local" });
+    assert.equal(readState().families[PEER_INBOUND_FAMILY], undefined, "precondition: the state file has no era");
+    const first = await runPeerTokenHmacBoot({ db: s.db });
+    assert.equal(first.key, "ok");
+    assert.ok(readState().families[PEER_INBOUND_FAMILY]?.converted_at, "the era is now in the state file");
+    assert.deepEqual(snapshotFiles(s.home), [], "adopted, not converted: no snapshot");
+    await auditCountAtLeast(s.db, 1);
+    assert.ok((await legacyAudits(s.db)).some((r) => JSON.parse(r.details).mirror === true));
+
+    await s.db.execute({ sql: "DELETE FROM dashboard_settings_overrides WHERE key = ?", args: [`token_hmac_era:${PEER_INBOUND_FAMILY}`] });
+    forgetTokenMacAlarms();
+    await addPeer(s.db, "plantedAfterMirrorDelete", sha256("bot-bearer"));
+    assert.equal(await validateInstanceToken(s.db, "bot-bearer"), null, "refused at runtime");
+    const second = await runPeerTokenHmacBoot({ db: s.db });
+    assert.equal(await storedOf(s.db, "plantedAfterMirrorDelete"), sha256("bot-bearer"), "not converted");
+    assert.ok(second.alarms >= 1, "and alarmed");
+    assert.equal(await validateInstanceToken(s.db, "bot-bearer"), null);
+  } finally {
+    s.close();
+  }
+});
+
+// ─── round 3 ──────────────────────────────────────────────────────────────
+
+/** A db whose reads of the era mirror throw a NON-"no such table" error (the bot's "unreadable mirror"). */
+function withUnreadableMirror(db) {
+  return new Proxy(db, {
+    get(target, prop) {
+      if (prop !== "execute") return target[prop];
+      return (statement) => {
+        const sql = String(typeof statement === "string" ? statement : statement?.sql ?? "");
+        const args = Array.isArray(statement?.args) ? statement.args : [];
+        if (/^\s*SELECT/i.test(sql) && args.some((a) => String(a).startsWith("token_hmac_era:"))) {
+          throw new Error("disk I/O error (simulated)");
+        }
+        return target.execute(statement);
+      };
+    },
+  });
+}
+
+async function plantPeerMirror(db) {
+  const { eraSettingKey } = await import("../servers/shared/token-mac.js");
+  const { writeSetting } = await import("../servers/gateway/dashboard/settings/registry.js");
+  await writeSetting(db, eraSettingKey(PEER_INBOUND_FAMILY), new Date().toISOString(), { scope: "local" });
+}
+
+test("M-B: an unreadable mirror does not postpone the era: with no marker the boot converts and records it", async () => {
+  const s = scratch();
+  try {
+    ensureKey({ allowCreate: true, mirrorConverted: false, h1ValuesExist: false });
+    await addPeer(s.db, "peerA", sha256(OLD));
+    const boot = await runPeerTokenHmacBoot({ db: withUnreadableMirror(s.db) });
+    assert.equal(boot.family.state, "converted");
+    assert.equal(boot.converted, 1);
+    assert.ok(readState().families[PEER_INBOUND_FAMILY]?.converted_at, "the state file has the marker");
+    assert.equal(await storedOf(s.db, "peerA"), macToken(PEER_INBOUND_FAMILY, OLD));
+  } finally {
+    s.close();
+  }
+});
+
+test("M-B: a failed adoption write still takes the conversion path", async () => {
+  const s = scratch();
+  try {
+    ensureKey({ allowCreate: true, mirrorConverted: false, h1ValuesExist: false });
+    await addPeer(s.db, "peerA", sha256(OLD));
+    await plantPeerMirror(s.db);
+    const { adoptMirrorOnlyEra } = await import("../servers/gateway/boot/token-hmac-era-adopt.js");
+    const boot = await runPeerTokenHmacBoot({
+      db: s.db,
+      adoptEra: (family, opts) => adoptMirrorOnlyEra(family, { ...opts, mark: async () => { throw new Error("state write failed (simulated)"); } }),
+    });
+    assert.equal(boot.converted, 1, "converted, not scanned");
+    assert.ok(readState().families[PEER_INBOUND_FAMILY]?.converted_at);
+    assert.equal(await storedOf(s.db, "peerA"), macToken(PEER_INBOUND_FAMILY, OLD));
+  } finally {
+    s.close();
+  }
+});
+
+test("L-B: a pending snapshot beats adoption: its rows convert and the real count and file are recorded", async () => {
+  const s = scratch();
+  try {
+    await addPeer(s.db, "peerA", sha256(OLD));
+    const failing = await runPeerTokenHmacBoot({
+      db: s.db, runTransaction: async () => { throw new Error("simulated crash"); },
+    });
+    assert.equal(failing.family.state, "failed");
+    const [snapshot] = snapshotFiles(s.home);
+    assert.ok(snapshot);
+    await plantPeerMirror(s.db);
+    forgetForcedPeerLegacyRefusal();
+    const boot = await runPeerTokenHmacBoot({ db: s.db });
+    assert.equal(boot.converted, 1);
+    const era = readState().families[PEER_INBOUND_FAMILY];
+    assert.equal(era.count, 1);
+    assert.equal(era.rollback_file, snapshot);
+    assert.equal((await validateInstanceToken(s.db, OLD))?.id, "peerA");
+  } finally {
+    s.close();
+  }
+});
+
+test("L-D: when more than one keyed row verifies for a bearer, the lookup is ambiguous: refused and alarmed (ids only)", async () => {
+  const s = scratch();
+  try {
+    await addPeer(s.db, "peerA", sha256(OLD));
+    await runPeerTokenHmacBoot({ db: s.db });
+    assert.equal((await validateInstanceToken(s.db, OLD))?.id, "peerA", "positive control");
+    // A bot copies the genuine peer's keyed value onto a second trusted row.
+    await addPeer(s.db, "peerCopy", macToken(PEER_INBOUND_FAMILY, OLD));
+    forgetTokenMacAlarms();
+    assert.equal(await validateInstanceToken(s.db, OLD), null, "the genuine bearer is refused too");
+    const deadline = Date.now() + 2_000;
+    let rows = [];
+    while (Date.now() < deadline) {
+      // eslint-disable-next-line no-await-in-loop -- a bounded poll
+      rows = (await legacyAudits(s.db)).map((r) => JSON.parse(r.details)).filter((d) => d.ambiguous === true);
+      if (rows.length) break;
+      // eslint-disable-next-line no-await-in-loop -- a bounded poll
+      await new Promise((r) => { setTimeout(r, 20); });
+    }
+    assert.equal(rows.length >= 1, true, "alarmed");
+    assert.equal(rows[0].count, 2);
+    assert.deepEqual(rows[0].rows.slice().sort(), ["peerA", "peerCopy"]);
+    assert.equal(JSON.stringify(rows[0]).includes(macToken(PEER_INBOUND_FAMILY, OLD)), false, "no value in the audit row");
+  } finally {
+    s.close();
+  }
+});

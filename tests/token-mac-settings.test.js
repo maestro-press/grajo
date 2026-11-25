@@ -1371,3 +1371,92 @@ test("static: storedForms is what the converter reads, so a planted value in eit
     s.close();
   }
 });
+// ─── round 2 (H1) ─────────────────────────────────────────────────────────
+
+test("H1: an era recorded ONLY in the database is adopted into the state file; a sha256 value planted after the mirror is deleted stays refused and is never converted", async () => {
+  const s = scratch();
+  try {
+    ensureKey({ allowCreate: true, mirrorConverted: false, h1ValuesExist: false });
+    const { eraSettingKey } = await import("../servers/shared/token-mac.js");
+    for (const family of SETTINGS_TOKEN_FAMILIES) {
+      // eslint-disable-next-line no-await-in-loop -- thirteen families
+      await writeSetting(s.db, eraSettingKey(family), new Date().toISOString(), { scope: "local" });
+    }
+    assert.equal(readState().families.mcp_board_token_hash, undefined, "precondition: the state file has no era");
+    const first = await runSettingsTokenHmacBoot({ db: s.db });
+    assert.equal(first.key, "ok");
+    for (const family of SETTINGS_TOKEN_FAMILIES) {
+      assert.ok(readState().families[family]?.converted_at, `${family}: the era is now in the state file`);
+    }
+    assert.deepEqual(snapshotFiles(s.home), [], "adopted, not converted: no snapshot");
+    assert.ok((await legacyAudits(s.db)).some((r) => JSON.parse(r.details).mirror === true));
+
+    await s.db.execute({ sql: "DELETE FROM dashboard_settings_overrides WHERE key LIKE 'token_hmac_era:%'", args: [] });
+    forgetTokenMacAlarms();
+    await plantLegacy(s.db, "mcp_board_token_hash", "bot-board-after-mirror-delete");
+    assert.equal(await validateBoardToken(s.db, "bot-board-after-mirror-delete"), false, "refused at runtime");
+    const second = await runSettingsTokenHmacBoot({ db: s.db });
+    assert.equal(await stored(s.db, "mcp_board_token_hash"), sha256("bot-board-after-mirror-delete"), "not converted");
+    assert.ok(second.alarms >= 1, "and alarmed");
+    assert.equal(await validateBoardToken(s.db, "bot-board-after-mirror-delete"), false);
+  } finally {
+    s.close();
+  }
+});
+
+// ─── round 3 ──────────────────────────────────────────────────────────────
+
+function withUnreadableMirror(db) {
+  return new Proxy(db, {
+    get(target, prop) {
+      if (prop !== "execute") return target[prop];
+      return (statement) => {
+        const sql = String(typeof statement === "string" ? statement : statement?.sql ?? "");
+        const args = Array.isArray(statement?.args) ? statement.args : [];
+        if (/^\s*SELECT/i.test(sql) && args.some((a) => String(a).startsWith("token_hmac_era:"))) {
+          throw new Error("disk I/O error (simulated)");
+        }
+        return target.execute(statement);
+      };
+    },
+  });
+}
+
+test("M-B: an unreadable mirror does not postpone the era: with no marker the boot converts and records it", async () => {
+  const s = scratch();
+  try {
+    ensureKey({ allowCreate: true, mirrorConverted: false, h1ValuesExist: false });
+    plantTokenFile("mcp_board_token_hash", "board-raw-r3");
+    await plantLegacy(s.db, "mcp_board_token_hash", "board-raw-r3");
+    const boot = await runSettingsTokenHmacBoot({ db: withUnreadableMirror(s.db) });
+    assert.equal(boot.key, "ok");
+    assert.ok(readState().families.mcp_board_token_hash?.converted_at, "the state file has the marker");
+    assert.equal(await stored(s.db, "mcp_board_token_hash"), macToken("mcp_board_token_hash", "board-raw-r3"));
+    assert.equal(await validateBoardToken(s.db, "board-raw-r3"), true);
+  } finally {
+    s.close();
+  }
+});
+
+test("M-B: a failed adoption write still takes the conversion path", async () => {
+  const s = scratch();
+  try {
+    ensureKey({ allowCreate: true, mirrorConverted: false, h1ValuesExist: false });
+    const { eraSettingKey } = await import("../servers/shared/token-mac.js");
+    for (const family of SETTINGS_TOKEN_FAMILIES) {
+      // eslint-disable-next-line no-await-in-loop -- thirteen families
+      await writeSetting(s.db, eraSettingKey(family), new Date().toISOString(), { scope: "local" });
+    }
+    plantTokenFile("mcp_board_token_hash", "board-raw-r3b");
+    await plantLegacy(s.db, "mcp_board_token_hash", "board-raw-r3b");
+    const { adoptMirrorOnlyEra } = await import("../servers/gateway/boot/token-hmac-era-adopt.js");
+    await runSettingsTokenHmacBoot({
+      db: s.db,
+      adoptEra: (family, opts) => adoptMirrorOnlyEra(family, { ...opts, mark: async () => { throw new Error("state write failed (simulated)"); } }),
+    });
+    assert.ok(readState().families.mcp_board_token_hash?.converted_at);
+    assert.equal(await stored(s.db, "mcp_board_token_hash"), macToken("mcp_board_token_hash", "board-raw-r3b"), "converted, not scanned");
+  } finally {
+    s.close();
+  }
+});

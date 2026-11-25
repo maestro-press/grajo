@@ -12,6 +12,7 @@ import { execFileSync } from "node:child_process";
 import { copyFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { macToken } from "../servers/shared/token-mac.js";
 
 const root = mkdtempSync(join(tmpdir(), "reports-delivery-"));
 process.env.CROW_DATA_DIR = join(root, "master");
@@ -1354,7 +1355,7 @@ test("tier a: the row is claimed first, the token is minted for it, then the ema
   const raw = tokenIn(mail.calls[0].text);
   assert.ok(raw, mail.calls[0].text);
   assert.ok(mail.calls[0].html.includes(`${ORIGIN}/r/${raw}`), "the html footer carries the same link");
-  assert.equal(hashToken(raw), tokens[0].token_hash, "only the hash was stored");
+  assert.equal(macToken("report:link", raw), tokens[0].token_hash, "only the keyed verifier was stored");
   const opened = await resolveLinkToken(w.db, {
     approvals: approvalsDeps(), now: () => T0, artifacts: { store: artifactsStore },
   }, raw);
