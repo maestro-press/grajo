@@ -12,6 +12,7 @@
  * fake-satellite-mgmt.js: real pins, real signatures, no socket), the real source loader, the real
  * Abilities/Safety renders, the real save handlers and the real authorize function.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -25,6 +26,7 @@ const DATA = mkdtempSync(join(tmpdir(), "crow-satbld-data-"));
 const DB_PATH = join(DATA, "crow.db");
 const saved = { CROW_HOME: process.env.CROW_HOME, HOME: process.env.HOME, CROW_DATA_DIR: process.env.CROW_DATA_DIR, CROW_DB_PATH: process.env.CROW_DB_PATH };
 process.env.CROW_HOME = HOME;
+markBotDefPreEra(process.env.CROW_HOME);
 // An empty home: readCanonicalMcp finds no ~/.pi/agent/mcp.json, so probeAll spawns nothing and
 // Bot Builder's only live source here is the satellite.
 process.env.HOME = HOME;

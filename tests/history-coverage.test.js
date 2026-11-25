@@ -23,6 +23,9 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 
 import { createDbClient } from "../servers/db.js";
+// Restoring a bot_def re-signs the row through the bot-definition write seam, which this process
+// must have installed: importing the store does that (a gateway installs it at boot).
+import "../servers/shared/bot-def-store.js";
 import { runMigrations } from "../scripts/migrations/runner.mjs";
 import { run as runTasksBase } from "../scripts/migrations/0000-tasks-base.mjs";
 import { run as runBoardStages } from "../scripts/migrations/0001-board-stages.mjs";
@@ -137,6 +140,37 @@ const update = (db, ctx, table, keyColumn, key, fields) => {
   );
 };
 
+/**
+ * Write one `pi_bot_defs` row the way Bot Builder does: SIGNED (servers/shared/bot-def-store.js
+ * `signBotDef`), so the row carries a keyed MAC and every version captured of it carries that seal.
+ *
+ * A bot_def version can only be RESTORED when its own captured MAC verifies (see the restore rule in
+ * servers/shared/history/api.js), so a row seeded with raw SQL has no restorable history — that is
+ * the rule the reviews asked for, not a fixture detail.
+ */
+async function writeBotVersion(f, {
+  botId = "hank", displayName = "Hank", definition, enabled = 1, projectId = null,
+} = {}, ctx = OWNER) {
+  const { signBotDef } = await import("../servers/shared/bot-def-store.js");
+  const text = typeof definition === "string" ? definition : JSON.stringify(definition);
+  const seal = signBotDef({ bot_id: botId, definition: text, enabled, project_id: projectId });
+  const existing = (await f.db.execute({ sql: "SELECT 1 AS x FROM pi_bot_defs WHERE bot_id = ?", args: [botId] })).rows[0];
+  if (existing) {
+    await withWriteContext(ctx, () => f.db.execute({
+      sql: "UPDATE pi_bot_defs SET display_name = ?, definition = ?, enabled = ?, project_id = ?, def_mac = ?, def_generation = ? WHERE bot_id = ?",
+      args: [displayName, seal.definition, enabled, projectId, seal.def_mac, seal.generation, botId],
+    }));
+  } else {
+    await withWriteContext(ctx, () => f.db.execute({
+      sql: "INSERT INTO pi_bot_defs (bot_id, display_name, definition, enabled, project_id, def_mac, def_generation) "
+        + "VALUES (?,?,?,?,?,?,?)",
+      args: [botId, displayName, seal.definition, enabled, projectId, seal.def_mac, seal.generation],
+    }));
+  }
+  if (typeof seal.settle === "function") seal.settle();
+  return seal;
+}
+
 const versionsOf = async (db, itemType, itemId) =>
   (
     await db.execute({
@@ -233,16 +267,10 @@ test("each new type is captured and restorable", async () => {
     assert.equal(articleVersions.length, 3);
 
     // A bot definition: content is captured, credentials are not (see the next two
-    // tests for that half).
-    await insert(f.db, OWNER, "pi_bot_defs", {
-      bot_id: "hank",
-      display_name: "Hank",
-      definition: JSON.stringify(botDefinition()),
-      enabled: 1,
-    });
-    await update(f.db, OWNER, "pi_bot_defs", "bot_id", "hank", {
-      definition: JSON.stringify(botDefinition({ prompt: "You are Hank, revised." })),
-    });
+    // tests for that half). Written SIGNED (writeBotVersion), because a bot_def version is
+    // restorable only when its own captured MAC verifies.
+    await writeBotVersion(f, { definition: botDefinition() });
+    await writeBotVersion(f, { definition: botDefinition({ prompt: "You are Hank, revised." }) });
     const botVersions = await versionsOf(f.db, "bot_def", "hank");
     assert.equal(botVersions.length, 2, "insert + a definition edit");
     // The definition is stored through its allow-list projection, which SQLite
@@ -434,35 +462,44 @@ test("a URL-shaped credential is scrubbed from a source's url only, never from p
 test("restoring a bot_def never blanks or overwrites the live credential keys", async () => {
   const f = await fixture();
   try {
-    await insert(f.db, OWNER, "pi_bot_defs", {
-      bot_id: "hank",
-      display_name: "Hank",
-      definition: JSON.stringify(botDefinition({ prompt: "You are Hank.", token: "old-discord-token" })),
-      enabled: 1,
-    });
-    await update(f.db, OWNER, "pi_bot_defs", "bot_id", "hank", {
-      definition: JSON.stringify(botDefinition({ prompt: "You are Hank, second.", token: "old-discord-token" })),
-    });
-    const versions = await versionsOf(f.db, "bot_def", "hank");
-
-    // The operator rotates the Discord token (a credential-only change) and adds an
-    // env key. NEITHER is a version: the projection cannot see them.
-    const rotated = botDefinition({ prompt: "You are Hank, second.", token: "rotated-discord-token" });
+    await writeBotVersion(f, { definition: botDefinition({ prompt: "You are Hank.", token: "old-discord-token" }) });
+    // The operator rotates the Discord token and adds an env key. NEITHER is a version: the allow-list
+    // projection cannot see them, so the history does not change at all.
+    const rotated = botDefinition({ prompt: "You are Hank.", token: "rotated-discord-token" });
     rotated.spawn_env = { OPENAI_API_KEY: "rotated-env-key" };
-    await update(f.db, OWNER, "pi_bot_defs", "bot_id", "hank", { definition: JSON.stringify(rotated) });
-    assert.equal((await versionsOf(f.db, "bot_def", "hank")).length, versions.length, "a token rotation writes no version");
+    await writeBotVersion(f, { definition: rotated });
+    const versions = await versionsOf(f.db, "bot_def", "hank");
+    assert.equal(versions.length, 1, "a token rotation writes no version");
 
-    // Restoring the first version puts the persona back and leaves the live
-    // credentials exactly as they are.
-    await restoreVersion(f.db, { versionId: Number(versions[0].id) }, OWNER);
+    // Restoring that version writes NOTHING: its content is what the live row already says (only the
+    // credentials differ, and a version cannot see them), so the restore is reported as unchanged
+    // rather than re-signed — and the live credentials are never touched.
+    const noop = await restoreVersion(f.db, { versionId: Number(versions[0].id) }, OWNER);
+    assert.equal(noop.unchanged, true, "a version whose visible content is already live writes nothing");
+    const kept = JSON.parse(
+      (await f.db.execute({ sql: "SELECT definition FROM pi_bot_defs WHERE bot_id = 'hank'" })).rows[0].definition,
+    );
+    assert.equal(kept.gateways[0].token, "rotated-discord-token", "the live token was NOT touched");
+    assert.equal(kept.spawn_env.OPENAI_API_KEY, "rotated-env-key", "nor the live env blob");
+
+    // A version captured AFTER the rotation restores normally, and it keeps the live credential keys
+    // exactly as they are — the merge rule this test is named for: a projected key the version has a
+    // value for is restored, everything the version cannot see is left alone.
+    await writeBotVersion(f, { definition: botDefinition({ prompt: "You are Hank, second.", token: "rotated-discord-token" }) });
+    const all = await versionsOf(f.db, "bot_def", "hank");
+    const second = all[1];
+    assert.equal(JSON.parse(second.snapshot_json).definition.system_prompt, "You are Hank, second.");
+    // One more save, so the version above is not the newest one being restored.
+    await writeBotVersion(f, { definition: botDefinition({ prompt: "You are Hank, third.", token: "rotated-discord-token" }) });
+    const res = await restoreVersion(f.db, { versionId: Number(second.id) }, OWNER);
+    assert.ok(res.newVersionId, "a version whose own MAC verifies restores");
     const live = JSON.parse(
       (await f.db.execute({ sql: "SELECT definition FROM pi_bot_defs WHERE bot_id = 'hank'" })).rows[0].definition,
     );
-    assert.equal(live.system_prompt, "You are Hank.", "the version's content is restored");
-    assert.equal(live.gateways[0].token, "rotated-discord-token", "the live token is NOT overwritten");
-    assert.equal(live.spawn_env.OPENAI_API_KEY, "rotated-env-key", "the live env blob is kept");
+    assert.equal(live.system_prompt, "You are Hank, second.", "the version's content is back");
+    assert.equal(live.gateways[0].token, "rotated-discord-token", "the live token is kept, never blanked");
     assert.equal(live.gateways[1].bot_token, `${CANARY}-slack-bot`, "the other credential keys are untouched");
-    assert.equal(live.session_dir, "/workspace/bots/hank", "keys outside the allow-list are not touched either");
+    assert.equal(live.session_dir, "/workspace/bots/hank", "keys outside the allow-list are untouched either");
   } finally {
     await f.dispose();
   }
@@ -855,41 +892,52 @@ test("the bundle init baselines an already-populated kb_articles BEFORE it insta
   }
 });
 
-test("restoring a bot definition from before a key existed adds no null key and keeps the live credentials", async () => {
+test("restoring a bot definition a key holder never signed is refused (no version is blessed)", async () => {
   const f = await fixture();
   try {
     // A definition WITHOUT the allow-listed keys the Bot Builder adds later, and with
     // credential keys in it: the projection stores the missing keys as null.
-    await insert(f.db, OWNER, "pi_bot_defs", {
-      bot_id: "hank",
-      display_name: "Hank",
-      definition: JSON.stringify(botDefinition()),
-      enabled: 1,
-    });
+    await writeBotVersion(f, { definition: botDefinition() });
     const first = (await versionsOf(f.db, "bot_def", "hank"))[0];
     const storedProjection = JSON.parse(first.snapshot_json).definition;
     assert.equal(storedProjection.companion_features, null, "the projection holds an absent key as null (the test is not vacuous)");
     assert.equal(storedProjection.tracker_config, null);
+    assert.match(String(JSON.parse(first.snapshot_json).def_mac), /^h1\./, "and the version carries the seal it was captured with");
 
-    // The operator then adds those keys and rotates a credential.
+    // The operator then adds those keys and rotates a credential. The version's content merged over
+    // TODAY's row is not the row that was signed, so the restore refuses instead of blessing a
+    // definition nobody vouched for (a bot could otherwise plant a version and ask for a restore).
     const later = botDefinition({ prompt: "You are Hank, with a companion.", token: "rotated-discord-token" });
     later.companion_features = { avatar: "heron" };
     later.tracker_config = { board: "work" };
     await update(f.db, OWNER, "pi_bot_defs", "bot_id", "hank", { definition: JSON.stringify(later) });
 
-    await restoreVersion(f.db, { versionId: Number(first.id) }, OWNER);
+    await assert.rejects(
+      () => restoreVersion(f.db, { versionId: Number(first.id) }, OWNER),
+      (err) => err.code === "BOT_DEF_UNVERIFIED",
+    );
     const live = JSON.parse(
       (await f.db.execute({ sql: "SELECT definition FROM pi_bot_defs WHERE bot_id = 'hank'" })).rows[0].definition,
     );
-    assert.equal(live.system_prompt, "You are Hank.", "a key present with a real value is restored");
-    assert.deepEqual(live.companion_features, { avatar: "heron" }, "a stored null leaves the live key alone");
-    assert.deepEqual(live.tracker_config, { board: "work" }, "and the same for every other absent-then key");
-    assert.equal(live.gateways[0].token, "rotated-discord-token", "the live credential keys are kept");
-    assert.equal(live.session_dir, "/workspace/bots/hank", "keys outside the allow-list are untouched");
-    // And no key was ADDED as a null: the stored projection's null meant "absent then",
-    // not "set it to null now".
+    assert.deepEqual(live.companion_features, { avatar: "heron" }, "the refusal wrote nothing");
+    assert.equal(live.gateways[0].token, "rotated-discord-token", "and kept the credentials");
+
+    // A version captured NOW — with those keys present — restores, and the null-free merge rule is
+    // what it always was: a projection null never overwrites a live value with null.
+    await writeBotVersion(f, { definition: later });
+    const captured = await versionsOf(f.db, "bot_def", "hank");
+    const fresh = captured[captured.length - 1];
+    // Move the live row on, so the restore has something to put back.
+    await writeBotVersion(f, { definition: { ...later, system_prompt: "You are Hank, later still." } });
+    const res = await restoreVersion(f.db, { versionId: Number(fresh.id) }, OWNER);
+    assert.ok(res.newVersionId);
+    const after = JSON.parse(
+      (await f.db.execute({ sql: "SELECT definition FROM pi_bot_defs WHERE bot_id = 'hank'" })).rows[0].definition,
+    );
+    assert.deepEqual(after.companion_features, { avatar: "heron" });
+    assert.equal(after.session_dir, "/workspace/bots/hank", "keys outside the allow-list are untouched");
     assert.ok(
-      !/"(companion_features|tracker_config|fallback)"\s*:\s*null/.test(JSON.stringify(live)),
+      !/"(companion_features|tracker_config|fallback)"\s*:\s*null/.test(JSON.stringify(after)),
       "the merge added no null key",
     );
   } finally {

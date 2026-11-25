@@ -33,6 +33,7 @@
  * A scratch CROW_HOME/data dir with a real crow.db from scripts/init-db.js; the offline switches keep boot
  * quiet. Nothing here touches ~/.crow.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -49,6 +50,7 @@ const DB_FILE = join(MASTER_DIR, "crow.db");
 const TASKS_FILE = join(MASTER_DIR, "tasks.db");
 process.env.CROW_DATA_DIR = MASTER_DIR;
 process.env.CROW_HOME = join(root, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 process.env.CROW_DB_PATH = DB_FILE;
 process.env.CROW_TASKS_DB_PATH = TASKS_FILE;
 process.env.CROW_DISABLE_INSTANCE_SYNC = "1";

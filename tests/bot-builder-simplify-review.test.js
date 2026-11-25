@@ -283,7 +283,7 @@ test("REVIEW race: a write between the handler's read and its UPDATE is lost (no
     return async (q) => {
       const r = await tgt.execute(q);
       const sql = typeof q === "string" ? q : q.sql;
-      if (!injected && /SELECT definition, project_id, display_name FROM pi_bot_defs/.test(sql)) {
+      if (!injected && /SELECT definition, enabled, project_id, display_name FROM pi_bot_defs/.test(sql)) {
         injected = true; // skill approved meanwhile (skill_promote commits here)
         const d = JSON.parse(r.rows[0].definition); d.skills = ["approved-skill"];
         await tgt.execute({ sql: "UPDATE pi_bot_defs SET definition=? WHERE bot_id=?", args: [JSON.stringify(d), "race"] });
@@ -377,7 +377,7 @@ async function refusedSave(botId, body) {
     return async (q) => {
       const r = await tgt.execute(q);
       const sql = typeof q === "string" ? q : q.sql;
-      if (!injected && /SELECT definition, project_id, display_name FROM pi_bot_defs/.test(sql)) {
+      if (!injected && /SELECT definition, enabled, project_id, display_name FROM pi_bot_defs/.test(sql)) {
         injected = true;
         const d = JSON.parse(r.rows[0].definition); d.skills = ["approved-meanwhile"];
         await tgt.execute({ sql: "UPDATE pi_bot_defs SET definition=? WHERE bot_id=?", args: [JSON.stringify(d), botId] });

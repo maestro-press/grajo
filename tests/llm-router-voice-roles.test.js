@@ -7,6 +7,7 @@
  * ensure carry-over) resolve the same way. Every DB is a fresh scratch
  * init-db; no model server is ever reached (a local stub answers).
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -25,11 +26,32 @@ import { createVoiceTurnRunner } from "../servers/gateway/voice/turn.js";
 import { createToolFamilies } from "../servers/gateway/voice/tool-families.js";
 import { createVoiceBotLoader } from "../servers/gateway/voice/crow-voice.js";
 import { ensureVoiceBot, CROW_VOICE_BOT_ID } from "../servers/shared/voice-bot.js";
+// A `pi_bot_defs` row is authority and only a host process may write one: importing the store
+// installs it into the write seam the voice bot's row goes through (a gateway does this at boot —
+// without it the ensure refuses the write, by design), and a scratch CROW_HOME gives this process
+// the token-mac key the row is signed with.
+import "../servers/shared/bot-def-store.js";
+import { verifyBotDef } from "../servers/shared/bot-def-mac.js";
+import { ensureKey, forgetTokenMacKey } from "../servers/shared/token-mac.js";
 
 const FAST_KEY = VOICE_ROUTE_KEYS.fast;
 const ESC_KEY = VOICE_ROUTE_KEYS.escalate;
 const FAST_ID = FAST_KEY.slice(FAST_KEY.indexOf("/") + 1);
 const NO_ENV = {};
+
+/** This process's `CROW_HOME`: a home of its own holding the key the voice bot's def is signed with. */
+const BOT_DEF_HOME = mkdtempSync(join(tmpdir(), "roles-voice-home-"));
+const SAVED_HOME = process.env.CROW_HOME;
+process.env.CROW_HOME = BOT_DEF_HOME;
+markBotDefPreEra(process.env.CROW_HOME);
+forgetTokenMacKey();
+ensureKey({ crowHome: BOT_DEF_HOME, allowCreate: true, mirrorConverted: false, h1ValuesExist: false });
+after(() => {
+  forgetTokenMacKey();
+  if (SAVED_HOME === undefined) delete process.env.CROW_HOME;
+  else process.env.CROW_HOME = SAVED_HOME;
+  try { rmSync(BOT_DEF_HOME, { recursive: true, force: true }); } catch { /* best effort */ }
+});
 
 function fresh() {
   const dir = mkdtempSync(join(tmpdir(), "roles-voice-"));
@@ -439,7 +461,11 @@ test("voice bot carries a role", async () => {
         args: [JSON.stringify({ fast_voice_model: carried, tools: { crow_mcp: [] } })],
       });
       assert.deepEqual(await ensureVoiceBot(db, opts), { created: true });
-      const row = (await db.execute({ sql: "SELECT definition FROM pi_bot_defs WHERE bot_id = ?", args: [CROW_VOICE_BOT_ID] })).rows[0];
+      const row = (await db.execute({ sql: "SELECT * FROM pi_bot_defs WHERE bot_id = ?", args: [CROW_VOICE_BOT_ID] })).rows[0];
+      // The ensure went through the app's one writer, so the row it left VERIFIES.
+      assert.match(String(row.def_mac), /^h1\.[0-9a-f]{16}\.[0-9a-f]{64}$/, "the ensure signed the row");
+      const verdict = await verifyBotDef(row, { db, crowHome: BOT_DEF_HOME });
+      assert.equal(verdict.ok, true, `the stored voice definition must verify (${verdict.reason})`);
       return JSON.parse(row.definition).fast_voice_model;
     } finally { cleanup(); }
   };

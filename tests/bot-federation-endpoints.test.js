@@ -3,8 +3,15 @@ import assert from "node:assert/strict";
 import { makeBotFederationHandlers } from "../servers/gateway/routes/bot-federation-routes.js";
 
 // In-memory bot store backed by a fake libsql db.
+// The shape of the ONE writer (servers/shared/bot-def-store.js): it reads the row (SELECT *), then
+// writes definition + MAC + generation in one statement. The fake answers both, and reports one row
+// affected so an optimistic-concurrency write counts as landed.
 function makeDb({ manageable, def }) {
   const store = { definition: JSON.stringify(def), enabled: 1, project_id: null };
+  const row = () => ({
+    bot_id: "scout", display_name: "Scout", definition: store.definition, enabled: store.enabled,
+    project_id: store.project_id, def_mac: null, def_generation: null,
+  });
   return {
     _store: store,
     async execute({ sql, args }) {
@@ -15,12 +22,24 @@ function makeDb({ manageable, def }) {
         if (key === "remote_managed_bots") return { rows: [{ value: JSON.stringify(manageable) }] };
         return { rows: [] };
       }
-      if (/SELECT definition, project_id FROM pi_bot_defs/.test(sql)) {
-        if (args[0] !== "scout") return { rows: [] };
-        return { rows: [{ definition: store.definition, project_id: store.project_id }] };
+      // The seal probe (`SELECT def_mac, def_generation … LIMIT 0`) must not throw: this store has
+      // the columns. (A real row is served by the SELECT * branch below.)
+      if (/SELECT def_mac, def_generation FROM pi_bot_defs LIMIT 0/.test(sql)) return { rows: [] };
+      if (/SELECT \* FROM pi_bot_defs/.test(sql)) {
+        return { rows: args[0] === "scout" ? [row()] : [] };
       }
-      if (/UPDATE pi_bot_defs SET definition/.test(sql)) { store.definition = args[0]; return { rows: [] }; }
-      if (/UPDATE pi_bot_defs SET enabled/.test(sql)) { store.enabled = args[0]; return { rows: [] }; }
+      if (/SELECT definition, enabled, project_id FROM pi_bot_defs/.test(sql)) {
+        if (args[0] !== "scout") return { rows: [] };
+        return { rows: [{ definition: store.definition, enabled: store.enabled, project_id: store.project_id }] };
+      }
+      if (/SELECT 1 AS present FROM pi_bot_defs WHERE def_mac IS NOT NULL/.test(sql)) return { rows: [] };
+      if (/UPDATE pi_bot_defs SET definition/.test(sql)) {
+        store.definition = args[0];
+        store.enabled = Number(args[2]) ? 1 : 0;
+        store.project_id = args[3] ?? null;
+        return { rows: [], rowsAffected: 1 };
+      }
+      if (/UPDATE pi_bot_defs SET enabled/.test(sql)) { store.enabled = args[0]; return { rows: [], rowsAffected: 1 }; }
       return { rows: [] };
     },
   };

@@ -10,6 +10,7 @@
 // argv and the MCP config it was handed, and answers one prompt.
 //
 // The model gate and the csv/golden cases are pure functions and need no database.
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -35,6 +36,7 @@ writeFileSync(join(HOME_DIR, ".pi", "agent", "mcp.json"), JSON.stringify({ mcpSe
 const ORIGINAL_HOME = process.env.HOME;
 process.env.HOME = HOME_DIR;
 process.env.CROW_HOME = join(ROOT, "crowhome");
+markBotDefPreEra(process.env.CROW_HOME);
 process.env.CROW_DATA_DIR = join(ROOT, "data");
 delete process.env.CROW_DB_PATH;
 delete process.env.CROW_TASKS_DB_PATH;

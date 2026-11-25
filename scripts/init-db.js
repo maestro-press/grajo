@@ -2814,8 +2814,8 @@ await initTable("job_search_sites table", `
 `);
 
 // --- Bot Builder tables (F3: moved from scripts/init-pi-bots.mjs) ---
-// Full current shape: pi_bot_defs.project_id and bot_sessions.model/escalated/
-// kind are in the CREATE body here (init-pi-bots.mjs adds model/escalated via
+// Full current shape: pi_bot_defs.project_id, pi_bot_defs.def_mac/def_generation and
+// bot_sessions.model/escalated/kind are in the CREATE body here (init-pi-bots.mjs adds model/escalated via
 // guarded ALTER on pre-F3 DBs). CREATE ... IF NOT EXISTS — a no-op on the live
 // MPA crow.db. init-pi-bots.mjs remains the MPA-only JSON->column project_id
 // backfill + guard.
@@ -2841,6 +2841,17 @@ await initTable("pi_bot_defs table", `
   CREATE INDEX IF NOT EXISTS idx_pi_bot_defs_enabled ON pi_bot_defs (enabled);
   CREATE INDEX IF NOT EXISTS idx_pi_bot_defs_project ON pi_bot_defs (project_id);
 `);
+
+// pi_bot_defs.def_mac / def_generation (bot definition tamper evidence): the keyed MAC over the
+// whole definition (servers/shared/bot-def-mac.js) and the replay counter that lives in
+// <CROW_HOME>/secrets/bot-def-generations.json. Both nullable, nothing to backfill: the pre-listen
+// boot converter (servers/gateway/boot/bot-def-mac.js) fills them once and marks the era. Added to
+// the CREATE body above (fresh installs) AND via addColumnIfMissing here (pre-existing installs) —
+// additive-only, no SCHEMA_GENERATION bump, matching every other post-hoc column in this file; the
+// migration rail (scripts/migrations/0041-bot-def-mac.mjs) carries the same DDL for an instance
+// that converges onto this checkout without a schema-generation crossing.
+await addColumnIfMissing("pi_bot_defs", "def_mac", "TEXT");
+await addColumnIfMissing("pi_bot_defs", "def_generation", "INTEGER");
 
 await initTable("bot_sessions table", `
   CREATE TABLE IF NOT EXISTS bot_sessions (

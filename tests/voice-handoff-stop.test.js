@@ -5,6 +5,7 @@
  * tasks.db per test, the real store, give-service and voice-bot loader, the confirm tests' controllable fake
  * engine (a held spawn, stop, watchTurns), a fake clock, and the real turn runner for the media cases.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -18,6 +19,7 @@ import { harness } from "./fixtures/voice-turn-harness.mjs";
 const root = mkdtempSync(join(tmpdir(), "vh-stop-"));
 process.env.CROW_DATA_DIR = join(root, "master");
 process.env.CROW_HOME = join(root, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 process.env.CROW_TASKS_DB_PATH = join(root, "master", "tasks.db");
 const REPO = new URL("..", import.meta.url).pathname;

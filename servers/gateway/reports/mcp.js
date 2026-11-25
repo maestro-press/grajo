@@ -73,6 +73,7 @@ import { requestRun } from "./run-requests.js";
 import { listDraftSources } from "./source-approvals.js";
 import { cronNext } from "../../shared/schedule-core.js";
 import { validTimeZone } from "../../shared/relative-dates.js";
+import { readVerifiedBotDef } from "../../shared/bot-def-store.js";
 
 /** The mount prefix and the one path a bot's config names. */
 export const REPORTS_MCP_PREFIX = "/reports";
@@ -327,9 +328,11 @@ export function claimsOf(extra) {
 /* ---------------------------------------------------------------------- the project */
 
 /**
- * The project a verified bot works in: its own home project, and nothing a request can name. The same
- * read servers/shared/project-share-scope.js makes (that helper is not exported, so the query is here);
- * null when the bot has no project, when the project is archived, or when the def row is gone.
+ * The project a verified bot works in: its own home project, and nothing a request can name. The row
+ * is read through the store's VERIFIED read (round C, item E4): this decides which project this door
+ * may reach, so it is authority, and an unverified row answers null exactly like a missing one — a
+ * definition changed outside Crow never picks the project. Null when the bot has no project, when the
+ * project is archived, or when the row is gone.
  *
  * @param {object} db
  * @param {string} botId
@@ -338,11 +341,18 @@ export function claimsOf(extra) {
 async function homeProjectOf(db, botId) {
   if (typeof botId !== "string" || !botId) return null;
   try {
+    const read = await readVerifiedBotDef(db, botId);
+    if (!read.ok) {
+      if (read.reason !== "unknown-bot") {
+        console.warn(`[bot-def] ${botId} settings could not be verified (${read.reason}); the reports door used no project`);
+      }
+      return null;
+    }
+    if (read.row?.project_id == null) return null;
     const { rows } = await db.execute({
-      sql: `SELECT p.id FROM pi_bot_defs d JOIN project_spaces p ON p.id = d.project_id
-             WHERE d.bot_id = ? AND p.archived_at IS NULL
+      sql: `SELECT p.id FROM project_spaces p WHERE p.id = ? AND p.archived_at IS NULL
                AND (p.status IS NULL OR p.status != 'archived') LIMIT 1`,
-      args: [botId],
+      args: [Number(read.row.project_id)],
     });
     if (!rows[0]) return null;
     const id = Number(rows[0].id);

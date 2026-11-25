@@ -9,6 +9,7 @@
  * Scratch CROW_HOME + data dir, a real crow.db from scripts/init-db.js. Nothing here touches
  * ~/.crow.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -23,6 +24,7 @@ const HOME = join(dir, "home");
 mkdirSync(DATA, { recursive: true });
 mkdirSync(HOME, { recursive: true });
 process.env.CROW_HOME = HOME;
+markBotDefPreEra(process.env.CROW_HOME);
 process.env.CROW_DATA_DIR = DATA;
 delete process.env.CROW_DB_PATH;
 process.env.CROW_TASKS_DB_PATH = join(DATA, "tasks.db");

@@ -40,6 +40,10 @@ for (const k of Object.keys(process.env)) {
 const dir = mkdtempSync(join(tmpdir(), "s6-read-"));
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = join(dir, "home");
+// An install this release has never booted on: the host era record explicitly allows the unsealed rows
+// these fixtures seed directly (a MISSING record refuses them; see servers/shared/bot-def-mac.js).
+mkdirSync(join(process.env.CROW_HOME, "secrets"), { recursive: true, mode: 0o700 });
+writeFileSync(join(process.env.CROW_HOME, "secrets", "bot-def-era.json"), '{"v":1,"state":"pre-era"}\n', { mode: 0o600 });
 delete process.env.CROW_DB_PATH;
 process.env.PIBOT_MAX_PI = "99";
 process.env.PIBOT_WARM_GATEWAY_URL = "http://127.0.0.1:1";

@@ -18,7 +18,16 @@
  * stale page gets error=stale and writes nothing. Neither touches another
  * bot's row, a device record or a setting. Everything the saves do not own
  * (routine, handoff, migrated_from, permission_policy, the carried-over
- * tools) is kept as stored.
+ * tools) is kept as stored — FOR A ROW THAT VERIFIES. A row whose definition
+ * no key holder can vouch for (changed outside Crow) is replaced from the
+ * CLEAN BASE instead (`voiceBotDefinition(...)` plus the posted fields, its
+ * project from the instance's own voice-bot rule), so nothing the stored row
+ * holds survives that save; see `casWrite`. The page SHOWS that same clean base
+ * for such a row (a stored prompt nobody signed is never offered back to the
+ * owner to re-seal), with the instance's own defaults for the name and switch.
+ *
+ * The row itself is read through the store's verified reader
+ * (`readVerifiedBotDef`), never a raw `SELECT` of `definition`.
  *
  * The controls of both forms sit in one ordered page through the `form`
  * attribute, so the sections read in the order the operator thinks in. The
@@ -43,6 +52,7 @@ import { resolveRoutineBackends } from "../../../voice/own-tools.js";
 import { fastVoiceKeyFor } from "../../../voice/crow-voice.js";
 import { connectedAddonToolNames, createToolExecutor } from "../../../ai/tool-executor.js";
 import { loadModelOptions, loadRoleRefs } from "./data-queries.js";
+import { writeBotDef, readVerifiedBotDef } from "../../../../shared/bot-def-store.js";
 import { rowRev, defRev } from "./def-adapter.js";
 import { emitBotDefsChanged } from "./defs-changed.js";
 import { abilityLineHtml, voiceAbilityScript } from "./voice-use.js";
@@ -85,9 +95,38 @@ export function voiceRev(row) {
 const obj = (v) => (v && typeof v === "object" && !Array.isArray(v) ? v : {});
 const crowMcpOf = (def) => (Array.isArray(def?.tools?.crow_mcp) ? def.tools.crow_mcp.filter((x) => typeof x === "string" && x) : []);
 
+/** The project a re-approved voice bot is filed in: none, the instance's own rule for it
+ *  (`ensureVoiceBot` writes `project_id: null`). A row's own value is never reused for that. */
+const VOICE_BOT_PROJECT_ID = null;
+
+/**
+ * The instance's own defaults for the two ROW fields beside the definition that the keyed MAC also
+ * covers: the name the boot-time create gives the row and the switch it sets (`ensureVoiceBot`). A
+ * row nothing can vouch for is shown with THESE and sealed with THESE — never with the row's own
+ * values (round G1).
+ */
+const VOICE_BOT_DISPLAY_NAME = "Crow";
+const VOICE_BOT_ENABLED = 1;
+
+/**
+ * The CLEAN BASE a row nothing can vouch for is rebuilt from: `voiceBotDefinition(...)` with this
+ * instance's own default fast model — the quick key the gateway routes voice turns to, which is the
+ * same base the boot-time create uses (`ensureVoiceBot`). `cloudKey` builds the cloud preset.
+ */
+async function cleanVoiceBase({ preset = "fast_local", fastKey = null, cloudKey = null } = {}) {
+  const key = fastKey ?? (await import("../../../routes/llm-router.js")).VOICE_ROUTE_KEYS.fast;
+  return voiceBotDefinition({ preset, fastKey: key, cloudKey });
+}
+
+/**
+ * The voice bot's row, read through the store's VERIFIED reader (round C, item E2): `verified` says
+ * whether a key holder can vouch for it, and every save below branches on that.
+ */
 async function loadVoiceRow(db) {
   try {
-    return (await db.execute({ sql: "SELECT bot_id, display_name, enabled, definition, project_id FROM pi_bot_defs WHERE bot_id=?", args: [CROW_VOICE_BOT_ID] })).rows[0] || null;
+    const read = await readVerifiedBotDef(db, CROW_VOICE_BOT_ID);
+    if (!read.row) return null;
+    return { row: read.row, verified: read.ok, reason: read.ok ? null : read.reason };
   } catch { return null; }
 }
 const parseDef = (row) => { try { const d = JSON.parse(row.definition || ""); return d && typeof d === "object" && !Array.isArray(d) ? d : null; } catch { return null; } };
@@ -100,26 +139,73 @@ async function loadProfiles(db, key) {
   } catch { return []; }
 }
 
-/** The compare-and-swap every voice write uses: lands only if the row still holds what the page showed (voiceRev's columns). */
-async function casWrite(db, row, { definition, displayName = row.display_name, enabled = row.enabled }) {
-  const r = await db.execute({
-    sql: "UPDATE pi_bot_defs SET definition=?, display_name=?, enabled=?, updated_at=datetime('now') WHERE bot_id=? AND definition IS ? AND display_name IS ? AND project_id IS ? AND enabled = ?",
-    args: [definition, displayName, Number(enabled) ? 1 : 0, CROW_VOICE_BOT_ID, row.definition ?? null, row.display_name ?? null, row.project_id ?? null, Number(row.enabled) ? 1 : 0],
+/**
+ * The compare-and-swap every voice write uses: lands only if the row still holds what the page showed
+ * (voiceRev's columns).
+ *
+ * TWO SAVES, ONE FORM (round C, item E2).
+ *   - The row VERIFIES: this is an ordinary write. Its content comes from the row the store just
+ *     verified, so it is signed like any other partial save and `ownerFullReplace` is NOT claimed.
+ *   - The row does NOT verify (a definition changed outside Crow): the caller hands in a definition
+ *     built ENTIRELY from `voiceBotDefinition(...)` plus the posted form fields, and the row's other
+ *     MAC-covered fields too — `display_name` (outside the MAC, but just as untrusted), `enabled` and
+ *     `project_id` (the instance's own rule, `VOICE_BOT_PROJECT_ID`). A caller that leaves one out
+ *     gets a PROGRAMMING error (`VOICE_CAS_NEEDS_FIELDS`), never a quiet read of the row: the whole
+ *     point is that nothing the row holds survives the save. That is what `ownerFullReplace` is for:
+ *     the row's content is REPLACED, not re-signed, so nothing the row held (its tools, its
+ *     permission_policy, its project_id, any key this file has never heard of) can survive it.
+ */
+export const VOICE_CAS_NEEDS_FIELDS = "VOICE_CAS_NEEDS_FIELDS";
+export async function casWrite(db, row, { definition, displayName, enabled, projectId, verified }) {
+  if (!verified) {
+    // Round G1(b): an unverified row is REPLACED, so every field that would otherwise be taken from
+    // it must come from the caller — the clean base, the instance's rule, or the posted form.
+    const missing = [
+      definition === undefined ? "definition" : null,
+      displayName === undefined ? "display_name" : null,
+      enabled === undefined ? "enabled" : null,
+      projectId === undefined ? "project_id" : null,
+    ].filter(Boolean);
+    if (missing.length) {
+      const err = new Error(
+        `casWrite needs ${missing.join(", ")} to replace an unverified row: nothing may be read from it `
+        + "(see servers/gateway/dashboard/panels/bot-builder/voice-bot-editor.js)",
+      );
+      err.code = VOICE_CAS_NEEDS_FIELDS;
+      err.missing = missing;
+      throw err;
+    }
+  }
+  // The row's keyed MAC covers the definition, the name and the switch together
+  // (servers/shared/bot-def-store.js), so the store writes all three in one statement. The defaults
+  // below are reachable only for a row that VERIFIED — the guard above refuses the rest.
+  const r = await writeBotDef(db, {
+    bot_id: CROW_VOICE_BOT_ID,
+    definition,
+    display_name: displayName === undefined ? row.display_name : displayName,
+    enabled: enabled === undefined ? row.enabled : enabled,
+    project_id: projectId === undefined ? (row.project_id ?? null) : projectId,
+    expectDefinition: row.definition ?? null,
+    expectDisplayName: row.display_name ?? null,
+    expectProjectId: row.project_id ?? null,
+    expectEnabled: row.enabled,
+    ...(verified ? {} : { ownerFullReplace: true }),
   });
   return Number(r && r.rowsAffected) > 0;
 }
 
 const back = (res, q) => res.redirectAfterPost(`${VOICE_EDITOR_HREF}&${q}`);
 
-/** Read the row and check the page's rev. → { row, def } or a redirect already sent (null). */
+/** Read the row and check the page's rev. → { row, verified, def } or a redirect already sent (null). */
 async function freshRow(req, res, db) {
-  const row = await loadVoiceRow(db);
+  const found = await loadVoiceRow(db);
+  const row = found ? found.row : null;
   const def = row ? parseDef(row) : null;
   if (!row) { back(res, "error=voice_missing"); return null; }
   if (!def) { back(res, "error=voice_corrupt"); return null; }
   const rev = (req.body || {}).rev;
   if (typeof rev !== "string" || !rev || rev !== voiceRev(row)) { back(res, "error=stale"); return null; }
-  return { row, def };
+  return { row, verified: found.verified, def };
 }
 
 /**
@@ -183,7 +269,7 @@ export async function handleVoiceBotSave(req, res, { db }) {
   const b = req.body || {};
   const got = await freshRow(req, res, db);
   if (!got) return;
-  const { row, def } = got;
+  const { row, verified } = got;
   const name = String(b.display_name ?? "").trim();
   if (!name || Array.from(name).length > NAME_MAX) return back(res, "error=voice_name_invalid");
   const prompt = String(b.system_prompt ?? "").replace(/\r\n?/g, "\n");
@@ -202,6 +288,11 @@ export async function handleVoiceBotSave(req, res, { db }) {
   const stt = await profile("stt_profile_id", "stt_profiles");
   if (!tts.ok || !stt.ok) return back(res, "error=voice_profile_invalid");
 
+  // A row a key holder can vouch for is edited AS IT IS; a row nothing can vouch for is replaced
+  // from the CLEAN BASE (`voiceBotDefinition`), so not one key of the stored row survives the save
+  // (round C, item E2). Everything below (tools, routine, hand-off) is applied to that base.
+  const def = verified ? got.def : await cleanVoiceBase({ fastKey: model });
+
   let tools = crowMcpOf(def);
   if (b.memory_tools === "on") { for (const m of MEMORY_TOOLS) if (!tools.includes(m)) tools.push(m); }
   else tools = tools.filter((x) => !isMemoryTool(x));
@@ -214,7 +305,17 @@ export async function handleVoiceBotSave(req, res, { db }) {
   };
   await applyRoutine(db, b, def, next);
   await applyHandoff(db, b, def, next);
-  if (!(await casWrite(db, row, { definition: JSON.stringify(next), displayName: name, enabled: b.enabled === "on" ? 1 : 0 }))) return back(res, "error=stale");
+  // A save refuses (`BOT_DEF_UNVERIFIED`) on a row that does not verify — a definition changed outside
+  // Crow. The editor answers with its EXISTING stale-form error: nothing new to read, and the operator
+  // gets the same "reload" signal a lost compare-and-swap gives.
+  const saved = await casWrite(db, row, {
+    definition: JSON.stringify(next),
+    displayName: name,
+    enabled: b.enabled === "on" ? 1 : 0,
+    ...(verified ? {} : { projectId: VOICE_BOT_PROJECT_ID }),
+    verified,
+  }).catch(() => false);
+  if (!saved) return back(res, "error=stale");
   emitBotDefsChanged(CROW_VOICE_BOT_ID);
   return back(res, "saved=1");
 }
@@ -225,7 +326,7 @@ export async function handleVoiceBotPreset(req, res, { db }) {
   if (!VOICE_PRESETS.includes(preset)) return back(res, "error=voice_preset_invalid");
   const got = await freshRow(req, res, db);
   if (!got) return;
-  const { row, def } = got;
+  const { row, verified } = got;
   let cloudKey = null;
   if (preset === "cloud") {
     cloudKey = String(b.cloud_model ?? "").trim();
@@ -233,15 +334,18 @@ export async function handleVoiceBotPreset(req, res, { db }) {
     if (!opts.some((o) => o.key === cloudKey)) return back(res, "error=voice_cloud_model_required");
   }
   // The quick local model the gateway routes voice turns to (the same key the boot-time create uses).
-  const { VOICE_ROUTE_KEYS } = await import("../../../routes/llm-router.js");
   let base;
-  try { base = voiceBotDefinition({ preset, fastKey: VOICE_ROUTE_KEYS.fast, cloudKey }); }
+  try { base = await cleanVoiceBase({ preset, cloudKey }); }
   catch { return back(res, "error=voice_cloud_model_required"); }
   const presetTools = base.tools.crow_mcp;
   const reset = b.reset === "1";
   // A preset switch keeps the tools the migration carried (entries beyond the preset list) and the
   // Memory tools switch as it stands (absent memory entries stay absent); Reset to preset
   // deliberately goes back to the bare preset list and the default persona.
+  //
+  // An UNVERIFIED row is rebuilt from that clean base only (round C, item E2): its tool list is the
+  // preset's, never whatever the tampered row carried.
+  const def = verified ? got.def : base;
   const current = crowMcpOf(def);
   const carried = current.filter((x) => !presetTools.includes(x));
   const memoryOff = !current.some(isMemoryTool);
@@ -254,7 +358,14 @@ export async function handleVoiceBotPreset(req, res, { db }) {
     tools: { ...obj(def.tools), crow_mcp: reset ? [...presetTools] : [...rebuilt, ...carried] },
   };
   if (reset) next.system_prompt = DEFAULT_PERSONA;
-  if (!(await casWrite(db, row, { definition: JSON.stringify(next) }))) return back(res, "error=stale");
+  // An unverified row is replaced from the clean base, so the name and the switch it does not post
+  // come from the instance's own defaults too, never from the row (round G1(b)).
+  const saved = await casWrite(db, row, {
+    definition: JSON.stringify(next),
+    ...(verified ? {} : { displayName: VOICE_BOT_DISPLAY_NAME, enabled: VOICE_BOT_ENABLED, projectId: VOICE_BOT_PROJECT_ID }),
+    verified,
+  }).catch(() => false);
+  if (!saved) return back(res, "error=stale");
   emitBotDefsChanged(CROW_VOICE_BOT_ID);
   return back(res, "saved=1");
 }
@@ -420,9 +531,10 @@ async function handoffSection(db, v, lang, sec, hint) {
 
 export async function renderVoiceBotEditor(req, res, { db, layout, lang = "en", PAGE_CSS = "", notice = "", kioskAvailable = false }) {
   const backLink = `<p><a href="/dashboard/bot-builder">&larr; ${t("botbuilder.noticeAllBots", lang)}</a></p>`;
-  const row = await loadVoiceRow(db);
-  const def = row ? parseDef(row) : null;
-  if (!row || !def) {
+  const found = await loadVoiceRow(db);
+  const row = found ? found.row : null;
+  const stored = row ? parseDef(row) : null;
+  if (!row || !stored) {
     // A row that is there but can't be read is kept as it is (ensureVoiceBot never rewrites it).
     const key = row ? "botbuilder.voiceErrCorrupt" : "botbuilder.voiceErrMissing";
     return res.send(layout({
@@ -430,6 +542,15 @@ export async function renderVoiceBotEditor(req, res, { db, layout, lang = "en", 
       content: PAGE_CSS + section(t("botbuilder.voiceEditorTitle", lang), backLink + notice + `<p>${escapeHtml(t(key, lang))}</p>`),
     }));
   }
+  // A row no key holder can vouch for is SHOWN as the clean base (round G1(a)): the form is what the
+  // operator re-saves, and that save replaces the row from this same base, so a stored prompt nobody
+  // signed never appears here for the owner to re-seal by accident. The page keeps its structure and
+  // says nothing new — the save's own error=stale answers a save; this line is for the log.
+  const { verified } = found;
+  if (!verified) {
+    console.warn(`[bot-def] ${CROW_VOICE_BOT_ID} was changed outside Crow (${found.reason}); the voice editor shows the clean base`);
+  }
+  const def = verified ? stored : await cleanVoiceBase();
   const v = normalizeVoiceSettings(def);
   const rev = voiceRev(row);
   const { opts } = await loadModelOptions(db);
@@ -444,7 +565,9 @@ export async function renderVoiceBotEditor(req, res, { db, layout, lang = "en", 
   const dialedKey = dialed.key || model;
   const provId = dialedKey.includes("/") ? dialedKey.slice(0, dialedKey.indexOf("/")) : dialedKey;
   const memoryOn = crowMcpOf(def).some(isMemoryTool);
-  const name = row.display_name || "Crow";
+  const name = verified ? (row.display_name || VOICE_BOT_DISPLAY_NAME) : VOICE_BOT_DISPLAY_NAME;
+  // The switch is MAC-covered too, so an unverified row shows the instance's own default as well.
+  const enabledOn = verified ? Number(row.enabled) : VOICE_BOT_ENABLED;
   const sec = (key, body) => `<div class="btb-vsec"><h3>${escapeHtml(t(key, lang))}</h3>${body}</div>`;
   const hint = (key) => `<p class="btb-hint">${escapeHtml(t(key, lang))}</p>`;
   const hidden = (action) => `<input type="hidden" name="action" value="${action}">` +
@@ -455,7 +578,7 @@ export async function renderVoiceBotEditor(req, res, { db, layout, lang = "en", 
     `<form method="POST" action="/dashboard/bot-builder" id="btb-vpreset">${hidden("voice_bot_preset")}</form>`;
 
   const onSec = sec("botbuilder.voiceOnTitle",
-    `<label class="btb-vcheck"><input type="checkbox" name="enabled" value="on" form="btb-vsave"${Number(row.enabled) ? " checked" : ""}> ` +
+    `<label class="btb-vcheck"><input type="checkbox" name="enabled" value="on" form="btb-vsave"${enabledOn ? " checked" : ""}> ` +
     `${escapeHtml(t("botbuilder.voiceOnTitle", lang))}</label>` + hint("botbuilder.voiceOnHint"));
 
   const presetCard = (id, labelKey, hintKey) =>

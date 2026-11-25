@@ -25,7 +25,7 @@ import {
   getBucketStats,
 } from "../../storage/s3-client.js";
 import { resolveCallActor, UNKNOWN } from "../../research/actor.js";
-import { botReadScope } from "../../shared/project-share-scope.js";
+import { botReadScope, boundByBotRules } from "../../shared/project-share-scope.js";
 import { BLOG_POST_REFERENCE_TYPE, BLOG_POST_OWNER_ONLY_MESSAGE, INVALID_MIME_TYPE_MESSAGE, isCleanMediaType } from "../../blog/media-policy.js";
 
 const MAX_UPLOAD_SIZE = parseInt(process.env.MAX_UPLOAD_SIZE || "104857600", 10);
@@ -125,7 +125,25 @@ export default function storageHttpRouter(authMiddleware) {
       // servers/blog/media-policy.js (the inline allowlist and the parsed
       // Content-Type), which decides on the object, not on who uploaded it.
       const actor = resolveCallActor(UNKNOWN, { requestInfo: { headers: req.headers } });
-      const botBound = (await botReadScope(db, actor)) != null;
+      // The row behind a bot actor is AUTHORITY (its project_id decides the bot's home and its
+      // definition carries `tools`), and a contained bot can write it — so a bot actor's row is read
+      // VERIFIED and must verify, or the request is refused. A row that does not verify never decides
+      // scope here; the message is the same one the peer relay uses for the same condition.
+      let botRow;
+      if (boundByBotRules(actor)) {
+        const { readVerifiedBotDef } = await import("../../shared/bot-def-store.js");
+        const read = await readVerifiedBotDef(db, actor.id);
+        // A row that EXISTS and does not verify is the refusal (nothing it says decides scope). A bot
+        // id with NO row at all is the older case: no home project, no definition, so the rules below
+        // refuse or scope it exactly as they always did (an unknown bot still gets the blog rule).
+        if (!read.ok && read.reason !== "unknown-bot") {
+          console.warn(`[bot-def] ${actor.id} settings could not be verified (${read.reason}); the storage upload was refused`);
+          closeDb();
+          return res.status(403).json({ error: "the bot's settings could not be verified" });
+        }
+        botRow = read.row;
+      }
+      const botBound = (await botReadScope(db, actor, { botRow })) != null;
       if (botBound && referenceType === BLOG_POST_REFERENCE_TYPE) {
         closeDb();
         return res.status(403).json({ error: BLOG_POST_OWNER_ONLY_MESSAGE });

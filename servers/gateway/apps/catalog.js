@@ -11,6 +11,7 @@ import { effectiveCrowMcp } from "../../../scripts/pi-bots/skill-tools.mjs";
 import { remoteServersForBot, remoteBlockName } from "../../../scripts/pi-bots/remote-blocks.mjs";
 import { novncUrl } from "../../shared/novnc-url.js";
 import bus from "../../shared/event-bus.js";
+import { readVerifiedBotDef, verifyBotRows } from "../../shared/bot-def-store.js";
 
 const TTL_MS = 30_000;
 
@@ -200,11 +201,17 @@ async function computeAppsForProject(db, projectId, { crowHome }) {
   const apps = listApps({ crowHome });
   const knownServers = apps.flatMap((a) => a.mcpServers);
   const remoteEnabled = await remoteOn(db);
-  const { rows } = await db.execute({ sql: "SELECT bot_id, definition FROM pi_bot_defs WHERE project_id = ? AND enabled != 0", args: [projectId] });
+  const { rows } = await db.execute({ sql: "SELECT * FROM pi_bot_defs WHERE project_id = ? AND enabled != 0", args: [projectId] });
   const sets = [];
-  for (const row of rows) {
+  // AUTHORITY: each enabled bot's verified definition decides which apps this project shows (its
+  // `tools.crow_mcp`), and a contained bot can write its own row — so a definition whose keyed
+  // MAC does not verify grants nothing here (servers/shared/bot-def-store.js). ONE query for the
+  // project's bots and ONE era read for all of them, so this stays a single bot-defs statement.
+  for (const verified of await verifyBotRows(db, rows)) {
+    if (!verified.ok) continue;
     let def = {};
-    try { def = JSON.parse(row.definition || "{}") || {}; } catch { /* a corrupt def grants nothing */ }
+    try { def = JSON.parse(verified.row.definition || "{}") || {}; } catch { def = {}; }
+    // eslint-disable-next-line no-await-in-loop -- one bot per project's enabled set
     sets.push(await grantedServers(db, def, { remoteEnabled, crowHome, knownServers }));
   }
   return appsForBots(apps, sets);

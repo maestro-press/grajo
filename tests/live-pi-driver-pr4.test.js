@@ -5,6 +5,7 @@
  * gets it (an appended system prompt file, never the operator's message). Also the eval-only
  * briefing seam in handleInbound: refused outside an eval scratch, and invisible to the prod path.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
@@ -81,6 +82,7 @@ async function quickServer(t, { status = 200 } = {}) {
 /** A scratch home, a quick server and the options for a two-day run. */
 async function setup(t, { env = { CROW_SESSION_SUMMARIES: "1" }, knobs = {}, threads = null, over = {}, quickStatus = 200 } = {}) {
   const s = await makeScratch({ botId: BOT, template });
+  markBotDefPreEra(s.home);
   const q = await quickServer(t, { status: quickStatus });
   const capture = join(s.home, "capture.ndjson");
   const events = [];
@@ -345,6 +347,7 @@ async function seamCall(dir, env, opts) {
 /** A real env that is NOT an eval scratch (no CROW_RESEARCH_EVAL), with the stub pi wired. */
 function nonEvalEnv(dir, capture) {
   const home = join(dir, "home");
+  markBotDefPreEra(home);
   mkdirSync(join(home, "data"), { recursive: true });
   return {
     PATH: process.env.PATH, HOME: home, CROW_HOME: home, CROW_DATA_DIR: join(home, "data"), CROW_DB_PATH: join(home, "data", "crow.db"),
@@ -404,6 +407,7 @@ test("forged eval-looking options cannot pass the seam", async (t) => {
 /** A real eval scratch with the bot seeded, the env the driver's child gets, and its capture file. */
 async function evalSeamScratch(t) {
   const s = await makeScratch({ botId: BOT, template });
+  markBotDefPreEra(s.home);
   t.after(() => s.cleanup());
   const capture = join(s.home, "capture.ndjson");
   const env = childEnv({ home: s.home, botId: BOT, runId: randomUUID(), piCli: STUB, turnTimeoutMs: 20_000, parent: { ...process.env, PIBOT_TEST_CAPTURE: capture } });

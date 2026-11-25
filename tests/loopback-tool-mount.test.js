@@ -7,6 +7,7 @@
  * loopback because the test fetches 127.0.0.1; "not local" is driven with a
  * forwarding header and with CROW_TRUSTED_PROXIES.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -235,6 +236,7 @@ before(async () => {
   // minted under one home would read as a foreign keyId under another and be refused.)
   savedHome = process.env.CROW_HOME;
   process.env.CROW_HOME = dir;
+  markBotDefPreEra(process.env.CROW_HOME);
   TOKEN = await EXAMPLE_TOKEN().rotate(db);
   tokens.local = await generateLocalToken(db);
   tokens.board = await generateBoardToken(db);

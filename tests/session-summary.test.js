@@ -6,6 +6,7 @@
  * model or GPU calls. The engine half reuses the fake-PiRpc harness idiom of
  * tests/perch-interactive-capacity.test.js.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -18,6 +19,7 @@ import Database from "better-sqlite3";
 const dir = mkdtempSync(join(tmpdir(), "session-summary-"));
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = join(dir, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 delete process.env.CROW_SESSION_SUMMARIES;
 process.env.PI_MODELS_JSON = join(dir, "models.json");

@@ -23,7 +23,7 @@
  * CI=true (devcontainers etc.) does NOT reduce the suite — we warn instead.
  * Every entry must name an existing test file (rot guard, hard error).
  */
-import { readdirSync, readFileSync, mkdtempSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { readdirSync, readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir, homedir } from "node:os";
@@ -143,6 +143,13 @@ env.CROW_DATA_DIR = join(scratch, "data");
 // having created it first ("Cannot open database because the directory does
 // not exist" in bundle-npm-required / bundles-auth-bypass, 2026-10-04).
 mkdirSync(env.CROW_DATA_DIR, { recursive: true });
+// Tests that seed raw (unsealed) pi_bot_defs rows run in a home that predates
+// sealing: the host-side era record says "pre-era" (same shape as
+// writeBotDefEraState in servers/shared/bot-def-mac.js). Tests ABOUT sealing
+// make their own homes and their own era setup.
+mkdirSync(join(scratch, "secrets"), { recursive: true, mode: 0o700 });
+writeFileSync(join(scratch, "secrets", "bot-def-era.json"),
+  JSON.stringify({ v: 1, state: "pre-era", at: new Date().toISOString() }) + "\n", { mode: 0o600 });
 // Belt and braces: these now resolve per instance (CROW_HOME / CROW_DATA_DIR,
 // servers/shared/crow-home.js), but a suite gateway must never touch a real
 // copy even if a resolver regresses — the same-machine instance registry

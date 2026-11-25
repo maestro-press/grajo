@@ -1568,13 +1568,19 @@ export default function botBoardApiRouter(dashboardAuth) {
   // escape. We additionally refuse symlinks and never overwrite an existing skill.
 
   async function loadBotDef(cdb, botId) {
-    const row = (await cdb.execute({
-      sql: "SELECT definition, updated_at FROM pi_bot_defs WHERE bot_id=?",
-      args: [botId],
-    })).rows[0];
-    if (!row) return null;
-    let def; try { def = JSON.parse(row.definition || "{}"); } catch { def = {}; }
-    return { def, updatedAt: row.updated_at == null ? null : String(row.updated_at) };
+    // The row is read through the store's VERIFIED read (round C, item E4): `def.session_dir` decides
+    // where a skill proposal is read from and written to, so a definition nothing can vouch for must
+    // not hand this route a path. An unverified row is the route's existing "unknown bot" answer.
+    const { readVerifiedBotDef } = await import("../../shared/bot-def-store.js");
+    const read = await readVerifiedBotDef(cdb, botId);
+    if (!read.row || !read.ok) {
+      if (read.row && !read.ok) {
+        console.warn(`[bot-def] ${botId} settings could not be verified (${read.reason}); its skill proposals were not read`);
+      }
+      return null;
+    }
+    const def = read.def && typeof read.def === "object" ? read.def : {};
+    return { def, updatedAt: read.row.updated_at == null ? null : String(read.row.updated_at) };
   }
 
   // ---- list a bot's staged proposals (name, text, guardrail flags) ----

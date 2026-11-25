@@ -142,6 +142,12 @@ const APP_MODULES = {
     keys: ["CROW_ADDON_HOST"],
     exempt: {},
   },
+  // The bot-definition WRITE seam a bot-loadable module calls through (Studio's Update, the
+  // artifacts companion migration, skill promotion). Its only environment read is CROW_APP_ROOT,
+  // and only in the header's prose: a copy an installed bundle resolves through its own appImport
+  // falls back to ~/crow when the gateway exported no app root. It holds no key and imports
+  // nothing, so a module that loads it in an add-on's child needs nothing else from the gateway.
+  "servers/shared/bot-def-seal.js": { keys: ["CROW_APP_ROOT"], exempt: {} },
   "servers/gateway/addon-keys-paths.js": { keys: [], exempt: {} },
   "servers/shared/design-kit.js": { keys: [], exempt: {} },
   "servers/shared/relative-dates.js": { keys: [], exempt: {} },

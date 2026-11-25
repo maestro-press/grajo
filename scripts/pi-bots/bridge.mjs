@@ -95,6 +95,14 @@ import { piProviderIdHere } from "./pi_provider_id.mjs";
 import { PiModelUnavailableError } from "./pi-model-catalog.mjs";
 import { meterBotTurn } from "./metering.mjs";
 import { getOrCreateLocalInstanceId } from "../../servers/gateway/instance-registry.js";
+// The bot-definition verification (HOST-SIDE: it reaches the keyed-hash module, which holds the
+// one key a bot cannot read; see tests/bot-seed-import-guard.test.js — this file is on the
+// reviewed host-side list for exactly that reason). `loadBot` refuses an unverifiable definition.
+import { botDefEraConvertedSync, botDefRefusalAlarm, reconcileBotDefPending, verifyBotDefSync } from "../../servers/shared/bot-def-mac.js";
+// Side effect, on purpose: importing the store installs the bot-loadable WRITE seam in this
+// process, which is what skill promotion (scripts/pi-bots/skill_promote.mjs, run by the post-turn
+// review) writes a definition through. A bot-loadable module may never import the store itself.
+import "../../servers/shared/bot-def-store.js";
 
 // The provider-key display source (design §1.2, review round 1 L2): the masking
 // set includes every sealed `providers.api_key` this home can open, and only a
@@ -1822,10 +1830,32 @@ export function loadBot(botId) {
   const c = db(CROW_DB);
   // M3b: project_id is now the column (not JSON). The JSON copy may still
   // exist for back-compat on legacy rows but is no longer authoritative.
-  const row = c.prepare("SELECT bot_id, display_name, definition, enabled, project_id FROM pi_bot_defs WHERE bot_id=?").get(botId);
-  c.close();
+  let row;
+  try {
+    try {
+      row = c.prepare("SELECT bot_id, display_name, definition, enabled, project_id, def_mac, def_generation FROM pi_bot_defs WHERE bot_id=?").get(botId);
+    } catch {
+      // A store shaped before the seal columns exist: the row has no `def_mac` KEY, and the era
+      // record decides whether that is accepted (it is refused unless the host record says pre-era).
+      row = c.prepare("SELECT bot_id, display_name, definition, enabled, project_id FROM pi_bot_defs WHERE bot_id=?").get(botId);
+    }
+  } finally { c.close(); }
   if (!row) throw new Error("unknown bot " + botId);
   if (!row.enabled) throw new Error("bot " + botId + " disabled");
+  // THE SPAWN GATE. A bot definition carries a keyed MAC over its whole content (see
+  // servers/shared/bot-def-mac.js): this process can write crow.db's bot rows, and so can any
+  // contained bot, so a definition that does not verify is not this instance's — the turn is
+  // refused (never a spawn) and ONE line per bot per reason per 24 h says why. The era is the
+  // HOST-SIDE record the gateway's converter writes (`<secrets>/bot-def-era.json`, read directly
+  // here): anything but an explicit "pre-era" refuses an unsealed row, and nothing in crow.db (a
+  // `def_mac` column, the DB mirror) can open it. A pending generation is settled only when the row
+  // already carries it and its MAC verifies (the gateway's boot abandons the rest).
+  try { reconcileBotDefPending([row]); } catch { /* verification below still decides */ }
+  const verification = verifyBotDefSync(row, { converted: botDefEraConvertedSync() });
+  if (!verification.ok) {
+    botDefRefusalAlarm(botId, verification.reason);
+    throw new Error(`bot ${botId} settings could not be verified (${verification.reason})`);
+  }
   return Object.assign({}, row, { def: JSON.parse(row.definition || "{}") });
 }
 // M3b: load the project_spaces row for a bot so the bridge can resolve a

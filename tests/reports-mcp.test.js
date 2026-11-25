@@ -17,6 +17,7 @@
 // Harness: a scratch crow.db (init-db) and a scratch CROW_HOME (CROW_DATA_DIR/CROW_HOME are repointed
 // before any gateway module is imported), two projects, two bots, a real reports token minted at boot
 // and read back from `secrets/reports-token`, and the real per-boot actor key.
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -35,6 +36,7 @@ const root = mkdtempSync(join(tmpdir(), "reports-mcp-"));
 const CROW_HOME = join(root, "home");
 process.env.CROW_DATA_DIR = join(root, "master");
 process.env.CROW_HOME = CROW_HOME;
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 process.env.CROW_TASKS_DB_PATH = join(root, "master", "tasks.db");
 mkdirSync(CROW_HOME, { recursive: true });
@@ -153,6 +155,7 @@ async function addSchedule(db, { cron = "0 7 * * 1", tz = "Europe/Berlin" } = {}
  */
 async function setup() {
   rmScratch(join(CROW_HOME, "secrets"));
+  markBotDefPreEra(CROW_HOME);
   writeKeychainKey();
   const dir = mkdtempSync(join(root, "t-"));
   const crow = join(dir, "crow.db");

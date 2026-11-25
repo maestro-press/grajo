@@ -33,6 +33,7 @@ import { changeTracker } from "./ui.js";
 import { applyTrackerChoice, applyShowCards, trackerIsCustom } from "./tracker-choice.js";
 import { saveBasics, saveAbilities, saveSafety, saveAdvanced, applySatelliteOptin } from "./save-handlers.js";
 import { guardPolicyForSave } from "./policy-guard.js";
+import { writeBotDef, setBotEnabled } from "../../../../shared/bot-def-store.js";
 import { isVoiceBotId } from "../../../../shared/voice-bot.js";
 import { handleVoiceBotSave, handleVoiceBotPreset } from "./voice-bot-editor.js";
 import { ENGINE_CHANNELS } from "../../../bot-engine-status.js";
@@ -104,7 +105,7 @@ async function handleBoardOn(req, res, { db }) {
   const fail = (msg) => res.redirectAfterPost((b.return === "board" ? `/dashboard/bot-board?bot=${enc}&error=` : "/dashboard/bot-builder?error=") + encodeURIComponent(msg));
   let row = null;
   try {
-    row = (await db.execute({ sql: "SELECT bot_id, display_name, definition, project_id FROM pi_bot_defs WHERE bot_id=?", args: [botId] })).rows[0] || null;
+    row = (await db.execute({ sql: "SELECT bot_id, display_name, definition, enabled, project_id FROM pi_bot_defs WHERE bot_id=?", args: [botId] })).rows[0] || null;
   } catch { row = null; }
   if (!row) return res.redirectAfterPost("/dashboard/bot-builder?error=unknown_bot");
   let def;
@@ -170,12 +171,18 @@ async function handleBoardOn(req, res, { db }) {
   // The column is authoritative (M3b). Like the Edit tab's board save, add no
   // JSON copy; an existing copy is kept in step with the column.
   if (!hadProjectKey) delete def.project_id;
-  // The same compare-and-swap the tab saves use: refuse a stale row.
+  // The same compare-and-swap the tab saves use: refuse a stale row. The values read above are
+  // `expect*` — the store refuses unless they are still the row it verifies (round D, item F1).
   let r;
   try {
-    r = await db.execute({
-      sql: "UPDATE pi_bot_defs SET definition=?, project_id=?, updated_at=datetime('now') WHERE bot_id=? AND definition IS ? AND project_id IS ?",
-      args: [JSON.stringify(def), projectId, botId, row.definition ?? null, row.project_id ?? null],
+    r = await writeBotDef(db, {
+      bot_id: botId,
+      definition: def,
+      project_id: projectId,
+      // The same compare-and-swap the tab saves use: refuse a stale row.
+      expectDefinition: row.definition ?? null,
+      expectEnabled: row.enabled,
+      expectProjectId: row.project_id ?? null,
     });
   } catch (e) { await undo(); return fail(String((e && e.message) || e)); }
   if (Number(r && r.rowsAffected) === 0) { await undo(); return fail(t("botbuilder.staleForm", lang)); }
@@ -244,9 +251,13 @@ export async function handleBotBuilderPost(req, res, { db }) {
           "/dashboard/bot-builder?error=" + encodeURIComponent(fill(t("botbuilder.createExists", reqLang(req)), { id: botId }))
         );
       }
-      await db.execute({
-        sql: "INSERT INTO pi_bot_defs (bot_id, display_name, definition, project_id, enabled) VALUES (?,?,?,?,1)",
-        args: [botId, display, JSON.stringify(defaultDefinition(botId, projectId, model)), projectId],
+      await writeBotDef(db, {
+        bot_id: botId,
+        display_name: display,
+        definition: defaultDefinition(botId, projectId, model),
+        project_id: projectId,
+        enabled: 1,
+        mode: "insert",
       });
     } catch (e) {
       return res.redirectAfterPost("/dashboard/bot-builder?error=" + encodeURIComponent(String(e.message || e)));
@@ -286,7 +297,7 @@ export async function handleBotBuilderPost(req, res, { db }) {
     const lang = reqLang(req);
     const back = (q) => res.redirectAfterPost(`/dashboard/bot-builder?bot=${encodeURIComponent(id)}&tab=abilities&${q}`);
     let row = null;
-    try { row = (await db.execute({ sql: "SELECT definition FROM pi_bot_defs WHERE bot_id=?", args: [id] })).rows[0]; } catch {}
+    try { row = (await db.execute({ sql: "SELECT definition, enabled, project_id FROM pi_bot_defs WHERE bot_id=?", args: [id] })).rows[0]; } catch {}
     if (!row) return res.redirectAfterPost("/dashboard/bot-builder?error=unknown_bot");
     let def; try { def = JSON.parse(row.definition || "{}"); } catch { def = {}; }
     const pp = def.permission_policy || {};
@@ -296,9 +307,15 @@ export async function handleBotBuilderPost(req, res, { db }) {
     const nextDef = { ...def, permission_policy: next, tools: { ...(def.tools || {}), pi_builtin: builtin.includes("bash") ? builtin : [...builtin, "bash"] } };
     const bad = guardPolicyForSave(next, pp, nextDef);
     if (bad) return back("error=" + encodeURIComponent(fill(t("botbuilder.policyInvalid", lang), { reason: bad })));
-    // Compare-and-swap on the definition read above (a concurrent writer wins).
-    const r = await db.execute({ sql: "UPDATE pi_bot_defs SET definition=?, updated_at=datetime('now') WHERE bot_id=? AND definition=?",
-      args: [JSON.stringify(nextDef), id, row.definition] });
+    // Compare-and-swap on the row read above (a concurrent writer wins), and the store refuses
+    // unless those values are still the row it verifies (round D, item F1).
+    const r = await writeBotDef(db, {
+      bot_id: id,
+      definition: nextDef,
+      expectDefinition: row.definition,
+      expectEnabled: row.enabled,
+      expectProjectId: row.project_id ?? null,
+    });
     if (!r.rowsAffected) return back("error=" + encodeURIComponent(t("botbuilder.staleForm", lang)));
     emitBotDefsChanged(id);
     return back("saved=1");
@@ -307,7 +324,15 @@ export async function handleBotBuilderPost(req, res, { db }) {
   if (action === "toggle") {
     let toggled = true;
     try {
-      await db.execute({ sql: "UPDATE pi_bot_defs SET enabled = 1 - enabled, updated_at=datetime('now') WHERE bot_id=?", args: [b.bot_id] });
+      // `enabled` is inside the definition's MAC, so a toggle is a re-signed write, never a bare
+      // `SET enabled` (servers/shared/bot-def-store.js `setBotEnabled`) — and a partial write states
+      // the row it read (round D, item F1).
+      const current = (await db.execute({ sql: "SELECT definition, enabled, project_id FROM pi_bot_defs WHERE bot_id=?", args: [b.bot_id] })).rows?.[0];
+      await setBotEnabled(db, b.bot_id, Number(current?.enabled) ? 0 : 1, {
+        expectDefinition: current?.definition ?? null,
+        expectEnabled: current?.enabled,
+        expectProjectId: current?.project_id ?? null,
+      });
     } catch { toggled = false; /* ignore */ }
     if (toggled) emitBotDefsChanged(b.bot_id);
     // Back to the review tab (the toggle lives under the Status checklist
@@ -359,7 +384,7 @@ export async function handleBotBuilderPost(req, res, { db }) {
       // M3b: also fetch project_id column (authoritative). After parsing
       // the JSON we set def.project_id from the column so the rest of
       // this handler can keep reading `def.project_id` transparently.
-      row = (await db.execute({ sql: "SELECT definition, project_id, display_name FROM pi_bot_defs WHERE bot_id=?", args: [botId] })).rows[0];
+      row = (await db.execute({ sql: "SELECT definition, enabled, project_id, display_name FROM pi_bot_defs WHERE bot_id=?", args: [botId] })).rows[0];
     } catch { row = null; }
     if (!row) return res.redirectAfterPost("/dashboard/bot-builder?error=unknown_bot");
     const tab = action.slice(5);
@@ -617,14 +642,18 @@ export async function handleBotBuilderPost(req, res, { db }) {
       // this save read (a skill approved, a peer edit or another tab in the
       // meantime makes it refuse instead of silently overwriting).
       // M3b: the project_id column is authoritative for every reader.
-      const sets = [], args = [];
-      if (defChanged) { sets.push("definition=?"); args.push(newText); }
-      if (columnNameUpdate !== null) { sets.push("display_name=?"); args.push(columnNameUpdate); }
-      if (columnProjectIdUpdate !== undefined) { sets.push("project_id=?"); args.push(columnProjectIdUpdate); }
-      sets.push("updated_at=datetime('now')");
-      const r = await db.execute({
-        sql: `UPDATE pi_bot_defs SET ${sets.join(", ")} WHERE bot_id=? AND definition IS ? AND display_name IS ? AND project_id IS ?`,
-        args: [...args, botId, row.definition ?? null, row.display_name ?? null, row.project_id ?? null],
+      // The writer also re-MACs the definition (servers/shared/bot-def-store.js):
+      // the whole row is covered by the keyed MAC, so this is the one place a
+      // Bot Builder save can land.
+      const r = await writeBotDef(db, {
+        bot_id: botId,
+        ...(defChanged ? { definition: newText } : {}),
+        ...(columnNameUpdate !== null ? { display_name: columnNameUpdate } : {}),
+        ...(columnProjectIdUpdate !== undefined ? { project_id: columnProjectIdUpdate } : {}),
+        expectDefinition: row.definition ?? null,
+        expectEnabled: row.enabled,
+        expectDisplayName: row.display_name ?? null,
+        expectProjectId: row.project_id ?? null,
       });
       if (Number(r && r.rowsAffected) === 0) {
         return res.redirectAfterPost(`/dashboard/bot-builder?bot=${encodeURIComponent(botId)}&tab=${backTab}&error=` +
@@ -633,7 +662,11 @@ export async function handleBotBuilderPost(req, res, { db }) {
       await writeSatOptin();
       await runAfter();
     } catch (e) {
-      return res.redirectAfterPost(`/dashboard/bot-builder?bot=${encodeURIComponent(botId)}&tab=${backTab}&error=` + encodeURIComponent(String(e.message || e)));
+      // An unverified row (a definition changed outside Crow) refuses with `BOT_DEF_UNVERIFIED`; the
+      // route answers with its EXISTING "reload and try again" text — nothing new for the operator to
+      // read (the `[bot-def]` log line says what to do), and the refusal cannot be mistaken for a save.
+      const msg = e && e.code === "BOT_DEF_UNVERIFIED" ? t("botbuilder.staleForm", lang) : String((e && e.message) || e);
+      return res.redirectAfterPost(`/dashboard/bot-builder?bot=${encodeURIComponent(botId)}&tab=${backTab}&error=` + encodeURIComponent(msg));
     }
     emitBotDefsChanged(botId);
     return res.redirectAfterPost(`/dashboard/bot-builder?bot=${encodeURIComponent(botId)}&tab=${backTab}&saved=1${extraQ}`);

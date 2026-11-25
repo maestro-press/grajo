@@ -27,6 +27,7 @@ import { appendAudit } from "../../../../shared/project-acl.js";
 import { boardState } from "../../shared/bot-display.js";
 import { applyTrackerChoice } from "./tracker-choice.js";
 import { emitBotDefsChanged } from "./defs-changed.js";
+import { writeBotDef } from "../../../../shared/bot-def-store.js";
 import { lstatSync } from "node:fs";
 
 function pathPresent(p) {
@@ -46,7 +47,7 @@ export async function moveBotToProject(db, botId, projectId, { crowHome, actor =
   if (isVoiceBotId(botId)) return { ok: false, code: "voice_bot" };
   let row = null;
   try {
-    row = (await db.execute({ sql: "SELECT bot_id, display_name, definition, project_id FROM pi_bot_defs WHERE bot_id=?", args: [botId] })).rows[0] || null;
+    row = (await db.execute({ sql: "SELECT bot_id, display_name, definition, enabled, project_id FROM pi_bot_defs WHERE bot_id=?", args: [botId] })).rows[0] || null;
   } catch { row = null; }
   if (!row) return { ok: false, code: "unknown_bot" };
 
@@ -106,9 +107,16 @@ export async function moveBotToProject(db, botId, projectId, { crowHome, actor =
   if (!hadProjectKey) delete def.project_id;
   let r;
   try {
-    r = await db.execute({
-      sql: "UPDATE pi_bot_defs SET definition=?, project_id=?, updated_at=datetime('now') WHERE bot_id=? AND definition IS ? AND project_id IS ?",
-      args: [JSON.stringify(def), toId, botId, row.definition ?? null, row.project_id ?? null],
+    // The definition and the project_id column change together, and the row's keyed MAC covers
+    // both (servers/shared/bot-def-store.js), so this is the one write — which refuses unless the
+    // values read at the top are still the row it verifies (round D, item F1).
+    r = await writeBotDef(db, {
+      bot_id: botId,
+      definition: def,
+      project_id: toId,
+      expectDefinition: row.definition ?? null,
+      expectEnabled: row.enabled,
+      expectProjectId: row.project_id ?? null,
     });
   } catch { r = null; }
   if (!r || Number(r.rowsAffected) === 0) { undoCarryOver(made); return { ok: false, code: "stale" }; }

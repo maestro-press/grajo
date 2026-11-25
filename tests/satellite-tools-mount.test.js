@@ -10,6 +10,7 @@
  * refresh, the real satellite-tools family token, real v3 `satellite-tools` signatures under this
  * process's scope key, and a stub Perch engine for the owner-session rule.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -25,6 +26,7 @@ const DATA = mkdtempSync(join(tmpdir(), "crow-sattools-data-"));
 const DB_PATH = join(DATA, "crow.db");
 const saved = { CROW_HOME: process.env.CROW_HOME, CROW_DATA_DIR: process.env.CROW_DATA_DIR, CROW_DB_PATH: process.env.CROW_DB_PATH };
 process.env.CROW_HOME = HOME;
+markBotDefPreEra(process.env.CROW_HOME);
 process.env.CROW_DATA_DIR = DATA;
 process.env.CROW_DB_PATH = DB_PATH;
 process.env.CROW_DISABLE_INSTANCE_SYNC = "1";

@@ -16,6 +16,7 @@
  * generic (`google-workspace`, `google-workspace-personal`, `workspace-mcp`), and every address is
  * `@example.com`.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -31,6 +32,7 @@ for (const k of Object.keys(process.env)) if (/^(PI_|PIBOT_)/.test(k)) delete pr
 const ROOT = mkdtempSync(join(tmpdir(), "staged-recorder-"));
 process.env.CROW_DATA_DIR = ROOT;
 process.env.CROW_HOME = join(ROOT, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 delete process.env.CROW_TASKS_DB_PATH;
 // The canonical pi MCP config is what a turn's MCP blocks are minted from, and what a credential

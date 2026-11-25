@@ -53,6 +53,9 @@ import {
 } from "fs";
 import { resolve, dirname, basename, join } from "path";
 import { resolveCrowHome } from "./crow-home.js";
+// The secrets-directory helper lives on its own (see ./secrets-dir.js and the re-export below):
+// the key-keeping modules take it from there, so this module stays off a bot host's import graph.
+import { ensureSecretsDir } from "./secrets-dir.js";
 import { randomBytes } from "crypto";
 
 // peer-tokens.json is an INSTANCE-scoped resource: it must honor CROW_HOME
@@ -138,14 +141,13 @@ function ensureDir() {
   ensureSecretsDir(dir);
 }
 
-/** Create <CROW_HOME>/secrets 700 (or tighten an existing one we own). */
-export function ensureSecretsDir(dir) {
-  try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch {}
-  try {
-    const st = statSync(dir);
-    if (st.uid === process.getuid?.() && (st.mode & 0o777) !== 0o700) chmodSync(dir, 0o700);
-  } catch { /* best effort; a read-only view (inside the pi sandbox) is fine */ }
-}
+/** Create <CROW_HOME>/secrets 700 (or tighten an existing one we own).
+ *
+ * Defined in `./secrets-dir.js` and re-exported here so the key-keeping modules (`token-mac.js`,
+ * `bot-def-mac.js`) can take just this helper without pulling this credential store into a bot host
+ * process's import graph; every existing importer of `ensureSecretsDir` from here keeps working.
+ */
+export { ensureSecretsDir };
 
 /**
  * Verify the file is mode 0600 (owner rw only). Returns true if OK or the

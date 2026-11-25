@@ -5,6 +5,7 @@
  * real path-scoped family token and real v3 signatures, as tests/loopback-tool-mount.test.js
  * does) and through shapeServiceResult, and requires identical answers.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -18,6 +19,7 @@ import { rmScratch } from "./helpers/safe-rm.js";
 const DIR = mkdtempSync(join(tmpdir(), "crow-svcshape-"));
 const DB_PATH = join(DIR, "crow.db");
 process.env.CROW_HOME = DIR;
+markBotDefPreEra(process.env.CROW_HOME);
 process.env.CROW_DATA_DIR = DIR;
 process.env.CROW_DB_PATH = DB_PATH;
 process.env.CROW_DISABLE_INSTANCE_SYNC = "1";

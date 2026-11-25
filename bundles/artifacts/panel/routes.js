@@ -378,7 +378,7 @@ export default function artifactsRouter(dashboardAuth, seams = {}) {
     // The reserved Crow voice bot has no house style; refuse set and clear before any read or write.
     if ((await appImport("servers/shared/voice-bot.js")).isVoiceBotId(id)) throw bad("the Crow voice bot has no house style");
     let row = null;
-    try { row = (await S.db.execute({ sql: "SELECT definition FROM pi_bot_defs WHERE bot_id=?", args: [id] })).rows[0] || null; } catch { row = null; }
+    try { row = (await S.db.execute({ sql: "SELECT definition, enabled, project_id FROM pi_bot_defs WHERE bot_id=?", args: [id] })).rows[0] || null; } catch { row = null; }
     if (!row) throw notFound("no such bot");
     // Setting needs a bot that uses Artifacts (the listed ones); clearing a
     // stale default works on any bot.
@@ -389,9 +389,19 @@ export default function artifactsRouter(dashboardAuth, seams = {}) {
     if (theme === null) delete design.house_style; else design.house_style = theme;
     const next = { ...def };
     if (Object.keys(design).length) next.design = design; else delete next.design;
-    // Compare-and-swap on the definition read above (Bot Builder's rule): a
-    // concurrent Bot Builder save wins and this one asks for a reload.
-    const r = await S.db.execute({ sql: "UPDATE pi_bot_defs SET definition=?, updated_at=datetime('now') WHERE bot_id=? AND definition IS ?", args: [JSON.stringify(next), id, row.definition ?? null] });
+    // Compare-and-swap on the row read above (Bot Builder's rule): a
+    // concurrent Bot Builder save wins and this one asks for a reload. The write goes
+    // through the app's one writer (`servers/shared/bot-def-seal.js`, through the app
+    // root like every other app module here), which re-signs the definition — and it refuses
+    // unless the values read above are still the row it verifies (round D, item F1).
+    const { writeBotDefSealed } = await appImport("servers/shared/bot-def-seal.js");
+    const r = await writeBotDefSealed(S.db, {
+      bot_id: id,
+      definition: next,
+      expectDefinition: row.definition ?? null,
+      expectEnabled: row.enabled,
+      expectProjectId: row.project_id ?? null,
+    });
     if (!Number(r.rowsAffected)) throw Object.assign(new Error("the bot changed meanwhile; reload and try again"), { code: "stale" });
     try { (await appImport("servers/gateway/dashboard/panels/bot-builder/defs-changed.js")).emitBotDefsChanged(id); } catch { /* no bot-builder bus here */ }
     await M.store.audit(S.db, { actor: OWNER, action: "house-style", target: `bot:${id}`, detail: { theme } });
@@ -803,6 +813,16 @@ export default function artifactsRouter(dashboardAuth, seams = {}) {
 }
 
 async function loadBotDef(db, botId) {
-  const r = (await db.execute({ sql: "SELECT definition FROM pi_bot_defs WHERE bot_id=?", args: [botId] })).rows[0];
-  try { return r ? JSON.parse(r.definition || "{}") : null; } catch { return null; }
+  // Delivery and target verification read this definition (the tools a bot may use, its
+  // `session_dir`), so it is verified (round C, item E4): a row nothing vouches for answers null,
+  // and every caller here then refuses by its existing name (`bot_lacks_artifacts`, `target_*`).
+  // The verifier comes through the app's own seam (`servers/shared/bot-def-seal.js`) — this panel
+  // must not reach the store, which holds the key. A process with no verifier installed refuses the row too (fail closed).
+  try {
+    const { verifyBotDefSealed } = await appImport("servers/shared/bot-def-seal.js");
+    const r = (await db.execute({ sql: "SELECT * FROM pi_bot_defs WHERE bot_id=?", args: [botId] })).rows[0];
+    if (!r) return null;
+    if (!verifyBotDefSealed(r).ok) return null;
+    return JSON.parse(r.definition || "{}");
+  } catch { return null; }
 }

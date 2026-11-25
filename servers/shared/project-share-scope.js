@@ -43,9 +43,10 @@
 // here caches. See the private engineering notes for the Phase 1 share design.
 
 import { appendAudit } from "./project-acl.js";
-import { resolveBotAccess } from "./project-bot-shares.js";
+import { resolveBotAccess, verifiedBotRowOrNull } from "./project-bot-shares.js";
 import { CROW_VOICE_BOT_ID } from "./voice-bot.js";
 import { UNKNOWN, auditActor, resolveCallActor } from "../research/actor.js";
+import { botDefVerifyInstalled } from "./bot-def-seal.js";
 
 /** The message a missing id and a hidden row both get: they must be indistinguishable. */
 export const NOT_FOUND_MESSAGE = "Not found.";
@@ -279,11 +280,36 @@ const asId = (value) => {
 const deviceNamed = (value) => typeof value === "string" && value.trim() !== "";
 
 /**
- * The bot's home project id, or null: a bot whose definition is gone, or whose project is archived
- * or tombstoned, has no home (`resolveBotAccess` reads the same way).
+ * The bot's home project id, or null: a bot whose definition is gone, a row nothing can vouch for,
+ * or whose project is archived or tombstoned, has no home (`resolveBotAccess` reads the same way).
+ *
+ * `botRow` is an INJECTION seam for a GATEWAY caller: that caller reads the row through
+ * `readVerifiedBotDef` (servers/shared/bot-def-store.js) and passes it here, so a row that does not
+ * verify never decides a bot's home project.
+ *
+ * WITHOUT an injected row, the DEFAULT read follows the process it runs in (round C, item E4): where
+ * the store is installed (every gateway-side caller — the seam then has a verifier), the default read
+ * VERIFIES and an unverified row decides nothing; where it is not (a bot's own MCP child, which
+ * cannot hold the key), the plain read stays — that child can only affect its own call.
  */
-async function homeProjectId(db, botId) {
+async function homeProjectId(db, botId, botRow) {
   if (botId == null || botId === "") return null;
+  let injected = botRow;
+  if (injected === undefined && botDefVerifyInstalled()) {
+    injected = await verifiedBotRowOrNull(db, botId);
+    if (!injected) return null;
+  }
+  if (injected !== undefined) {
+    const row = typeof injected === "function" ? await injected() : injected;
+    if (!row || row.project_id == null) return null;
+    // The project must still be live — the same filter the raw read below applies.
+    const { rows } = await db.execute({
+      sql: `SELECT p.id AS id FROM project_spaces p WHERE p.id = ? AND p.archived_at IS NULL
+             AND (p.status IS NULL OR p.status != 'archived') LIMIT 1`,
+      args: [Number(row.project_id)],
+    });
+    return rows[0] && rows[0].id != null ? Number(rows[0].id) : null;
+  }
   const { rows } = await db.execute({
     sql: `SELECT p.id AS id FROM pi_bot_defs d JOIN project_spaces p ON p.id = d.project_id
            WHERE d.bot_id = ? AND p.archived_at IS NULL
@@ -311,7 +337,7 @@ async function homeProjectId(db, botId) {
  *
  * @returns {Promise<{allowed: true, projectId: number|null} | {allowed: false, code: string, message: string}>}
  */
-export async function decideProjectAccess(db, actor, { tool, projectId, args = {}, deviceId = null } = {}) {
+export async function decideProjectAccess(db, actor, { tool, projectId, args = {}, deviceId = null, botRow } = {}) {
   const requested = asId(projectId);
   if (!boundByBotRules(actor)) return { allowed: true, projectId: requested };
 
@@ -321,7 +347,7 @@ export async function decideProjectAccess(db, actor, { tool, projectId, args = {
   const policy = toolPolicyFor(tool, args);
   if (!policy || policy.kind === "owner_only") return deny("owner_only");
 
-  const home = await homeProjectId(db, actor.id);
+  const home = await homeProjectId(db, actor.id, botRow);
 
   if (requested == null) {
     if (home == null && policy.kind === "home_only") return deny("home_only");
@@ -338,7 +364,7 @@ export async function decideProjectAccess(db, actor, { tool, projectId, args = {
   if (policy.kind === "home_only") return deny("home_only");
   if (SCOPED_LISTING_PROJECT.has(String(tool))) return deny("home_only");
 
-  const access = await resolveBotAccess(db, actor.id, requested);
+  const access = await resolveBotAccess(db, actor.id, requested, { botRow });
   if (access.kind === "none") return deny("no_share");
   if (access.suspended) return deny("suspended");
   if (policy.kind === "write" && access.level === "read") return deny("read_only");
@@ -352,10 +378,10 @@ export async function decideProjectAccess(db, actor, { tool, projectId, args = {
  *
  * @returns {Promise<null | { homeProjectId: number|null }>}
  */
-export async function botReadScope(db, actor) {
+export async function botReadScope(db, actor, { botRow } = {}) {
   if (!boundByBotRules(actor)) return null;
   if (actor.unverified) return { homeProjectId: null };
-  return { homeProjectId: await homeProjectId(db, actor.id) };
+  return { homeProjectId: await homeProjectId(db, actor.id, botRow) };
 }
 
 /**
@@ -375,11 +401,11 @@ export function scopePredicate(scope, { column = "project_id" } = {}) {
  *
  * @returns {Promise<{projectId: number|string|null} | {refused: true, message: string}>}
  */
-export async function botWriteProject(db, actor, requestedProjectId) {
+export async function botWriteProject(db, actor, requestedProjectId, { botRow } = {}) {
   const requested = requestedProjectId == null || requestedProjectId === "" ? null : requestedProjectId;
   if (!boundByBotRules(actor)) return { projectId: requested };
   if (requested != null) return { projectId: asId(requested) };
-  const home = await homeProjectId(db, actor.id);
+  const home = await homeProjectId(db, actor.id, botRow);
   if (home == null) return { refused: true, message: NAME_A_PROJECT_MESSAGE };
   return { projectId: home };
 }
@@ -388,13 +414,13 @@ export async function botWriteProject(db, actor, requestedProjectId) {
  * The same decision for a by-id row, whose own `project_id` the caller resolved first. A
  * project-less row (`rowProjectId == null`) is owner-only, so a bot is refused `no_share`.
  */
-export async function decideRowAccess(db, actor, { tool, rowProjectId, args = {}, deviceId = null } = {}) {
+export async function decideRowAccess(db, actor, { tool, rowProjectId, args = {}, deviceId = null, botRow } = {}) {
   if (!boundByBotRules(actor)) return { allowed: true, projectId: asId(rowProjectId) };
   if (actor.unverified) return deny("owner_only");
   const policy = toolPolicyFor(tool, args);
   if (!policy || policy.kind === "owner_only") return deny("owner_only");
   if (rowProjectId == null) return deny("no_share");
-  return decideProjectAccess(db, actor, { tool, projectId: rowProjectId, args, deviceId });
+  return decideProjectAccess(db, actor, { tool, projectId: rowProjectId, args, deviceId, botRow });
 }
 
 const REFUSAL_WINDOW_MS = 60_000;
@@ -482,7 +508,7 @@ export async function auditRefusal(db, actor, { tool, projectId, code, now = Dat
  *
  * Every refusal from `checkRow` is the not-found result; the true code goes to the audit log only.
  */
-export function makeShareGate(db, tool, { extra, baseActor } = {}) {
+export function makeShareGate(db, tool, { extra, baseActor, botRow } = {}) {
   const actor = resolveCallActor(baseActor || UNKNOWN, extra);
 
   const audit = (projectId, code) => auditRefusal(db, actor, { tool, projectId, code });
@@ -491,23 +517,23 @@ export function makeShareGate(db, tool, { extra, baseActor } = {}) {
     actor,
     async check(projectId, callArgs = {}) {
       const args = callArgs && typeof callArgs === "object" ? callArgs : {};
-      const decision = await decideProjectAccess(db, actor, { tool, projectId, args, deviceId: args.device_id });
+      const decision = await decideProjectAccess(db, actor, { tool, projectId, args, deviceId: args.device_id, botRow });
       if (decision.allowed) return { projectId: decision.projectId ?? null };
       await audit(projectId ?? null, decision.code);
       return refusalResult(decision.message);
     },
     async checkRow(rowProjectId, callArgs = {}) {
       const args = callArgs && typeof callArgs === "object" ? callArgs : {};
-      const decision = await decideRowAccess(db, actor, { tool, rowProjectId, args, deviceId: args.device_id });
+      const decision = await decideRowAccess(db, actor, { tool, rowProjectId, args, deviceId: args.device_id, botRow });
       if (decision.allowed) return null;
       await audit(rowProjectId ?? null, decision.code);
       return notFoundResult();
     },
     readScope() {
-      return botReadScope(db, actor);
+      return botReadScope(db, actor, { botRow });
     },
     writeProject(requested) {
-      return botWriteProject(db, actor, requested);
+      return botWriteProject(db, actor, requested, { botRow });
     },
   };
 }

@@ -528,6 +528,39 @@ try {
   console.error("[token-hmac] settings-token boot conversion failed:", err.message);
 }
 
+// Bot definition tamper evidence (the `bot:def` family): seal every `pi_bot_defs` row with a
+// keyed MAC + generation and mark the era. Same rail and the same reason as the two boots above:
+// it runs after the schema exists and long before listen, so no spawn (the bridge loads a
+// definition per turn) and no authority read can trust a row the converter has not seen. A lost
+// or invalid key never stops the boot — it logs one loud line and every definition is refused,
+// so no bot spawns until the operator resets the key. Importing the boot also imports
+// `servers/shared/bot-def-store.js`, which INSTALLS the bot-loadable write seam for this process.
+try {
+  const { runBotDefMacBoot } = await import("./boot/bot-def-mac.js");
+  const _botDefDb = createDbClient();
+  try {
+    const _botDef = await runBotDefMacBoot({ db: _botDefDb });
+    if (_botDef.key !== "ok") {
+      console.error(`[bot-def] boot is running WITHOUT a usable key (${_botDef.key}): ${_botDef.keyPath}`);
+    } else if (_botDef.alarms) {
+      console.warn(`[bot-def] ${_botDef.alarms} unsealed or changed bot definition(s) reported at boot`);
+    }
+  } finally {
+    _botDefDb.close();
+  }
+} catch (err) {
+  // Never take the gateway down for it, but fail closed: after an unexpected throw, unsealed
+  // (no-MAC) definitions are refused for the rest of this process. The conversion re-runs on the
+  // next boot (see servers/shared/bot-def-mac.js).
+  try {
+    const { forceRefuseBotDefUnsealed } = await import("../shared/bot-def-mac.js");
+    forceRefuseBotDefUnsealed();
+  } catch (e2) {
+    console.error("[bot-def] could not force the unsealed refusal:", e2.message);
+  }
+  console.error("[bot-def] boot conversion failed:", err.message);
+}
+
 // Stamp the moment the new/classic shell first existed on this instance, before
 // listen, so a device whose session predates it opens classic (shell/mode.js).
 try {

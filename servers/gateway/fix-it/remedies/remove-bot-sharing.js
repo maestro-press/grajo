@@ -28,6 +28,7 @@ import { BOT_ID_RE } from "../../../../scripts/pi-bots/bot-workspace-env.mjs";
 // checks ownership through servers/shared/project-ownership.js). See
 // tests/bot-seed-import-guard.test.js.
 import { isLocalPasswordSessionOn } from "../../dashboard/local-session.js";
+import { BOT_DEF_UNVERIFIED, writeBotDef } from "../../../shared/bot-def-store.js";
 import { OWNER_ONLY_FLASH, OWNER_ONLY_MESSAGE } from "./restore-bundle-compose.js";
 
 export const ACTION_ID = "bot-sharing-remove";
@@ -94,7 +95,7 @@ export default async function removeBotSharing(args = {}, { item, db, req } = {}
   if (!owner) return { resolved: false, flash: OWNER_ONLY_FLASH, message: OWNER_ONLY_MESSAGE };
 
   const { rows } = await db.execute({
-    sql: "SELECT definition FROM pi_bot_defs WHERE bot_id = ?",
+    sql: "SELECT definition, enabled, project_id FROM pi_bot_defs WHERE bot_id = ?",
     args: [botId],
   });
   const row = rows?.[0];
@@ -105,9 +106,19 @@ export default async function removeBotSharing(args = {}, { item, db, req } = {}
   // No selection left to remove: the card's condition is already gone, so the item is answered.
   if (!next) return { resolved: true };
 
-  const written = await db.execute({
-    sql: "UPDATE pi_bot_defs SET definition = ?, updated_at = datetime('now') WHERE bot_id = ? AND definition IS ?",
-    args: [JSON.stringify(next), botId, row.definition ?? null],
+  // The one write path (servers/shared/bot-def-store.js): it re-MACs the definition it stores, and
+  // refuses unless the row read above (`expect*`, round D item F1) is still the row it verifies.
+  const written = await writeBotDef(db, {
+    bot_id: botId,
+    definition: next,
+    expectDefinition: row.definition ?? null,
+    expectEnabled: row.enabled,
+    expectProjectId: row.project_id ?? null,
+  }).catch((err) => {
+    // An unverified row (changed outside Crow) or one that moved between the read and the write
+    // refuses with `BOT_DEF_UNVERIFIED`; the card answers with its EXISTING error flash either way.
+    if (err && err.code === BOT_DEF_UNVERIFIED) return { rowsAffected: 0 };
+    throw err;
   });
   if (!written.rowsAffected) {
     // Somebody saved this definition between the read and the write: the newer text wins, and the

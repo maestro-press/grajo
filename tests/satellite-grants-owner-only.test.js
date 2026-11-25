@@ -4,6 +4,7 @@
  * satellite grants or their "always ask before" entries; a bundle that becomes satellite-hosted
  * starts with no grants. servers/gateway/satellites/grants.js and its callers.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
@@ -18,6 +19,7 @@ const DATA = mkdtempSync(join(tmpdir(), "crow-satgrants-data-"));
 const DB_PATH = join(DATA, "crow.db");
 const saved = { CROW_HOME: process.env.CROW_HOME, CROW_DATA_DIR: process.env.CROW_DATA_DIR, CROW_DB_PATH: process.env.CROW_DB_PATH };
 process.env.CROW_HOME = HOME;
+markBotDefPreEra(process.env.CROW_HOME);
 process.env.CROW_DATA_DIR = DATA;
 process.env.CROW_DB_PATH = DB_PATH;
 
@@ -41,7 +43,12 @@ const post = async (body, session) => {
   return res;
 };
 const defNow = async () => JSON.parse((await db.execute({ sql: "SELECT definition FROM pi_bot_defs WHERE bot_id = ?", args: [BOT] })).rows[0].definition);
-const setDef = (def) => db.execute({ sql: "UPDATE pi_bot_defs SET definition = ? WHERE bot_id = ?", args: [JSON.stringify(def), BOT] });
+const setDef = (def) => db.execute({
+  // A row seeded directly: the content is replaced AND the seal cleared (a stale MAC is exactly what
+  // the write path refuses — see servers/shared/bot-def-store.js).
+  sql: "UPDATE pi_bot_defs SET definition = ?, def_mac = NULL, def_generation = NULL WHERE bot_id = ?",
+  args: [JSON.stringify(def), BOT],
+});
 
 before(async () => {
   assert.ok(process.env.CROW_SUITE_SCRATCH, "runs only in the scratch suite env");

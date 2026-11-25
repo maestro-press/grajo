@@ -15,6 +15,7 @@
 // Safety: CROW_HOME/CROW_DATA_DIR point at a scratch dir for the whole file
 // (peer-credentials-crow-home.test.js's pattern) so generateBoardToken's real
 // file write (<crowHome>/board-token) can never touch ~/.crow.
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, existsSync, readFileSync, statSync } from "node:fs";
@@ -126,6 +127,7 @@ async function connectClient(path, token, extraHeaders = {}) {
 before(async () => {
   scratchHome = mkdtempSync(join(tmpdir(), "board-mcp-home-"));
   process.env.CROW_HOME = scratchHome;
+  markBotDefPreEra(process.env.CROW_HOME);
   process.env.CROW_DATA_DIR = join(scratchHome, "data");
 
   const f = fixture();

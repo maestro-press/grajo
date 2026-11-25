@@ -6,6 +6,7 @@
 // injected through `deps.loadSeed`, and injected preview runs (`getRun`; the run tables arrive in a
 // later PR). The schedules, mail accounts, keychain, providers and bot rows are real tables, so the
 // module's own defaults are exercised too.
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -16,6 +17,7 @@ import { join } from "node:path";
 const root = mkdtempSync(join(tmpdir(), "reports-approvals-"));
 process.env.CROW_DATA_DIR = join(root, "master");
 process.env.CROW_HOME = join(root, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 process.env.CROW_TASKS_DB_PATH = join(root, "master", "tasks.db");
 // Go-live asks `linkFor` about every approved recipient, and a dashboard link needs a base URL a reader

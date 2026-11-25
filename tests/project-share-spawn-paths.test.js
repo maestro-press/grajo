@@ -34,6 +34,7 @@
  * Scratch CROW_HOME / data dir / HOME throughout: nothing here reads or writes the real ~/.crow,
  * ~/.pi, or a gateway.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -59,6 +60,7 @@ writeFileSync(join(HOME, ".pi", "agent", "mcp.json"), JSON.stringify({ mcpServer
 
 process.env.HOME = HOME;
 process.env.CROW_HOME = CROW_HOME;
+markBotDefPreEra(process.env.CROW_HOME);
 process.env.CROW_DATA_DIR = DATA;
 process.env.CROW_DB_PATH = DB_FILE;
 process.env.CROW_TASKS_DB_PATH = join(DATA, "tasks.db");

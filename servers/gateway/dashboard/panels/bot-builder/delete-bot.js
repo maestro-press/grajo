@@ -244,6 +244,13 @@ export async function handleDeleteConfirm(req, res, { db, lang = "en" } = {}) {
     return res.redirectAfterPost(
       `/dashboard/bot-builder?bot=${encodeURIComponent(botId)}&tab=review&error=` + encodeURIComponent(String(e.message || e)));
   }
+  // …and its APPROVED COPY, which must not outlive it: a bot later created with the same id would
+  // otherwise be diffed against the old bot's content (servers/shared/bot-def-approved.js). Never
+  // fatal — a copy left behind only weakens the next recovery diff.
+  try {
+    const { forgetApprovedBotDef } = await import("../../../../shared/bot-def-approved.js");
+    forgetApprovedBotDef(botId);
+  } catch { /* best effort */ }
 
   // The bot's git key (C5). The def row is gone, so no spawn can use the key
   // any more; removing it here lets the owner take the deploy key off the forge

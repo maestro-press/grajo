@@ -17,6 +17,7 @@
  * for the engine (the same shape as tests/perch-interactive-dispatch.test.js) with a stub
  * `withServiceBlocks` (Task 18's seam), injected timers. No pi child, gateway or ~/.crow is touched.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -30,6 +31,7 @@ import { markFromLaptop } from "./helpers/off-box.js";
 const dir = mkdtempSync(join(tmpdir(), "turn-principal-rails-"));
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = join(dir, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 process.env.CROW_TASKS_DB_PATH = join(dir, "tasks.db");
 process.env.PI_MODELS_JSON = join(dir, "models.json");

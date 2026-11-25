@@ -3,6 +3,7 @@
 // the real catalog (a temp CROW_HOME) over a real init-db'd crow.db; the API is
 // mounted behind the real csrfMiddleware and a session-checking auth stub, as
 // dashboard/index.js orders it. The live half is tests/apps-launcher-live.test.js.
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -15,6 +16,7 @@ const dir = mkdtempSync(join(tmpdir(), "shell-apps-launcher-"));
 process.env.CROW_DATA_DIR = dir;
 const HOME = join(dir, "home");
 process.env.CROW_HOME = HOME;
+markBotDefPreEra(process.env.CROW_HOME);
 mkdirSync(HOME, { recursive: true });
 delete process.env.CROW_DB_PATH;
 const DB_FILE = join(dir, "crow.db");

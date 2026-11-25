@@ -71,7 +71,9 @@ import { dirname, join } from "node:path";
 import { createHash, createHmac, randomBytes, scrypt as scryptCb, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
 import { resolveCrowHome } from "./crow-home.js";
-import { ensureSecretsDir } from "./peer-credentials.js";
+// A tiny fs helper of its own: importing it from ./peer-credentials.js would drag the peer credential
+// store into a bot host process's import graph (tests/no-peer-key-in-bot-process.test.js).
+import { ensureSecretsDir } from "./secrets-dir.js";
 
 const scryptAsync = promisify(scryptCb);
 
@@ -130,6 +132,13 @@ export const TOKEN_MAC_FAMILIES = Object.freeze([
   "dashboard:session",
   "peer:inbound",
   "report:link",
+  // §1d — bot DEFINITIONS (`pi_bot_defs`): one MAC per row over the canonical form of
+  // (bot_id, enabled, project_id, definition, generation), so a contained bot that can write
+  // crow.db cannot raise its own policy (`tools.crow_mcp`, `permission_policy`, `write_paths`,
+  // `project_id`, remote servers). See `servers/shared/bot-def-mac.js` (host-only) for the
+  // canonical form and the replay counter; the family domain here is what keeps a bot's
+  // definition MAC from ever being replayed as a token verifier, and vice versa.
+  "bot:def",
   // §1c / §2.2 — the dashboard password (the `p2$` form below).
   "password",
 ]);
@@ -1042,6 +1051,32 @@ function loadKeyForVerify(opts) {
     }
     throw err;
   }
+}
+
+/**
+ * Verify a stored value that must be an `h1.` MAC over `value` under `family` — the TOKEN-LESS
+ * form of `verifyStored`, for a caller whose stored value is a MAC over a DOCUMENT rather than a
+ * verifier over a raw secret (the `bot:def` family, whose MAC input is a bot definition's
+ * canonical form).
+ *
+ * There is deliberately no legacy branch and no era to consult: a bare sha256 is refused
+ * whatever the family's era says, because this module never minted one for such a caller. So the
+ * answer cannot fail open — the worst case is refusing a value an older release would have
+ * accepted, and no release ever wrote one.
+ *
+ * @returns {{ok: boolean, form: "h1"|"foreign"|"invalid", reason?: string}} `reason` is the
+ *          key problem (`key-lost` / `key-invalid` / `key-missing`) when the key is unusable.
+ */
+export function verifyMacValue(family, value, stored, opts = {}) {
+  assertFamily(family);
+  const loaded = loadKeyForVerify(opts);
+  if (!loaded.ok) return { ok: false, form: "invalid", reason: loaded.reason };
+  if (typeof stored !== "string") return { ok: false, form: "invalid" };
+  const h1 = H1_STORED.exec(stored);
+  if (!h1) return { ok: false, form: "invalid" };
+  if (h1[1] !== loaded.key.id) return { ok: false, form: "foreign" };
+  const expected = macHex(loaded.key, family, sha256Hex(String(value)));
+  return safeEqualHex(expected, h1[2]) ? { ok: true, form: "h1" } : { ok: false, form: "h1" };
 }
 
 // ─── the legacy alarm (§3.3) — LOG-ONLY in this PR ─────────────────────────

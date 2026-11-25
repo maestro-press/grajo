@@ -368,14 +368,32 @@ async function reset({ yes, force }) {
     }
   }
 
+  // 0. THE BOT DEFINITIONS, VERIFIED UNDER THE KEY THAT IS ABOUT TO RETIRE. A definition's verifier
+  //    is an `h1.` MAC under that key, and after the swap nothing can tell a definition a key holder
+  //    wrote from one a contained bot wrote. So the last moment to decide is NOW: every row is
+  //    verified here (with the replay floor ON, round C item E5), and only the rows that verified are
+  //    re-sealed in step 3b — re-sealed from the TUPLES collected here, never from a fresh read. A
+  //    row that does not verify is LEFT AS IT IS (still refused, so its bot still does not spawn) and
+  //    is printed for the operator, who re-approves that bot with
+  //    `scripts/cli/bot-def-reapprove.mjs <bot_id>`. A RESET NEVER BLESSES AN UNVERIFIED ROW:
+  //    with the old key gone there is nothing to verify with, so nothing would be re-sealed at all.
+  const db = createDbClient();
+  let botDefCheck = { verified: [], unverified: [], rows: [] };
+  try {
+    const { verifyAllBotDefs } = await import("../servers/shared/bot-def-store.js");
+    botDefCheck = await verifyAllBotDefs(db);
+  } catch (err) {
+    console.warn(`bot defs:      could not be verified (${err?.message || err}); none will be re-sealed`);
+  }
+
   // 1. The key goes aside first: nothing may mint under it after this line. The era state is NOT
   //    touched here — every family stays CONVERTED throughout (step 4 re-marks them, including
   //    the settings-backed ones), so the reset has no window in which a family is unconverted.
   const movedKey = moveAside(keyPath, "lost");
 
-  const db = createDbClient();
   let revoked = 0;
   let droppedStatic = 0;
+  let resealed = { resealed: 0, failed: 0, refused: [] };
   let key;
   let mirrored = 0;
   try {
@@ -398,6 +416,19 @@ async function reset({ yes, force }) {
     //    the one place a key may be created over an existing state file: the operator retired
     //    the old key on purpose, and every other field of the state stays as it is.
     key = adoptOperatorKey({ at: new Date().toISOString() });
+
+    // 3b. Every BOT DEFINITION THAT VERIFIED under the retired key is re-sealed under the NEW key
+    //     (servers/shared/bot-def-store.js). Each row gets a fresh generation too, which is also what
+    //     retires any older (definition, MAC) pair a bot may have copied. `verifiedRows` is the TUPLE
+    //     list step 0 verified while the OLD key was still loadable, and the re-seal writes exactly
+    //     that content: it never re-reads a row, so a row a bot rewrote in between is skipped (its
+    //     UPDATE's WHERE pins the step-0 tuple) instead of being stamped with content no key holder
+    //     ever vouched for. A row that did not verify is not touched (a reset is a key change, never
+    //     an amnesty). A store with no `pi_bot_defs` (or no seal columns) reports zero.
+    {
+      const { resealAllBotDefs } = await import("../servers/shared/bot-def-store.js");
+      resealed = await resealAllBotDefs(db, { at: new Date(), verifiedRows: botDefCheck.verified });
+    }
 
     // 4. Re-mark EVERY family CONVERTED, never cleared: the three `oauth_tokens` families and all
     //    thirteen settings-backed ones. From here on a legacy sha256 value in one of them — a row
@@ -432,9 +463,37 @@ async function reset({ yes, force }) {
   console.log("                 and kiosk announce are re-minted at the next start; the local MCP token has to");
   console.log("                 be generated again in Settings → Connect (its raw value is not kept anywhere)");
   console.log(`  era mirror:    ${mirrored} family marker(s) written to the DB as converted (no rows behind them)`);
+  console.log(
+    `  bot defs:      ${resealed.resealed} definition(s) re-sealed under the new key`
+    + (resealed.failed ? `, ${resealed.failed} could not be` : ""),
+  );
+  // Rows that changed WHILE the reset ran: verified at step 0, not the row step 3b found. The re-seal
+  // writes STEP 0's content and its UPDATE lands only on the row that still matches it, so they are
+  // left exactly as they are and named (round C, item E5) — a reset re-seals what a key holder could
+  // vouch for, never whatever a running bot wrote in between.
+  const racedDefs = resealed.skipped || [];
+  if (racedDefs.length) {
+    console.log(
+      "  bot defs changed during the reset (NOT re-sealed; re-run the reset or re-approve each): "
+      + racedDefs.join(", "),
+    );
+  }
+  // The rows nothing can vouch for. Listed by id, with the two ways out: the re-approve command (for
+  // any bot, no Bot Builder page needed) or a full-form save in Bot Builder.
+  const unverifiedDefs = botDefCheck.unverified || [];
+  if (unverifiedDefs.length) {
+    console.log(
+      `  bot defs NOT re-sealed (changed outside Crow or captured before the seal). Until each one is\n`
+      + "  re-approved it is refused and its bot does not start. For each id, review the stored\n"
+      + "  definition and re-approve exactly that content:\n"
+      + unverifiedDefs.map((id) => `    node scripts/cli/bot-def-reapprove.mjs ${id} --show`).join("\n"),
+    );
+  }
   console.log("");
   console.log("Start the gateway again. Existing MCP clients must re-authorize, and every browser");
   console.log("must sign in again with the dashboard password.");
+  console.log("Restart the separate bot bridge process(es) too (pibot-bridge, the gateway's own bot");
+  console.log("runtime, or both): each one holds the retired key in memory until it restarts.");
   return 0;
 }
 

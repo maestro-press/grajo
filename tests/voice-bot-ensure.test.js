@@ -20,6 +20,11 @@ const DB_FILE = join(dir, "crow.db");
 const REPO = new URL("..", import.meta.url).pathname;
 
 const { ensureVoiceBot, CROW_VOICE_BOT_ID, VOICE_DENY_TOOLS, voiceBotDefinition } = await import("../servers/shared/voice-bot.js");
+// The gateway installs the bot-definition store at boot; without it the voice bot's write seam
+// (`servers/shared/bot-def-seal.js`) refuses to write a row, by design. Importing the store installs
+// it, so this process writes and verifies the row the way a gateway does.
+const { verifyBotDef } = await import("../servers/shared/bot-def-mac.js");
+await import("../servers/shared/bot-def-store.js");
 const { listDevices } = await import("../servers/shared/device-store.js");
 const { createDbClient } = await import("../servers/db.js");
 const { toolEffect } = await import("../servers/gateway/voice/action-claims.js");
@@ -50,10 +55,35 @@ const voiceRow = () => { const c = raw(); const r = c.prepare("SELECT * FROM pi_
 const voiceDef = () => JSON.parse(voiceRow().definition);
 const allDefs = () => { const c = raw(); const r = c.prepare("SELECT bot_id, definition FROM pi_bot_defs WHERE bot_id <> ? ORDER BY bot_id").all(CROW_VOICE_BOT_ID); c.close(); return r; };
 
+/**
+ * A definition only counts if its row VERIFIES: the voice bot is written through the one writer
+ * (`servers/shared/bot-def-store.js`), which puts a keyed MAC over the whole definition, so a
+ * definition whose `def_mac` does not cover it would be refused at the voice bot's next spawn.
+ *
+ * @returns {Promise<object>} the voice row
+ */
+async function assertVoiceRowVerified() {
+  const row = voiceRow();
+  assert.ok(row, "a written voice row is there to verify");
+  assert.match(String(row.def_mac), /^h1\.[0-9a-f]{16}\.[0-9a-f]{64}$/, "the ensure signed the row");
+  assert.ok(Number(row.def_generation) >= 1, "and put it at a generation");
+  const db = createDbClient();
+  try {
+    const verdict = await verifyBotDef(row, { db });
+    assert.equal(verdict.ok, true, `the stored voice definition must verify (${verdict.reason})`);
+  } finally {
+    db.close?.();
+  }
+  return row;
+}
+
 async function run(extra = {}) {
   const db = createDbClient();
   try {
-    return await ensureVoiceBot(db, { fastKey: FAST, readSetting, listDevices, toolEffect, voiceCategoryFor, log: () => {}, ...extra });
+    const result = await ensureVoiceBot(db, { fastKey: FAST, readSetting, listDevices, toolEffect, voiceCategoryFor, log: () => {}, ...extra });
+    // Every case below reads the def the ensure just wrote; the row has to verify first.
+    if (result.created) await assertVoiceRowVerified();
+    return result;
   } finally { db.close?.(); }
 }
 
@@ -283,6 +313,7 @@ test("two gateways at once leave one row", async () => {
     const c = raw(); const { n } = c.prepare("SELECT COUNT(*) AS n FROM pi_bot_defs WHERE bot_id=?").get(CROW_VOICE_BOT_ID); c.close();
     assert.equal(n, 1);
     assert.equal(results.filter((r) => r.created === true).length, 1);
+    await assertVoiceRowVerified();
   } finally { a.close?.(); b.close?.(); }
 });
 
@@ -314,6 +345,7 @@ test("boot hook: skipped on a --no-auth gateway, creates the row otherwise, clos
   assert.equal(opened, 1);
   assert.equal(closed, 1);
   assert.equal(voiceRow().display_name, "Crow");
+  await assertVoiceRowVerified();
 });
 
 test("boot hook: a failure is caught and logged, never thrown", async () => {

@@ -11,6 +11,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+// The bot-definition signer: a seeded row carries the MAC every authority read verifies.
+import { signBotDef } from "../servers/shared/bot-def-store.js";
 
 for (const k of Object.keys(process.env)) if (/^(PI_|PIBOT_)/.test(k)) delete process.env[k];
 const dir = mkdtempSync(join(tmpdir(), "skill-tools-"));
@@ -91,9 +93,21 @@ const READ_HANK = () => ({ system_prompt: "You are Hank.", models: { default: "s
   tools: { pi_builtin: ["read"], crow_mcp: [LIST, GET] } });
 
 function putBot(botId, def) {
+  // A row as Bot Builder stores it: SIGNED (servers/shared/bot-def-store.js `signBotDef`), so the row
+  // carries a keyed MAC and its generation. The spawn gate (bridge.loadBot) and every authority read
+  // verify it, and once ANY row in the store is sealed an unsealed one is refused as tampered — so a
+  // raw INSERT here would model a store nobody could trust.
+  const seal = signBotDef({ bot_id: botId, definition: JSON.stringify(def), enabled: 1, project_id: null });
   const c = new Database(DB_FILE);
-  c.prepare("INSERT OR REPLACE INTO pi_bot_defs (bot_id, display_name, definition, enabled) VALUES (?,?,?,1)").run(botId, "Bot " + botId, JSON.stringify(def));
-  c.close();
+  try {
+    c.prepare(
+      "INSERT OR REPLACE INTO pi_bot_defs (bot_id, display_name, definition, enabled, project_id, def_mac, def_generation) "
+      + "VALUES (?,?,?,1,NULL,?,?)",
+    ).run(botId, "Bot " + botId, seal.definition, seal.def_mac, seal.generation);
+  } finally {
+    c.close();
+    if (typeof seal.settle === "function") seal.settle();
+  }
 }
 function storedDef(botId) {
   const c = new Database(DB_FILE);

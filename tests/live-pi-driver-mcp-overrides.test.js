@@ -7,6 +7,7 @@
  * Nothing here spawns the fixture server: the stub pi never starts an MCP client, so the override is
  * only checked where it lands — the config pi received and the world .mcp.json on disk.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
@@ -92,6 +93,7 @@ test("S1: --inject refuses a payload with a __proto__ (or constructor/prototype)
 /** A real env that is NOT an eval scratch, with the stub pi wired. */
 function nonEvalEnv(dir, capture) {
   const home = join(dir, "home");
+  markBotDefPreEra(home);
   mkdirSync(join(home, "data"), { recursive: true });
   return {
     PATH: process.env.PATH, HOME: home, CROW_HOME: home, CROW_DATA_DIR: join(home, "data"), CROW_DB_PATH: join(home, "data", "crow.db"),
@@ -106,6 +108,7 @@ const readLines = (p) => (existsSync(p) ? readFileSync(p, "utf8").split("\n").fi
 /** A real eval scratch with the bot seeded, the driver child's env, and its capture file. */
 async function evalScratch(t, { delivery = "fd", knobs = {} } = {}) {
   const s = await makeScratch({ botId: BOT, template });
+  markBotDefPreEra(s.home);
   t.after(() => s.cleanup());
   const capture = join(s.home, "capture.ndjson");
   const env = {
@@ -139,6 +142,7 @@ test("mcpOverrides refuses outside an eval scratch, before buildBotWorld: no pi,
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const capture = join(dir, "capture.ndjson");
   const home = join(dir, "home");
+  markBotDefPreEra(home);
   mkdirSync(home, { recursive: true });
   const out = await seamCall(dir, nonEvalEnv(dir, capture), {
     bot_id: BOT, gateway_thread_id: nextThread(), user_message: "hi", mcpOverrides: overrideFor(home),

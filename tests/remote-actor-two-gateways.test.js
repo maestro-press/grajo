@@ -26,6 +26,7 @@ import assert from "node:assert/strict";
 import { readFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
+import Database from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { Named, installWorkspace, pairInto, repinCode, until, sha, settingsRevoke, hasMarker, REPO } from "./fixtures/peer-pair.mjs";
@@ -123,6 +124,48 @@ async function commentAs(from, to, file, { headers = {}, rpc = null, mount = "/t
 
 const mod = (p) => JSON.stringify(new URL(`../${p}`, import.meta.url).href);
 
+/**
+ * Seed a `pi_bot_defs` row the way real code does: through the ONE writer, in a process holding
+ * the instance's key.
+ *
+ * A raw INSERT cannot do this on an instance that has booted: A's pre-listen bot-def converter
+ * marks the `bot:def` era (it does so even with no rows yet), and after that a definition without
+ * a MAC is refused as `no-mac` by every authority read — including the relay's, which is what this
+ * test drives. `writeBotDef` seals the row (MAC + generation) with A's own
+ * `<CROW_HOME>/secrets/token-hmac.key`, so the row A's relay child reads is the row a real bot
+ * host would have.
+ */
+async function seedBotDef(inst, botId, definition, { displayName = null } = {}) {
+  const { sqliteDbFacade, writeBotDef } = await import("../servers/shared/bot-def-store.js");
+  const conn = new Database(join(inst.dataDir, "crow.db"));
+  conn.pragma("busy_timeout = 5000");
+  try {
+    const facade = sqliteDbFacade(conn);
+    const { rows } = await facade.execute({ sql: "SELECT * FROM pi_bot_defs WHERE bot_id=?", args: [botId] });
+    const existing = rows[0] || null;
+    const res = await writeBotDef(facade, {
+      bot_id: botId,
+      display_name: displayName ?? botId,
+      definition,
+      enabled: 1,
+      mode: existing ? "update" : "insert",
+      // An update states the row it read (round D, item F1): the store refuses unless those values
+      // are still the row it verifies.
+      ...(existing ? {
+        expectDefinition: existing.definition ?? null,
+        expectEnabled: existing.enabled,
+        expectProjectId: existing.project_id ?? null,
+      } : {}),
+      // The seams: this process writes into `inst`'s home, so the key and the generation counter
+      // are resolved from it rather than from THIS process's CROW_HOME.
+      opts: { crowHome: inst.dir },
+    });
+    assert.ok(res.rowsAffected === 1, `seeded ${botId} on ${inst.name}`);
+  } finally {
+    conn.close();
+  }
+}
+
 /** `from`'s voice bot: the real buildRemoteVoiceContext + callRemote, run in a child with `from`'s env. */
 async function voiceComment(from, to, bot, file) {
   put(file);
@@ -202,7 +245,7 @@ test("E-P1: A's pi bot reaches B through A's relay (real router, writer and prox
   A.sql("INSERT OR REPLACE INTO dashboard_settings (key, value) VALUES ('feature_flags', ?)", [JSON.stringify({ remote_invocation: true })]);
   try {
   const def = { tools: { crow_mcp: [], remote_mcp: [`${B.id}::crow-memory`] } };
-  A.sql("INSERT OR REPLACE INTO pi_bot_defs (bot_id, display_name, definition) VALUES ('hank', 'Hank', ?)", [JSON.stringify(def)]);
+  await seedBotDef(A, "hank", def, { displayName: "Hank" });
   // B6: the relay signature binds the bot session, which A's relay resolves (a live row of hank's).
   A.sql("INSERT INTO bot_sessions (bot_id, gateway_type, gateway_thread_id, status) VALUES ('hank', 'discord', 'discord:7', 'active')");
   const sessionId = String(A.sql("SELECT id FROM bot_sessions WHERE bot_id = 'hank' AND gateway_thread_id = 'discord:7' ORDER BY id DESC LIMIT 1")[0].id);

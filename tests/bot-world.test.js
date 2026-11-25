@@ -36,6 +36,7 @@
  *
  * CROW_DATA_DIR/CROW_HOME are scratch, so the operator's ~/.crow is untouchable.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -54,6 +55,7 @@ for (const k of Object.keys(process.env)) {
 const dir = mkdtempSync(join(tmpdir(), "bot-world-"));
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = join(dir, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 process.env.PIBOT_MAX_PI = "99";                            // never defer on a busy dev box
 process.env.PIBOT_WARM_GATEWAY_URL = "http://127.0.0.1:1";  // refused instantly; warm is non-fatal

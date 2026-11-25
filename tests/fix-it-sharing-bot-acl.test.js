@@ -4,6 +4,7 @@
 // Harness: a real init-db'd scratch crow.db, the real Fix-it store, the real detector and remedy, and a
 // scratch CROW_HOME for the allow-list file. The remedy's owner gate is stubbed (the real one needs a
 // password session in crow.db) exactly as tests/fix-it-* do.
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -16,6 +17,7 @@ import { rmScratch } from "./helpers/safe-rm.js";
 const root = mkdtempSync(join(tmpdir(), "fix-it-sharing-bot-"));
 process.env.CROW_DATA_DIR = join(root, "home");
 process.env.CROW_HOME = join(root, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 mkdirSync(process.env.CROW_HOME, { recursive: true });
 const REPO = new URL("..", import.meta.url).pathname;
@@ -53,6 +55,7 @@ beforeEach(async () => {
   await db.execute("DELETE FROM pi_bot_defs");
   await db.execute("DELETE FROM fix_it_items");
   rmScratch(SECRETS_DIR);
+  markBotDefPreEra(join(root, "home"));
   remedy._setOwnerCheckForTest(async () => true);
 });
 
@@ -142,6 +145,7 @@ test("the card clears itself when the bot gets an allow-list entry, and when the
   assert.equal((await pending()).length, 0, "an ACL entry answers the card");
 
   rmScratch(SECRETS_DIR);
+  markBotDefPreEra(join(root, "home"));
   await db.execute("DELETE FROM pi_bot_defs");
   await seedBot("hank", { def: sharingDef("crow-sharing/crow_send_message") });
   await detector.default.check(store, { crowHome: process.env.CROW_HOME });
@@ -202,7 +206,7 @@ test("a concurrent def save beats the undo's compare-and-set: nothing is applied
   /** A db that lets the concurrent save land BETWEEN the remedy's read and its UPDATE. */
   const racing = {
     execute: async (query) => {
-      if (/SELECT definition FROM pi_bot_defs/.test(String(query.sql))) {
+      if (/SELECT definition, enabled, project_id FROM pi_bot_defs/.test(String(query.sql))) {
         const read = await db.execute(query);
         await db.execute({
           sql: "UPDATE pi_bot_defs SET definition = ? WHERE bot_id = 'hank'",

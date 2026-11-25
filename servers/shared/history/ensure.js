@@ -13,7 +13,15 @@
  * every column a trigger names, create any missing capture trigger (and, first,
  * the append-only guard triggers and their erase control table). CREATE TRIGGER
  * IF NOT EXISTS makes this a cheap read plus a no-op on a healthy store, and it
- * cannot overwrite a trigger that is already there.
+ * cannot overwrite a trigger that is already there — with ONE deliberate
+ * exception: a CAPTURE trigger whose stored body is not the body generated now is
+ * dropped and re-created (see the body-upgrade section below: a `seal` column an
+ * older body does not capture, and item J4's bot-definition triggers, whose body
+ * is compared with the catalogue's own whitespace-normalised rule). That exception
+ * never happens silently: each such re-creation writes one `[history]` line and one
+ * `audit_log` row carrying the stored body's SHA-256 (item K1 — the stored body is the
+ * tampering evidence, and a silent repair would destroy it). A trigger that was merely
+ * MISSING is created with neither.
  *
  * CAPTURE WAITS FOR ITS BASELINE. A capture trigger is only installed for a table
  * the migration has already BASELINED — 0024 is recorded as applied in
@@ -49,6 +57,7 @@
  * schema_migrations in both cases: the registry keeps ONE book for the instance.
  */
 import Database from "better-sqlite3";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolveDbPath } from "../../db.js";
 import { tasksDbPath as defaultTasksDbPath } from "../../../scripts/pi-bots/instance-paths.mjs";
@@ -59,10 +68,11 @@ import {
   STORE_CROW,
   STORE_TASKS,
   guardTriggerDefs,
-  tableColumns,
+  requiredTableColumns,
   triggerDefs,
 } from "./covered.js";
 import { ITEM_ERASURES_DDL, PENDING_ERASURES_DDL, PENDING_REMOTE_ERASURES_DDL } from "./erase.js";
+import { normalizeTriggerSql } from "../trigger-catalog.js";
 
 const tableExists = (db, table) =>
   Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
@@ -78,6 +88,73 @@ const triggerNamesIn = (db) =>
 
 /** The migration that owns capture triggers and baselines for crow.db's first three types. */
 export const BASELINE_MIGRATION_ID = "0024-item-versions";
+
+/**
+ * The bot-definition capture triggers (`hist_pi_bot_defs_ai/au/ad`): the one family ensure re-creates
+ * on a BODY difference, not only on a missing seal column (item J4).
+ */
+const BOT_DEF_CAPTURE_TRIGGER = /^hist_pi_bot_defs_a[diu]$/;
+
+/**
+ * A RE-CREATION OVER AN EXISTING TRIGGER LEAVES A TRACE (item K1).
+ *
+ * Dropping and re-creating a trigger whose stored body is not the body generated now is a repair, but
+ * the stored body is also the only evidence that somebody changed it — an operator's hand edit, a
+ * restored backup, or a bot (crow.db is bound read-write into every contained bot). Doing it silently
+ * would erase that evidence, so every such re-creation writes ONE log line and ONE audit row.
+ *
+ * The audit row goes where the trigger inventory's finding goes: `audit_log` in crow.db, event
+ * `trigger_inventory`, details `{db, trigger, table, reason}` — the same shape, with `reason`
+ * `history-trigger-recreated` (the inventory's own reasons are `foreign`/`body-changed`) and the
+ * stored body's SHA-256 in place of the body itself (a trigger body can be long, and the hash is what
+ * identifies it: the inventory keys its de-duplication on the same normalised-text hash).
+ *
+ * A trigger that was simply MISSING is created with no audit row: nothing was overwritten and there is
+ * nothing to investigate.
+ */
+export const HISTORY_RECREATED_EVENT = "trigger_inventory";
+export const HISTORY_RECREATED_REASON = "history-trigger-recreated";
+
+/** The store name the audit row carries, matching the trigger inventory's own labels. */
+const storeLabel = (store) => (store === STORE_TASKS ? "tasks.db" : "crow.db");
+
+/**
+ * One audit row for a trigger re-created over a stored body that differed. Answers whether the row
+ * was written.
+ *
+ * IT MAY NOT BE ABLE TO. ensure runs in processes that are not the gateway — a migration, a bundle's
+ * own boot, a test fixture — and not every handle it is given has an `audit_log`: tasks.db has none at
+ * all (the instance's book lives in crow.db, which is why the boot caller passes that handle here), and
+ * a store opened read-only refuses the insert. Then the log line is the whole record, which is why the
+ * line is written first and unconditionally; this function never throws (an audit failure must never
+ * become a reason the repair did not happen — the repair is what re-arms capture).
+ *
+ * @param {object|null} auditDb a better-sqlite3 handle whose `audit_log` is the instance's book
+ * @param {{name: string, table: string, sha256: string, store: string}} finding
+ * @returns {boolean} true when a row was written
+ */
+function auditRecreatedTrigger(auditDb, { name, table, sha256, store }) {
+  if (!auditDb) return false;
+  try {
+    if (!tableExists(auditDb, "audit_log")) return false;
+    auditDb
+      .prepare("INSERT INTO audit_log (event_type, actor, details) VALUES (?, ?, ?)")
+      .run(
+        HISTORY_RECREATED_EVENT,
+        null,
+        JSON.stringify({
+          db: storeLabel(store),
+          trigger: name,
+          table,
+          reason: HISTORY_RECREATED_REASON,
+          bodySha256: sha256,
+        }),
+      );
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** Has the migration registry recorded `migrationId` in this store? (No registry table = no.) */
 const migrationRecorded = (db, migrationId = BASELINE_MIGRATION_ID) => {
@@ -134,7 +211,8 @@ const hasBaseline = (db, itemType, recorded) =>
  * none of those is a trigger, so none appears in `restored`.
  *
  * @param {import("better-sqlite3").Database} db
- * @param {{store?: string, baselineRecorded?: (migrationId: string) => boolean}} [opts]
+ * @param {{store?: string, baselineRecorded?: (migrationId: string) => boolean,
+ *   log?: ((message: string) => void)|null, auditDb?: object|null}} [opts]
  *   `store` names which store this handle IS (default `crow`): a crow.db handle must
  *   never look for tasks.db's table, and a type whose covered table lives in another
  *   store is left to that store's own ensure (migration 0025 installs the card
@@ -142,21 +220,31 @@ const hasBaseline = (db, itemType, recorded) =>
  *   recorded as applied" for the store being ensured; it defaults to THIS handle's
  *   own schema_migrations — which is right for crow.db and wrong for tasks.db, whose
  *   registry rows live in crow.db (so the boot caller passes the crow.db set there).
+ *   `log` receives the one line a body-differed re-creation writes (see
+ *   HISTORY_RECREATED_REASON); null (the default) keeps a library call quiet, but the
+ *   boot entry point always passes one. `auditDb` is the handle whose `audit_log` gets
+ *   that re-creation's audit row, defaulting to `db` itself (right for crow.db; the
+ *   tasks.db pass gets the crow.db handle, because tasks.db has no audit_log).
  * @returns {{restored: string[], skipped: string[], awaitingBaseline: string[],
- *   disarmed: number}} `restored` is the trigger names this call created (empty on
- *   a healthy store); `skipped` is the covered tables left alone because they are
- *   absent or still missing a column a trigger names (the migration will install
- *   theirs once the table is whole); `awaitingBaseline` is the ready tables whose
- *   capture is left to the migration because no baseline exists yet; `disarmed` is
- *   the number of erase-switch rows reset to 0.
+ *   disarmed: number, recreated: Array<{name: string, table: string, sha256: string}>}}
+ *   `restored` is the trigger names this call created (empty on a healthy store);
+ *   `recreated` is the subset that OVERWROTE a stored body that differed (the ones that
+ *   logged and were audited — a merely missing trigger is in `restored` only); `skipped`
+ *   is the covered tables left alone because they are absent or still missing a column a
+ *   trigger names (the migration will install theirs once the table is whole);
+ *   `awaitingBaseline` is the ready tables whose capture is left to the migration because
+ *   no baseline exists yet; `disarmed` is the number of erase-switch rows reset to 0.
  */
-export function ensureHistoryTriggers(db, { store = STORE_CROW, baselineRecorded = null } = {}) {
+export function ensureHistoryTriggers(
+  db,
+  { store = STORE_CROW, baselineRecorded = null, log = null, auditDb = db } = {},
+) {
   const skipped = [];
   const awaitingBaseline = [];
   // Nothing to guard or capture yet: migration 0024 owns creation, and a store
   // without item_versions has never run it.
   if (!tableExists(db, "item_versions")) {
-    return { restored: [], skipped: ["item_versions absent"], awaitingBaseline, disarmed: 0 };
+    return { restored: [], skipped: ["item_versions absent"], awaitingBaseline, disarmed: 0, recreated: [] };
   }
   if (!columnsOf(db, "item_versions").has("project_ref")) {
     // An item_versions from an earlier build of the migration: its triggers
@@ -166,6 +254,7 @@ export function ensureHistoryTriggers(db, { store = STORE_CROW, baselineRecorded
       skipped: ["item_versions.project_ref absent"],
       awaitingBaseline,
       disarmed: 0,
+      recreated: [],
     };
   }
 
@@ -209,7 +298,9 @@ export function ensureHistoryTriggers(db, { store = STORE_CROW, baselineRecorded
   // audited door. Reset it before anything can write.
   const disarmed = db.prepare("UPDATE item_versions_erase SET armed = 0 WHERE armed <> 0").run().changes;
 
-  const wanted = [...guardTriggerDefs()];
+  // `table` rides along (the guard defs sit on item_versions, a capture def on its own table) so a
+  // re-creation's log line and audit row can name where the trigger fires.
+  const wanted = guardTriggerDefs().map((def) => ({ ...def, table: "item_versions" }));
   for (const [itemType, spec] of Object.entries(COVERED)) {
     // This handle is ONE database. A type whose table lives in the other store is
     // that store's own ensure's business (0025 installs the card triggers in
@@ -227,7 +318,8 @@ export function ensureHistoryTriggers(db, { store = STORE_CROW, baselineRecorded
     // snapshot is a superset of tracked (covered.js asserts it), so one check
     // covers both the WHEN list and the stored fields. A DERIVED field is
     // computed, not read, so it is not expected to be a column of the table.
-    const missing = tableColumns(spec).filter((c) => !columns.has(c));
+    // A `seal` column is captured with each version, so the table must have it too.
+    const missing = requiredTableColumns(spec).filter((c) => !columns.has(c));
     if (missing.length) {
       skipped.push(spec.table);
       continue;
@@ -243,11 +335,70 @@ export function ensureHistoryTriggers(db, { store = STORE_CROW, baselineRecorded
       awaitingBaseline.push(spec.table);
       continue;
     }
-    wanted.push(...triggerDefs(itemType));
+    wanted.push(...triggerDefs(itemType).map((def) => ({ ...def, table: spec.table })));
   }
 
   const existing = triggerNamesIn(db);
   const missingDefs = wanted.filter((d) => !existing.has(d.name));
+  // A TRIGGER BODY UPGRADE. `CREATE TRIGGER IF NOT EXISTS` never rewrites a trigger that is
+  // already there, so a store whose capture triggers were installed by an earlier build would keep
+  // capturing without a spec's newly added `seal` fields forever (and every bot definition version
+  // would then be unverifiable). A capture trigger whose stored body does not name every seal column
+  // is re-created here — one drop and one create per stale trigger, on the migration-installed
+  // three only (the guards and every other type are untouched).
+  const staleSeal = wanted.filter((d) => {
+    if (!d.seal || !d.seal.length) return false;
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?").get(d.name);
+    if (!row || typeof row.sql !== "string") return false;
+    return !d.seal.every((column) => row.sql.includes(column));
+  });
+  // …AND A BOT-DEFINITION CAPTURE TRIGGER IS RE-CREATED WHEN ITS BODY IS NOT THE BODY GENERATED NOW
+  // (item J4), not only when a seal column is missing from it. A `hist_pi_bot_defs_a[diu]` installed
+  // by an earlier build that differs in ANY way keeps recording versions the current writer's seal
+  // cannot reproduce, which is a latent outage: the bot's next save is refused, and so is every
+  // restore of those versions. The comparison is the catalogue's own (whitespace-normalised SQL,
+  // `IF NOT EXISTS` and the trailing semicolon ignored), so a re-indented trigger is left alone and
+  // a body that changed is replaced by the one generated here.
+  const staleBody = wanted.filter((d) => {
+    if (!BOT_DEF_CAPTURE_TRIGGER.test(d.name)) return false;
+    if (staleSeal.includes(d)) return false; // already being re-created below
+    const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?").get(d.name);
+    if (!row || typeof row.sql !== "string") return false;
+    return normalizeTriggerSql(row.sql) !== normalizeTriggerSql(d.sql);
+  });
+  const storedSqlOf = (name) => {
+    const row = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?")
+      .get(name);
+    return row && typeof row.sql === "string" ? row.sql : "";
+  };
+  const stale = [...staleSeal, ...staleBody];
+  // What each stale trigger's STORED body was, captured BEFORE the drop: the SHA-256 (of the same
+  // whitespace-normalised text the catalogue compares) is the whole record of the body that is about
+  // to be replaced. A trigger that was merely MISSING is not here at all — it is created, never
+  // overwritten, so there is nothing to investigate.
+  const recreated = stale.map((def) => ({
+    name: def.name,
+    table: def.table,
+    sha256: createHash("sha256").update(normalizeTriggerSql(storedSqlOf(def.name))).digest("hex"),
+  }));
+  if (stale.length) {
+    db.transaction(() => {
+      for (const def of stale) {
+        db.exec(`DROP TRIGGER IF EXISTS ${def.name}`);
+        db.exec(def.sql);
+      }
+    }).immediate();
+  }
+  // The trace, AFTER the repair landed: one line per re-created body, then its audit row (see
+  // auditRecreatedTrigger for why the row can be absent while the line never is).
+  for (const finding of recreated) {
+    log?.(
+      `[history] re-created trigger ${finding.name} on ${finding.table}: stored body differed from ` +
+        `Crow's (expected after an upgrade that changes it; otherwise investigate)`,
+    );
+    auditRecreatedTrigger(auditDb, { ...finding, store });
+  }
   if (missingDefs.length) {
     db.transaction(() => {
       for (const def of missingDefs) db.exec(def.sql);
@@ -255,10 +406,11 @@ export function ensureHistoryTriggers(db, { store = STORE_CROW, baselineRecorded
   }
 
   return {
-    restored: missingDefs.map((d) => d.name),
+    restored: [...missingDefs, ...stale].map((d) => d.name),
     skipped,
     awaitingBaseline,
     disarmed: Number(disarmed),
+    recreated,
   };
 }
 
@@ -295,49 +447,60 @@ export function ensureHistoryTriggers(db, { store = STORE_CROW, baselineRecorded
  * reported to the log, and the gateway also drops an alert-spool entry so "history
  * capture is off" shows up in the bell.
  *
+ * A body-differed re-creation leaves its trace here too: each such trigger writes one
+ * `[history]` line (the `log` this function is given) and one `audit_log` row in
+ * crow.db — including for a trigger in tasks.db, whose own file has no audit table.
+ *
  * @param {{log?: (message: string) => void, dbPath?: string, tasksDbPath?: string}} [opts]
  */
 export function ensureHistoryTriggersAtBoot({ log = console.log, dbPath, tasksDbPath } = {}) {
   const path = dbPath || resolveDbPath();
-  if (!existsSync(path)) return { restored: [], skipped: ["crow.db absent"], awaitingBaseline: [], disarmed: 0 };
+  if (!existsSync(path)) {
+    return { restored: [], skipped: ["crow.db absent"], awaitingBaseline: [], disarmed: 0, recreated: [] };
+  }
 
   const db = new Database(path, { fileMustExist: true });
   db.pragma("busy_timeout = 10000");
   let result;
-  let recorded;
   try {
-    result = ensureHistoryTriggers(db);
-    recorded = recordedMigrations(db);
+    result = ensureHistoryTriggers(db, { log });
+    const recorded = recordedMigrations(db);
     report(result, log);
-  } finally {
-    db.close();
-  }
 
-  // tasks.db, the card store: its own item_versions, guards, erase switch and
-  // capture triggers, and its own stuck-switch disarm. Skipped when the file is not
-  // there yet (a board that has never run) — opening it would CREATE it.
-  const tasksPath = tasksDbPath || defaultTasksDbPath();
-  if (existsSync(tasksPath)) {
-    let tdb;
-    try {
-      tdb = new Database(tasksPath, { fileMustExist: true });
-      tdb.pragma("busy_timeout = 10000");
-      const tasksResult = ensureHistoryTriggers(tdb, {
-        store: STORE_TASKS,
-        baselineRecorded: (migrationId) => recorded.has(String(migrationId)),
-      });
-      report(tasksResult, log, "tasks.db");
-    } catch (err) {
-      // A board store that is busy or being migrated (the tasks addon child holds it
-      // open) must not fail the boot over a re-ensure the next boot repeats.
-      log(`[history] tasks.db capture not ensured this boot: ${err?.message ?? err}`);
-    } finally {
+    // tasks.db, the card store: its own item_versions, guards, erase switch and
+    // capture triggers, and its own stuck-switch disarm. Skipped when the file is not
+    // there yet (a board that has never run) — opening it would CREATE it.
+    //
+    // It runs while crow.db is still open, because that handle is also where a tasks.db
+    // re-creation is audited: tasks.db has no audit_log of its own (the instance's book lives
+    // in crow.db, exactly as the trigger inventory does it).
+    const tasksPath = tasksDbPath || defaultTasksDbPath();
+    if (existsSync(tasksPath)) {
+      let tdb;
       try {
-        tdb?.close();
-      } catch {
-        /* a stuck close must not fail the boot */
+        tdb = new Database(tasksPath, { fileMustExist: true });
+        tdb.pragma("busy_timeout = 10000");
+        const tasksResult = ensureHistoryTriggers(tdb, {
+          store: STORE_TASKS,
+          baselineRecorded: (migrationId) => recorded.has(String(migrationId)),
+          log,
+          auditDb: db,
+        });
+        report(tasksResult, log, "tasks.db");
+      } catch (err) {
+        // A board store that is busy or being migrated (the tasks addon child holds it
+        // open) must not fail the boot over a re-ensure the next boot repeats.
+        log(`[history] tasks.db capture not ensured this boot: ${err?.message ?? err}`);
+      } finally {
+        try {
+          tdb?.close();
+        } catch {
+          /* a stuck close must not fail the boot */
+        }
       }
     }
+  } finally {
+    db.close();
   }
   return result;
 }

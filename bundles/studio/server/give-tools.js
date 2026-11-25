@@ -37,6 +37,23 @@
 
 /** What a caller is told when the def is already past saving by hand. */
 const BAD_DEF_TEXT = "That bot's definition could not be read; fix it in Bot Builder first.";
+/**
+ * The one write path for a bot definition, through the app's own seam
+ * (`servers/shared/bot-def-seal.js`, resolved through the APP ROOT because an installed copy of
+ * this bundle lives under `~/.crow/bundles`, where a relative path into the app does not exist).
+ *
+ * A `pi_bot_defs` row carries a keyed MAC over its whole definition and the key is host-only, so
+ * the GATEWAY signs it (it installs the store at boot). A process with no store installed refuses
+ * the edit instead of storing a definition nothing can verify. A caller may inject its own
+ * `writeDef` (a test), which must have the same `{bot_id, definition, expectDefinition, expectEnabled,
+ * expectProjectId}` contract.
+ */
+async function defaultWriteDef(db, args) {
+  const { writeBotDefSealed } = await appImport("servers/shared/bot-def-seal.js");
+  return writeBotDefSealed(db, args);
+}
+
+import { appImport } from "./app-root.js";
 
 /**
  * What a caller is told when the bot is not this project's, or is gone — and
@@ -122,6 +139,9 @@ export function withStudioTools(def) {
  *   never a voice bot)
  * @param {((message: string) => void)|null} [options.log] one line per failed
  *   budget read; defaults to silence
+ * @param {((db: object, args: object) => Promise<{rowsAffected: number}>)|null}
+ *   [options.writeDef] the bot-definition write path (default: the app's
+ *   `servers/shared/bot-def-seal.js` seam, which the gateway has installed)
  * @returns {(request: {botId: string, projectId: number}) =>
  *   Promise<{ok: true, already: boolean}>}
  */
@@ -133,6 +153,7 @@ export function createGiveBotStudioTools({
   budgetFor = null,
   isVoiceBot = null,
   log = () => {},
+  writeDef = null,
 } = {}) {
   if (!db || typeof db.execute !== "function") {
     throw new TypeError("Studio give-tools needs a database client");
@@ -161,7 +182,7 @@ export function createGiveBotStudioTools({
     if (voiceBot(id) === true) throw refuse("not_found", NOT_FOUND_TEXT);
 
     const { rows } = await db.execute({
-      sql: "SELECT definition, project_id FROM pi_bot_defs WHERE bot_id = ?",
+      sql: "SELECT definition, enabled, project_id FROM pi_bot_defs WHERE bot_id = ?",
       args: [id],
     });
     const row = rows?.[0];
@@ -221,12 +242,32 @@ export function createGiveBotStudioTools({
       }
     }
 
-    // Compare-and-swap on the definition that was read (Bot Builder's own rule):
-    // a concurrent save wins, and this one asks the page to reload.
-    const written = await db.execute({
-      sql: "UPDATE pi_bot_defs SET definition=?, updated_at=datetime('now') WHERE bot_id=? AND definition IS ?",
-      args: [JSON.stringify(candidate), id, row.definition ?? null],
-    });
+    // Compare-and-swap on the row that was read (Bot Builder's own rule): a concurrent save wins,
+    // and this one asks the page to reload. The write goes through the APP's one writer, which
+    // re-signs the definition (see defaultWriteDef) — and refuses unless the values read here are
+    // still the row it verifies (round D, item F1).
+    //
+    // A row the store cannot verify (a definition changed outside Crow) or one that moved
+    // between this read and the write (`BOT_DEF_UNVERIFIED`, caller-read-differs) answers
+    // the page's EXISTING "reload" refusal: same sentence, nothing new to read.
+    const write = typeof writeDef === "function" ? writeDef : defaultWriteDef;
+    let written;
+    try {
+      written = await write(db, {
+        bot_id: id,
+        definition: candidate,
+        expectDefinition: row.definition ?? null,
+        expectEnabled: row.enabled,
+        expectProjectId: row.project_id ?? null,
+      });
+    } catch (err) {
+      // Both spellings of "your read moved": the store's `BOT_DEF_UNVERIFIED` (which carries
+      // `reason: caller-read-differs` for exactly this race) and a bare caller-read-differs reason.
+      if (err && (err.code === "BOT_DEF_UNVERIFIED" || err.reason === "caller-read-differs")) {
+        throw refuse("stale", STALE_TEXT);
+      }
+      throw err;
+    }
     if (!Number(written.rowsAffected)) throw refuse("stale", STALE_TEXT);
 
     // A running gateway has to see the new def, or the bot keeps its old tool

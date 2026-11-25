@@ -14,6 +14,7 @@
  *   - valid session + CSRF token   → works, and writes NO device record
  *   - the paired-device flow is untouched, and its token opens nothing here
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -27,6 +28,7 @@ import { WebSocket, WebSocketServer } from "ws";
 const dir = mkdtempSync(join(tmpdir(), "kiosk-session-mode-"));
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = join(dir, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 delete process.env.CROW_DASHBOARD_PUBLIC;
 delete process.env.CROW_CSRF_STRICT;

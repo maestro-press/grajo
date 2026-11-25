@@ -115,6 +115,7 @@ import { redactSecrets } from "../../shared/redact-secrets.js";
 import { isLocallyOrchestratable } from "../../shared/locality.js";
 import { isLazyLoader } from "../../shared/lazy-loader.js";
 import { isDoorUrl } from "../models/door-resolve.js";
+import { readVerifiedBotDef } from "../../shared/bot-def-store.js";
 
 /* ------------------------------------------------------------------------ the words */
 
@@ -350,23 +351,24 @@ function hostOf(baseUrl) {
  * The model key a bot's own spawn uses: `pi_bot_defs.definition.models.default`, a `provider/model`
  * key or a `role:<id>` reference. A role is resolved against this instance's bindings (the same
  * resolver a bot's session uses), because the key a bot stores may name a role rather than a row.
+ *
+ * A row that does not verify answers null (round C, item E4): this key picks the MODEL an approval
+ * records, so it is authority, and a definition changed outside Crow must not decide it. Null means
+ * "the instance default, unknown" — the same answer a bot with no `models.default` gets.
  * Null when the bot names no model (it runs on the instance default) or the def cannot be read.
  */
 async function botModelKey(db, botId) {
   if (typeof botId !== "string" || !botId) return null;
-  let definition;
-  try {
-    const { rows } = await db.execute({
-      sql: "SELECT definition FROM pi_bot_defs WHERE bot_id = ?",
-      args: [botId],
-    });
-    definition = rows[0]?.definition;
-  } catch {
-    return null;
-  }
   let def;
   try {
-    def = JSON.parse(definition || "{}");
+    const read = await readVerifiedBotDef(db, botId);
+    if (!read.row || !read.ok) {
+      if (read.row && !read.ok) {
+        console.warn(`[bot-def] ${botId} settings could not be verified (${read.reason}); no model was recorded for it`);
+      }
+      return null;
+    }
+    def = read.def;
   } catch {
     return null;
   }

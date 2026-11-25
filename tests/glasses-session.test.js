@@ -9,6 +9,7 @@
  * The database is a real one built by scripts/init-db.js in the suite's scratch home.
  * Only the four outside services are stand-ins; nothing of Crow's is replaced.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -31,6 +32,7 @@ if (!process.env.CROW_HOME) throw new Error("run through npm test (scripts/run-s
 const HOME = join(process.env.CROW_HOME, "glasses-session");
 mkdirSync(join(HOME, "data"), { recursive: true });
 process.env.CROW_HOME = HOME;
+markBotDefPreEra(process.env.CROW_HOME);
 process.env.CROW_DATA_DIR = join(HOME, "data");
 delete process.env.CROW_DB_PATH;
 // What Tailscale Serve adds for a tailnet user; this process's client stands in for tailscaled.

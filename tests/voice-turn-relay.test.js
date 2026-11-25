@@ -6,6 +6,7 @@
  * test, the real hand-off core, store, candidate cache and voice-bot loader, the real own tools and the real
  * pending store, chained as defaultVoiceDeps chains them; a fake engine and a fake clock.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -19,6 +20,7 @@ import { harness } from "./fixtures/voice-turn-harness.mjs";
 const root = mkdtempSync(join(tmpdir(), "vh-relay-"));
 process.env.CROW_DATA_DIR = join(root, "master");
 process.env.CROW_HOME = join(root, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 process.env.CROW_TASKS_DB_PATH = join(root, "master", "tasks.db");
 const REPO = new URL("..", import.meta.url).pathname;

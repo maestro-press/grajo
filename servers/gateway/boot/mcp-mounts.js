@@ -617,7 +617,20 @@ export async function mountMcpServers(app, deps) {
       app.put(`${uploads.UPLOAD_PATH_PREFIX}/:upload_id`, uploads.handleUploadPut);
       const { readReservation } = await import("../box-reservation.js");
       const { sweepReserved } = await import("../box-reservation-notify.js");
-      const botDefOf = async (botId) => { const r = (await artDb.execute({ sql: "SELECT definition FROM pi_bot_defs WHERE bot_id=?", args: [botId] })).rows[0]; try { return r ? JSON.parse(r.definition || "{}") : null; } catch { return null; } };
+      // The queued-round retry delivers to a bot, and what it may do comes from this definition: read
+      // it VERIFIED (round C, item E4). A row nothing can vouch for answers null, which the delivery
+      // refuses by name (`bot_lacks_artifacts`) instead of handing a tampered tool list a session.
+      const botDefOf = async (botId) => {
+        const { readVerifiedBotDef } = await import("../../shared/bot-def-store.js");
+        const read = await readVerifiedBotDef(artDb, botId);
+        if (!read.row || !read.ok) {
+          if (read.row && !read.ok) {
+            console.warn(`[bot-def] ${botId} settings could not be verified (${read.reason}); the artifacts sweep skipped it`);
+          }
+          return null;
+        }
+        return read.def;
+      };
       // R2-M5/R2-M2: the sweep runs whether or not a Perch engine exists
       // (timeouts and reconciliation need none), once at mount start (off the
       // boot path — it may wait on the write lock, R3-L7), then every 60 s.

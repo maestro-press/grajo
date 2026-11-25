@@ -15,6 +15,7 @@
  * Hermetic: CROW_DATA_DIR/CROW_HOME/HOME are scratch, the bin engine is a stub
  * that records the prompt it is handed.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -32,6 +33,7 @@ for (const k of Object.keys(process.env)) {
 const dir = realpathSync(mkdtempSync(join(tmpdir(), "share-prompt-")));
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = join(dir, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 // No sandbox wrapper: the stub must be the process pi is handed.
 process.env.CROW_PI_SANDBOX = "off";

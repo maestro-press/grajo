@@ -6,6 +6,7 @@
  * frames before measuring. Skips without a browser unless CROW_REQUIRE_TEST_CHROME=1.
  * CROW_TEST_SHOT_DIR=<dir> saves a PNG per case.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -22,6 +23,7 @@ const dir = mkdtempSync(join(tmpdir(), "project-home-bots-live-"));
 process.env.CROW_DATA_DIR = dir;
 const HOME = join(dir, "home");
 process.env.CROW_HOME = HOME;
+markBotDefPreEra(process.env.CROW_HOME);
 mkdirSync(HOME, { recursive: true });
 delete process.env.CROW_DB_PATH;
 process.env.CROW_TASKS_DB_PATH = join(dir, "tasks.db");

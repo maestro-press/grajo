@@ -111,6 +111,9 @@ function instance(addons, { bundleDirs, fullSchema = false } = {}) {
   const sessionDir = join(dir, "session");
   mkdirSync(sessionDir, { recursive: true });
   process.env.CROW_HOME = home;
+  // The host era record allows the unsealed fixture rows (a MISSING record refuses them).
+  mkdirSync(join(home, "secrets"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(home, "secrets", "bot-def-era.json"), '{"v":1,"state":"pre-era"}\n', { mode: 0o600 });
   process.env.CROW_DATA_DIR = data;
   process.env.CROW_DB_PATH = dbPath;
   return {

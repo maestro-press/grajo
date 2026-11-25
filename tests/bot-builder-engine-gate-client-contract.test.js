@@ -79,10 +79,11 @@ beforeEach(async () => {
   _setEngineStatusForTest({ state: "absent" });
   // A complete gmail record so the gate arms and recordIsComplete() would
   // read "complete" for gmail on a fresh render, same fixture shape as
-  // tests/bot-builder-engine-gate.test.js.
+  // tests/bot-builder-engine-gate.test.js. `def_mac`/`def_generation` are cleared with the content:
+  // a raw write leaves the former MAC stale, and a stale MAC is what the write path refuses.
   await db.execute({
     sql: "INSERT INTO pi_bot_defs (bot_id, display_name, definition, enabled) VALUES (?,?,?,1) " +
-      "ON CONFLICT(bot_id) DO UPDATE SET definition=excluded.definition",
+      "ON CONFLICT(bot_id) DO UPDATE SET definition=excluded.definition, def_mac=NULL, def_generation=NULL",
     args: ["gate-bot", "Gate Bot", JSON.stringify({ gateways: [{ type: "gmail", address: "bot@x.com", allowlist: ["a@b.c"] }], tools: {}, models: {} })],
   });
 });

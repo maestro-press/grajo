@@ -10,6 +10,7 @@
  * stub loopback signing relay stands in for the gateway on the key-less legs. No real pi, npx,
  * uvx, gateway or ~/.crow is touched.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -24,6 +25,7 @@ const dir = mkdtempSync(join(tmpdir(), "service-blocks-"));
 const CROW_HOME = join(dir, "home");
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = CROW_HOME;
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 delete process.env.PORT;
 process.env.CROW_GATEWAY_PORT = "1";

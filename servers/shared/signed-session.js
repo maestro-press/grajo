@@ -13,7 +13,14 @@
  * signing relay (servers/gateway/routes/actor-sign.js) and the loopback MCP
  * mount helper (resolveSignedScope, for the v3 scope-bound kinds). `db` is any
  * client with the libsql `execute` shape.
+ *
+ * THE BOT'S OWN ROW IS VERIFIED, NOT TRUSTED. `resolveSignedScope` reads `pi_bot_defs` for the
+ * bot's `enabled` flag and its project, and a contained bot can write that row. So the read goes
+ * through the one verified path (`servers/shared/bot-def-store.js` `readVerifiedBotDef`, a keyed
+ * MAC over the whole definition): a row that does not verify resolves to nothing, which refuses
+ * the signature (and with it the call) rather than widening what the caller may reach.
  */
+import { readVerifiedBotDef } from "./bot-def-store.js";
 
 const ENDED = new Set(["done", "stopped"]);
 
@@ -148,8 +155,10 @@ export async function resolveSignedScope(db, { botId, scopeRef, threadId, gatewa
     }
     let def;
     try {
-      const r = await db.execute({ sql: "SELECT project_id, enabled FROM pi_bot_defs WHERE bot_id = ?", args: [bot] });
-      def = r.rows[0] || null;
+      // AUTHORITY: `enabled` and the project the bot acts in, from a row a contained bot can write.
+      // Only a definition whose keyed MAC verifies is used; anything else refuses the signature.
+      const verified = await readVerifiedBotDef(db, bot);
+      def = verified.ok ? verified.row : null;
     } catch {
       return null;
     }

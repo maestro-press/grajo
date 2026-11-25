@@ -45,12 +45,22 @@ try {
     // changes for these runs. A caller that seeds its own bot row is left alone.
     if (env.CROW_EVAL_BOT_GRANT === "1" && env.CROW_ACTOR_BOT_ID) {
       const { grantShare } = await import("../../servers/shared/project-bot-shares.js");
-      await db.execute({
-        sql: `INSERT INTO pi_bot_defs (bot_id, display_name, definition, enabled)
-              VALUES (?, ?, '{}', 1)
-              ON CONFLICT(bot_id) DO NOTHING`,
-        args: [env.CROW_ACTOR_BOT_ID, env.CROW_ACTOR_BOT_ID],
+      const { writeBotDef } = await import("../../servers/shared/bot-def-store.js");
+      // The ONE write path: the row carries a keyed MAC over its whole definition, so the bot this
+      // eval runs as verifies at its own spawn. A row that already exists is left alone.
+      const { rows: existing } = await db.execute({
+        sql: "SELECT bot_id FROM pi_bot_defs WHERE bot_id=?", args: [env.CROW_ACTOR_BOT_ID],
       });
+      if (!existing.length) {
+        await writeBotDef(db, {
+          bot_id: env.CROW_ACTOR_BOT_ID,
+          display_name: env.CROW_ACTOR_BOT_ID,
+          definition: "{}",
+          enabled: 1,
+          mode: "insert",
+          orIgnore: true,
+        });
+      }
       await grantShare(db, { projectId, botId: env.CROW_ACTOR_BOT_ID, level: "read_write" });
     }
   } finally {

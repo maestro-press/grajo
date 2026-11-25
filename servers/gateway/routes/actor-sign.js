@@ -77,6 +77,7 @@
 import { Router } from "express";
 import { classifyPeer } from "../../shared/peer-class.js";
 import { resolveSignedSession, sessionMatchesTuple, resolveRunningJob, jobMatchesTuple } from "../../shared/signed-session.js";
+import { readVerifiedBotDef } from "../../shared/bot-def-store.js";
 import { createBotHostCallerResolver } from "../bot-host-caller.js";
 import { SESSION_ACTOR_KINDS, SCOPE_ACTOR_KINDS, hasActorKey, signKindForTuple } from "../../../scripts/pi-bots/actor-sig.mjs";
 import { BOT_ID_RE } from "../../../scripts/pi-bots/bot-workspace-env.mjs";
@@ -222,9 +223,16 @@ export function actorSignRouter({ createDbClient, deps = {} } = {}) {
     try {
       db = createDbClient();
       // 5. A bot this host hosts, on this gateway (from the row the host itself reads).
-      const bot = await db.execute({ sql: "SELECT definition, enabled FROM pi_bot_defs WHERE bot_id = ?", args: [botId] });
-      const row = bot.rows[0];
-      if (!row) return fail(403, "unknown bot");
+      // AUTHORITY: `enabled`, the definition's gateways and whether this host hosts the turn all
+      // come from this row, which a contained bot can write — so only a VERIFIED definition is
+      // trusted (servers/shared/bot-def-store.js; a keyed MAC over the whole definition).
+      const bot = await readVerifiedBotDef(db, botId);
+      // A bot id with NO row is the site's plain "no such bot" answer (403, the same shape this
+      // route gave before the read was verified); only a row that EXISTS and fails verification is
+      // the tamper refusal. Collapsing the two would report an unverifiable definition where an
+      // operator only mistyped an id.
+      if (!bot.ok) return fail(403, bot.reason === "unknown-bot" ? "unknown bot" : "the bot's definition could not be verified");
+      const row = bot.row;
       if (Number(row.enabled) !== 1) return fail(403, "the bot is not enabled");
       let def = null;
       try { def = row.definition ? JSON.parse(row.definition) : null; } catch { def = null; }

@@ -18,6 +18,7 @@
  *
  * Also: the POST goes through the real CSRF rail (403 without the token).
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -28,6 +29,7 @@ import { join, dirname, basename, resolve } from "node:path";
 const dir = mkdtempSync(join(tmpdir(), "btb-board-on-"));
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = join(dir, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 
 let db = null, handleBotBuilderPost = null, applyTrackerChoice = null, worldRootFor = null, translations = null, slugify = null;

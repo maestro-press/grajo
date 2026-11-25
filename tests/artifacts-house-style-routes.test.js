@@ -15,6 +15,9 @@ import { createLocalBlobStore } from "../bundles/artifacts/server/blob-store.js"
 import { initArtifactsTables } from "../bundles/artifacts/server/init-tables.js";
 import artifactsRouter from "../bundles/artifacts/panel/routes.js";
 import { ARTIFACTS_STRINGS } from "../bundles/artifacts/panel/artifacts.js";
+// The bot-definition WRITE seam this panel uses is installed by importing the store (the gateway does
+// that at boot); without it the panel refuses to write a definition, by design.
+await import("../servers/shared/bot-def-store.js");
 
 const s = { kitOn: true };
 const THEMES = new Map([["ocean-depths", { name: "Ocean Depths", colors: { bg: "#1a2332", fg: "#f1faee", accent: "#2d8b8b", accent2: "#a8dadc" } }]]);

@@ -14,6 +14,8 @@ import { offSkills } from "../shared/skill-state.js";
 import { getExposedCapabilities } from "./peer-exposure.js";
 import { getExposureForPeer } from "./peer-exposure-store.js";
 import { canonicalForCategory } from "./capability-ids.js";
+import { readVerifiedBotDef } from "../shared/bot-def-store.js";
+import { botDefRefusalAlarm } from "../shared/bot-def-mac.js";
 import { getPeerManagedBots } from "./bot-management-exposure.js";
 import { CROW_VOICE_BOT_ID } from "../shared/voice-bot.js";
 
@@ -102,10 +104,23 @@ function localSkills(crowHome) {
 async function localBots(db) {
   try {
     const { rows } = await db.execute({
-      sql: "SELECT bot_id, display_name, enabled, project_id, definition FROM pi_bot_defs WHERE bot_id != ? ORDER BY bot_id",
+      sql: "SELECT bot_id FROM pi_bot_defs WHERE bot_id != ? ORDER BY bot_id",
       args: [CROW_VOICE_BOT_ID],
     });
-    return rows || [];
+    // AUTHORITY: what is advertised to a peer is each bot's tools and project from its definition,
+    // and a contained bot can write its own row — so only definitions whose keyed MAC verifies are
+    // listed (servers/shared/bot-def-store.js). A refused bot is simply not advertised.
+    const out = [];
+    for (const row of rows || []) {
+      // eslint-disable-next-line no-await-in-loop -- one bot at a time, on a catalog build
+      const verified = await readVerifiedBotDef(db, row.bot_id);
+      if (!verified.ok) {
+        if (verified.reason !== "unknown-bot") botDefRefusalAlarm(row.bot_id, verified.reason);
+        continue;
+      }
+      out.push(verified.row);
+    }
+    return out;
   } catch { return []; }
 }
 

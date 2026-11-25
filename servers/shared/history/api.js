@@ -133,6 +133,18 @@
  * is computed from project_spaces when the version is written (covered.js
  * `derived`), not a column of crow_context: it decides the FILING of a restored
  * section and is never part of the INSERT/UPDATE into the table itself.
+ *
+ * A BOT DEFINITION RESTORE ONLY WORKS WHILE THE LIVE KEYS OUTSIDE THE HISTORY
+ * PROJECTION ARE UNCHANGED SINCE CAPTURE (round C, item E7). A `bot_def` version
+ * holds the row's seal (`def_mac`, `def_generation`) and an allow-listed
+ * PROJECTION of `definition` — never the credential-bearing keys (gateway tokens,
+ * `spawn_env`) and never a key added to `BOT_DEFINITION_KEYS` after the capture,
+ * because the projection is computed from that list as it is TODAY. So the
+ * version's own MAC can only be reproduced when the definition at capture time had
+ * no key outside the projection. When it did, or when the row is gone and there is
+ * nothing to merge into, the restore is refused as `BOT_DEF_UNVERIFIED` (the log
+ * line says `snapshot-mismatch` or `bot-deleted`) rather than written unproven —
+ * the safe direction: a restore must prove its content, and a projection cannot.
  */
 import { resolveCrowHome } from "../crow-home.js";
 import { BOT_DEFINITION_KEYS, COVERED, columnValueExpr, tableColumns } from "./covered.js";
@@ -140,6 +152,13 @@ import { erasureKeys, findEraseRefusalSync } from "./erase.js";
 import { AUTHOR_KINDS, withWriteContext } from "./write-context.js";
 import { lineDiff } from "../line-diff.js";
 import { newRowUuid } from "../row-uuid.js";
+// The bot-definition SIGN seam, not the store: this module is reached from bot-loadable history
+// code, so it must not hold the key. `signBotDefSealed` returns the generation + MAC for a row the
+// caller writes with its own statement (see the pi_bot_defs restore below); a process with no store
+// installed refuses, and a table without the seal columns is left as it was.
+// `verifyBotDefSealed` is the seam's SYNCHRONOUS verify — the restore uses it to check a CAPTURED
+// version's own MAC (at the generation it was captured at) before anything is written.
+import { signBotDefSealed, verifyBotDefSealed } from "../bot-def-seal.js";
 
 /** The item type project workspace FILES answer to (not a table — see listVersions). */
 export const WORKSPACE_FILE_ITEM_TYPE = "workspace_file";
@@ -1614,6 +1633,9 @@ export async function restoreVersion(
   const id = normalizeVersionId(versionId);
   if (id === null) throw historyError("invalid_request", "restoreVersion needs a version id");
 
+  // Sign seals whose generation was already bumped in the secrets-side counter: settled once the
+  // transaction committed, abandoned (the counter put back) when it did not. See `botDefSeal`.
+  const settledSeals = [];
   // ONE synchronous transaction for read → compare → write → the new version id,
   // with the writer's context open so servers/db.js stamps the version the
   // trigger writes. Nothing in here may await: an await would hand the open
@@ -1632,7 +1654,115 @@ export async function restoreVersion(
       const itemId = normalizeItemId(version.item_id);
       if (itemId === null) throw historyError("invalid_request", `version ${id} has no item id`);
 
-      const snapshot = JSON.parse(version.snapshot_json);
+      /**
+       * A BOT DEFINITION carries a keyed MAC over its whole row (servers/shared/bot-def-mac.js), so
+       * a generic restore cannot leave it stale: the row would be refused at the bot's next spawn.
+       *
+       * A RESTORE ALSO PROVES THE VERSION. `item_versions` lives in crow.db, which a contained bot
+       * can write: without this check a bot could plant a "version" whose definition widens its own
+       * `permission_policy`, and the owner's restore would re-sign it — the MAC laundering the write
+       * path refuses, one door over. Every bot_def version therefore records the row's
+       * `(def_mac, def_generation)` at capture time (covered.js `seal`), and a restore verifies the
+       * SNAPSHOT's own MAC at the generation it was captured at (the replay floor is off for that
+       * one call: an old version is legitimately behind the live counter). A version that does not
+       * verify — a fabricated one, and every version captured before this rule — is refused with
+       * `BOT_DEF_UNVERIFIED`, so only content a key holder once signed can come back.
+       *
+       * The LIVE row must verify too (the write path's rule), unless this version replaces all
+       * three MAC-covered fields from a verified snapshot — then the restored content is fully
+       * determined by that snapshot and the tampered live row is simply overwritten.
+       *
+       * `signBotDefSealed` then computes the NEXT generation + MAC for the values about to be
+       * written, and the caller settles it once the transaction committed (a crash in between is the
+       * "pending" case verification already accepts). `null` when this table is not pi_bot_defs, or
+       * when the store has no seal columns (an install whose migration has not run) — then nothing is
+       * added.
+       */
+      let versionSnapshot = null;
+      const botDefSeal = (fields) => {
+        if (spec.table !== "pi_bot_defs") return null;
+        if (!tableHasColumn(run, spec.table, "def_mac") || !tableHasColumn(run, spec.table, "def_generation")) return null;
+        // A projected `definition` arrives as the stored JSON SUBTYPE (an object) from SQLite and as
+        // text from an older snapshot: both are normalised to the TEXT the column holds, which is
+        // what the MAC's canonical form parses (so formatting never moves the MAC).
+        const raw = fields.definition;
+        const definition = raw == null ? null : typeof raw === "string" ? raw : JSON.stringify(raw);
+        const captured = versionSnapshot && typeof versionSnapshot === "object" ? versionSnapshot : {};
+        const botId = String(fields.bot_id ?? itemId);
+        const enabled = fields.enabled == null ? 1 : Number(fields.enabled);
+        const projectId = fields.project_id == null ? null : Number(fields.project_id);
+
+        // 1. THE VERSION'S OWN MAC, at its own generation. A version captured before the seal
+        //    carries no MAC, and there is nothing to prove about it — so it is refused too (the
+        //    review's "pre-era versions included"): the seal was added in the same release as the
+        //    capture, so a version without one was never vouched for by a key holder.
+        //
+        //    THE LOG NAMES WHICH REFUSAL IT IS (round C, item E7). `bot-deleted` means the row is
+        //    gone, so a restore would have to reproduce the captured MAC from the version alone — and
+        //    a version only carries the history PROJECTION of the definition; any live key outside it
+        //    (a gateway token, `migrated_from`, a key added after the capture) is missing from the
+        //    proof. `snapshot-mismatch` means the row is there and the version still does not
+        //    reproduce its own captured MAC (a planted/fabricated version, or the same projection
+        //    gap). Both stay refused: a restore is `BOT_DEF_UNVERIFIED` unless it can PROVE the
+        //    content, which is why a bot-definition restore only works while the live keys outside
+        //    the history projection are unchanged since capture (see this module's header).
+        const capturedMac = typeof captured.def_mac === "string" && captured.def_mac ? captured.def_mac : null;
+        const capturedGeneration = Number.isSafeInteger(captured.def_generation) ? captured.def_generation : null;
+        const snapshotVerdict = capturedMac
+          ? verifyBotDefSealed({
+            bot_id: botId, definition, enabled, project_id: projectId,
+            def_mac: capturedMac, def_generation: capturedGeneration,
+          }, { replay: false })
+          : { ok: false, reason: "no captured MAC" };
+        if (!snapshotVerdict.ok) {
+          let livePresent = false;
+          try {
+            livePresent = Boolean(run({ sql: "SELECT 1 AS present FROM pi_bot_defs WHERE bot_id = ?", args: [itemId] }).rows?.[0]);
+          } catch { livePresent = false; }
+          const why = livePresent ? "snapshot-mismatch" : "bot-deleted";
+          console.warn(
+            `[bot-def] ${botId} history version ${id} could not be verified (${why}: ${snapshotVerdict.reason}); `
+            + "the restore was refused — save the bot again in Bot Builder instead.",
+          );
+          throw historyError(
+            "BOT_DEF_UNVERIFIED",
+            `${spec.table}/${itemId} version ${id} cannot be verified, so it cannot be restored`,
+          );
+        }
+
+        // 2. THE LIVE ROW must verify too, unless this version replaces all three MAC-covered fields.
+        const replacesAll = ["definition", "enabled", "project_id"]
+          .every((column) => Object.prototype.hasOwnProperty.call(versionSnapshot || {}, column));
+        if (!replacesAll) {
+          const live = run({
+            sql: `SELECT ${tableColumns(spec).map(quote).join(", ")}, def_mac, def_generation FROM pi_bot_defs WHERE bot_id = ?`,
+            args: [itemId],
+          }).rows?.[0] || null;
+          if (live) {
+            const liveVerdict = verifyBotDefSealed(live);
+            if (!liveVerdict.ok) {
+              console.warn(
+                `[bot-def] ${botId} settings could not be verified (${liveVerdict.reason}); the history restore `
+                + "was refused — re-approve the bot first: `node scripts/cli/bot-def-reapprove.mjs "
+                + `${botId} --show`,
+              );
+              throw historyError(
+                "BOT_DEF_UNVERIFIED",
+                `${spec.table}/${itemId} was changed outside Crow, so it cannot be restored over`,
+              );
+            }
+          }
+        }
+
+        // 3. The NEXT generation signs the restored content. `seal.definition` is the canonical text
+        // the MAC covers, and the caller writes exactly that (see the two call sites).
+        const seal = signBotDefSealed({ bot_id: botId, definition, enabled, project_id: projectId });
+        if (Number.isInteger(seal.generation)) settledSeals.push(seal);
+        return seal;
+      };
+
+      versionSnapshot = JSON.parse(version.snapshot_json);
+      const snapshot = versionSnapshot;
       // An ERASED item is never restored (the tombstone is the operator's ruling
       // that it is gone for good) — but only while the version being restored is
       // the ERASED item's: a version created at or before `erased_at` is, and a
@@ -1739,11 +1869,35 @@ export async function restoreVersion(
         // has to move updated_at the way updateCard does, or every reader watching
         // that timestamp misses the change.
         const stamp = RESTORE_STAMPS[spec.table];
+        // A restored bot definition is re-signed in the same statement: the value a column ends up
+        // with is the restored one when it changed, else the live one.
+        const restoredValue = (column) => {
+          const at = columns.indexOf(column);
+          if (at >= 0 && changed.includes(column)) return values[at];
+          return row ? row[column] : null;
+        };
+        const seal = botDefSeal({
+          bot_id: itemId,
+          definition: restoredValue("definition"),
+          enabled: restoredValue("enabled"),
+          project_id: restoredValue("project_id"),
+        });
+        // The MAC covers the CANONICAL text, and the signer returns exactly that: write the signed
+        // form, never a re-serialisation of our own.
+        if (seal && seal.definition != null) {
+          const at = columns.indexOf("definition");
+          if (at >= 0 && changed.includes("definition")) values[at] = seal.definition;
+        }
         const setClauses = [...changed.map((c) => `${quote(c)} = ?`), ...(stamp ? [stamp] : [])];
+        const args = [...changed.map((column) => values[columns.indexOf(column)])];
+        if (seal) {
+          setClauses.push("def_mac = ?", "def_generation = ?");
+          args.push(seal.def_mac, seal.generation);
+        }
         const sql =
           `UPDATE ${quote(spec.table)} SET ${setClauses.join(", ")} ` +
           `WHERE ${quote(spec.idColumn)} = ?`;
-        const args = [...changed.map((column) => values[columns.indexOf(column)]), itemId];
+        args.push(itemId);
         const written = run({ sql, args });
         // The row was read inside this transaction, so nothing could have removed
         // it — but a restore that updates nothing must never look like success.
@@ -1775,6 +1929,21 @@ export async function restoreVersion(
       if (spec.table === "research_sources") neutraliseRestoredSource(run, columns, values);
       const insertColumns = [spec.idColumn, ...columns];
       const insertValues = [...values];
+      // A re-created bot definition is signed before it is inserted (see botDefSeal).
+      {
+        const at = (column) => columns.indexOf(column);
+        const seal = botDefSeal({
+          bot_id: itemId,
+          definition: at("definition") >= 0 ? values[at("definition")] : "{}",
+          enabled: at("enabled") >= 0 ? values[at("enabled")] : 1,
+          project_id: at("project_id") >= 0 ? values[at("project_id")] : null,
+        });
+        if (seal) {
+          insertColumns.push("def_mac", "def_generation");
+          insertValues.push(seal.def_mac, seal.generation);
+          if (seal.definition != null && at("definition") >= 0) insertValues[at("definition")] = seal.definition;
+        }
+      }
       // fetch_status is not in the source's snapshot (it is fetch bookkeeping), so a
       // restored source would otherwise fall to its NULL default — the research
       // server's "shared or cloned from another instance" mark.
@@ -1798,9 +1967,16 @@ export async function restoreVersion(
       const newVersionId = versionIdAfter(run, watermark, version.item_type, itemId);
       return report({ newVersionId, unchanged: false, row: readRow(run, spec, itemId), op: "insert" });
     }).catch((err) => {
+      for (const seal of settledSeals.splice(0)) {
+        try { seal.abandon(); } catch { /* the counter is a floor; a failed revert is not fatal */ }
+      }
       throw asHistoryError(err);
     }),
   );
+  // Committed: the rows the seals signed are there, so the counter's generation is theirs.
+  for (const seal of settledSeals.splice(0)) {
+    try { seal.settle(); } catch { /* the row is signed either way; a later write settles it */ }
+  }
 
   // The write is committed and cannot be taken back by a sync problem, so the
   // emit is last and best effort. A no-op restore has nothing to send.

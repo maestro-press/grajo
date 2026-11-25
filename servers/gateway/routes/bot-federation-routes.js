@@ -14,18 +14,26 @@ import { redactDefForPeer, applyPeerPatch } from "../bot-federation.js";
 import { regenerateBotMcp as defaultRegen } from "../dashboard/panels/bot-mcp-regen.js";
 import { auditCrossHostCall } from "../../shared/cross-host-auth.js";
 import { getOrCreateLocalInstanceId } from "../instance-registry.js";
+import { writeBotDef, setBotEnabled } from "../../shared/bot-def-store.js";
 
 /** Factory so tests can inject db + regen. */
 export function makeBotFederationHandlers({ db, regenerateBotMcp = defaultRegen, auditFn = auditCrossHostCall }) {
   async function loadDef(botId) {
     const row = (await db.execute({
-      sql: "SELECT definition, project_id FROM pi_bot_defs WHERE bot_id=?",
+      sql: "SELECT definition, enabled, project_id FROM pi_bot_defs WHERE bot_id=?",
       args: [botId],
     })).rows[0];
     if (!row) return null;
     let def = {};
     try { def = JSON.parse(row.definition || "{}"); } catch { def = {}; }
-    return { def };
+    // `definition`, `enabled` and `project_id` are returned as READ: they are the compare-and-swap
+    // the write path takes (a peer edit refuses rather than clobbers a newer save).
+    return {
+      def,
+      definition: row.definition ?? null,
+      enabled: row.enabled,
+      project_id: row.project_id ?? null,
+    };
   }
 
   async function audit(req, action, botId, httpStatus, error) {
@@ -81,10 +89,32 @@ export function makeBotFederationHandlers({ db, regenerateBotMcp = defaultRegen,
         return res.status(400).json({ error: "field_not_patchable", detail: String(e.message || e) });
       }
       const toolsChanged = Object.keys(patch).some((k) => k.startsWith("tools.") || k === "skills");
-      await db.execute({
-        sql: "UPDATE pi_bot_defs SET definition=?, updated_at=datetime('now') WHERE bot_id=?",
-        args: [JSON.stringify(merged), botId],
-      });
+      // The ONE write path (servers/shared/bot-def-store.js): the row's keyed MAC covers the
+      // definition and the project_id column, so a peer edit is signed exactly like an owner's.
+      // A write that lands 0 rows — a stale compare-and-swap because the bot was saved meanwhile (by
+      // the owner, another peer, or a bot-definition write) — OR that is refused because the row does
+      // not verify (`BOT_DEF_UNVERIFIED`: it was changed outside Crow) is the route's EXISTING conflict
+      // answer, never a silent success: the peer's patch did not apply.
+      let written;
+      try {
+        written = await writeBotDef(db, {
+          bot_id: botId,
+          definition: merged,
+          expectDefinition: row.definition ?? null,
+          expectEnabled: row.enabled,
+          expectProjectId: row.project_id ?? null,
+        });
+      } catch (err) {
+        if (err && err.code === "BOT_DEF_UNVERIFIED") {
+          await audit(req, "federation.bot.patch", botId, 409, "unverified");
+          return res.status(409).json({ error: "stale", detail: "the bot changed meanwhile; fetch it again and re-apply the patch" });
+        }
+        throw err;
+      }
+      if (Number(written && written.rowsAffected) === 0) {
+        await audit(req, "federation.bot.patch", botId, 409, "stale");
+        return res.status(409).json({ error: "stale", detail: "the bot changed meanwhile; fetch it again and re-apply the patch" });
+      }
       let mcp = null;
       if (toolsChanged) {
         try { mcp = await regenerateBotMcp(db, botId); }
@@ -109,10 +139,27 @@ export function makeBotFederationHandlers({ db, regenerateBotMcp = defaultRegen,
         return res.status(404).json({ error: "bot_not_found" });
       }
       const enabled = req.body && Number(req.body.enabled) ? 1 : 0;
-      await db.execute({
-        sql: "UPDATE pi_bot_defs SET enabled=?, updated_at=datetime('now') WHERE bot_id=?",
-        args: [enabled, botId],
-      });
+      // `enabled` is inside the definition's MAC (servers/shared/bot-def-store.js `setBotEnabled`),
+      // and a partial write states the row it read (round D, item F1): a peer toggle over a row that
+      // moved or does not verify is refused, never signed blind.
+      let written;
+      try {
+        written = await setBotEnabled(db, botId, enabled, {
+          expectDefinition: row.definition ?? null,
+          expectEnabled: row.enabled,
+          expectProjectId: row.project_id ?? null,
+        });
+      } catch (err) {
+        if (err && err.code === "BOT_DEF_UNVERIFIED") {
+          await audit(req, "federation.bot.enabled", botId, 409, "unverified");
+          return res.status(409).json({ error: "stale", detail: "the bot changed meanwhile; fetch it again and retry" });
+        }
+        throw err;
+      }
+      if (Number(written && written.rowsAffected) === 0) {
+        await audit(req, "federation.bot.enabled", botId, 409, "stale");
+        return res.status(409).json({ error: "stale", detail: "the bot changed meanwhile; fetch it again and retry" });
+      }
       await audit(req, "federation.bot.enabled", botId, 200, null);
       return res.json({ ok: true, enabled });
     },

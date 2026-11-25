@@ -54,7 +54,7 @@ import {
   COVERED,
   SECRET_COLUMN,
   STORE_TASKS,
-  tableColumns,
+  requiredTableColumns,
   triggerSql,
   typesForMigration,
 } from "../../servers/shared/history/covered.js";
@@ -111,7 +111,7 @@ function installOne(db, itemType) {
 function readiness(db, spec) {
   if (!tableExists(db, spec.table)) return { ready: false, reason: `${spec.table} absent` };
   const columns = columnsOf(db, spec.table);
-  const missing = tableColumns(spec).filter((c) => !columns.has(c));
+  const missing = requiredTableColumns(spec).filter((c) => !columns.has(c));
   if (missing.length) return { ready: false, reason: `${spec.table} missing ${missing.join(", ")}` };
   const secretColumns = [...spec.tracked, ...spec.snapshot].filter((c) => SECRET_COLUMN.test(c));
   if (secretColumns.length) {

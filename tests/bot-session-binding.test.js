@@ -12,6 +12,7 @@
  *     one is made with the new row's id, and the config carries the relay's
  *     signature for exactly that session.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -25,6 +26,7 @@ for (const k of Object.keys(process.env)) if (/^(PI_|PIBOT_)/.test(k)) delete pr
 const dir = mkdtempSync(join(tmpdir(), "bot-session-binding-"));
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = join(dir, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 process.env.PIBOT_MAX_PI = "99";
 process.env.PIBOT_WARM_GATEWAY_URL = "http://127.0.0.1:1";

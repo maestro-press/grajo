@@ -213,6 +213,10 @@ describe("handleInbound board rail (execute prompt + board_report_result detecti
   const ROOT = mkdtempSync(join(tmpdir(), "bridge-board-rail-"));
   process.env.CROW_DATA_DIR = ROOT;
   process.env.CROW_HOME = join(ROOT, "home");
+  // An install this release has never booted on: the host era record explicitly allows the unsealed rows
+  // these fixtures seed directly (a MISSING record refuses them; see servers/shared/bot-def-mac.js).
+  mkdirSync(join(process.env.CROW_HOME, "secrets"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(process.env.CROW_HOME, "secrets", "bot-def-era.json"), '{"v":1,"state":"pre-era"}\n', { mode: 0o600 });
   delete process.env.CROW_DB_PATH;
   delete process.env.CROW_TASKS_DB_PATH;
 

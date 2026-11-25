@@ -88,17 +88,16 @@ test("a stored companion record with a device_id loads and saves without error (
   // A public install may still carry one. It must read and re-save: the channel is
   // retired, not rejected as unknown.
   await db.execute({
-    sql: "UPDATE pi_bot_defs SET definition = ? WHERE bot_id = 'draft-bot'",
+    sql: "UPDATE pi_bot_defs SET definition = ?, def_mac = NULL, def_generation = NULL WHERE bot_id = 'draft-bot'",
     args: [JSON.stringify({ gateways: [{ type: "companion", device_id: "kiosk-legacy" }], companion_features: { avatar: "heron" }, tools: {}, models: {} })],
   });
   const res = mkRes();
   await handleBotBuilderPost({ body: { action: "save_gateways", bot_id: "draft-bot", gw_type: "companion" } }, res, { db });
-  assert.match(res.redirected, /saved=1/, "save must succeed: " + res.redirected);
-  const def = await readDef();
+  assert.match(res.redirected, /saved=1/, "save must succeed: " + res.redirected);  const def = await readDef();
   assert.equal(def.gateways[0]?.type, "companion", "the stored record survives a save");
   assert.equal(def.gateways[0]?.device_id, "kiosk-legacy");
   await db.execute({
-    sql: "UPDATE pi_bot_defs SET definition = ? WHERE bot_id = 'draft-bot'",
+    sql: "UPDATE pi_bot_defs SET definition = ?, def_mac = NULL, def_generation = NULL WHERE bot_id = 'draft-bot'",
     args: [JSON.stringify({ gateways: [{ type: "gmail", address: "x@y.z", allowlist: [] }], tools: {}, models: {} })],
   });
 });

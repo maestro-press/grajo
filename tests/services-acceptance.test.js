@@ -18,6 +18,7 @@
  * The connection's child is the fake stdio server tests/fixtures/echo-mcp-server.mjs. No npx,
  * uvx, real service, real gateway or ~/.crow is touched.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import express from "express";
@@ -37,6 +38,7 @@ const dir = mkdtempSync(join(tmpdir(), "services-acceptance-"));
 const CROW_HOME = join(dir, "home");
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = CROW_HOME;
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 delete process.env.PORT;
 process.env.CROW_GATEWAY_PORT = "1";          // replaced with the real mount port in before()

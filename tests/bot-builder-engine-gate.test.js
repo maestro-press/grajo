@@ -87,9 +87,15 @@ beforeEach(async () => {
   else process.env.CROW_HOME = origCrowHome;
   // Reset each bot to a plain gmail gateway before every test so a prior
   // test's saved (or rejected) state can't leak into the next.
+  //
+  // `def_mac`/`def_generation` are cleared with it: a raw content write leaves the row's former MAC
+  // stale, and a stale MAC is exactly what the write path refuses (`BOT_DEF_UNVERIFIED`, see
+  // servers/shared/bot-def-store.js) — a fixture that keeps it would be modelling a row changed
+  // outside Crow. Cleared, this is a row seeded directly (the pre-era shape), which every write may
+  // seal.
   await db.execute({
     sql: "INSERT INTO pi_bot_defs (bot_id, display_name, definition, enabled) VALUES (?,?,?,1) " +
-      "ON CONFLICT(bot_id) DO UPDATE SET definition=excluded.definition",
+      "ON CONFLICT(bot_id) DO UPDATE SET definition=excluded.definition, def_mac=NULL, def_generation=NULL",
     args: ["gate-bot", "Gate Bot", JSON.stringify({ gateways: [{ type: "gmail", address: "x@y.z", allowlist: ["x@y.z"] }], tools: {}, models: {} })],
   });
   await writeSetting(db, "feature_flags", JSON.stringify({}), { scope: "local" });
@@ -328,7 +334,10 @@ test("MPA-shaped host + UNSET bot_runtime flag + engine ready → saved, NO warn
   _setEngineStatusForTest({ state: "ready", source: "env", cliPath: "/fake/cli.js" });
   _setBotRuntimeStatusForTest({ mode: "gateway" });
   await writeSetting(db, "feature_flags", JSON.stringify({}), { scope: "local" }); // bot_runtime key absent entirely
-  process.env.CROW_HOME = "/home/x/.crow-mpa"; // isMpaHost() keys off CROW_HOME|CROW_DATA_DIR containing ".crow-mpa"
+  // isMpaHost() keys off CROW_HOME|CROW_DATA_DIR containing ".crow-mpa". Only CROW_DATA_DIR moves:
+  // the bot-definition save needs the token-mac key in <CROW_HOME>/secrets, and a fresh CROW_HOME
+  // here would read as "the key was lost" beside a database whose rows are already sealed.
+  process.env.CROW_DATA_DIR = join(dir, ".crow-mpa-data");
   const res = mkRes();
   await handleBotBuilderPost(
     { body: { action: "save_gateways", bot_id: "gate-bot", gw_type: "discord", gw_token: "tok123" } },
@@ -343,7 +352,9 @@ test("plain (non-MPA) host + UNSET bot_runtime flag + engine ready → saved WIT
   _setEngineStatusForTest({ state: "ready", source: "env", cliPath: "/fake/cli.js" });
   _setBotRuntimeStatusForTest({ mode: "gateway" });
   await writeSetting(db, "feature_flags", JSON.stringify({}), { scope: "local" }); // bot_runtime key absent entirely
-  delete process.env.CROW_HOME; // CROW_DATA_DIR is already a plain tmp dir (no ".crow-mpa")
+  // A plain (non-".crow-mpa") data dir: CROW_HOME stays where it is, because the save needs the
+  // token-mac key in <CROW_HOME>/secrets (servers/shared/bot-def-store.js).
+  process.env.CROW_DATA_DIR = join(dir, "plain-data");
   const res = mkRes();
   await handleBotBuilderPost(
     { body: { action: "save_gateways", bot_id: "gate-bot", gw_type: "discord", gw_token: "tok123" } },

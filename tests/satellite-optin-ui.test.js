@@ -7,6 +7,7 @@
  * A scratch Crow home + init-db database, the real Safety tab renderer with its tool probe pinned
  * (sources._setSourcesForTest), the real save handler and the real change tracker.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after, beforeEach } from "node:test";
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
@@ -22,6 +23,7 @@ const DATA = mkdtempSync(join(tmpdir(), "crow-satoptin-data-"));
 const DB_PATH = join(DATA, "crow.db");
 const saved = { CROW_HOME: process.env.CROW_HOME, CROW_DATA_DIR: process.env.CROW_DATA_DIR, CROW_DB_PATH: process.env.CROW_DB_PATH };
 process.env.CROW_HOME = HOME;
+markBotDefPreEra(process.env.CROW_HOME);
 process.env.CROW_DATA_DIR = DATA;
 process.env.CROW_DB_PATH = DB_PATH;
 

@@ -28,6 +28,7 @@ import { escapeHtml, section, stepper, button, callout, docsUrl } from "../../sh
 import { csrfInput } from "../../shared/csrf.js";
 import { t, fill } from "../../shared/i18n.js";
 import { loadModelOptions, defaultDefinition, probeAll, loadSkills } from "./data-queries.js";
+import { writeBotDef } from "../../../../shared/bot-def-store.js";
 import {
   renderGatewayFields, normalizeGatewayFields, SIMPLE_GATEWAY_TYPES,
   buildCrowMessagesGatewayConfig,
@@ -469,9 +470,18 @@ export async function handleWizardCreate(req, res, { db, lang }) {
   }
 
   try {
-    await db.execute({
-      sql: "INSERT INTO pi_bot_defs (bot_id, display_name, definition, project_id, enabled) VALUES (?,?,?,?,1)",
-      args: [botId, display, JSON.stringify(def), projectId],
+    // The one insert path: the store sets the definition's keyed MAC and its generation in the
+    // same statement (servers/shared/bot-def-store.js), so the row is verifiable from birth.
+    // `ownerFullReplace` marks this as a FULL-FORM save: the wizard built the whole definition from
+    // what the operator entered and was shown, so nothing comes from an older row.
+    await writeBotDef(db, {
+      bot_id: botId,
+      display_name: display,
+      definition: def,
+      project_id: projectId,
+      enabled: 1,
+      mode: "insert",
+      ownerFullReplace: true,
     });
   } catch (e) {
     // The fresh wizard keeps the preselected project (a plain id only).

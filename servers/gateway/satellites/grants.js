@@ -12,6 +12,7 @@
  */
 import { satelliteBundleIds } from "./installs.js";
 import { splitEntry } from "../../../scripts/pi-bots/skill-tools.mjs";
+import { writeBotDef } from "../../shared/bot-def-store.js";
 
 const list = (v) => (Array.isArray(v) ? v : null);
 
@@ -76,12 +77,21 @@ export async function stripBotGrantsForBundle(db, bundle, { log = () => {}, atte
     // Compare-and-swap with a re-read on a miss: a concurrent edit never keeps a planted grant.
     for (let i = 0; i < attempts && !done; i++) {
       try {
-        const row = (await db.execute({ sql: "SELECT definition FROM pi_bot_defs WHERE bot_id = ?", args: [botId] })).rows[0];
+        const row = (await db.execute({ sql: "SELECT definition, enabled, project_id FROM pi_bot_defs WHERE bot_id = ?", args: [botId] })).rows[0];
         if (!row) { done = true; break; }
         let def;
         try { def = JSON.parse(row.definition || "{}") || {}; } catch { done = true; break; }
         if (!strip(def)) { done = true; break; }
-        const r = await db.execute({ sql: "UPDATE pi_bot_defs SET definition = ? WHERE bot_id = ? AND definition = ?", args: [JSON.stringify(def), botId, row.definition] });
+        // The ONE write path: it re-MACs the definition and refuses unless the values read here are
+        // still the row it verifies (round D, item F1) — which is what makes this retry's own
+        // compare-and-swap the read it built the change from.
+        const r = await writeBotDef(db, {
+          bot_id: botId,
+          definition: def,
+          expectDefinition: row.definition ?? null,
+          expectEnabled: row.enabled,
+          expectProjectId: row.project_id ?? null,
+        });
         if (Number(r?.rowsAffected ?? 0) > 0) { changed.push(botId); done = true; }
       } catch { /* retried */ }
     }

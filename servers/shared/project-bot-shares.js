@@ -25,6 +25,7 @@
 // See the private engineering notes for the Phase 1 share design.
 
 import { AclError, appendAudit, assertProjectExists } from "./project-acl.js";
+import { botDefVerifyInstalled, verifyBotDefSealed } from "./bot-def-seal.js";
 
 export const SHARE_LEVELS = Object.freeze(["read", "read_write"]);
 
@@ -48,7 +49,39 @@ async function loadProjectRow(db, projectId) {
   return rows[0] || null;
 }
 
-async function loadBotRow(db, botId) {
+/**
+ * The bot's row through the store's VERIFIED read, for a caller that has no key of its own: the
+ * seam's synchronous verify (the same era decision the bridge's spawn gate makes) runs on a row read
+ * here, and an unverified row is "no bot" — a definition changed outside Crow decides nothing about
+ * a share (round C, item E4). Null when the row is missing or does not verify.
+ *
+ * Exported for `project-share-scope.js`, whose default (uninjected) read uses it too: the two files
+ * must answer the same way. Only a process WITH the store installed reaches it (`botDefVerifyInstalled`).
+ */
+export async function verifiedBotRowOrNull(db, botId) {
+  if (botId == null || botId === "") return null;
+  let rows;
+  try {
+    ({ rows } = await db.execute({ sql: "SELECT * FROM pi_bot_defs WHERE bot_id = ? LIMIT 1", args: [String(botId)] }));
+  } catch {
+    return null;
+  }
+  const row = rows?.[0] || null;
+  if (!row) return null;
+  return verifyBotDefSealed(row).ok ? row : null;
+}
+
+/**
+ * The bot's row, verified.
+ *
+ * An INJECTED `botRow` is the caller's own verified read and is used as it is. With no injection the
+ * read follows the process (round C, item E4): a GATEWAY-side caller (the store is installed, so the
+ * seam has a verifier) DEFAULT-VERIFIES and an unverified row reads as no bot at all; a bot's own MCP
+ * child (no store, no key) keeps the plain read, which can only affect that bot's own call.
+ */
+async function loadBotRow(db, botId, botRow) {
+  if (botRow !== undefined) return (typeof botRow === "function" ? await botRow() : botRow) || null;
+  if (botDefVerifyInstalled()) return verifiedBotRowOrNull(db, botId);
   const { rows } = await db.execute({
     sql: "SELECT bot_id, display_name, project_id, definition FROM pi_bot_defs WHERE bot_id = ? LIMIT 1",
     args: [String(botId)],
@@ -134,11 +167,11 @@ async function remoteInvocationOn(db, bot) {
  * @returns {Promise<{ id: number, changed: "created"|"level_changed"|"unchanged", remoteInvocationOn: boolean }>}
  * @throws {ShareError} bad_level | bot_not_found | project_not_found | same_project | outside_members
  */
-export async function grantShare(db, { projectId, botId, level } = {}) {
+export async function grantShare(db, { projectId, botId, level, botRow } = {}) {
   if (!SHARE_LEVELS.includes(level)) {
     throw new ShareError(`Share level must be one of ${SHARE_LEVELS.join(", ")}`, "bad_level");
   }
-  const bot = await loadBotRow(db, botId);
+  const bot = await loadBotRow(db, botId, botRow);
   if (!bot) throw new ShareError(`Bot ${botId} not found`, "bot_not_found");
 
   const project = await loadProjectRow(db, projectId);
@@ -202,7 +235,7 @@ export async function grantShare(db, { projectId, botId, level } = {}) {
  * Revoke the bot's live share of a project: `revoked_at`, never a delete. Audited to both logs.
  * @throws {ShareError} no_such_share
  */
-export async function revokeShare(db, { projectId, botId } = {}) {
+export async function revokeShare(db, { projectId, botId, botRow } = {}) {
   const id = Number(projectId);
   const { rows } = await db.execute({
     sql: `SELECT id, level FROM project_bot_shares
@@ -217,7 +250,7 @@ export async function revokeShare(db, { projectId, botId } = {}) {
     args: [Number(live.id)],
   });
 
-  const bot = await loadBotRow(db, botId);
+  const bot = await loadBotRow(db, botId, botRow);
   const homeId = homeOf(bot);
   const project = await loadProjectRow(db, id);
   const home = homeId == null || homeId === id ? null : await loadProjectRow(db, homeId);
@@ -236,8 +269,17 @@ export async function revokeShare(db, { projectId, botId } = {}) {
  * @returns {Promise<{ kind: "home"|"share"|"none", level: null|"read"|"read_write",
  *   suspended: boolean, reason: null|"outside_member" }>}
  */
-export async function resolveBotAccess(db, botId, projectId) {
+export async function resolveBotAccess(db, botId, projectId, { botRow } = {}) {
   if (botId == null || projectId == null) return noAccess();
+  // THE DEFAULT READ VERIFIES WHERE THE STORE IS INSTALLED (round C, item E4): a gateway-side caller
+  // (every share decision on this instance's own MCP mounts) never takes a home project from a row
+  // nothing can vouch for. A bot's own child process has no store installed and keeps the plain
+  // read, which can only affect the caller's own call.
+  let injected = botRow;
+  if (injected === undefined && botDefVerifyInstalled()) {
+    injected = await verifiedBotRowOrNull(db, botId);
+    if (!injected) return noAccess();
+  }
   const { rows } = await db.execute({
     sql: `SELECT p.status, p.archived_at, d.bot_id, d.project_id AS home_project_id,
                  s.id AS share_id, s.level AS share_level,
@@ -254,6 +296,21 @@ export async function resolveBotAccess(db, botId, projectId) {
   });
   const row = rows[0];
   if (!row || !row.bot_id) return noAccess();
+  if (injected !== undefined) {
+    // A VERIFIED row decides the home side (the caller's read); the share side is this table's.
+    const verified = typeof injected === "function" ? await injected() : injected;
+    if (!verified) return noAccess();
+    row.home_project_id = verified.project_id ?? null;
+    row.home_outside = 0;
+    if (row.home_project_id != null) {
+      const r2 = await db.execute({
+        sql: `SELECT COUNT(*) AS n FROM project_members
+               WHERE project_id = ? AND contact_id IS NOT NULL AND revoked_at IS NULL`,
+        args: [Number(row.home_project_id)],
+      });
+      row.home_outside = Number(r2.rows[0] && r2.rows[0].n) || 0;
+    }
+  }
   if (row.archived_at || String(row.status) === "archived") return noAccess();
   if (row.home_project_id != null && Number(row.home_project_id) === Number(projectId)) {
     return { kind: "home", level: null, suspended: false, reason: null };

@@ -100,7 +100,15 @@ export function createVoiceBotLoader({ now = Date.now, generation = () => 0, ttl
     if (hit && hit.gen === gen && now() - hit.at < ttlMs) return hit.value;
     let value = null;
     try {
-      const row = (await db.execute({ sql: "SELECT definition, enabled FROM pi_bot_defs WHERE bot_id = ?", args: [CROW_VOICE_BOT_ID] })).rows[0];
+      // AUTHORITY, so a VERIFIED read: this def decides Crow's voice model, its tool list and part of
+      // the voice prompt (servers/shared/bot-def-store.js). An unverified row reads as "no voice bot"
+      // here — the existing missing-row path.
+      const { readVerifiedBotDef } = await import("../../shared/bot-def-store.js");
+      const read = await readVerifiedBotDef(db, CROW_VOICE_BOT_ID);
+      const row = read.ok ? read.row : null;
+      if (!read.ok && read.reason !== "unknown-bot") {
+        console.warn(`[bot-def] ${CROW_VOICE_BOT_ID} settings could not be verified (${read.reason})`);
+      }
       if (row && Number(row.enabled) === 1) {
         const def = JSON.parse(row.definition);
         if (def && typeof def === "object" && !Array.isArray(def)) value = { def, cloud: await fastModelIsCloud(db, def, { resolveVoiceKeysFn }) };

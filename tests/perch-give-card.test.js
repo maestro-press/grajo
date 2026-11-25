@@ -16,6 +16,7 @@
  * given and says why (started:false + code). One board_mutations row and one
  * card_given audit row per give.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -27,6 +28,7 @@ import Database from "better-sqlite3";
 const dir = mkdtempSync(join(tmpdir(), "perch-give-card-"));
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = join(dir, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 process.env.CROW_TASKS_DB_PATH = join(dir, "tasks.db");
 const DB_FILE = join(dir, "crow.db");

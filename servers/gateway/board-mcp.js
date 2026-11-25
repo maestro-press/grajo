@@ -58,6 +58,8 @@ import { z } from "zod";
 import { jsonObject } from "../shared/tool-schema-types.js";
 import { createDbClient } from "../db.js";
 import { isVoiceBotId } from "../shared/voice-bot.js";
+import { readVerifiedBotDef } from "../shared/bot-def-store.js";
+import { botDefRefusalAlarm } from "../shared/bot-def-mac.js";
 import { activeProjectWhere } from "../shared/shell-items.js";
 import { tasksDbPath } from "../../scripts/pi-bots/instance-paths.mjs";
 import {
@@ -198,8 +200,17 @@ export function assertBotCardWriteChannel(actor) {
 /** The linked project of a bot (pi_bot_defs.project_id), or null. */
 export async function botProjectOf(cdb, botId) {
   if (!cdb || !botId) return null;
-  const r = (await cdb.execute({ sql: "SELECT project_id FROM pi_bot_defs WHERE bot_id=?", args: [botId] })).rows[0];
-  return r && r.project_id != null ? Number(r.project_id) : null;
+  // AUTHORITY: this project id decides which cards a bot may read and change, and a contained bot
+  // can write its own row, so only a definition whose keyed MAC verifies is used. A refused row
+  // answers null — the bot sees at most what an unassigned bot sees, never another project's cards.
+  const verified = await readVerifiedBotDef(cdb, botId);
+  if (!verified.ok) {
+    // No row at all is not tampering: it is the caller's own not-found path (an id that was never
+    // created, or a deleted bot). Only a row that EXISTS and fails verification earns the line.
+    if (verified.reason !== "unknown-bot") botDefRefusalAlarm(botId, verified.reason);
+    return null;
+  }
+  return verified.row.project_id != null ? Number(verified.row.project_id) : null;
 }
 
 /** Whether a bot actor may READ `row` (a tasks_items row, or null for an id

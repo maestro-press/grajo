@@ -5,8 +5,8 @@ import { getLocalCatalog, canonicalForCategory } from "../servers/gateway/capabi
 const db = {
   async execute() {
     return { rows: [
-      { bot_id: "a", display_name: "A", enabled: 1, project_id: null, definition: JSON.stringify({ models: { default: "m1" }, tools: { crow_mcp: ["crow-memory/x"] }, system_prompt: "SENTINEL_SECRET_LEAK" }) },
-      { bot_id: "b", display_name: "B", enabled: 0, project_id: 3, definition: "{}" },
+      { bot_id: "a", display_name: "A", enabled: 1, project_id: null, definition: JSON.stringify({ models: { default: "m1" }, tools: { crow_mcp: ["crow-memory/x"] }, system_prompt: "SENTINEL_SECRET_LEAK" }), def_mac: null, def_generation: null },
+      { bot_id: "b", display_name: "B", enabled: 0, project_id: 3, definition: "{}", def_mac: null, def_generation: null },
     ] };
   },
 };

@@ -5,6 +5,7 @@
  */
 import { writeBotMcp } from "../../../../scripts/pi-bots/mcp_writer.mjs";
 import { botHoldsLiveShare } from "../../../shared/project-bot-shares.js";
+import { readVerifiedBotDef } from "../../../shared/bot-def-store.js";
 import { resolveCrowHome } from "../../../../scripts/pi-bots/ext_registry.mjs";
 import { mcpConfigDelivery } from "../../../../scripts/pi-bots/mcp-delivery.mjs";
 import { worldRootFor } from "../../../../scripts/pi-bots/world-root.mjs";
@@ -34,13 +35,28 @@ export async function resolveBotSessionDir(db, botId, def, projectId, crowHome =
  * S6-CROW: in fd delivery mode nothing is written — the bridge builds and
  * pipes the config per turn — so this validates the selection, removes any
  * stale on-disk copy, and returns path: null.
+ *
+ * AUTHORITY: the definition decides `session_dir` (the world root pi runs from) and the credentials a
+ * regenerated config carries, and a contained bot can write the row — so it is read VERIFIED
+ * (servers/shared/bot-def-store.js). An unverified row refuses with the route's existing
+ * `bot_not_found` diagnostic (plus the `[bot-def]` line) rather than writing credentials anywhere.
  */
 export async function regenerateBotMcp(db, botId, opts = {}) {
-  const row = (await db.execute({
-    sql: "SELECT definition, display_name, project_id FROM pi_bot_defs WHERE bot_id=?",
-    args: [botId],
-  })).rows[0];
-  if (!row) throw new Error("bot_not_found");
+  const read = await readVerifiedBotDef(db, botId);
+  if (!read.ok) {
+    if (read.reason !== "unknown-bot") {
+      console.warn(
+        `[bot-def] ${botId} was changed outside Crow; review it with `
+        + `\`node scripts/cli/bot-def-reapprove.mjs ${botId} --show\``
+        + ` (${read.reason}); the MCP config was not regenerated`,
+      );
+      const err = new Error("bot_not_found");
+      err.code = "BOT_DEF_UNVERIFIED";
+      throw err;
+    }
+    throw new Error("bot_not_found");
+  }
+  const row = read.row;
   const stored = JSON.parse(row.definition || "{}");
   const crowHome = resolveCrowHome();
   // the same repo-skill tool union a spawn applies (bot-world.mjs), so a

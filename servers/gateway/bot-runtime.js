@@ -62,6 +62,7 @@ import { runBridgeTick as defaultRunBridgeTick } from "../../scripts/pi-bots/bri
 import { superviseProcess as defaultSuperviseProcess } from "./process-supervisor.js";
 import { setBreakerSource } from "./bot-engine-status.js";
 import { initGatewayActorKey } from "../../scripts/pi-bots/actor-sig.mjs";
+import { botDefEraConvertedSync, botDefRefusalAlarm, verifyBotDefSync } from "../shared/bot-def-mac.js";
 
 const DISCORD_GATEWAY_PATH = fileURLToPath(
   new URL("../../scripts/pi-bots/discord_gateway.mjs", import.meta.url)
@@ -104,12 +105,28 @@ let tickInFlight = false;
 function discordBotConfigs(conn) {
   let rows = [];
   try {
-    rows = conn.prepare("SELECT bot_id, definition FROM pi_bot_defs WHERE enabled=1").all();
+    try {
+      rows = conn.prepare("SELECT bot_id, definition, def_mac, def_generation FROM pi_bot_defs WHERE enabled=1").all();
+    } catch {
+      // A store shaped before the seal columns exist: every row reads as unsealed (pre-era).
+      rows = conn.prepare("SELECT bot_id, definition FROM pi_bot_defs WHERE enabled=1").all();
+    }
   } catch {
     return [];
   }
+  // AUTHORITY: a definition here carries a Discord bot TOKEN and a channel allowlist, and a
+  // contained bot can write the row. Only a definition whose keyed MAC verifies is used
+  // (servers/shared/bot-def-mac.js); an unverified one starts no gateway at all. The era is the
+  // host-side era record (`<secrets>/bot-def-era.json`): absent or anything but "pre-era" refuses an
+  // unsealed row.
+  const converted = botDefEraConvertedSync();
   const out = [];
   for (const row of rows) {
+    const verification = verifyBotDefSync({ ...row, enabled: 1 }, { converted });
+    if (!verification.ok) {
+      botDefRefusalAlarm(row.bot_id, verification.reason);
+      continue;
+    }
     let def;
     try { def = JSON.parse(row.definition || "{}"); } catch { continue; }
     const gw = (def.gateways || []).find((g) => g && g.type === "discord" && g.token);

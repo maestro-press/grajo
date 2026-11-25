@@ -94,7 +94,17 @@ export async function authorizeSatelliteCall(db, actor, { sat: satelliteId, bund
     const ownerTurn = isOwnerTurnScope(actor, { engine });
     if (!ownerTurn && !(await getBotOptin(db, actor.botId))) return refuse("not_owner_turn");
     // 2. the bot, enabled (pi_bot_defs.enabled is the one "on" switch a bot has).
-    const row = (await db.execute({ sql: "SELECT definition, enabled FROM pi_bot_defs WHERE bot_id = ?", args: [actor.botId] })).rows[0];
+    // AUTHORITY, so a VERIFIED read: this definition's `tools` decides which satellite tools the
+    // bot may call, and a contained bot can write its own row.
+    const { readVerifiedBotDef } = await import("../../shared/bot-def-store.js");
+    const read = await readVerifiedBotDef(db, actor.botId);
+    if (!read.ok) {
+      if (read.reason !== "unknown-bot") {
+        console.warn(`[bot-def] ${actor.botId} settings could not be verified (${read.reason}); the satellite call was refused`);
+      }
+      return refuse("not_granted");
+    }
+    const row = read.row;
     if (!row || Number(row.enabled) !== 1) return refuse("not_granted");
     let def = null;
     try { def = row.definition ? JSON.parse(row.definition) : null; } catch { def = null; }

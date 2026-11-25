@@ -175,7 +175,7 @@
     {
       "id": "artifacts",
       "name": "Artifacts",
-      "version": "0.11.3",
+      "version": "0.11.4",
       "description": "Pages, documents and diagrams your bots make. Comment on any part, send feedback, and the bot revises and replies in each thread.",
       "type": "bundle",
       "author": "Crow",
@@ -7193,7 +7193,7 @@
     {
       "id": "studio",
       "name": "Crow Studio",
-      "version": "0.23.5",
+      "version": "0.23.6",
       "description": "A shared music studio: you in the dashboard and an AI agent over MCP edit one live song together; every edit is tagged and undoable.",
       "type": "mcp-server",
       "author": "Crow",

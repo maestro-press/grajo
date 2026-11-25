@@ -18,6 +18,7 @@
  * the host (the operator's real ~/.crow included, found through HOME), so HOME
  * must be scratch before bridge.mjs is imported.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import "./helpers/pi-scratch-home.mjs";
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -30,6 +31,7 @@ import Database from "better-sqlite3";
 const dir = mkdtempSync(join(tmpdir(), "perch-narrowing-"));
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = join(dir, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 // The bridge reads these at module load / spawn time.
 process.env.PIBOT_MAX_PI = "99";               // never defer on a busy dev box

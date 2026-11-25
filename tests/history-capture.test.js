@@ -14,6 +14,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,6 +23,7 @@ import Database from "better-sqlite3";
 
 import { COVERED, STORE_TASKS, STAMP_ONLY_TRANSITIONS, guardTriggerSql, triggerSql, typesForMigration } from "../servers/shared/history/covered.js";
 import { ensureHistoryTriggers, ensureHistoryTriggersAtBoot } from "../servers/shared/history/ensure.js";
+import { normalizeTriggerSql } from "../servers/shared/trigger-catalog.js";
 import {
   ITEM_VERSIONS_DDL,
   run,
@@ -719,6 +721,152 @@ test("dropped history triggers come back at the next ensure", () => {
 
     // Idempotent: a second ensure on a healthy store writes nothing.
     assert.deepEqual(ensureHistoryTriggers(db).restored, [], "a healthy store needs no repair");
+    db.close();
+  } finally {
+    fx.dispose();
+  }
+});
+
+test("J4: a bot-definition capture trigger whose BODY changed is re-created (not only one missing a seal column)", () => {
+  const fx = migratedFixture();
+  try {
+    const db = fx.open();
+    // An EARLIER BUILD's body: it still NAMES the seal columns (so the missing-seal rule alone would
+    // leave it in place) but records a different snapshot — the latent outage, because the writer's
+    // seal cannot be reproduced from what this one captures, so every save and every restore of these
+    // versions is refused.
+    db.exec("DROP TRIGGER hist_pi_bot_defs_au");
+    db.exec(`CREATE TRIGGER hist_pi_bot_defs_au AFTER UPDATE ON pi_bot_defs
+WHEN NEW.enabled IS NOT OLD.enabled
+BEGIN
+  INSERT INTO item_versions (item_type, item_id, op, snapshot_json)
+  VALUES ('bot_def', CAST(NEW.bot_id AS TEXT), 'update',
+          json_object('def_mac', NEW.def_mac, 'def_generation', NEW.def_generation));
+END`);
+
+    db.prepare("INSERT INTO pi_bot_defs (bot_id, display_name, definition, enabled) VALUES ('j4', 'J4', ?, 1)")
+      .run(JSON.stringify({ system_prompt: "one" }));
+    db.prepare("UPDATE pi_bot_defs SET enabled = 0 WHERE bot_id = 'j4'").run();
+    const stale = db.prepare(
+      "SELECT snapshot_json FROM item_versions WHERE item_type = 'bot_def' AND item_id = 'j4' ORDER BY id DESC LIMIT 1",
+    ).get();
+    assert.equal(JSON.parse(stale.snapshot_json).display_name, undefined,
+      "the old body captures none of what the current writer needs");
+
+    // The boot re-ensure: a body that is not the body generated NOW is re-created (item J4).
+    const repaired = ensureHistoryTriggers(db);
+    assert.deepEqual(repaired.restored, ["hist_pi_bot_defs_au"], "the changed body is re-created");
+    assert.deepEqual(ensureHistoryTriggers(db).restored, [], "and the store is healthy afterwards");
+
+    // The write now captures a version the seal can be reproduced from.
+    db.prepare("UPDATE pi_bot_defs SET enabled = 1 WHERE bot_id = 'j4'").run();
+    const fresh = db.prepare(
+      "SELECT snapshot_json FROM item_versions WHERE item_type = 'bot_def' AND item_id = 'j4' ORDER BY id DESC LIMIT 1",
+    ).get();
+    const snapshot = JSON.parse(fresh.snapshot_json);
+    assert.equal(snapshot.display_name, "J4", "the re-created body captures the row's content");
+    assert.equal(snapshot.enabled, 1);
+    assert.ok(Object.prototype.hasOwnProperty.call(snapshot, "def_mac")
+      && Object.prototype.hasOwnProperty.call(snapshot, "def_generation"),
+    "the seal pair rides with the version again");
+    db.close();
+  } finally {
+    fx.dispose();
+  }
+});
+
+test("K1: a re-created trigger logs one line and writes one audit row (the stored body's hash, not the body)", () => {
+  const fx = migratedFixture();
+  try {
+    const db = fx.open();
+    // Evidence of tampering: a bot-definition capture trigger replaced by hand with a body of its own.
+    // Re-creating it is right (the writer's seal depends on the generated body), but doing it silently
+    // would destroy the only record that somebody changed it.
+    const STORED = `CREATE TRIGGER hist_pi_bot_defs_au AFTER UPDATE ON pi_bot_defs
+WHEN 0
+BEGIN
+  SELECT 'planted body';
+END`;
+    db.exec("DROP TRIGGER hist_pi_bot_defs_au");
+    db.exec(STORED);
+
+    const auditRows = () =>
+      db.prepare("SELECT event_type, details FROM audit_log WHERE event_type = 'trigger_inventory' ORDER BY id").all();
+    assert.deepEqual(auditRows(), [], "nothing audited before the repair");
+
+    const lines = [];
+    const result = ensureHistoryTriggers(db, { log: (m) => lines.push(m) });
+    const expectedHash = createHash("sha256").update(normalizeTriggerSql(STORED)).digest("hex");
+
+    // ONE line, naming the trigger and its table — the operator-facing half of the record.
+    assert.deepEqual(lines, [
+      "[history] re-created trigger hist_pi_bot_defs_au on pi_bot_defs: stored body differed from " +
+        "Crow's (expected after an upgrade that changes it; otherwise investigate)",
+    ]);
+    assert.deepEqual(result.recreated, [
+      { name: "hist_pi_bot_defs_au", table: "pi_bot_defs", sha256: expectedHash },
+    ]);
+
+    // ONE audit row, in the trigger inventory's shape and table, with a distinct reason and the stored
+    // body's SHA-256 — the body itself is not copied into the audit log.
+    const rows = auditRows();
+    assert.equal(rows.length, 1, "exactly one audit row for the one changed body");
+    const details = JSON.parse(rows[0].details);
+    assert.deepEqual(details, {
+      db: "crow.db",
+      trigger: "hist_pi_bot_defs_au",
+      table: "pi_bot_defs",
+      reason: "history-trigger-recreated",
+      bodySha256: expectedHash,
+    });
+    assert.ok(!rows[0].details.includes("planted body"), "the stored body is not written to the audit log");
+
+    // The generated body is back in place ...
+    const installed = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'hist_pi_bot_defs_au'",
+    ).get().sql;
+    assert.match(installed, /INSERT INTO item_versions/);
+
+    // ... and an UNCHANGED trigger (the one just re-created) reports nothing at all.
+    const quiet = [];
+    const again = ensureHistoryTriggers(db, { log: (m) => quiet.push(m) });
+    assert.deepEqual(again.restored, [], "a healthy store needs no repair");
+    assert.deepEqual(again.recreated, []);
+    assert.deepEqual(quiet, [], "an unchanged trigger says nothing");
+    assert.equal(auditRows().length, 1, "and writes no second audit row");
+    db.close();
+  } finally {
+    fx.dispose();
+  }
+});
+
+test("K1: a merely MISSING trigger is created with no audit row (and an unreachable audit_log still logs)", () => {
+  const fx = migratedFixture();
+  try {
+    const db = fx.open();
+    const auditCount = () =>
+      db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE event_type = 'trigger_inventory'").get().n;
+
+    // MISSING, not changed: nothing was overwritten, so there is nothing to investigate.
+    db.exec("DROP TRIGGER hist_memories_ai");
+    const lines = [];
+    const result = ensureHistoryTriggers(db, { log: (m) => lines.push(m) });
+    assert.deepEqual(result.restored, ["hist_memories_ai"], "the missing trigger comes back");
+    assert.deepEqual(result.recreated, [], "a creation is not a re-creation");
+    assert.deepEqual(lines, [], "and nothing is logged as a body change");
+    assert.equal(auditCount(), 0, "no audit row for a trigger that was simply absent");
+
+    // A process whose handle has no audit_log (a migration, a fixture, a read-only store) must still
+    // leave the log line: the line never depends on the audit table being reachable.
+    db.exec("DROP TRIGGER hist_pi_bot_defs_ai");
+    db.exec("CREATE TRIGGER hist_pi_bot_defs_ai AFTER INSERT ON pi_bot_defs BEGIN SELECT 1; END");
+    db.exec("DROP TABLE audit_log");
+    const fallback = [];
+    assert.doesNotThrow(() => ensureHistoryTriggers(db, { log: (m) => fallback.push(m) }));
+    assert.deepEqual(fallback, [
+      "[history] re-created trigger hist_pi_bot_defs_ai on pi_bot_defs: stored body differed from " +
+        "Crow's (expected after an upgrade that changes it; otherwise investigate)",
+    ]);
     db.close();
   } finally {
     fx.dispose();

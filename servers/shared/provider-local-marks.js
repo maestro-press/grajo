@@ -369,13 +369,21 @@ export async function strictVoiceKeysInUse(db, { env = process.env } = {}) {
   } catch (err) { console.warn(`[roles] voice keys unreadable: ${err?.message}`); }
   try {
     const { CROW_VOICE_BOT_ID } = await import("./voice-bot.js");
-    const { rows } = await db.execute({ sql: "SELECT definition FROM pi_bot_defs WHERE bot_id = ?", args: [CROW_VOICE_BOT_ID] });
-    if (rows[0]) {
+    // The key this row names is shown to the operator as "local" / "cloud", so a definition changed
+    // outside Crow must not name it (round C, item E4). The row is verified through the WRITE-SEAM's
+    // synchronous verifier — this module must never reach the store (it is on bot-reachable paths),
+    // and a process with no store installed (a bot's own child) keeps the plain read, which can only
+    // affect what that process lists. Where the verifier IS installed (gateway, panels, CLIs), an
+    // unverified row adds nothing here: a withheld mark, never a laundered one.
+    const { botDefVerifyInstalled, verifyBotDefSealed } = await import("./bot-def-seal.js");
+    const { rows } = await db.execute({ sql: "SELECT * FROM pi_bot_defs WHERE bot_id = ?", args: [CROW_VOICE_BOT_ID] });
+    const row = rows[0];
+    if (row && !(botDefVerifyInstalled() && !verifyBotDefSealed(row).ok)) {
       let def = null;
-      try { def = JSON.parse(rows[0].definition || "{}"); } catch {}
+      try { def = JSON.parse(row.definition || "{}"); } catch {}
       await add(def?.fast_voice_model);
     }
-  } catch { /* no bot table or row */ }
+  } catch { /* no bot table or row, no seam in this process */ }
   try { await add(await readValue(db, "phone_local_model")); } catch { /* none */ }
   return [...out];
 }

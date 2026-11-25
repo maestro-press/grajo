@@ -17,11 +17,25 @@
  * companions are NOT added and the caller says why. An unresolvable model or
  * an unknown cap adds them: they are explicit, so a later budget refusal
  * names them like any ticked tool.
+ *
+ * THE CONTENT COMES FROM THE ROW THE CALLER READ, AND THE STORE REFUSES IF THAT IS NOT THE ROW IT
+ * VERIFIES (round D, item F1). The migration reads the row, builds the companion list from it, and
+ * hands the store the same values it read (`expectDefinition` & co). A row that changed between
+ * that read and the write — or one that does not verify at all — makes the store refuse with
+ * `BOT_DEF_UNVERIFIED`; this migration then logs and skips that bot, so nothing is ever re-signed
+ * with content nobody vouched for, and nothing is built from a second, later read of the table.
+ *
+ * Note: the candidate set comes from a plain `SELECT bot_id, display_name`, which is a candidate
+ * LIST; the row itself is read once, right before the write.
  */
 import { withArtifactsCompanions } from "./bot-world.mjs";
 import { primeBareServerTools } from "./bare-server-tools.mjs";
 import { resolveCrowHome } from "./ext_registry.mjs";
 import { isVoiceBotId, isVoiceBotDef } from "../../servers/shared/voice-bot.js";
+// The bot-definition WRITE SEAM, not the store: this file is on the bot-reachable tree
+// (scripts/pi-bots/**), so it must not reach the key. The seam holds no key and imports nothing;
+// the gateway installs the real writer at boot, and a process with none refuses the write.
+import { writeBotDefSealed } from "../../servers/shared/bot-def-seal.js";
 
 // v2 (2026-11): v1 shipped before the upload pair existed, so an instance
 // that already carries the v1 marker has defs with Find and Attach but no
@@ -89,22 +103,59 @@ export async function addCompanionsGuarded(def, { budget = null } = {}) {
  * they re-tick Update after making room.
  */
 export async function migrateArtifactsCompanions(db, { log = (m) => console.log(m), budgetFor = defaultCompanionBudget, notify = null } = {}) {
-  const out = { skipped: false, updated: [], refused: [] };
+  const out = { skipped: false, updated: [], refused: [], unverified: [] };
   try {
     const done = (await db.execute({ sql: "SELECT value FROM dashboard_settings WHERE key=?", args: [MIGRATION_KEY] })).rows[0];
     if (done) return { ...out, skipped: true };
-    const rows = (await db.execute({ sql: "SELECT bot_id, display_name, definition FROM pi_bot_defs", args: [] })).rows;
+    // A candidate LIST (ids and names only): nothing is decided from it.
+    const rows = (await db.execute({ sql: "SELECT bot_id, display_name FROM pi_bot_defs", args: [] })).rows;
     for (const r of rows) {
-      let def;
-      try { def = JSON.parse(r.definition || "{}"); } catch { continue; }
-      if (!def || typeof def !== "object") continue;
-      if (isVoiceBotId(r.bot_id) || isVoiceBotDef(def)) continue; // the voice bot's tools are its own
-      const res = await addCompanionsGuarded(def, { budget: await budgetFor(def) });
-      if (res.refused) {
-        out.refused.push(String(r.bot_id));
-        log(`[artifacts] ${r.bot_id}: Find, Attach and the upload tools were not added — this model's tool limit is reached`);
+      const botId = String(r.bot_id);
+      let added = [];
+      let refused = false;
+      try {
+        // THE ROW THIS CHANGE IS BUILT FROM, read once (round D, item F1): the store refuses unless
+        // these exact values are still the row it verifies, so a tampered or moved row is refused
+        // rather than rewritten.
+        // eslint-disable-next-line no-await-in-loop -- one bot at a time, an operator migration
+        const row = (await db.execute({
+          sql: "SELECT definition, enabled, project_id FROM pi_bot_defs WHERE bot_id = ?",
+          args: [botId],
+        })).rows?.[0] || null;
+        if (!row) continue;
+        let def;
+        try { def = JSON.parse(row.definition || "{}"); } catch { def = null; }
+        if (!def || typeof def !== "object") continue;
+        if (isVoiceBotId(botId) || isVoiceBotDef(def)) continue; // the voice bot's tools are its own
+        const res = await addCompanionsGuarded(def, { budget: await budgetFor(def) });
+        refused = res.refused;
+        if (!res.refused && res.added.length) {
+          added = res.added;
+          // eslint-disable-next-line no-await-in-loop -- one bot at a time, an operator migration
+          await writeBotDefSealed(db, {
+            bot_id: botId,
+            definition: res.def,
+            expectDefinition: row.definition ?? null,
+            expectEnabled: row.enabled,
+            expectProjectId: row.project_id ?? null,
+          });
+        }
+      } catch (err) {
+        if (err && err.code === "BOT_DEF_UNVERIFIED") {
+          // A definition changed outside Crow (or no store installed for the seam): nothing is
+          // written, and the operator re-approves that bot
+          // (`node scripts/cli/bot-def-reapprove.mjs <bot_id> --show`).
+          out.unverified.push(botId);
+          log(`[artifacts] ${botId}: its definition could not be verified, so the companions were not added`);
+          continue;
+        }
+        throw err;
+      }
+      if (refused) {
+        out.refused.push(botId);
+        log(`[artifacts] ${botId}: Find, Attach and the upload tools were not added — this model's tool limit is reached`);
         if (typeof notify === "function") {
-          const name = String(r.display_name || r.bot_id);
+          const name = String(r.display_name || botId);
           try {
             await notify({
               title: `${name} cannot ask to link artifacts`,
@@ -113,10 +164,9 @@ export async function migrateArtifactsCompanions(db, { log = (m) => console.log(
             });
           } catch { /* a lost notice never fails the migration */ }
         }
-      } else if (res.added.length) {
-        await db.execute({ sql: "UPDATE pi_bot_defs SET definition=?, updated_at=datetime('now') WHERE bot_id=?", args: [JSON.stringify(res.def), r.bot_id] });
-        out.updated.push(String(r.bot_id));
-        log(`[artifacts] ${r.bot_id}: added ${res.added.join(", ")} (the needs_link recovery and big-source tools)`);
+      } else if (added.length) {
+        out.updated.push(botId);
+        log(`[artifacts] ${botId}: added ${added.join(", ")} (the needs_link recovery and big-source tools)`);
       }
     }
     await db.execute({ sql: "INSERT OR REPLACE INTO dashboard_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))", args: [MIGRATION_KEY, new Date().toISOString()] });

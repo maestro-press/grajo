@@ -11,7 +11,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startStubModel } from "../scripts/lib/stub-model-server.mjs";
@@ -24,7 +24,7 @@ import {
   proveSampling, readStartMarker, retryableFailure, runLive, runLiveRows, stableStringify, TRANSPORT_FAILURE,
 } from "../scripts/research-eval/live.mjs";
 import { startSamplingProxy } from "../scripts/research-eval/sampling-proxy.mjs";
-import { makeTemplate } from "../scripts/research-eval/scratch.mjs";
+import { makeScratch, makeTemplate } from "../scripts/research-eval/scratch.mjs";
 import { SAMPLING, seedFor } from "../scripts/research-eval/score.mjs";
 import { FIXTURE_START_MARKER } from "../scripts/lib/eval-guard.mjs";
 import { doneKeys } from "../scripts/research-eval/run.mjs";
@@ -601,6 +601,31 @@ test("a transport failure is retried with the same seed, at most MAX_ATTEMPTS, t
   assert.equal(row.attempt_reasons.length, 3, "every attempt's reason is kept");
   for (const r of row.attempt_reasons) assert.match(r, /cannot find the pi session file/);
   assert.equal(logs.filter((m) => /: transport failure \(/.test(m)).length, 2);
+});
+
+test("a scratch copied from the template carries the secrets its sealed bot row needs", async () => {
+  // The template's scratch-init seeds the acting bot through the ONE write path, so the copied
+  // crow.db holds a definition sealed under the template's token-mac key at a generation recorded
+  // in secrets/. A scratch with the database alone would refuse that row (`key-missing`) at the
+  // first spawn — the template's secrets travel with the database it signed.
+  const template = await tpl();
+  const { tokenMacKeyPath } = await import("../servers/shared/token-mac.js");
+  const scratch = await makeScratch({ template });
+  try {
+    const keyPath = tokenMacKeyPath({ crowHome: scratch.home });
+    assert.ok(existsSync(keyPath), "the key travels with the copied crow.db");
+    assert.equal(statSync(keyPath).mode & 0o777, 0o600, "and stays owner-only (token-mac refuses any other mode)");
+    assert.ok(existsSync(join(scratch.home, "secrets", "bot-def-generations.json")), "so does the generation counter the row's generation lives in");
+    const { createDbClient } = await import("../servers/db.js");
+    const { readVerifiedBotDef } = await import("../servers/shared/bot-def-store.js");
+    const db = createDbClient(scratch.dbPath);
+    try {
+      const read = await readVerifiedBotDef(db, EVAL_BOT_ID, { crowHome: scratch.home });
+      assert.equal(read.ok, true, `the copied row verifies in the scratch (${read.reason})`);
+    } finally { db.close(); }
+  } finally {
+    scratch.cleanup();
+  }
 });
 
 test("a model 400 is flagged, never re-rolled", async (t) => {

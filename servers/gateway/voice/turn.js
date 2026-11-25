@@ -26,6 +26,8 @@ import { lastWriteRecap } from "./own-tools.js";
 import { transcriptBufferOn, reloadTranscriptSetting, voiceTranscripts } from "./transcript-buffer.js";
 import { transcriptLogOn, voiceTranscriptLog } from "./transcript-log.js";
 import { CROW_VOICE_BOT_ID, normalizeVoiceSettings, isVoiceBotDef } from "../../shared/voice-bot.js";
+// ONE line per bot per reason per 24 h when a definition this process read does not verify.
+import { botDefRefusalAlarm } from "../../shared/bot-def-mac.js";
 import { botDefsGeneration, watchBotDefs } from "./defs-generation.js";
 import { trackTurn } from "./presence.js";
 
@@ -2146,7 +2148,16 @@ async function readVoiceDefFresh() {
   const { createDbClient } = await import("../../db.js");
   const db = createDbClient();
   try {
-    const r = (await db.execute({ sql: "SELECT definition, enabled FROM pi_bot_defs WHERE bot_id = ?", args: [CROW_VOICE_BOT_ID] })).rows[0];
+    // AUTHORITY, so a VERIFIED read (servers/shared/bot-def-store.js): this def decides Crow's voice
+    // prompt, its tool list and its policy, and a contained bot can write the row. An unverified
+    // definition reads as "no def" here (the existing missing/disabled answer) with one line.
+    const { readVerifiedBotDef } = await import("../../shared/bot-def-store.js");
+    const read = await readVerifiedBotDef(db, CROW_VOICE_BOT_ID);
+    if (!read.ok) {
+      if (read.reason !== "unknown-bot") botDefRefusalAlarm(CROW_VOICE_BOT_ID, read.reason);
+      return null;
+    }
+    const r = read.row;
     return r && Number(r.enabled) ? JSON.parse(r.definition) : null;
   } finally { try { db.close(); } catch {} }
 }
@@ -2187,7 +2198,22 @@ export async function defaultVoiceDeps() {
     transcriptLog: voiceTranscriptLog,
     ensureVoiceBot: async (db) => { await ensureCrowVoiceBot(db); },
     botDefsGeneration,
-    loadBotRow: async (db, botId) => (await db.execute({ sql: "SELECT bot_id, display_name, definition, enabled FROM pi_bot_defs WHERE bot_id = ?", args: [botId] })).rows[0] || null,
+    loadBotRow: async (db, botId) => {
+      // AUTHORITY, so a VERIFIED read (servers/shared/bot-def-store.js). The row this returns feeds
+      // `getChatTools`, `botVoiceScope`, `permission_policy.deny`, the external-send rule and the
+      // system prompt — inside the GATEWAY, under `operatorVoiceActor` — and a contained bot can write
+      // it. An unverified row answers `null`, which is exactly the existing "no such enabled bot"
+      // path the turn already handles, plus ONE `[bot-def]` line per bot per reason per 24 h.
+      const { readVerifiedBotDef } = await import("../../shared/bot-def-store.js");
+      const read = await readVerifiedBotDef(db, botId);
+      if (!read.ok) {
+        if (read.reason !== "unknown-bot") botDefRefusalAlarm(botId, read.reason);
+        return null;
+      }
+      const row = read.row;
+      if (!row) return null;
+      return { bot_id: row.bot_id, display_name: row.display_name, definition: row.definition, enabled: row.enabled };
+    },
     getSttProfile: async (db, device) => (device.stt_profile_id
       ? byId(await stt.getSttProfiles(db, { includeKeys: true }), device.stt_profile_id)
       : stt.getDefaultSttProfile(db, { includeKeys: true })),

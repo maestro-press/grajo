@@ -8,6 +8,7 @@
  * One scratch, init-db'd crow.db (CROW_DATA_DIR in a tmp dir, never the
  * operator's ~/.crow) seeded with the voice row plus two ordinary bots.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -19,6 +20,7 @@ import Database from "better-sqlite3";
 const dir = mkdtempSync(join(tmpdir(), "voice-bot-guards-"));
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = join(dir, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 process.env.CROW_TASKS_DB_PATH = join(dir, "tasks.db");
 delete process.env.CROW_DB_PATH;
 const DB_FILE = join(dir, "crow.db");

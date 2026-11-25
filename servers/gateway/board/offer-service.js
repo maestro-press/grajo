@@ -20,6 +20,8 @@
 import { boardState } from "../dashboard/shared/bot-display.js";
 import { assertProjectExists } from "../../shared/project-acl.js";
 import { isVoiceBotId } from "../../shared/voice-bot.js";
+import { readVerifiedBotDef } from "../../shared/bot-def-store.js";
+import { botDefRefusalAlarm } from "../../shared/bot-def-mac.js";
 
 /** How long an accept holds its claim before recovery may reopen it. createCard's own bound
  *  (the client's busy timeout, about 10 s) keeps the create far inside this. */
@@ -65,11 +67,15 @@ export function cleanOfferTitle(raw) {
 }
 
 export async function loadBotRow(db, botId) {
-  const { rows } = await db.execute({
-    sql: "SELECT bot_id, display_name, definition, enabled, project_id FROM pi_bot_defs WHERE bot_id=?",
-    args: [botId],
-  });
-  return rows[0] || null;
+  // AUTHORITY: `enabled` and the board/project this row describes decide whether work can be given
+  // to the bot, and a contained bot can write the row — so only a VERIFIED definition is used
+  // (servers/shared/bot-def-store.js). A refused row answers null, i.e. "bot unavailable".
+  const verified = await readVerifiedBotDef(db, botId);
+  if (!verified.ok) {
+    if (verified.reason !== "unknown-bot") botDefRefusalAlarm(botId, verified.reason);
+    return null;
+  }
+  return verified.row;
 }
 
 /** "Give to…" target check: the bot exists and is enabled (else 400

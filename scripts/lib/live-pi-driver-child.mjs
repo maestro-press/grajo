@@ -162,11 +162,26 @@ async function main(argv, env) {
       checkToolGrant(effective, { allowToolless: job.allowToolless === true });
     } catch (e) { throw refuse(`effective tools: ${e.message}`); }
 
-    // Seed the bot (D6), after the guard.
+    // Seed the bot (D6), after the guard. The ONE write path (servers/shared/bot-def-store.js):
+    // the row carries a keyed MAC over its whole definition, so the child's own spawn verifies it.
+    // An existing row is replaced, and the store refuses unless the values read here are still the
+    // row it verifies (round D, item F1).
     const { id, ...rest } = job.botDef;
-    conn.prepare(`INSERT INTO pi_bot_defs (bot_id, display_name, definition, enabled) VALUES (?, ?, ?, 1)
-      ON CONFLICT(bot_id) DO UPDATE SET display_name = excluded.display_name, definition = excluded.definition, enabled = 1`)
-      .run(id, String(job.botDef.display_name || id), JSON.stringify(rest));
+    const { sqliteDbFacade, writeBotDef } = await import("../../servers/shared/bot-def-store.js");
+    const facade = sqliteDbFacade(conn);
+    const existing = conn.prepare("SELECT * FROM pi_bot_defs WHERE bot_id=?").get(id);
+    await writeBotDef(facade, {
+      bot_id: id,
+      display_name: String(job.botDef.display_name || id),
+      definition: rest,
+      enabled: 1,
+      mode: existing ? "update" : "insert",
+      ...(existing ? {
+        expectDefinition: existing.definition ?? null,
+        expectEnabled: existing.enabled,
+        expectProjectId: existing.project_id ?? null,
+      } : {}),
+    });
   } finally { conn.close(); }
 
   const { countLivePi } = await import("../pi-bots/pi_lifecycle.mjs");

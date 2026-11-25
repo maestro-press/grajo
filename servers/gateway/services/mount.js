@@ -48,6 +48,7 @@ import { connectionBindingOk, isSensitiveConnection } from "../../shared/service
 import { mountLoopbackMcp } from "../loopback-tool-mount.js";
 import { SERVICES_TOKEN } from "../local-token.js";
 import { effectiveCrowMcp, splitEntry } from "../../../scripts/pi-bots/skill-tools.mjs";
+import { readVerifiedBotDef } from "../../shared/bot-def-store.js";
 import {
   ensureChild, childSecretValues, serviceTools, listableConnection, cancelCall as stopConnectionChild,
 } from "./children.js";
@@ -103,9 +104,13 @@ export function serviceSelection(list, serviceId) {
 }
 
 async function botDef(db, botId) {
-  const r = (await db.execute({ sql: "SELECT definition FROM pi_bot_defs WHERE bot_id = ?", args: [botId] })).rows[0];
-  if (!r) return null;
-  const def = JSON.parse(r.definition || "{}");
+  // AUTHORITY: this definition's `tools.crow_mcp` decides which tools a bot may call on a
+  // connected service, and a contained bot can write its own row. Only a VERIFIED definition is
+  // used (servers/shared/bot-def-store.js); a refused one answers null, which the caller's own
+  // `not_granted` refusal turns into a fail-closed refusal.
+  const verified = await readVerifiedBotDef(db, botId);
+  if (!verified.ok || !verified.def) return null;
+  const def = verified.def;
   return def && typeof def === "object" && !Array.isArray(def) ? def : null;
 }
 

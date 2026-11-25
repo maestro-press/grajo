@@ -9,6 +9,7 @@
  * the fake-PiRpc harness (tests/session-summary.test.js) for the placement.
  * No model is ever called.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -25,6 +26,7 @@ const dir = mkdtempSync(join(tmpdir(), "project-briefing-"));
 process.env.CROW_DATA_DIR = dir;
 const HOME = join(dir, "home");
 process.env.CROW_HOME = HOME;
+markBotDefPreEra(process.env.CROW_HOME);
 mkdirSync(HOME, { recursive: true });
 delete process.env.CROW_DB_PATH;
 delete process.env.CROW_SESSION_BRIEFING;

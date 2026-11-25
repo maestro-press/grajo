@@ -36,6 +36,11 @@ import { resolveSkill, REPO_SKILLS_DIR } from "./skill_resolver.mjs";
 import { botAuthoredSkill, recordSkillEvent } from "./skill_provenance.mjs";
 import { botsDbPath } from "./instance-paths.mjs";
 import { resolveCrowHome } from "../../servers/shared/crow-home.js";
+// The bot-definition WRITE SEAM, not the store: this file is on the bot-reachable tree
+// (scripts/pi-bots/**), so it must not reach the key. `signBotDefSealed` gives the generation +
+// MAC for the row this module writes in its own BEGIN IMMEDIATE transaction, and
+// `verifyBotDefSealed` is the seam's synchronous VERIFY, called inside that same transaction.
+import { signBotDefSealed, verifyBotDefSealed } from "../../servers/shared/bot-def-seal.js";
 
 const CROW_DB = botsDbPath();
 // Sole write target: THIS instance's skills dir (CROW_HOME/skills), the same dir
@@ -50,21 +55,79 @@ function db() { const d = new Database(CROW_DB); d.pragma("busy_timeout = 10000"
 // Transactional read-modify-write of pi_bot_defs.definition: add `name` to
 // def.skills (the one skills store). BEGIN IMMEDIATE so a concurrent SSR save can't
 // interleave between our read and write. Returns {ok} / {ok:false,message}.
+//
+// The row carries a keyed MAC over the whole definition and a replay generation (see
+// servers/shared/bot-def-mac.js), so the UPDATE sets both in the same statement as the definition —
+// `signBotDefSealed` computes them (through the seam: this file must not hold the key) and the
+// generation is settled only once the transaction committed.
+//
+// THE ROW MUST VERIFY FIRST (inside the transaction, through the seam). This runs host-side after a
+// bot's own turn, with NO owner action: attaching a skill to a definition that does not verify would
+// re-sign whatever the row holds — including an edit the bot itself made — and hand it back as the
+// owner's. An unverified row is refused (one log line, the caller's existing failure path), and the
+// planned generation is ABANDONED whenever the statement does not land.
 function attachSkillToDef(bot_id, name) {
   const c = db();
+  let planned = null;
+  let written = 0;
   try {
+    // A store shaped before the seal columns exist (an install whose migration has not run, a
+    // scratch fixture): the plain update, exactly as before.
+    let hasSeal = true;
+    try { c.prepare("SELECT def_mac, def_generation FROM pi_bot_defs LIMIT 0"); } catch { hasSeal = false; }
     const tx = c.transaction(() => {
-      const row = c.prepare("SELECT definition FROM pi_bot_defs WHERE bot_id=?").get(bot_id);
+      const row = c.prepare("SELECT bot_id, definition, enabled, project_id, def_mac, def_generation FROM pi_bot_defs WHERE bot_id=?").get(bot_id);
       if (!row) throw new Error("unknown-bot");
       let def; try { def = JSON.parse(row.definition || "{}"); } catch { def = {}; }
       def.skills = Array.isArray(def.skills) ? def.skills : [];
       if (!def.skills.includes(name)) def.skills.push(name);
-      c.prepare("UPDATE pi_bot_defs SET definition=?, updated_at=datetime('now') WHERE bot_id=?")
-        .run(JSON.stringify(def), bot_id);
+      if (!hasSeal) {
+        const res = c.prepare("UPDATE pi_bot_defs SET definition=?, updated_at=datetime('now') WHERE bot_id=?")
+          .run(JSON.stringify(def), bot_id);
+        written = Number(res.changes) || 0;
+        return null;
+      }
+      // The seam's verify makes the SAME era decision the bridge's spawn gate makes (round C, items
+      // E3/M4): this process has no database scan of its own here, so it says what its own row shows
+      // (`anyMac`) and the seam adds the secrets-side evidence (the marker file, the generations file).
+      // A row that lost its `def_mac` COLUMN is therefore refused (`no-mac-column`), never accepted as
+      // "pre-era".
+      const verdict = verifyBotDefSealed(row, { anyMac: row.def_mac != null });
+      if (!verdict.ok) {
+        const err = new Error(`bot ${bot_id} settings could not be verified (${verdict.reason})`);
+        err.code = "BOT_DEF_UNVERIFIED";
+        throw err;
+      }
+      const seal = signBotDefSealed({
+        bot_id, definition: def, enabled: row.enabled, project_id: row.project_id ?? null,
+      });
+      planned = seal;
+      // The SEALED row is the one this statement may land on (round C, item E1): the row that was
+      // verified, pinned by its own content and its own seal, even though this transaction already
+      // holds the write lock.
+      const res = c.prepare("UPDATE pi_bot_defs SET definition=?, def_mac=?, def_generation=?, updated_at=datetime('now') WHERE bot_id=?"
+        + " AND definition IS ? AND enabled IS ? AND project_id IS ? AND def_mac IS ? AND def_generation IS ?")
+        .run(seal.definition, seal.def_mac, seal.generation, bot_id,
+          row.definition ?? null, row.enabled ?? null, row.project_id ?? null, row.def_mac ?? null, row.def_generation ?? null);
+      written = Number(res.changes) || 0;
+      // 0 rows means the row vanished under the transaction: the planned generation must not stand.
+      if (written === 0) throw new Error("write-failed");
+      return seal;
     });
-    tx.immediate();
+    const seal = tx.immediate();
+    if (seal && typeof seal.settle === "function") seal.settle();
+    planned = null;
     return { ok: true };
   } catch (e) {
+    // A transaction that threw (including a 0-row update) ABANDONS the planned generation, so the
+    // counter never records a write that did not happen.
+    if (planned && typeof planned.abandon === "function") { try { planned.abandon(); } catch { /* the counter is a floor */ } }
+    if (e && e.code === "BOT_DEF_UNVERIFIED") {
+      console.warn(
+        `[bot-def] ${bot_id} was changed outside Crow; review it with `
+        + `\`node scripts/cli/bot-def-reapprove.mjs ${bot_id} --show\``,
+      );
+    }
     return { ok: false, message: String((e && e.message) || e) };
   } finally {
     c.close();

@@ -16,6 +16,7 @@
  * `{ engine: () => engineImpl }` — an ACCESSOR, so the swap takes effect on
  * the next request without rebuilding the app.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -30,6 +31,7 @@ actAsServe(); // this process's HTTP client stands in for tailscaled (the Serve 
 const dir = mkdtempSync(join(tmpdir(), "perch-interactive-routes-"));
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = join(dir, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 // Track 3 Task 9: dispatch/attach-card read+write the INSTANCE-GLOBAL tasks
 // store (tasksDbPath() from scripts/pi-bots/instance-paths.mjs) — set

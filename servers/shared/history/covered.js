@@ -456,6 +456,20 @@ export const COVERED = Object.freeze({
     projected: Object.freeze({
       definition: definitionProjection,
     }),
+    // The bot-definition TAMPER EVIDENCE is CAPTURED WITH THE VERSION (`seal`) and NEVER RESTORED.
+    // `def_mac` is a keyed MAC over the row's own content under THIS instance's token-hmac key
+    // (servers/shared/bot-def-mac.js). Writing a stored one back would be stale the moment a
+    // version is restored, so a restore RE-SIGNS the row instead — but the CAPTURED pair is what
+    // lets a restore PROVE the version is a real one: `item_versions` lives in crow.db, which a
+    // contained bot can write, so a fabricated version (a widened permission_policy, say) must not
+    // be launderable through a History restore. `seal` fields ride in snapshot_json and are never
+    // written back as columns (they are not in `snapshot`, so `tableColumns` never offers them).
+    seal: Object.freeze(["def_mac", "def_generation"]),
+    // Neither is a snapshot FIELD, so `omitted` names them too: `def_mac` belongs to the key that
+    // signed the row this version captured, and `def_generation` is the replay counter kept outside
+    // crow.db (a restore must bump it, never replay it). Their captured copy exists only for the
+    // proof above.
+    omitted: Object.freeze(["def_mac", "def_generation"]),
     projectRef: Object.freeze(["project_id"]),
   }),
   card: Object.freeze({
@@ -647,6 +661,20 @@ for (const [itemType, spec] of Object.entries(COVERED)) {
   // The whole point of a projection list is that a credential key cannot reach
   // the version table: every projected KEY is checked against SECRET_COLUMN in
   // the projection's own definition below (BOT_DEFINITION_KEYS).
+  // A `seal` column is CAPTURED for verification and never restored: it cannot be a snapshot field
+  // (a restore would write it back), cannot be tracked (a new MAC is not a content change) and can
+  // never be credential-shaped.
+  for (const column of spec.seal || []) {
+    if (spec.snapshot.includes(column)) {
+      throw new Error(`history: ${itemType}.${column} is a seal field, so it cannot be a snapshot field`);
+    }
+    if (spec.tracked.includes(column)) {
+      throw new Error(`history: ${itemType}.${column} is a seal field, so it cannot be tracked`);
+    }
+    if (SECRET_COLUMN.test(column)) {
+      throw new Error(`history: ${itemType}.${column} looks like a credential and must never be captured`);
+    }
+  }
   if (spec.snapshot.includes(spec.idColumn)) {
     throw new Error(`history: ${itemType}.${spec.idColumn} is the item key, never a snapshot field`);
   }
@@ -769,6 +797,16 @@ export function tableColumns(spec) {
 }
 
 /**
+ * Every column a covered TABLE must actually HAVE for its spec to be usable: `tableColumns` plus the
+ * `seal` fields (captured with each version for verification, never restored). Used by the migration
+ * and the boot re-ensure to decide whether a table is ready for its triggers — a trigger that read a
+ * `seal` column the table does not have would fail every write to it.
+ */
+export function requiredTableColumns(spec) {
+  return [...tableColumns(spec), ...(spec.seal || [])];
+}
+
+/**
  * One stored value, BLOB-safe and TEXT-safe, from any SQL expression.
  *
  * json_object() raises "JSON cannot hold BLOB values" for a blob, and SQLite
@@ -829,9 +867,15 @@ export function compareExpr(spec, column) {
   return `(${columnValueExpr(spec, column, "NEW")}) IS NOT (${columnValueExpr(spec, column, "OLD")})`;
 }
 
-/** A json_object(...) snapshot of the snapshotted columns of one row (NEW/OLD or bare). */
+/** A json_object(...) snapshot of the snapshotted columns of one row (NEW/OLD or bare).
+ *
+ * A spec's `seal` columns ride along WITHOUT being restored: they are captured so a later reader can
+ * VERIFY what the version says (the bot definition's `def_mac`/`def_generation`), never written back
+ * (`tableColumns` does not offer them).
+ */
 export function snapshotExpr(spec, row = null) {
-  return `json_object(${spec.snapshot
+  const columns = [...spec.snapshot, ...(spec.seal || [])];
+  return `json_object(${columns
     .map((c) => `${str(c)}, ${columnValueExpr(spec, c, row)}`)
     .join(", ")})`;
 }
@@ -1016,7 +1060,8 @@ export const ATTRIBUTION_FIELDS = Object.freeze([...ATTRIBUTION_COLUMNS]);
  *                                     keeps what it removed)
  *
  * Each statement is `IF NOT EXISTS`, so the migration and the boot re-ensure are
- * both re-runnable.
+ * both re-runnable; `seal` names the columns of a spec's `seal` list, which is how `ensure.js`
+ * notices a body installed by an earlier build (one that does not capture them) and re-creates it.
  *
  * TODO(history-redaction, Task 4): redaction is deliberately NOT done here. The
  * public-hygiene secret rules are JavaScript regexes; SQLite has no `regexp`
@@ -1051,19 +1096,25 @@ export function triggerDefs(itemType) {
     })
     .join(" OR ");
 
+  // `seal` rides on each def so the boot re-ensure (ensure.js) can spot a capture body installed by
+  // an earlier build — one that does not record the columns a spec now captures — and re-create it.
+  const seal = spec.seal || [];
   return [
     {
       name: ai,
+      seal,
       sql: `CREATE TRIGGER IF NOT EXISTS ${ai} AFTER INSERT ON ${spec.table} BEGIN\n  ${insert("NEW", "insert")}\nEND`,
     },
     {
       name: au,
+      seal,
       sql:
         `CREATE TRIGGER IF NOT EXISTS ${au} AFTER UPDATE ON ${spec.table}\n` +
         `WHEN ${changeExpr}\nBEGIN\n  ${insert("NEW", "update")}\nEND`,
     },
     {
       name: ad,
+      seal,
       sql: `CREATE TRIGGER IF NOT EXISTS ${ad} AFTER DELETE ON ${spec.table} BEGIN\n  ${insert("OLD", "delete")}\nEND`,
     },
   ];

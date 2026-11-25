@@ -1290,6 +1290,17 @@ export async function runPostListenSetup(server, app, deps) {
     setInterval(() => { runSyncConflictExpirySweep(createDbClient); }, SYNC_CONFLICT_EXPIRY_INTERVAL_MS).unref();
   }
 
+  // Trigger inventory (item I3): list every trigger in crow.db and tasks.db and compare it with the
+  // set Crow installs (`servers/shared/trigger-catalog.js`). A trigger runs inside every write to its
+  // table with no code of ours in between, and a contained bot can create one, so a foreign or
+  // body-changed trigger is one warning line plus one audit row — never a drop, never a bell. Once
+  // after listen, then hourly on an unref'd timer; each cycle is caught, so it can never take the
+  // gateway down. Runs on EVERY gateway (--no-auth included): the triggers are in this instance's own
+  // files, whoever serves the dashboard.
+  import("./trigger-inventory.js")
+    .then(({ startTriggerInventory }) => startTriggerInventory({ dbFactory: createDbClient }))
+    .catch((err) => console.warn("[trigger-inventory] not armed:", err?.message || err));
+
   // Crow Messages saved drafts: a send interrupted between `sending` and `sent` (the process died)
   // leaves a row nobody can send or edit again, because every composer write is a compare-and-set on
   // `open`. The store's sweep puts it back (`send_interrupted`, one `reopened` audit row each).
@@ -1322,13 +1333,17 @@ export async function runPostListenSetup(server, app, deps) {
   // The opt-in one-week voice transcript log (voice/transcript-log.js): an hourly sweep deletes entries past seven days
   // even when nothing is written, and the whole log when the setting is off — also on every bot-definition save, so
   // unticking it deletes the log at once. Files only; never throws.
-  Promise.all([import("../voice/transcript-log.js"), import("../../shared/voice-bot.js")]).then(([{ startTranscriptLogSweep, sweepTranscriptLog, voiceTranscriptLog }, { CROW_VOICE_BOT_ID }]) => {
+  Promise.all([import("../voice/transcript-log.js"), import("../../shared/voice-bot.js"), import("../../shared/bot-def-store.js")]).then(([{ startTranscriptLogSweep, sweepTranscriptLog, voiceTranscriptLog }, { CROW_VOICE_BOT_ID }, { readVerifiedBotDef }]) => {
+    // The sweep deletes the whole log when the voice bot's switch says off, so the row it reads is
+    // authority (round C, item E4): the VERIFIED read, and a row nothing can vouch for answers null
+    // (the log is swept as if the switch were off — the fail-safe direction for a transcript log).
     const readDef = async () => {
       const db = createDbClient();
       try {
-        const r = (await db.execute({ sql: "SELECT definition, enabled FROM pi_bot_defs WHERE bot_id = ?", args: [CROW_VOICE_BOT_ID] })).rows[0];
-        return r && Number(r.enabled) ? JSON.parse(r.definition) : null;
-      } finally { try { db.close(); } catch {} }
+        const read = await readVerifiedBotDef(db, CROW_VOICE_BOT_ID);
+        if (!read.row || !read.ok || !Number(read.row.enabled)) return null;
+        return read.def;
+      } catch { return null; } finally { try { db.close(); } catch {} }
     };
     startTranscriptLogSweep(voiceTranscriptLog, readDef);
     import("../../shared/event-bus.js").then(({ default: bus }) => {

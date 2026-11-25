@@ -38,6 +38,7 @@ import { dirname, resolve as resolvePath } from "node:path";
 import { getTemplate, applyTemplate } from "../bot-builder/templates.js";
 import { defaultDefinition } from "../bot-builder/data-queries.js";
 import { readSetting, upsertSetting } from "../../settings/registry.js";
+import { writeBotDef } from "../../../../shared/bot-def-store.js";
 import { t } from "../../shared/i18n.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -327,9 +328,16 @@ export async function createStarterArtifacts(db, { lang } = {}) {
   });
   if (!existingBot.rows.length) {
     const displayName = t("starter.botName", lang);
-    await db.execute({
-      sql: "INSERT INTO pi_bot_defs (bot_id, display_name, definition, project_id, enabled) VALUES (?,?,?,NULL,1)",
-      args: [STARTER_BOT_ID, displayName, JSON.stringify(def)],
+    // The one insert path (servers/shared/bot-def-store.js): the row's keyed MAC covers the whole
+    // definition, so the starter bot is verifiable from the moment it exists.
+    await writeBotDef(db, {
+      bot_id: STARTER_BOT_ID,
+      display_name: displayName,
+      definition: def,
+      project_id: null,
+      enabled: 1,
+      mode: "insert",
+      orIgnore: true, // the existence check above is the same rule voice-bot.js uses for crow.voice
     });
   }
 

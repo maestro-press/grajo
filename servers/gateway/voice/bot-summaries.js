@@ -13,6 +13,7 @@ import defaultBus from "../../shared/event-bus.js";
 import { isVoiceBotId, isVoiceBotDef, normalizeVoiceSettings } from "../../shared/voice-bot.js";
 import { boardState, purposeLine, friendlyModel, oneLine } from "../dashboard/shared/bot-display.js";
 import { perchAttached } from "../shared/perch-attached.js";
+import { verifyBotRows } from "../../shared/bot-def-store.js";
 import { HANDOFF_SUMMARY_MAX_CHARS, HANDOFF_MAX_CANDIDATES } from "./handoff-constants.js";
 
 const NAME_MAX = 40;
@@ -112,14 +113,27 @@ export function botCapabilitySummary(row, { lang = "en", customDefs = {} } = {})
   return cut(body, HANDOFF_SUMMARY_MAX_CHARS - tail.length - 2) + "; " + tail;
 }
 
-/** The read behind both exports: `ok` false means the table could not be read (never cached). */
+/**
+ * The read behind both exports: `ok` false means the table could not be read (never cached).
+ *
+ * THE DEFINITIONS ARE VERIFIED (round C, item E4): every candidate's summary is prompt text for the
+ * voice model (its purpose, its tools, its skills, its model) and `enabled` decides who may be handed
+ * work, so a row nothing can vouch for never reaches the model. One era read covers all the rows
+ * (`verifyBotRows`); an unverified bot is simply not a candidate.
+ */
 async function readCandidates(db, voiceDef) {
   const allowed = normalizeVoiceSettings(voiceDef).handoff.allowed_bots;
   let rows;
   try {
     rows = (await db.execute(
-      "SELECT bot_id, display_name, definition, project_id FROM pi_bot_defs WHERE enabled=1 ORDER BY bot_id",
+      "SELECT * FROM pi_bot_defs WHERE enabled=1 ORDER BY bot_id",
     )).rows;
+  } catch {
+    return { ok: false, list: [] };
+  }
+  let verifiedRows;
+  try {
+    verifiedRows = (await verifyBotRows(db, rows)).filter((v) => v.ok).map((v) => v.row);
   } catch {
     return { ok: false, list: [] };
   }
@@ -129,7 +143,7 @@ async function readCandidates(db, voiceDef) {
     customDefs = await readCustomRoleDefs(db);
   } catch { customDefs = {}; } // no role rows: custom role refs show their id
   const list = [];
-  for (const row of rows) {
+  for (const row of verifiedRows) {
     const botId = String(row.bot_id);
     if (isVoiceBotId(botId)) continue;
     if (allowed.length && !allowed.includes(botId)) continue;

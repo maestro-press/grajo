@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { sqliteDbFacade, writeBotDef } from "../servers/shared/bot-def-store.js";
 
 const DB_PATH = process.env.CROW_DB_PATH || join(homedir(), ".crow-mpa/data/crow.db");
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -27,21 +28,23 @@ if (checkOnly) {
 
 const db = new Database(DB_PATH);
 db.pragma("busy_timeout = 10000");
-db.prepare(`
-  INSERT INTO pi_bot_defs (bot_id, display_name, definition, enabled, project_id, updated_at)
-  VALUES (@bot_id, @display_name, @definition, @enabled, @project_id, datetime('now'))
-  ON CONFLICT(bot_id) DO UPDATE SET
-    display_name = excluded.display_name,
-    definition   = excluded.definition,
-    enabled      = excluded.enabled,
-    project_id   = excluded.project_id,
-    updated_at   = datetime('now')
-`).run({
+// The ONE write path (servers/shared/bot-def-store.js): the row carries a keyed MAC over its whole
+// definition and a replay generation, so an import signs exactly like an owner save does. An
+// upsert is an update when the row exists and an insert when it does not.
+//
+// `ownerFullReplace` is what makes an import able to REPLACE a row no key holder could verify: the
+// file IS a complete definition (enabled and project_id included), supplied whole by the operator, so
+// nothing is taken from the existing row. Without it the store refuses that write (BOT_DEF_UNVERIFIED)
+// rather than re-sealing content it could not verify.
+const existing = db.prepare("SELECT bot_id FROM pi_bot_defs WHERE bot_id=?").get(data.bot_id);
+await writeBotDef(sqliteDbFacade(db), {
   bot_id: data.bot_id,
   display_name: data.display_name,
   definition,
   enabled: data.enabled ?? 1,
   project_id: data.project_id ?? null,
+  mode: existing ? "update" : "insert",
+  ownerFullReplace: true,
 });
 db.close();
 console.log(`Imported ${botId} from ${path}`);

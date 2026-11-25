@@ -6,6 +6,7 @@
  * in a scratch CROW_HOME; the proof a move keeps old chats is
  * realpath(<new root>/sessions) landing on the real sessions dir.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -21,6 +22,7 @@ for (const k of Object.keys(process.env)) {
 const dir = mkdtempSync(join(tmpdir(), "move-bot-"));
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = join(dir, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 process.env.HOME = join(dir, "fakehome");
 mkdirSync(join(process.env.HOME, ".pi", "agent"), { recursive: true });

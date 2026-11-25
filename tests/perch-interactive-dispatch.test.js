@@ -11,6 +11,7 @@
  * `before()`), so a stale row from an earlier test must never collide with a
  * later test's occupancy check.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -34,6 +35,7 @@ import { cardBriefBlock } from "../scripts/pi-bots/card-brief.mjs";
 const dir = mkdtempSync(join(tmpdir(), "perch-interactive-dispatch-"));
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = join(dir, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 process.env.PI_MODELS_JSON = join(dir, "models.json");
 

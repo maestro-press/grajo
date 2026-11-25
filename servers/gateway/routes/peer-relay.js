@@ -74,6 +74,7 @@ import { REMOTE_CANON_MOUNT, remoteServersForBot, parseRemoteInvocationFlag } fr
 import { sanitizeActorName } from "../../../scripts/pi-bots/actor-env.mjs";
 import { BOT_ID_RE } from "../../../scripts/pi-bots/bot-workspace-env.mjs";
 import { botHoldsLiveShare } from "../../shared/project-bot-shares.js";
+import { readVerifiedBotDef } from "../../shared/bot-def-store.js";
 
 const CANON_BY_SEGMENT = new Map(Object.entries(REMOTE_CANON_MOUNT).map(([canon, mount]) => [mount.slice(1), canon]));
 const REQUEST_HEADERS = ["content-type", "accept", "mcp-session-id", "mcp-protocol-version", "last-event-id"];
@@ -180,8 +181,15 @@ export function peerRelayRouter({ createDbClient, deps = {} } = {}) {
       const mount = REMOTE_CANON_MOUNT[canonicalId];
       let row = null;
       try {
-        const r = await db.execute({ sql: "SELECT bot_id, display_name, definition, enabled FROM pi_bot_defs WHERE bot_id = ?", args: [bot] });
-        row = r.rows[0] || null;
+        // AUTHORITY: `enabled` and the definition's `tools.remote_mcp` selection decide whether this
+        // relayed call may go through, and a contained bot can write its own row — so only a
+        // definition whose keyed MAC verifies is used (servers/shared/bot-def-store.js).
+        const verified = await readVerifiedBotDef(db, bot);
+        if (!verified.ok && verified.reason !== "unknown-bot") {
+          console.error(`[peer-relay] the bot's settings could not be verified (${verified.reason})`);
+          return refuse(res, 403, "the bot's settings could not be verified", { id });
+        }
+        row = verified.row;
       } catch (err) {
         // The relay's own fault, not the bot's: never a misleading "not selected".
         console.error(`[peer-relay] bot lookup failed: ${err && err.message}`);

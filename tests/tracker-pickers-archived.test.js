@@ -2,6 +2,7 @@
 // Bot Builder project picker (the board list half lives in tests/board-mcp.test.js), a bot already linked to an archived project
 // stays linked, the legacy tracker save moves the link without touching the tracker, and a
 // custom tracker with no slug has copy instead of "(?)". Scratch env only; never touches ~/.crow.
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -13,6 +14,7 @@ import { parseHTML } from "linkedom";
 const dir = mkdtempSync(join(tmpdir(), "tracker-pickers-"));
 process.env.CROW_DATA_DIR = dir;
 process.env.CROW_HOME = dir;
+markBotDefPreEra(process.env.CROW_HOME);
 process.env.CROW_TASKS_DB_PATH = join(dir, "tasks.db");
 
 const BASE = { models: { default: "test-prov/model-a" }, gateways: [{ type: "perch" }], system_prompt: "x" };

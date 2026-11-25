@@ -190,14 +190,54 @@ if (tableExists("pi_bot_defs")) {
   // If a row was already migrated (column set), this is a no-op for that row.
   // If a bot was hand-edited to remove project_id from JSON, the column
   // stays at whatever it had — that's intentional (column is now authoritative).
-  const backfill = db.prepare(`
-    UPDATE pi_bot_defs
-       SET project_id = CAST(json_extract(definition, '$.project_id') AS INTEGER)
+  //
+  // Through the one writer (servers/shared/bot-def-store.js): project_id is inside the row's
+  // keyed MAC (servers/shared/bot-def-mac.js), so a bare `SET project_id` would leave the row
+  // unverifiable and every bot refused at its next spawn.
+  //
+  // THE CHANGE IS BUILT FROM THE ROW THE CALLER READ, AND THAT READ IS WHAT THE STORE CHECKS THE
+  // WRITE AGAINST (round D, item F1): one read per row, `JSON.parse` of ITS definition decides the
+  // value (never `json_extract`), and the row's own `definition`/`enabled`/`project_id` are handed
+  // to the store as `expect*`. A row that changed since that read — or one that does not verify at
+  // all — is refused and named; nothing is re-signed from a read nobody vouched for.
+  const { sqliteDbFacade, writeBotDef } = await import("../servers/shared/bot-def-store.js");
+  const facade = sqliteDbFacade(db);
+  const pending = db.prepare(`
+    SELECT bot_id FROM pi_bot_defs
      WHERE project_id IS NULL
        AND definition IS NOT NULL
-       AND json_extract(definition, '$.project_id') IS NOT NULL
-  `).run();
-  if (backfill.changes > 0) piBotDefsMigAdded.push(`backfill:${backfill.changes}`);
+  `).all();
+  let backfilled = 0;
+  const backfillRefused = [];
+  for (const row of pending) {
+    const current = db.prepare("SELECT definition, enabled, project_id FROM pi_bot_defs WHERE bot_id = ?").get(row.bot_id);
+    if (!current) continue;
+    let def;
+    try { def = JSON.parse(current.definition || "{}"); } catch { continue; }
+    const value = def && typeof def === "object" ? def.project_id : null;
+    if (value == null || value === "") continue;
+    const id = Number(value);
+    if (!Number.isSafeInteger(id)) continue;
+    try {
+      // eslint-disable-next-line no-await-in-loop -- an operator migration, one row at a time
+      const written = await writeBotDef(facade, {
+        bot_id: row.bot_id,
+        project_id: id,
+        expectDefinition: current.definition ?? null,
+        expectEnabled: current.enabled,
+        expectProjectId: current.project_id ?? null,
+      });
+      if (Number(written.rowsAffected) > 0) backfilled += 1;
+    } catch (err) {
+      if (!err || err.code !== "BOT_DEF_UNVERIFIED") throw err;
+      backfillRefused.push(String(row.bot_id));
+    }
+  }
+  if (backfilled > 0) piBotDefsMigAdded.push(`backfill:${backfilled}`);
+  if (backfillRefused.length) {
+    console.log(`  pi_bot_defs backfill: skipped ${backfillRefused.length} row(s) whose definition could not be verified `
+      + `[${backfillRefused.join(",")}]; re-approve them with \`node scripts/cli/bot-def-reapprove.mjs <bot_id> --show\``);
+  }
   if (!have.includes("idx_pi_bot_defs_project")) {
     db.prepare("CREATE INDEX IF NOT EXISTS idx_pi_bot_defs_project ON pi_bot_defs(project_id)").run();
   }

@@ -625,12 +625,16 @@ export function createToolExecutor(opts = {}) {
     const db = createDbClient();
     try {
       await ensureBotJobs(db);
-      const { rows } = await db.execute({
-        sql: "SELECT bot_id, enabled FROM pi_bot_defs WHERE bot_id = ?",
-        args: [botId],
-      });
-      if (!rows.length) return { result: `Error: unknown bot '${botId}'`, isError: true };
-      if (!rows[0].enabled) return { result: `Error: bot '${botId}' is disabled`, isError: true };
+      // AUTHORITY: this decides whether a chat may start background work AS that bot, and a contained
+      // bot can write its own row — so the row is read VERIFIED (servers/shared/bot-def-store.js).
+      const { readVerifiedBotDef } = await import("../../shared/bot-def-store.js");
+      const read = await readVerifiedBotDef(db, botId);
+      if (read.reason === "unknown-bot") return { result: `Error: unknown bot '${botId}'`, isError: true };
+      if (!read.ok) {
+        console.warn(`[bot-def] ${botId} settings could not be verified (${read.reason}); crow_delegate was refused`);
+        return { result: `Error: bot '${botId}' cannot take jobs (its settings could not be verified)`, isError: true };
+      }
+      if (!read.row.enabled) return { result: `Error: bot '${botId}' is disabled`, isError: true };
 
       const jobId = "job-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
       const deliverJson = deliverTo == null ? null

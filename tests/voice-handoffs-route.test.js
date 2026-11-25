@@ -5,6 +5,7 @@
  * scratch init-db'd crow.db plus a tasks.db per test, the real store, give-service and voice-bot loader, a
  * fake engine, and a fake clock shared by the store and the core.
  */
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -18,6 +19,7 @@ import { fromLaptop, markFromLaptop } from "./helpers/off-box.js";
 const root = mkdtempSync(join(tmpdir(), "vh-route-"));
 process.env.CROW_DATA_DIR = join(root, "master");
 process.env.CROW_HOME = join(root, "home");
+markBotDefPreEra(process.env.CROW_HOME);
 delete process.env.CROW_DB_PATH;
 process.env.CROW_TASKS_DB_PATH = join(root, "master", "tasks.db");
 const REPO = new URL("..", import.meta.url).pathname;

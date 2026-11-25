@@ -298,9 +298,14 @@ export async function ensureVoiceBot(db, { fastKey, readSetting, listDevices, to
     skipped_tools: skipped,
   };
 
-  const res = await db.execute({
-    sql: "INSERT INTO pi_bot_defs (bot_id, display_name, definition, enabled, project_id) VALUES (?, 'Crow', ?, 1, NULL) ON CONFLICT(bot_id) DO NOTHING",
-    args: [CROW_VOICE_BOT_ID, JSON.stringify(def)],
+  const res = await (await import("./bot-def-seal.js")).writeBotDefSealed(db, {
+    bot_id: CROW_VOICE_BOT_ID,
+    display_name: "Crow",
+    definition: def,
+    project_id: null,
+    enabled: 1,
+    mode: "insert",
+    orIgnore: true, // ON CONFLICT DO NOTHING: a row that already exists is left alone
   });
   const created = Number(res.rowsAffected) === 1;
   if (created) log(`[voice] created the Crow voice bot (fast model ${def.fast_voice_model}, carried from ${effective || "nothing"})`);

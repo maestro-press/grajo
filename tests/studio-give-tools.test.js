@@ -15,12 +15,22 @@
  *     definition, another project's bot, Crow's voice bot (refused before any
  *     read), a def holding only per-tool Studio entries (still offered the bare
  *     grant), and a tool budget that is already spent.
+ *
+ * Both halves run in a process set up the way a gateway process is, because a
+ * `pi_bot_defs` row is authority and only a host process may write one:
+ * importing `servers/shared/bot-def-store.js` installs it into the write seam
+ * `server/give-tools.js` calls (without it the edit refuses the write, by
+ * design), and a scratch `CROW_HOME` holds the token-mac key every row is
+ * signed with. So every check of a written def also verifies the row's
+ * `def_mac`: a definition whose MAC does not cover it would be refused at the
+ * bot's next spawn.
  */
 
-import { test } from "node:test";
+import { markBotDefPreEra } from "./helpers/bot-def-pre-era.mjs";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createClient } from "@libsql/client";
@@ -31,6 +41,30 @@ import { createHub } from "../bundles/studio/server/hub.js";
 import { initStudioTables } from "../bundles/studio/server/init-tables.js";
 import { createStudioWeb } from "../bundles/studio/server/web.js";
 import { createGiveBotStudioTools, grantsStudioTools, withStudioTools } from "../bundles/studio/server/give-tools.js";
+// The two things a gateway process has at boot: the bot-definition store installed into the write
+// seam (this import does that — and the STORE is also what this file's concurrent write goes
+// through), and a token-mac key to sign the rows it writes.
+import { writeBotDef } from "../servers/shared/bot-def-store.js";
+import { verifyBotDef } from "../servers/shared/bot-def-mac.js";
+import { ensureKey, forgetTokenMacKey } from "../servers/shared/token-mac.js";
+
+/**
+ * This process's `CROW_HOME`: a home of its own, never the suite's shared one (whose key state
+ * another test file's process could be moving), holding the token-mac key the def writes are
+ * signed with.
+ */
+const HOME = mkdtempSync(join(tmpdir(), "studio-give-key-home-"));
+const SAVED_HOME = process.env.CROW_HOME;
+process.env.CROW_HOME = HOME;
+markBotDefPreEra(process.env.CROW_HOME);
+forgetTokenMacKey();
+ensureKey({ crowHome: HOME, allowCreate: true, mirrorConverted: false, h1ValuesExist: false });
+after(() => {
+  forgetTokenMacKey();
+  if (SAVED_HOME === undefined) delete process.env.CROW_HOME;
+  else process.env.CROW_HOME = SAVED_HOME;
+  try { rmSync(HOME, { recursive: true, force: true }); } catch { /* best effort */ }
+});
 
 /** The project with a bot, and one without. */
 const PROJECT = 41;
@@ -393,6 +427,7 @@ test("a bot with only per-tool Studio entries is offered the bare grant", async 
     "the bare entry is appended beside the per-tool entries, which stay as they were",
   );
   assert.equal((await grantRows(db)).length, 1, "and the grant is audited once");
+  await assertVerifiedRow(db, BOT.bot_id);
 });
 
 test("without the injected edit the route answers 503", async (t) => {
@@ -423,6 +458,8 @@ async function botTables(db) {
       definition    TEXT,
       enabled       INTEGER NOT NULL DEFAULT 1,
       project_id    INTEGER,
+      def_mac       TEXT,
+      def_generation INTEGER,
       created_at    TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
     )
@@ -439,6 +476,17 @@ async function botTables(db) {
       created_at    TEXT NOT NULL DEFAULT (datetime('now'))
     )
   `);
+  // The dashboard settings tables a REAL crow.db always has (init-db). The write path reads the
+  // `bot:def` era marker through them, and a settings read that cannot run at all FAILS CLOSED ("we
+  // could not tell" is never "not converted") — so a fixture without them would look like a
+  // converted instance whose rows carry no MAC, which is exactly the state a write must refuse.
+  // With the tables present and empty, the era reads as un-converted: a pre-conversion install.
+  await db.execute(
+    "CREATE TABLE IF NOT EXISTS dashboard_settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)",
+  );
+  await db.execute(
+    "CREATE TABLE IF NOT EXISTS dashboard_settings_overrides (key TEXT, value TEXT, instance_id TEXT, updated_at TEXT, PRIMARY KEY (key, instance_id))",
+  );
 }
 
 /** @returns {Promise<object>} a scratch crow.db with the two tables the helper touches. */
@@ -456,6 +504,28 @@ function botDef(overrides = {}) {
     persona: { tone: "dry" },
     ...overrides,
   };
+}
+
+/**
+ * The row a write left behind must VERIFY — its `def_mac` is a keyed MAC over the whole definition,
+ * so a def that is merely stored (a raw UPDATE) is exactly the row the spawn gate refuses.
+ *
+ * The scratch store has no `dashboard_settings` table and carries no bot:def era marker, so the era
+ * reads as un-converted (a pre-conversion install); a sealed row must verify there too.
+ *
+ * @param {object} db the scratch libsql client
+ * @param {string} botId the bot whose row the edit wrote
+ * @returns {Promise<object>} that row
+ */
+async function assertVerifiedRow(db, botId) {
+  const { rows } = await db.execute({ sql: "SELECT * FROM pi_bot_defs WHERE bot_id = ?", args: [botId] });
+  const row = rows?.[0];
+  assert.ok(row, `no pi_bot_defs row for ${botId}`);
+  assert.match(String(row.def_mac), /^h1\.[0-9a-f]{16}\.[0-9a-f]{64}$/, "the write signed the definition");
+  assert.ok(Number(row.def_generation) >= 1, "and put the row at a generation");
+  const verdict = await verifyBotDef(row, { db, crowHome: HOME, readSetting: async () => null });
+  assert.equal(verdict.ok, true, `the stored row must verify, not merely parse (${verdict.reason})`);
+  return row;
 }
 
 /** @returns {Promise<string>} one bot's stored definition, exactly as stored. */
@@ -540,11 +610,19 @@ test("the def edit appends one bare studio entry and leaves everything else alon
   assert.equal(rows[0].target, `bot:${HELPER_BOT}`);
   assert.deepEqual(JSON.parse(rows[0].payload), { server: "studio", via: "studio-ask" });
 
+  // The write went through the app's one writer, so the row it left verifies.
+  const sealed = await assertVerifiedRow(db, HELPER_BOT);
+
   // A second click changes nothing and audits nothing.
   const again = await given({ botId: HELPER_BOT, projectId: PROJECT });
   assert.deepEqual(again, { ok: true, already: true });
   assert.deepEqual(await storedDef(db, HELPER_BOT), after, "the stored def is the same one");
   assert.equal((await grantRows(db)).length, 1, "no second audit row");
+  assert.equal(
+    (await assertVerifiedRow(db, HELPER_BOT)).def_generation,
+    sealed.def_generation,
+    "and nothing was re-signed for a click that changed nothing",
+  );
 
   // Only the BARE entry is the server grant (F8): a per-tool spelling grants
   // that one tool, so it is not "already" — the bare entry goes beside it.
@@ -573,6 +651,7 @@ test("a partial per-tool Studio def gets the bare entry appended, per-tool entri
   );
   assert.deepEqual(after.tools.fs, ["read"], "and nothing else in the def moved");
   assert.equal(grantsStudioTools(after), true, "the stored def now grants the server");
+  await assertVerifiedRow(db, HELPER_BOT);
 
   const rows = await grantRows(db);
   assert.equal(rows.length, 1, "the grant is audited once");
@@ -623,6 +702,9 @@ test("a primer that throws or returns nothing hands the budget an empty map", as
     "no listing is an empty map, never undefined, and neither failure blocks the edit",
   );
   assert.deepEqual((await storedDef(db, OTHER_BOT)).tools.crow_mcp, ["board/board_get_item", "studio"]);
+  // Neither failure blocked the edit, and both rows the edit wrote verify.
+  await assertVerifiedRow(db, HELPER_BOT);
+  await assertVerifiedRow(db, OTHER_BOT);
 });
 
 test("Crow's voice bot is refused before any row is read, and its def is untouched", async (t) => {
@@ -655,6 +737,7 @@ test("Crow's voice bot is refused before any row is read, and its def is untouch
   // never-voice).
   const plain = createGiveBotStudioTools({ db, appendAudit: (entry) => appendAudit(db, entry) });
   assert.deepEqual(await plain({ botId: VOICE_BOT, projectId: PROJECT }), { ok: true, already: false });
+  await assertVerifiedRow(db, VOICE_BOT);
 });
 
 test("the def edit creates tools/crow_mcp when the def has none", async (t) => {
@@ -668,6 +751,7 @@ test("the def edit creates tools/crow_mcp when the def has none", async (t) => {
   const after = await storedDef(db, HELPER_BOT);
   assert.deepEqual(after.tools.crow_mcp, ["studio"]);
   assert.deepEqual(Object.keys(after).sort(), ["model", "tools"], "no other key is created");
+  await assertVerifiedRow(db, HELPER_BOT);
 });
 
 test("a definition that changed since it was read is stale", async (t) => {
@@ -675,14 +759,26 @@ test("a definition that changed since it was read is stale", async (t) => {
   const readDefinition = await seedBot(db);
   const newer = JSON.stringify(botDef({ persona: { tone: "warm" } }));
 
-  // The race Bot Builder's compare-and-swap exists for: the row is rewritten
-  // after the helper read it, so its write matches nothing.
+  // The race Bot Builder's compare-and-swap exists for: the row is rewritten after the helper read
+  // it, so the definition the helper hands the store is no longer the row it verifies. The racing
+  // write is a REAL sealed write through the store (the way any other saver does it, stating the row
+  // it read), so the row stays VERIFIED and the refusal is the store's caller-read-differs path —
+  // not an unverified-row refusal.
+  let raced = false;
   const racy = {
     async execute(statement) {
       const sql = typeof statement === "string" ? statement : statement.sql;
-      if (/SELECT definition, project_id/i.test(sql)) {
-        await db.execute({ sql: "UPDATE pi_bot_defs SET definition = ? WHERE bot_id = ?", args: [newer, HELPER_BOT] });
-        return { rows: [{ definition: readDefinition, project_id: PROJECT }] };
+      // The helper's own read (give-tools.js): definition, enabled and project_id, in that order.
+      if (!raced && /SELECT definition, enabled, project_id FROM pi_bot_defs/i.test(sql)) {
+        raced = true;
+        await writeBotDef(db, {
+          bot_id: HELPER_BOT,
+          definition: newer,
+          expectDefinition: readDefinition,
+          expectEnabled: 1,
+          expectProjectId: PROJECT,
+        });
+        return { rows: [{ definition: readDefinition, enabled: 1, project_id: PROJECT }] };
       }
       return db.execute(statement);
     },
@@ -700,6 +796,7 @@ test("a definition that changed since it was read is stale", async (t) => {
     },
   );
   assert.deepEqual(await storedDef(db, HELPER_BOT), JSON.parse(newer), "the concurrent save stands");
+  await assertVerifiedRow(db, HELPER_BOT); // the refusal is the caller's read having moved, not a tampered row
   assert.equal((await grantRows(db)).length, 0, "and nothing was audited");
 });
 
@@ -753,4 +850,5 @@ test("a budget that cannot be read fails open, as the companion helper does", as
   assert.deepEqual(await budgeted({ botId: HELPER_BOT, projectId: PROJECT }), { ok: true, already: false });
   assert.deepEqual((await storedDef(db, HELPER_BOT)).tools.crow_mcp, ["board/board_get_item", "studio"]);
   assert.equal(logged.length, 1, "the failed budget read is logged, not fatal");
+  await assertVerifiedRow(db, HELPER_BOT);
 });
