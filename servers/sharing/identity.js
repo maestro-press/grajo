@@ -481,55 +481,6 @@ export function verify(data, signature, pubKey) {
 }
 
 /**
- * Encrypt data for a recipient using NaCl box (via noble).
- * Uses X25519 ECDH + AES-256-GCM.
- */
-export function encryptForPeer(plaintext, recipientEd25519Pub, senderSeed) {
-  const sharedKey = deriveKey(
-    createHash("sha256")
-      .update(senderSeed)
-      .update(typeof recipientEd25519Pub === "string" ? Buffer.from(recipientEd25519Pub, "hex") : recipientEd25519Pub)
-      .digest(),
-    "crow-peer-encrypt-v1",
-    32
-  );
-
-  const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", Buffer.from(sharedKey), iv);
-  const data = typeof plaintext === "string" ? Buffer.from(plaintext) : plaintext;
-  const encrypted = Buffer.concat([cipher.update(data), cipher.final()]);
-  const tag = cipher.getAuthTag();
-
-  return {
-    iv: iv.toString("hex"),
-    data: encrypted.toString("hex"),
-    tag: tag.toString("hex"),
-  };
-}
-
-/**
- * Decrypt data from a peer.
- */
-export function decryptFromPeer(encData, senderEd25519Pub, recipientSeed) {
-  const sharedKey = deriveKey(
-    createHash("sha256")
-      .update(recipientSeed)
-      .update(typeof senderEd25519Pub === "string" ? Buffer.from(senderEd25519Pub, "hex") : senderEd25519Pub)
-      .digest(),
-    "crow-peer-encrypt-v1",
-    32
-  );
-
-  const iv = Buffer.from(encData.iv, "hex");
-  const decipher = createDecipheriv("aes-256-gcm", Buffer.from(sharedKey), iv);
-  decipher.setAuthTag(Buffer.from(encData.tag, "hex"));
-  return Buffer.concat([
-    decipher.update(Buffer.from(encData.data, "hex")),
-    decipher.final(),
-  ]);
-}
-
-/**
  * Display identity info (for `npm run identity`).
  */
 export function displayIdentity() {

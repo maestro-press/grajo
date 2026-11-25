@@ -12,7 +12,7 @@ import Hypercore from "hypercore";
 import { mkdirSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { sign, encryptForPeer, decryptFromPeer } from "./identity.js";
+import { sign } from "./identity.js";
 import { shouldInitInstanceSync } from "./instance-sync.js";
 import { resolveDataDir } from "../db.js";
 
