@@ -554,7 +554,8 @@ function timeRank(fill) {
  * `is2faEnabled` the dashboard's own checks, `stepUpGate` the one step-up gate, `loadKey` the
  * keychain's write key, `saveBundleEnv` the bundle-env writer and `notify` the notification
  * writer. `engineClientFactory` builds an engine client; `startLoopsImpl` starts the boot loops;
- * `now` answers epoch milliseconds.
+ * `now` answers epoch milliseconds. `localSessionModule` and `totpModule` replace the two dashboard
+ * modules those default checks load, which only a test does.
  *
  * The Connect routes and their store come from `createConnectRoutes`, and so do the gates, the
  * audit writer and the engine-client builder: one set of rules, one gate, one lock. That module is
@@ -574,12 +575,17 @@ export function createPanelRoutes(options = {}) {
     throw new TypeError("createPanelRoutes needs an auth middleware");
   }
 
+  // The two module loaders these defaults read, overridable so a test can supply the module.
+  const loadTotp = typeof config.totpModule === "function" ? config.totpModule : totpModule;
+  const loadLocalSession =
+    typeof config.localSessionModule === "function" ? config.localSessionModule : localSessionModule;
+
   const is2faEnabled = typeof config.is2faEnabled === "function"
     ? config.is2faEnabled
     : async () => {
       try {
-        const module = await totpModule();
-        return module.is2faEnabled() === true;
+        const module = await loadTotp();
+        return (await module.is2faEnabled()) === true;
       } catch {
         return false;
       }
@@ -593,8 +599,8 @@ export function createPanelRoutes(options = {}) {
     ? config.isLocalSession
     : async (database, req) => {
       try {
-        const module = await localSessionModule();
-        return module.isLocalPasswordSessionOn(database, req) === true;
+        const module = await loadLocalSession();
+        return (await module.isLocalPasswordSessionOn(database, req)) === true;
       } catch {
         return false;
       }

@@ -1,7 +1,7 @@
 {
   "id": "coinbase",
   "name": "Coinbase (Beta)",
-  "version": "0.4.14",
+  "version": "0.4.15",
   "description": "Beta Coinbase trading engine for Crow. Practice mode is the default: orders are simulated against public market data, and live trading is switched on separately, in the Trading panel. Every order from a bot or the AI goes through one gateway with caps.",
   "type": "bundle",
   "author": "Crow",

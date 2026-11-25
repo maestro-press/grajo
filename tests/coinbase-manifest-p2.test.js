@@ -48,7 +48,7 @@ test("test_manifest_valid_panel_beta", () => {
   assert.deepEqual(r.errors, [], `manifest errors: ${r.errors.join("; ")}`);
   assert.equal(r.ok, true, r.errors.join("; "));
 
-  assert.equal(MANIFEST.version, "0.4.14", `version "${MANIFEST.version}" is 0.4.14`);
+  assert.equal(MANIFEST.version, "0.4.15", `version "${MANIFEST.version}" is 0.4.15`);
   assert.equal(MANIFEST.draft, false);
   assert.match(MANIFEST.name, /Beta/, `name "${MANIFEST.name}" says beta`);
   assert.match(MANIFEST.description, /beta/i, "the description says it is a beta");
@@ -131,7 +131,7 @@ test("test_manifest_valid_panel_beta", () => {
 });
 
 test("test_manifest_declares_trading_panel", () => {
-  assert.equal(MANIFEST.version, "0.4.14", "the manifest version is 0.4.14");
+  assert.equal(MANIFEST.version, "0.4.15", "the manifest version is 0.4.15");
   assert.equal(MANIFEST.panel, "panel/coinbase.js", "the panel key names the Trading panel's page");
   assert.equal(MANIFEST.panelRoutes, "panel/routes.js", "the panelRoutes key names the Trading panel's routes");
 

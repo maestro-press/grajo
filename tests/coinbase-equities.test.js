@@ -125,7 +125,7 @@ test("test_equity_env_vars_in_manifest", () => {
   const check = validateManifest(MANIFEST, BUNDLE_DIR);
   assert.deepEqual(check.errors, [], `manifest errors: ${check.errors.join("; ")}`);
   assert.equal(check.ok, true, check.errors.join("; "));
-  assert.equal(MANIFEST.version, "0.4.14", `the bundle version is 0.4.14 (found ${MANIFEST.version})`);
+  assert.equal(MANIFEST.version, "0.4.15", `the bundle version is 0.4.15 (found ${MANIFEST.version})`);
 
   for (const name of EQUITY_NAMES) {
     const spec = EQUITY_ENV[name];

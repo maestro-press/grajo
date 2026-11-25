@@ -650,10 +650,14 @@ export function createConnectRoutes(options = {}) {
       return ensureWriteKey(db, { crowHome });
     };
 
+  // The local-session loader this route set reads through, overridable so a test can supply it.
+  const loadLocalSession =
+    typeof config.localSessionModule === "function" ? config.localSessionModule : localSession;
+
   const isLocalSession = typeof config.isLocalSession === "function"
     ? config.isLocalSession
     : async (database, req) => {
-      const { isLocalPasswordSessionOn } = await localSession();
+      const { isLocalPasswordSessionOn } = await loadLocalSession();
       return isLocalPasswordSessionOn(database, req);
     };
 
