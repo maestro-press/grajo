@@ -270,6 +270,25 @@ export async function writeSetting(db, key, value, opts = {}) {
 }
 
 /**
+ * Write several global, syncable settings in ONE transaction (db.batch is all-or-nothing), then
+ * emit each to peers. A reader never sees half of a related set (an endpoint under the old keys).
+ * Every key must be syncable; anything else is refused before a write.
+ */
+export async function writeSettingsAtomic(db, entries) {
+  for (const [key] of entries) {
+    if (!isSyncable(key)) throw new Error(`Setting key "${key}" is not syncable; not written atomically.`);
+  }
+  await db.batch(entries.map(([key, value]) => ({
+    sql: `INSERT INTO dashboard_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+    args: [key, value],
+  })), "write");
+  for (const [key, value] of entries) {
+    await emitSettingsSync(db, "update", { key, value, instance_id: null });
+  }
+}
+
+/**
  * Delete a per-instance override, restoring the global row as the effective value.
  */
 export async function deleteLocalSetting(db, key) {

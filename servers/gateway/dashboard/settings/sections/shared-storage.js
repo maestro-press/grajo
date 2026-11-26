@@ -16,9 +16,17 @@
 import { escapeHtml } from "../../shared/components.js";
 import { tJs } from "../../shared/i18n.js";
 import * as Minio from "minio";
-import { readSetting, readSettings, writeSetting } from "../registry.js";
-import { sealSecret } from "../../../../sharing/secret-box.js";
-import { openStorageSharedValue, parseStorageUseSSL } from "../../../../shared/storage-shared-seal.js";
+import { readSetting, writeSetting, writeSettingsAtomic } from "../registry.js";
+import { sealSecret, sealSecretBound } from "../../../../sharing/secret-box.js";
+import {
+  normalizeStorageEndpoint, openStorageSharedValue, parseStorageUseSSL,
+  storageSharedAad,
+} from "../../../../shared/storage-shared-seal.js";
+import {
+  STORAGE_ERA_SETTING, readStorageEraState, storageEraOnAsync, writeStorageEraState,
+} from "../../../../shared/storage-shared-era.js";
+import { noteStorageCredentialRefusal } from "../../../../shared/storage-shared-alert.js";
+import { getOrCreateLocalInstanceId } from "../../../instance-registry.js";
 import { loadIdentityIfPresent, loadOrCreateIdentity } from "../../../../sharing/identity.js";
 import { resetStorageClient } from "../../../../storage/s3-client.js";
 
@@ -42,7 +50,15 @@ function _splitHostPort(endpoint) {
 }
 
 async function _readAll(db) {
-  const m = await readSettings(db, "storage.%");
+  // The GLOBAL `storage.shared.*` rows ONLY, exactly as the storage readers read them
+  // (s3-client.js SHARED_KEYS): a per-instance override row can never change which address or
+  // which stored key this form opens, so the form and the client cannot disagree.
+  const shared = [KEYS.endpoint, KEYS.useSSL, KEYS.region, KEYS.prefix, KEYS.accessKey, KEYS.secretKey];
+  const { rows } = await db.execute({
+    sql: `SELECT key, value FROM dashboard_settings WHERE key IN (${shared.map(() => "?").join(",")})`,
+    args: shared,
+  });
+  const m = new Map(rows.map((r) => [r.key, r.value]));
   return {
     endpoint: m.get(KEYS.endpoint) || "",
     useSSL: parseStorageUseSSL(m.get(KEYS.useSSL)),
@@ -50,7 +66,12 @@ async function _readAll(db) {
     prefix: m.get(KEYS.prefix) || "crow",
     accessSealed: m.get(KEYS.accessKey) || "",
     secretSealed: m.get(KEYS.secretKey) || "",
-    autoApply: m.get(KEYS.autoApply) === "true",
+    autoApply: (await readSetting(db, KEYS.autoApply)) === "true",
+    // The era READERS refuse by (storage-shared-era.js): the host state file OR the DB mirror.
+    era: await storageEraOnAsync(db),
+    // The era the WRITER decides "post-era" by: the HOST state file only. The mirror is a
+    // bot-writable row and may only add reader refusals, never change what the save writes.
+    eraHost: readStorageEraState().state === "converted",
   };
 }
 
@@ -71,9 +92,34 @@ function _buildClient({ endpoint, useSSL, accessKey, secretKey }) {
 function _openStored(value, settingKey, cfg, identity) {
   if (!value || !identity) return null;
   const opened = openStorageSharedValue(value, {
-    settingKey, endpoint: cfg.endpoint, useSSL: cfg.useSSL, identity,
+    settingKey, endpoint: cfg.endpoint, useSSL: cfg.useSSL, identity, era: cfg.era === true,
   });
+  // A stored key that stopped opening rings the owner bell once a UTC day, from the form as from
+  // any other reader (never a value; the alert carries only the code and the day).
+  if (!opened.ok) noteStorageCredentialRefusal(opened.reason);
   return opened.ok ? opened.plaintext : null;
+}
+
+/** Is the stored pair already in the bound form for the address it is stored under? */
+function _storedBoundHere(current, identity) {
+  for (const [value, key] of [[current.accessSealed, KEYS.accessKey], [current.secretSealed, KEYS.secretKey]]) {
+    if (typeof value !== "string" || !value.startsWith("enc:v2:")) return false;
+    const opened = openStorageSharedValue(value, {
+      settingKey: key, endpoint: current.endpoint, useSSL: current.useSSL, identity, era: false,
+    });
+    if (!opened.ok) return false;
+  }
+  return true;
+}
+
+/** Does the address being saved differ from the stored one, as the AAD names it? */
+function _addressMoved(current, endpoint, useSSL) {
+  if (current.useSSL !== (useSSL === true)) return true;
+  try {
+    return normalizeStorageEndpoint(current.endpoint) !== normalizeStorageEndpoint(endpoint);
+  } catch {
+    return true;
+  }
 }
 
 export default {
@@ -303,6 +349,18 @@ export default {
     let secretKey = payload.secret_key;
     if (!secretKey) secretKey = _openStored(current.secretSealed, KEYS.secretKey, current, identity) || "";
 
+    // A key filled from a stored `enc:v1:` or plaintext value is NOT bound to anything: it opens
+    // under any address, so it may be one half of an exchanged pair, and the address it is
+    // pre-flighted at came from a form field pre-filled from a row a bot can write. Only a stored
+    // `enc:v2:` value (opens only for the address currently stored) or a key the owner TYPED in
+    // this save may be bound.
+    const filledFromLegacy = [[payload.access_key, current.accessSealed, KEYS.accessKey], [payload.secret_key, current.secretSealed, KEYS.secretKey]]
+      .some(([typed, stored, settingKey]) => {
+        if (typed) return false;
+        const o = stored && identity ? openStorageSharedValue(stored, { settingKey, endpoint: current.endpoint, useSSL: current.useSSL, identity, era: current.era === true }) : null;
+        return !!(o && o.ok && o.version !== "v2");
+      });
+
     const endpoint = payload.endpoint;
     const useSSL = !!payload.use_ssl;
 
@@ -335,19 +393,88 @@ export default {
     const region = payload.region || "us-east-1";
     const prefix = payload.bucket_prefix || "crow";
 
-    await writeSetting(db, KEYS.endpoint, endpoint, { scope: "global" });
-    await writeSetting(db, KEYS.useSSL, useSSL ? "true" : "false", { scope: "global" });
-    await writeSetting(db, KEYS.region, region, { scope: "global" });
-    await writeSetting(db, KEYS.prefix, prefix, { scope: "global" });
-    // Only re-seal if the value actually changed (avoid churning the sync feed
-    // with fresh nonces every save when nothing rotated).
-    if (payload.access_key) {
-      await writeSetting(db, KEYS.accessKey, sealSecret(accessKey, identity), { scope: "global" });
+    // WHICH FORM, and whether this save is the CONVERSION.
+    //   - Post-era (the HOST state file exists): always the bound form `enc:v2:` — this
+    //     instance's own readers refuse v1 now. An endpoint the AAD cannot name (IPv6 literal,
+    //     a path) has no readable form, so the save is refused before anything is written.
+    //   - Pre-era: the bound form whenever every paired peer reads it (`sa>=1`) and the endpoint
+    //     can be named; otherwise `enc:v1:` exactly as always (one line says why when the
+    //     endpoint is the reason).
+    //   - THE CONVERSION: pre-era, with every peer at `sa>=2` (it also WRITES the bound form)
+    //     and a nameable endpoint, this save records the era (state file first, then the DB
+    //     mirror) after the rows are written. It is the ONLY conversion path: the pre-flight
+    //     above proved the pair at the address being saved, so an exchanged pair or a
+    //     re-pointed endpoint failed there and never reaches this point.
+    const localId = getOrCreateLocalInstanceId();
+    const capableAt = async (level) => {
+      try {
+        const { peersStorageAadCapable } = await import("../../../../sharing/tailnet-sync.js");
+        return await peersStorageAadCapable(db, localId, level);
+      } catch { return false; }
+    };
+    let nameable = true;
+    try { normalizeStorageEndpoint(endpoint); } catch { nameable = false; }
+    let bound = false;
+    let recordEra = false;
+    if (current.eraHost) {
+      if (!nameable) {
+        res.status(400).json({ error: "storage_endpoint_unsupported" });
+        return true;
+      }
+      bound = true;
+      if (!(await capableAt(2))) console.warn("[storage] shared credentials saved bound while a paired peer has not advertised support; that peer cannot write them until it is upgraded");
+    } else if (!nameable) {
+      console.warn("[storage] shared credentials stay in the old form: the endpoint cannot be bound");
+    } else if (filledFromLegacy) {
+      console.warn("[storage] shared credentials stay in the old form: a stored old-style key was reused; enter both keys to bind them");
+    } else if (await capableAt(1)) {
+      bound = true;
+      recordEra = await capableAt(2);
     }
-    if (payload.secret_key) {
-      await writeSetting(db, KEYS.secretKey, sealSecret(secretKey, identity), { scope: "global" });
+    const boundAad = bound ? (key) => storageSharedAad(key, endpoint, useSSL) : null;
+
+    // ONE transaction for everything the AAD binds together (endpoint, use_ssl, both keys):
+    // a concurrent reader sees the old set or the new set, never new keys under the old address
+    // (which would ring a false alert).
+    const entries = [
+      [KEYS.endpoint, endpoint],
+      [KEYS.useSSL, useSSL ? "true" : "false"],
+      [KEYS.region, region],
+      [KEYS.prefix, prefix],
+    ];
+    if (boundAad) {
+      // Both keys are always written together, under the same version. A blank field was
+      // opened above under the CURRENT endpoint's AAD (a stored key that does not open is the
+      // 400 above and nothing was written), so a changed endpoint or SSL flag RE-SEALS both
+      // here, inside this owner save, after the pre-flight passed. Nothing is rewritten when
+      // no key was entered, the stored pair is already bound, and the address did not move
+      // (avoids churning the sync feed with fresh nonces every save).
+      const storedBoundHere = _storedBoundHere(current, identity);
+      if (payload.access_key || payload.secret_key || !storedBoundHere || _addressMoved(current, endpoint, useSSL)) {
+        entries.push([KEYS.accessKey, sealSecretBound(accessKey, identity, boundAad(KEYS.accessKey))]);
+        entries.push([KEYS.secretKey, sealSecretBound(secretKey, identity, boundAad(KEYS.secretKey))]);
+      }
+    } else {
+      // Only re-seal if the value actually changed (avoid churning the sync feed
+      // with fresh nonces every save when nothing rotated).
+      if (payload.access_key) entries.push([KEYS.accessKey, sealSecret(accessKey, identity)]);
+      if (payload.secret_key) entries.push([KEYS.secretKey, sealSecret(secretKey, identity)]);
     }
+    await writeSettingsAtomic(db, entries);
     await writeSetting(db, KEYS.autoApply, payload.auto_apply_to_bundles ? "true" : "false", { scope: "local" });
+
+    if (recordEra && !current.eraHost) {
+      // The conversion is done: record the era, host state file FIRST (primary proof), then the
+      // DB mirror. A failed state-file write leaves both rows bound; the next boot records it.
+      try {
+        writeStorageEraState(undefined, { rows: 2 });
+        await writeSetting(db, STORAGE_ERA_SETTING, new Date().toISOString(), { scope: "local" });
+      } catch {
+        console.warn("[storage] the shared storage era could not be recorded; the next boot records it");
+        // Ring the same once-a-day owner alert (default title, no sentence), as any reader would.
+        noteStorageCredentialRefusal("storage_credentials_unbound");
+      }
+    }
 
     // Invalidate the storage client so subsequent uploads pick up fresh config.
     try { resetStorageClient(); } catch {}

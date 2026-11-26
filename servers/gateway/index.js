@@ -495,6 +495,49 @@ try {
   console.warn("[keychain-aad] conversion skipped:", err?.message || err);
 }
 
+// Shared Storage AAD era (storage.shared.* credentials, release 2): bind the two stored
+// credentials to their setting, the normalized endpoint and the SSL flag, then record the era in
+// which an old-style (`enc:v1:`) or plaintext value is REFUSED. It runs only once EVERY paired
+// peer has advertised it can open a bound value (the fleet gate), converts both rows in one
+// verified transaction or none, and never throws: a closed gate, a missing identity or anything
+// that looks like a swap converts nothing, records nothing and logs one line.
+try {
+  const { runStorageSharedAadBoot } = await import("./boot/storage-shared-aad.js");
+  const { resolveCrowHome, resolveInstanceDataDir } = await import("../shared/crow-home.js");
+  const { join } = await import("node:path");
+  const crowHome = resolveCrowHome();
+  const dbPath = process.env.CROW_DB_PATH
+    || join(resolveInstanceDataDir({ ...process.env, CROW_HOME: crowHome }), "crow.db");
+  let localInstanceId = null;
+  try {
+    const { getOrCreateLocalInstanceId } = await import("./instance-registry.js");
+    localInstanceId = getOrCreateLocalInstanceId();
+  } catch { /* no registry yet: the gate stays closed */ }
+  let identity = null;
+  try {
+    const { loadIdentityIfPresent } = await import("../sharing/identity.js");
+    identity = loadIdentityIfPresent();
+  } catch { /* no readable identity: the pass says so and converts nothing */ }
+  const gateDb = createDbClient();
+  try {
+    await runStorageSharedAadBoot({
+      dbPath,
+      crowHome,
+      identity,
+      mirrorInstanceId: localInstanceId,
+      log: (line) => console.log(line),
+      gate: async () => {
+        const { peersStorageAadCapable } = await import("../sharing/tailnet-sync.js");
+        return peersStorageAadCapable(gateDb, localInstanceId, 2);
+      },
+    });
+  } finally {
+    try { gateDb.close(); } catch { /* already closed */ }
+  }
+} catch (err) {
+  console.warn("[storage-aad] conversion skipped:", err?.message || err);
+}
+
 // Keyed token verifiers (§8 PR 2 of the keyed-token-hashes design): create or load the
 // HMAC key, convert every existing oauth_tokens row of the three families
 // (oauth:access / oauth:refresh / dashboard:session) to its `h1.` form, and alarm on any

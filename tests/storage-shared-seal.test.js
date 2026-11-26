@@ -655,7 +655,7 @@ const frameAt = (seen, dir, idx) => {
   return f ? JSON.parse(f.text) : null;
 };
 
-test("tailnet-sync: both hellos carry sa: 1, both sides record the peer, and the fleet answers capable", async () => {
+test("tailnet-sync: both hellos carry sa: 2, both sides record the peer, and the fleet answers capable", async () => {
   const fleet = await makeFleet();
   const { a, b } = fleet;
   const A = await startGateway(fleet, a, { log: quiet });
@@ -667,12 +667,12 @@ test("tailnet-sync: both hellos carry sa: 1, both sides record the peer, and the
     await A.startClients();
     assert.ok(await until(() => a.mgr.hasDedicatedStream(b.id) && b.mgr.hasDedicatedStream(a.id), 15_000), "the link forms");
 
-    assert.equal(frameAt(seen, "c2s", 1)?.sa, 1, "the client hello advertises the storage-AAD capability");
-    assert.equal(frameAt(seen, "s2c", 1)?.sa, 1, "so does the CR-capable server hello");
+    assert.equal(frameAt(seen, "c2s", 1)?.sa, 2, "the client hello advertises the storage-AAD capability");
+    assert.equal(frameAt(seen, "s2c", 1)?.sa, 2, "so does the CR-capable server hello");
 
-    assert.ok(await until(async () => (await override(b.db, b.id, `${SYNC_SA_KEY_PREFIX}${a.id}`)) === "1", 5000),
+    assert.ok(await until(async () => (await override(b.db, b.id, `${SYNC_SA_KEY_PREFIX}${a.id}`)) === "2", 5000),
       "the server records the client's advertised sa");
-    assert.ok(await until(async () => (await override(a.db, a.id, `${SYNC_SA_KEY_PREFIX}${b.id}`)) === "1", 5000),
+    assert.ok(await until(async () => (await override(a.db, a.id, `${SYNC_SA_KEY_PREFIX}${b.id}`)) === "2", 5000),
       "the client records the server's advertised sa");
     assert.equal(await peersStorageAadCapable(a.db, a.id), true);
     assert.equal(await peersStorageAadCapable(b.db, b.id), true);
@@ -718,8 +718,8 @@ test("tailnet-sync: a peer that advertises no sa is recorded as 0, so the fleet 
     assert.ok(await until(async () => (await override(b.db, b.id, `${SYNC_SA_KEY_PREFIX}${a.id}`)) === "0", 15_000),
       `the peer without sa is recorded as 0, not left unknown (got ${await override(b.db, b.id, `${SYNC_SA_KEY_PREFIX}${a.id}`)})`);
     assert.equal(frameAt(seen, "c2s", 1)?.sa, undefined, "the stripped hello really carried none");
-    assert.equal(frameAt(seen, "s2c", 1)?.sa, 1, "our own hello still advertises it");
-    assert.ok(await until(async () => (await override(a.db, a.id, `${SYNC_SA_KEY_PREFIX}${b.id}`)) === "1", 5000));
+    assert.equal(frameAt(seen, "s2c", 1)?.sa, 2, "our own hello still advertises it");
+    assert.ok(await until(async () => (await override(a.db, a.id, `${SYNC_SA_KEY_PREFIX}${b.id}`)) === "2", 5000));
 
     assert.equal(await peersStorageAadCapable(b.db, b.id), false, "one old peer pins the fleet at v1");
     assert.equal(await peersStorageAadCapable(a.db, a.id), true, "the other side saw a capable peer");

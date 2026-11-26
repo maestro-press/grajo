@@ -204,7 +204,7 @@ const CR_VERSION = 1;
 // NOT COVERED BY THE HELLO SIGNATURE (like `cr`/`pb`): a value in a hello is a claim, not a
 // proof, so release 2 must treat the gate it feeds as a COMPATIBILITY check (would that peer
 // break on a bound value?) and never as a security proof of what the peer can do.
-const SA_VERSION = 1;
+const SA_VERSION = 2;
 const NONCE_RE = /^[0-9a-f]{16,128}$/;
 function crRespMessage(serverId, clientId, clientNonce, serverNonce) {
   return `cr-resp:${serverId}:${clientId}:${clientNonce}:${serverNonce}`;
@@ -282,7 +282,12 @@ async function markPeerSa(ctx, peerId, saValue) {
  * Can EVERY trusted paired peer open a storage.shared.* value bound to its setting key,
  * endpoint and SSL flag?
  *
- * TRUE only when each of them last advertised `sa >= 1`; FALSE when any has no recorded value,
+ * LEVELS: `sa:1` (release 1) can READ a bound value but still WRITES `enc:v1:` on an owner
+ * save, which an instance past its era refuses. `sa:2` (release 2) also writes the bound form.
+ * The conversion therefore asks for `minLevel` 2. The level parse is strict: an integer only,
+ * absent = 0.
+ *
+ * TRUE only when each of them last advertised `sa >= minLevel` (default 1); FALSE when any has no recorded value,
  * a 0 or a non-numeric one, when `localInstanceId` is missing, or on any DB error (fail closed:
  * an unknown fleet is not a capable one). No trusted peers at all is TRUE — there is nobody to
  * break.
@@ -291,7 +296,7 @@ async function markPeerSa(ctx, peerId, saValue) {
  * gate calls it. Because the hello's `sa` is not covered by the hello signature, the answer is
  * a COMPATIBILITY fact about the fleet, never a security proof.
  */
-export async function peersStorageAadCapable(db, localInstanceId) {
+export async function peersStorageAadCapable(db, localInstanceId, minLevel = 1) {
   if (!db || !localInstanceId) return false;
   try {
     const { rows: peers } = await db.execute({
@@ -312,7 +317,7 @@ export async function peersStorageAadCapable(db, localInstanceId) {
       const value = advertised.get(String(peer.id));
       if (value === undefined) return false;
       const n = Number(value);
-      if (!Number.isInteger(n) || n < 1) return false;
+      if (!Number.isInteger(n) || n < minLevel) return false;
     }
     return true;
   } catch {

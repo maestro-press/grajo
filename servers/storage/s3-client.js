@@ -47,6 +47,8 @@ import * as Minio from "minio";
 import { createRequire } from "node:module";
 import { isSealed } from "../sharing/secret-box.js";
 import { STORAGE_SHARED_CREDENTIAL_KEYS, openStorageSharedValue, parseStorageUseSSL, splitNormalizedEndpoint } from "../shared/storage-shared-seal.js";
+import { storageEraOnAsync, storageEraOnSync } from "../shared/storage-shared-era.js";
+import { noteStorageCredentialRefusal } from "../shared/storage-shared-alert.js";
 
 const DEFAULT_BUCKET_BASE = "crow-files";
 const SHARED_KEYS = [
@@ -309,7 +311,7 @@ export async function useDbStorageConfigFromInstance(db) {
  * during a half-synced window. Secrets are opened via secret-box; if opening
  * fails (wrong identity, tampering), throws.
  */
-export async function loadSharedStorageFromDb(db, identity) {
+export async function loadSharedStorageFromDb(db, identity, { secretsDir } = {}) {
   if (!db || !identity) return null;
   try {
     const placeholders = SHARED_KEYS.map(() => "?").join(",");
@@ -317,7 +319,10 @@ export async function loadSharedStorageFromDb(db, identity) {
       sql: `SELECT key, value FROM dashboard_settings WHERE key IN (${placeholders})`,
       args: SHARED_KEYS,
     });
-    return _configFromRows(rows, identity);
+    // The era (storage-shared-era.js): the host state file or the DB mirror. After it, an
+    // `enc:v1:` or plaintext credential is refused (storage off), never opened.
+    const era = await storageEraOnAsync(db, secretsDir);
+    return _configFromRows(rows, identity, { era });
   } catch (err) {
     console.warn("[storage] loadSharedStorageFromDb failed:", err.message);
     return null;
@@ -355,7 +360,7 @@ export const SHARED_STORAGE_UNREADABLE = "unreadable";
  * a caller that must tell "nothing configured" from "could not read it" needs the difference.
  * @returns {{ok: true, config: object} | {ok: false, reason: "no-settings"|"unreadable"}}
  */
-export function readSharedStorageSettingsSync(dbPath, identity) {
+export function readSharedStorageSettingsSync(dbPath, identity, { secretsDir } = {}) {
   if (typeof dbPath !== "string" || dbPath === "" || !identity) {
     return { ok: false, reason: SHARED_STORAGE_NO_SETTINGS };
   }
@@ -367,7 +372,7 @@ export function readSharedStorageSettingsSync(dbPath, identity) {
     const placeholders = SHARED_KEYS.map(() => "?").join(",");
     const rows = db.prepare(`SELECT key, value FROM dashboard_settings WHERE key IN (${placeholders})`)
       .all(...SHARED_KEYS);
-    const config = _configFromRows(rows, identity);
+    const config = _configFromRows(rows, identity, { era: storageEraOnSync(db, secretsDir) });
     // Rows present but incomplete is the same normal state as no rows at all.
     return config ? { ok: true, config } : { ok: false, reason: SHARED_STORAGE_NO_SETTINGS };
   } catch (err) {
@@ -383,8 +388,8 @@ export function readSharedStorageSettingsSync(dbPath, identity) {
  * "could not read it". Callers that must tell them apart use readSharedStorageSettingsSync.
  * @returns {object|null}
  */
-export function loadSharedStorageFromDbSync(dbPath, identity) {
-  const read = readSharedStorageSettingsSync(dbPath, identity);
+export function loadSharedStorageFromDbSync(dbPath, identity, opts) {
+  const read = readSharedStorageSettingsSync(dbPath, identity, opts);
   return read.ok ? read.config : null;
 }
 
@@ -402,9 +407,14 @@ const SHARED_STORAGE_CREDENTIAL_REFUSED = "shared storage credentials could not 
  * `unreadable` in the sync one), never a config carrying the ciphertext or a null key.
  * @returns {{plaintext: string, version: "v1"|"v2"|"plain"}}
  */
-function _openSharedCredential(value, settingKey, endpoint, useSSL, identity) {
-  const opened = openStorageSharedValue(value, { settingKey, endpoint, useSSL, identity });
-  if (!opened.ok) throw new Error(SHARED_STORAGE_CREDENTIAL_REFUSED);
+function _openSharedCredential(value, settingKey, endpoint, useSSL, identity, era) {
+  const opened = openStorageSharedValue(value, { settingKey, endpoint, useSSL, identity, era });
+  if (!opened.ok) {
+    // The first failed open from ANY reader rings the owner bell once a UTC day (and only for
+    // the two reasons that mean "credentials stopped opening"; never a value).
+    noteStorageCredentialRefusal(opened.reason);
+    throw new Error(SHARED_STORAGE_CREDENTIAL_REFUSED);
+  }
   return opened;
 }
 
@@ -413,15 +423,15 @@ function _openSharedCredential(value, settingKey, endpoint, useSSL, identity) {
  * opening and the endpoint parsing live — the async and the sync reader (and the sync one's
  * caller in the bot engine) share it, so the two cannot drift.
  */
-function _configFromRows(rows, identity) {
+function _configFromRows(rows, identity, { era = false } = {}) {
   const kv = Object.fromEntries((rows || []).map((r) => [r.key, r.value]));
   const endpoint = kv["storage.shared.endpoint"];
   const accessSealed = kv["storage.shared.access_key"];
   const secretSealed = kv["storage.shared.secret_key"];
   if (!endpoint || !accessSealed || !secretSealed) return null;
   const useSSL = parseStorageUseSSL(kv["storage.shared.use_ssl"]);
-  const access = _openSharedCredential(accessSealed, STORAGE_SHARED_CREDENTIAL_KEYS[0], endpoint, useSSL, identity);
-  const secret = _openSharedCredential(secretSealed, STORAGE_SHARED_CREDENTIAL_KEYS[1], endpoint, useSSL, identity);
+  const access = _openSharedCredential(accessSealed, STORAGE_SHARED_CREDENTIAL_KEYS[0], endpoint, useSSL, identity, era);
+  const secret = _openSharedCredential(secretSealed, STORAGE_SHARED_CREDENTIAL_KEYS[1], endpoint, useSSL, identity, era);
   // A value that OPENS to another envelope is a sealed value sealed twice (or a blob copied
   // between settings): it is never a credential, so it fails closed here instead of being
   // echoed to the endpoint as a key id. (openStorageSharedValue refuses it as

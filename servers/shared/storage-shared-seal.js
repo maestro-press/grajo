@@ -26,7 +26,7 @@
  *   enc:v2: …        opened with the AAD above. A bad endpoint, a wrong key name, a changed
  *                    endpoint/SSL flag or a wrong identity all fail the tag check, and the
  *                    refusal is classified `storage_credentials_unbound`.
- *   enc:v1: …        still accepted (a mixed fleet's peer keeps writing v1 until release 2's
+ *   enc:v1: …        still accepted BEFORE the era (a mixed fleet's peer keeps writing v1 until release 2's
  *                    fleet gate passes), opened exactly as before.
  *   any other enc: … REFUSED as `unknown_envelope`. This is new and deliberate: an older
  *                    reader takes such a value as PLAINTEXT and hands the literal string
@@ -157,13 +157,18 @@ export function storageSharedAad(settingKey, endpoint, useSSL) {
  *   "noncanonical"                — a sealed body that is not the exact form this release
  *                                   writes (trailing whitespace, stripped padding);
  *   "unknown_envelope"            — any other `enc:` prefix, and a non-string/empty value;
- *   "nested_envelope"             — a value that OPENS to another envelope: never a credential.
+ *   "nested_envelope"             — a value that OPENS to another envelope: never a credential;
+ *   "storage_credentials_pre_era" — release 2: THIS instance's era is on (`era: true`), and the
+ *                                   value is an `enc:v1:` blob or plaintext. Nothing here writes
+ *                                   either after the conversion, so it can only be a bot's. The
+ *                                   caller owns the era verdict (storage-shared-era.js); this
+ *                                   function never reads it, so it stays pure.
  *
  * @param {unknown} value the stored row value
- * @param {{settingKey: string, endpoint: string, useSSL: boolean, identity: object}} ctx
+ * @param {{settingKey: string, endpoint: string, useSSL: boolean, identity: object, era?: boolean}} ctx
  * @returns {{ok: true, plaintext: string, version: "v1"|"v2"|"plain"} | {ok: false, reason: string}}
  */
-export function openStorageSharedValue(value, { settingKey, endpoint, useSSL, identity } = {}) {
+export function openStorageSharedValue(value, { settingKey, endpoint, useSSL, identity, era = false } = {}) {
   const refuse = (reason) => {
     // Reason code and setting key ONLY: never the value, the endpoint, the plaintext or an
     // error message (an error can quote a decoded nonce or a base64 body).
@@ -187,6 +192,7 @@ export function openStorageSharedValue(value, { settingKey, endpoint, useSSL, id
   }
 
   if (value.startsWith(PREFIX_V1)) {
+    if (era === true) return refuse("storage_credentials_pre_era");
     if (!isCanonicalSealed(value)) return refuse("noncanonical");
     let plaintext;
     try {
@@ -203,6 +209,8 @@ export function openStorageSharedValue(value, { settingKey, endpoint, useSSL, id
   // string as a credential.
   if (value.slice(0, 4).toLowerCase() === "enc:") return refuse("unknown_envelope");
 
+  // Plaintext: accepted before the era, refused after it.
+  if (era === true) return refuse("storage_credentials_pre_era");
   return { ok: true, plaintext: value, version: "plain" };
 }
 

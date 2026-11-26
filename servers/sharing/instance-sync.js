@@ -55,6 +55,9 @@ import { sanitizeDisplayName } from "./display-name.js";
 import { validateAvatar, avatarFieldValue } from "./avatar.js";
 import bus from "../shared/event-bus.js";
 import { TRUSTED_PEER_SQL } from "../shared/peer-trust.js";
+import { STORAGE_SHARED_CREDENTIAL_KEYS } from "../shared/storage-shared-seal.js";
+import { readStorageEraState } from "../shared/storage-shared-era.js";
+import { noteStorageCredentialRefusal } from "../shared/storage-shared-alert.js";
 import { SYNC_PB_KEY_PREFIX, SYNC_PB_CLEARED_PREFIX } from "../shared/self-dial-address.js";
 import { mintLamport, advanceCounter, stampSql, ensureLamportOriginColumn, incomingLosesLww, settingsOriginReady, normalizeLamportOrigin, NO_ORIGIN_COLUMN } from "../shared/sync-stamp.js";
 import { deleteContactArtifactComments } from "../shared/artifact-comment-delete.js";
@@ -3765,6 +3768,20 @@ export class InstanceSyncManager {
       sql: `SELECT value, lamport_ts${hasOrigin ? ", lamport_origin" : ""} FROM dashboard_settings WHERE key = ?`,
       args: [row.key],
     });
+    // THE SHARED STORAGE ERA GUARD. Once this instance has recorded its era (the HOST state
+    // file; never the bot-writable mirror, and never a peer capability row), the two credential
+    // settings may only arrive in the bound form: a value that is not exactly `enc:v2:` is
+    // DROPPED whatever its lamport (a tie, a re-emit from a not-yet-converted peer, a bot-forged
+    // frame), the local row is kept, and the owner alert rings (once a UTC day). Applying it
+    // would switch this instance's storage off, because every reader here refuses v1 and
+    // plaintext after the era. A delete is not refused. The era read is synchronous.
+    if (op !== "delete" && STORAGE_SHARED_CREDENTIAL_KEYS.includes(row.key)
+        && !(typeof row.value === "string" && row.value.startsWith("enc:v2:"))
+        && readStorageEraState().state === "converted") {
+      noteStorageCredentialRefusal("storage_credentials_pre_era");
+      console.warn("[instance-sync] an old-style shared storage credential from a peer was dropped (this instance only accepts the bound form)");
+      return;
+    }
     const localTs = existing[0]?.lamport_ts || 0;
     const localOrigin = hasOrigin ? normalizeLamportOrigin(existing[0]?.lamport_origin) : null;
     // Strictly older loses; strictly newer wins; an equal Lamport goes to the
