@@ -53,7 +53,12 @@ const SHARED_USER = Object.freeze({ kind: "contact", id: "crow-user-contact-1" }
 
 const open = [];
 let copied = 0;
-let clock = Date.now();
+// Mid-day UTC TOMORROW: the once-a-day keys are UTC dates, and a clock seeded from the real time crossed
+// UTC midnight inside a test when CI ran late in the evening. The comment store stamps comments with the
+// real time, so the fake clock must stay after them (the quiet period): the next UTC day's noon is 12 to
+// 36 hours ahead of any real "now", and a test's steps from there never reach the following midnight.
+const CLOCK_START = (() => { const d = new Date(); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 12, 0, 0); })();
+let clock = CLOCK_START;
 
 before(() => {
   mkdirSync(join(root, "master"), { recursive: true });
@@ -216,7 +221,7 @@ function replyTo(call, ...threadIds) {
 
 function reset() {
   _resetPickupTokensForTests();
-  clock = Date.now();
+  clock = CLOCK_START;
 }
 
 /* ------------------------------------------------------------------------ tests */
