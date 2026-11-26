@@ -240,15 +240,20 @@ export default {
         if (sk && sk !== '••••••••') obj.secret_key = sk;
         return obj;
       }
+      // URL-encoded, not FormData: the dashboard parses only urlencoded bodies, so a multipart
+      // POST reached handleAction with no action and the page re-rendered (HTTP 200, HTML).
+      // Only a JSON answer is the handler's; anything else (that re-rendered page) is a failure,
+      // never a "Saved".
       async function apiCall(action, data) {
-        const f = new FormData();
-        f.append('action', action);
-        f.append('payload', JSON.stringify(data));
+        const body = new URLSearchParams();
+        body.append('action', action);
+        body.append('payload', JSON.stringify(data));
         const res = await fetch(window.location.pathname + window.location.search, {
-          method: 'POST', body: f, credentials: 'same-origin',
+          method: 'POST', body, credentials: 'same-origin',
         });
         const text = await res.text();
-        let json; try { json = JSON.parse(text); } catch { json = { ok: res.ok, text }; }
+        let json = null; try { json = JSON.parse(text); } catch { json = null; }
+        if (!json || typeof json !== 'object') return { ok: false, json: null };
         return { ok: res.ok, json };
       }
       document.getElementById('ss-save').addEventListener('click', async () => {
