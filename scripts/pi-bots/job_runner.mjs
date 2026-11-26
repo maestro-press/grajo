@@ -167,8 +167,9 @@ export function claimNextJob(workerPid = process.pid) {
  * wrote the card, so an abandoned job needs no card rescue; the lock predicate
  * stops reporting the card held the moment the row is terminal.
  */
-export async function recoverStaleClaims(log = () => {}, { bridge = null } = {}) {
+export async function recoverStaleClaims(log = () => {}, { bridge = null, notifyFailure = defaultNotifyJobFailure, now = Date.now } = {}) {
   const c = dbConn();
+  const abandoned = []; // no-card jobs that just went terminal; belled after the connection closes
   try {
     const rows = c.prepare("SELECT job_id, bot_id, worker_pid, attempts, card_id, card_action FROM bot_jobs WHERE status='running'").all();
     for (const r of rows) {
@@ -181,9 +182,11 @@ export async function recoverStaleClaims(log = () => {}, { bridge = null } = {})
           .run("abandoned: worker died, max attempts reached", r.job_id);
         log(`job ${r.job_id} failed — abandoned, ${r.attempts} attempts` +
           (r.card_id != null ? `; card ${r.card_id} is unlocked — if it reads in_progress, nothing is working it` : ""));
+        if (r.card_id == null) abandoned.push(r);
       }
     }
   } finally { c.close(); }
+  for (const r of abandoned) await ringJobFailureBell(r, { log, notifyFailure, now });
 }
 
 export function finalizeJob(job_id, { status, result, error, tool_calls, pi_session_id }) {
@@ -670,7 +673,7 @@ export async function commitJobWorkspace(job, phase, { bridge = null, log = () =
  * or failure, before the job is finalized.
  * @returns {Promise<{status:string, result:string|null, error:string|null}>}
  */
-async function runAndFinalize(job, { log = () => {}, bridge = null } = {}) {
+async function runAndFinalize(job, { log = () => {}, bridge = null, notifyFailure = defaultNotifyJobFailure, now = Date.now } = {}) {
   await commitJobWorkspace(job, "start", { bridge, log });
   let outcome;
   try {
@@ -688,7 +691,54 @@ async function runAndFinalize(job, { log = () => {}, bridge = null } = {}) {
     // re-dispatches or moves it instead of waiting on nothing.
     log(`job ${job.job_id} failed — card ${job.card_id} is unlocked; if it reads in_progress, nothing is working it (re-dispatch or move it)`);
   }
+  if (outcome.status === "failed" && job.card_id == null) {
+    await ringJobFailureBell(job, { log, notifyFailure, now });
+  }
   return outcome;
+}
+
+const DAY_MS = 86400000;
+
+// One bell per bot per UTC day for a failed no-card job. In-memory: the gateway
+// runtime and the supervised runner are each one long-lived process, so a
+// restart may ring once more, which is acceptable. Entries older than 2 days are
+// dropped on insert.
+const notifiedJobFailures = new Map();
+
+/** Default owner notifier: one in-app bell. Fixed title, EMPTY body — never the error text. */
+async function defaultNotifyJobFailure({ bot_id, job_id }) {
+  const { createDbClient } = await import("../../servers/db.js");
+  const { createNotification } = await import("../../servers/shared/notifications.js");
+  let db;
+  try {
+    db = createDbClient();
+    await createNotification(db, {
+      type: "attention",
+      source: "pi-bots",
+      priority: "normal",
+      title: `${bot_id}'s turn failed`,
+      body: "",
+      action_url: `/dashboard/bot-builder?bot=${encodeURIComponent(bot_id)}`,
+      metadata: { bot_id, kind: "job-failed", job_id },
+    });
+  } finally {
+    if (db) { try { db.close(); } catch { /* already closed */ } }
+  }
+}
+
+/** Never throws and never touches the job's recorded outcome. */
+async function ringJobFailureBell(job, { log, notifyFailure, now }) {
+  try {
+    const t = now();
+    const day = new Date(t).toISOString().slice(0, 10);
+    const key = String(job.bot_id);
+    if (notifiedJobFailures.get(key)?.day === day) return;
+    for (const [k, v] of notifiedJobFailures) if (t - v.at > 2 * DAY_MS) notifiedJobFailures.delete(k);
+    notifiedJobFailures.set(key, { day, at: t });
+    await notifyFailure({ bot_id: job.bot_id, job_id: job.job_id });
+  } catch (e) {
+    try { log(`job-failure bell failed (non-fatal): ${(e && (e.code || e.name)) || "error"}`); } catch { /* logger must not matter */ }
+  }
 }
 
 /**
@@ -699,8 +749,8 @@ async function runAndFinalize(job, { log = () => {}, bridge = null } = {}) {
  * `bridge` is injectable for the same reason runJob's is: the terminal paths
  * are provable without spawning a real engine.
  */
-export async function tickJobs({ log = () => {}, deliverChannel = null, bridge = null } = {}) {
-  await recoverStaleClaims(log, { bridge });
+export async function tickJobs({ log = () => {}, deliverChannel = null, bridge = null, notifyFailure, now } = {}) {
+  await recoverStaleClaims(log, { bridge, ...(notifyFailure && { notifyFailure }), ...(now && { now }) });
 
   const maxPi = LIFECYCLE_DEFAULTS.maxPi;
   const reserve = Math.max(1, maxPi - 1); // leave >=1 slot for an interactive turn
@@ -711,7 +761,7 @@ export async function tickJobs({ log = () => {}, deliverChannel = null, bridge =
   if (!job) return { idle: true };
   log(`claimed job ${job.job_id} (bot=${job.bot_id}, attempt ${job.attempts})`);
 
-  const outcome = await runAndFinalize(job, { log, bridge });
+  const outcome = await runAndFinalize(job, { log, bridge, ...(notifyFailure && { notifyFailure }), ...(now && { now }) });
   log(`job ${job.job_id} → ${outcome.status}${outcome.error ? " (" + outcome.error + ")" : ""}`);
 
   if (outcome.status === "completed") {
@@ -727,11 +777,11 @@ export async function tickJobs({ log = () => {}, deliverChannel = null, bridge =
  * SAME finalize-and-un-strand helper as tickJobs and can be tested without
  * spawning a real engine.
  */
-export async function runOnce({ log = () => {}, deliverChannel = null, bridge = null } = {}) {
-  await recoverStaleClaims(log, { bridge });
+export async function runOnce({ log = () => {}, deliverChannel = null, bridge = null, notifyFailure, now } = {}) {
+  await recoverStaleClaims(log, { bridge, ...(notifyFailure && { notifyFailure }), ...(now && { now }) });
   const job = claimNextJob();
   if (!job) return { idle: true };
-  const outcome = await runAndFinalize(job, { log, bridge });
+  const outcome = await runAndFinalize(job, { log, bridge, ...(notifyFailure && { notifyFailure }), ...(now && { now }) });
   if (outcome.status === "completed") {
     await deliverResult(job, outcome.result, { log, deliverChannel }).catch(() => {});
   }
