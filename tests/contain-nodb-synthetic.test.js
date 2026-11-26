@@ -34,7 +34,7 @@ function fixture(name) {
   const cache = mk(name, "home", "alice", ".crow", "bot-cache");
   const cli = join(mk(name, "cli"), "cli.js"); writeFileSync(cli, "");
   const input = { home, uid: process.getuid(), crowHome, dataDir: data, botCacheDir: cache, sessionDir: state, botStateDir: state, cwd: ws,
-    workspaceDir: ws, nodeBin: process.execPath, cliPath: cli, writePaths: [], readPaths: [], mcpServers: [],
+    workspaceDir: ws, workspacePin: ws, nodeBin: process.execPath, cliPath: cli, writePaths: [], readPaths: [], mcpServers: [],
     systemDirs: ["/usr"], noDb: true, dbPaths: [join(data, "crow.db"), join(data, "tasks.db")], dataKeep: ["secrets"] };
   return { data, ws, input, home };
 }

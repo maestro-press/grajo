@@ -1337,6 +1337,7 @@ export async function prepareSpawn(world, { escalate = false, log = () => {}, pr
       // S6-CROW: the bot's project workspace joins its read roots (PiRpc,
       // bot-read-paths.mjs); null for a bot without a project.
       projectWorkspaceDir: (world.projectId != null && world.projectSpace && world.projectSpace.workspace_dir) || null,
+      projectId: world.projectId != null ? world.projectId : null,
       // The bot's id, for the workspace env (bot-workspace-env.mjs).
       botId: (world.bot && world.bot.bot_id) || null,
       extraReadPaths: world.extraReadPaths || [],

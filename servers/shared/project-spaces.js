@@ -15,6 +15,8 @@
 import { slugify, workspacePathFor, storagePrefixFor } from "./slugify.js";
 import { resolveDataDir } from "../db.js";
 import { ensureWorkspaceDir } from "./project-files.js";
+import { pinProjectWorkspace } from "./project-workspace-pins.js";
+import { resolveCrowHome } from "./crow-home.js";
 import { resolve } from "node:path";
 import { lstatSync } from "node:fs";
 
@@ -123,6 +125,7 @@ export async function createProjectSpace(db, opts = {}) {
     }
 
     const workspaceCreated = await ensureWorkspace(workspaceDir, dataDir, type);
+    pinWorkspace(id, workspaceDir, dataDir, type);
     await ensureHistory(db, { id, workspace_dir: workspaceDir, type }, dataDir);
 
     return { id, slug: explicitSlug, workspaceDir, storagePrefix, workspaceCreated };
@@ -170,9 +173,22 @@ export async function createProjectSpace(db, opts = {}) {
   const storagePrefix = storagePrefixFor(slug);
 
   const workspaceCreated = await ensureWorkspace(workspaceDir, dataDir, type);
+  pinWorkspace(id, workspaceDir, dataDir, type);
   await ensureHistory(db, { id, workspace_dir: workspaceDir, type }, dataDir);
 
   return { id, slug, workspaceDir, storagePrefix, workspaceCreated };
+}
+
+/**
+ * Pin the new project's workspace real path outside crow.db (project-workspace-pins.js), the answer
+ * a no-database bot spawn judges the row's workspace_dir against. A failure never fails the
+ * creation: one line, no path.
+ */
+function pinWorkspace(id, workspaceDir, dataDir, type) {
+  if (type === "learner_profile") return;
+  let r;
+  try { r = pinProjectWorkspace(id, workspaceDir, { crowHome: resolveCrowHome(), dataDir }); } catch { r = { ok: false, reason: "error" }; }
+  if (!r.ok) console.warn(`[workspace-pin] project ${id} was not pinned (${r.reason})`);
 }
 
 /**

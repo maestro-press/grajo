@@ -313,7 +313,7 @@ test("noDb: the data dir is not bound at all; only the workspace (and what is un
   mk(d, "backups"); mk(d, "secrets"); mk(d, "projects", "theirs"); mk(d, "artifacts");
   const ws = mk(d, "projects", "mine", "workspace");
   const own = mk(crowHome, "pi-bots", "nodbbot");
-  const on = buildContainPlan(base({ dataDir: d, noDb: true, workspaceDir: ws, botStateDir: own, sessionDir: own, cwd: ws, dataKeep: ["crow.db", "artifacts"] }));
+  const on = buildContainPlan(base({ dataDir: d, noDb: true, workspaceDir: ws, workspacePin: ws, botStateDir: own, sessionDir: own, cwd: ws, dataKeep: ["crow.db", "artifacts"] }));
   assert.deepEqual(on.refused, []);
   const inData = dataBinds(on.args, d);
   assert.ok(inData.length > 0 && inData.every((q) => (q[2] || q[1]) === ws || (q[2] || q[1]).startsWith(ws + "/")), "only the workspace (and things under it) touch the data dir: " + JSON.stringify(inData));
@@ -354,7 +354,7 @@ test("noDb: a write/read path under the data dir (not the workspace), the data d
   }
   // A path under the workspace is fine.
   const sub = mk(ws, "out");
-  const ok = buildContainPlan(base({ dataDir: d, noDb: true, dbPaths, workspaceDir: ws, writePaths: [sub] }));
+  const ok = buildContainPlan(base({ dataDir: d, noDb: true, dbPaths, workspaceDir: ws, workspacePin: ws, writePaths: [sub] }));
   assert.ok(has(ok.args, "--bind", ws, ws));
   assert.ok(!pairs(ok.args).some((q) => q[0] === "--bind" && (q[2] === d || d.startsWith(q[2] + "/"))), "no --bind at or above the data dir");
 });
@@ -371,7 +371,7 @@ test("noDb: a workspace that is not strictly below <data>/projects/ (a reserved 
   assert.throws(() => buildContainPlan(base({ dataDir: d, noDb: true, dbPaths: [join(dbElsewhere, "crow.db")], workspaceDir: d, cwd: d })),
     (e) => e instanceof ContainRefused && /not a project folder/.test(e.message), "the data dir itself, databases elsewhere");
   const ok = mk(d, "projects", "p1", "workspace");
-  const plan = buildContainPlan(base({ dataDir: d, noDb: true, dbPaths: [join(d, "crow.db")], workspaceDir: ok, cwd: ok }));
+  const plan = buildContainPlan(base({ dataDir: d, noDb: true, dbPaths: [join(d, "crow.db")], workspaceDir: ok, workspacePin: ok, cwd: ok }));
   assert.ok(has(plan.args, "--bind", ok), "a real project workspace is bound");
 });
 
@@ -384,7 +384,7 @@ test("noDb: with projects/ a symlink to another disk, a workspace at or above it
     assert.throws(() => buildContainPlan(base({ dataDir: d, noDb: true, dbPaths: [join(d, "crow.db")], workspaceDir: ws, cwd: ws })),
       (e) => e instanceof ContainRefused && /not a project folder/.test(e.message), ws);
   }
-  const plan = buildContainPlan(base({ dataDir: d, noDb: true, dbPaths: [join(d, "crow.db")], workspaceDir: join(d, "projects", "mine", "workspace"), cwd: mine }));
+  const plan = buildContainPlan(base({ dataDir: d, noDb: true, dbPaths: [join(d, "crow.db")], workspaceDir: join(d, "projects", "mine", "workspace"), workspacePin: mine, cwd: mine }));
   assert.ok(plan.args.includes(mine), "a workspace below the real projects root is bound");
 });
 
@@ -392,7 +392,7 @@ test("noDb: DATA_KEEP is ignored (no keep folder bound)", () => {
   const d = mk(T, "keep", "data");
   mk(d, "artifacts"); mk(d, "knowledge-base-mcp");
   const ws = mk(d, "projects", "mine", "ws");
-  const on = buildContainPlan(base({ dataDir: d, noDb: true, workspaceDir: ws, dataKeep: ["artifacts", "knowledge-base-mcp"] }));
+  const on = buildContainPlan(base({ dataDir: d, noDb: true, workspaceDir: ws, workspacePin: ws, dataKeep: ["artifacts", "knowledge-base-mcp"] }));
   for (const k of ["artifacts", "knowledge-base-mcp"]) assert.equal(dataBinds(on.args, join(d, k)).length, 0, k);
 });
 

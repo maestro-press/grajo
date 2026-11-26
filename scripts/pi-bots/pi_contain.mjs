@@ -1586,6 +1586,19 @@ export function buildContainPlan(o) {
     if (rdWsRaw && rdData && !rdWs && (under(rdWsRaw, rdData) || under(rdData, rdWsRaw) || under(rdProjects, rdWsRaw))) {
       throw new ContainRefused("contain refused: the workspace is not a project folder while the database is withheld (noDb)");
     }
+    // The workspace must also be the one PINNED for its project outside crow.db
+    // (servers/shared/project-workspace-pins.js): a row retargeted at ANOTHER project's workspace is
+    // still below projects/ and would otherwise bind. `workspacePin` is the pinned real path, or null
+    // for "this project has no pin"; the bridge always states it for a noDb spawn; an
+    // absent key is "no pin" (fail closed). The message names no path.
+    if (o.workspaceDir) {
+      if (typeof o.workspacePin !== "string" || !o.workspacePin) {
+        throw new ContainRefused("contain refused: the project's workspace has no pin while the database is withheld (noDb)");
+      }
+      if (rdWsRaw !== o.workspacePin) {
+        throw new ContainRefused("contain refused: the workspace differs from the project's pinned workspace while the database is withheld (noDb)");
+      }
+    }
     const kindOf = (w) => {
       for (const f of dbFiles) if (under(f, w)) return f === w ? "a database file" : "the folder of a database file";
       if (rdData && (under(rdData, w) || under(w, rdData))) {

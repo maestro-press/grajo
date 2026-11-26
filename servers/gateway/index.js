@@ -361,6 +361,18 @@ try {
   console.warn(`[satellite-pin] backfill crashed: ${err?.message || err}`);
 }
 
+// Project workspace pins: a no-database contained bot spawn binds the workspace read-write and
+// judges project_spaces.workspace_dir (bot-writable) against the real path pinned in
+// <CROW_HOME>/secrets/project-workspaces.json. Projects that predate the pin are pinned here ONCE
+// (own marker file), before any route serves. Fail-soft.
+// See boot/project-workspace-pin-backfill.js.
+try {
+  const { runProjectWorkspacePinBackfill } = await import("./boot/project-workspace-pin-backfill.js");
+  await runProjectWorkspacePinBackfill({ createDbClient });
+} catch (err) {
+  console.warn(`[workspace-pin] backfill crashed: ${err?.code || "error"}`);
+}
+
 // Record the sha this process booted on, for convergence. Captured once, here,
 // so every later comparison is against the code actually running rather than
 // whatever the shared checkout has since moved to. A null value makes

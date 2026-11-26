@@ -60,6 +60,7 @@ import { identityDataDir } from "../../servers/sharing/identity.js";
 import { resolveBackupDir } from "../../servers/shared/backup-naming.js";
 import { resolveCrowHome } from "../../servers/shared/crow-home.js";
 import { ENTRY_MARK } from "./pi_netns_entry.mjs";
+import { readWorkspacePin } from "../../servers/shared/project-workspace-pins.js";
 import { containSelected, containExcluded, prepareAgentShadow, sweepStaleContainDirs, containOwnWorldRoot, ContainRefused } from "./pi_contain.mjs";
 import { containedClassifierBlock, containedCloudTokenPath, pinOfBaseUrl, doorVouchTargets } from "./pi_contain_agent.mjs";
 import { botContainment, defToolNames, recordContainment, formatContainmentLine } from "./containment-status.mjs";
@@ -358,6 +359,16 @@ export function lockedTurnPin(rows, key) {
 }
 
 /**
+ * The `workspacePin` plan input for a spawn: `{ workspacePin: <pinned real path | null> }` for a noDb
+ * spawn that binds a project workspace (null = this project has no pin, which the plan refuses),
+ * `{}` for every other spawn so their plans are untouched.
+ */
+export function noDbWorkspacePinInput(opts, crowHome) {
+  if (!(opts && opts.noDb === true && opts.projectWorkspaceDir)) return {};
+  return { workspacePin: readWorkspacePin(opts.projectId, { crowHome }) };
+}
+
+/**
  * Mount inputs for the contain tier (pi_contain.mjs buildContainPlan): the
  * engine, this spawn's own paths and policy, the instance data dir, the
  * cloud-door token file, and the MCP servers pi will start (the
@@ -443,6 +454,9 @@ function containInputs({ nodeBin, cliPath, sessionDir, spawnCwd, piPolicy, opts,
     dbPaths: [CROW_DB, TASKS_DB],
     dataKeep: String(process.env.CROW_PI_CONTAIN_DATA_KEEP || "").split(",").map((x) => x.trim()).filter((x) => x && !x.includes("/")),
     sessionDir, cwd: spawnCwd, workspaceDir: opts.projectWorkspaceDir || null,
+    // noDb only: the project's workspace real path pinned OUTSIDE crow.db (null = no pin, which the
+    // plan refuses). Other spawns never carry it, so their plans are unchanged.
+    ...noDbWorkspacePinInput(opts, crowHome),
     botStateDir,
     writePaths: [...(piPolicy.write_paths || []), ...extraRw], readPaths: piPolicy.read_paths || [],
     mcpServers: servers,

@@ -490,7 +490,7 @@ export async function runJob(job, { log = () => {}, bridge: injectedBridge = nul
     const pi = await bridge.spawnPiRpc({
       def, sessionDir, resolved, piProvider, selfAuthoringDir: null,
       piSessionId: null, appendSystemPromptFile: sysFile,
-      projectWorkspaceDir, mcpDelivery, mcpConfig, noDb, coreInertBlocks, botId: job.bot_id,
+      projectWorkspaceDir, projectId: bot.project_id != null ? Number(bot.project_id) : null, mcpDelivery, mcpConfig, noDb, coreInertBlocks, botId: job.bot_id,
       // Share-derived file roots, fixed at this spawn (see the jobShares read above).
       // extraWritePaths only when a `read_write` share contributed one: a present-but-empty list
       // would rewrite write_paths and add the key to a def whose policy never carried it.
