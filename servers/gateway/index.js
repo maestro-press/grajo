@@ -495,12 +495,13 @@ try {
   console.warn("[keychain-aad] conversion skipped:", err?.message || err);
 }
 
-// Shared Storage AAD era (storage.shared.* credentials, release 2): bind the two stored
-// credentials to their setting, the normalized endpoint and the SSL flag, then record the era in
-// which an old-style (`enc:v1:`) or plaintext value is REFUSED. It runs only once EVERY paired
-// peer has advertised it can open a bound value (the fleet gate), converts both rows in one
-// verified transaction or none, and never throws: a closed gate, a missing identity or anything
-// that looks like a swap converts nothing, records nothing and logs one line.
+// Shared Storage AAD era (storage.shared.* credentials, release 2). This boot pass NEVER seals or
+// writes a credential row: only the owner's Shared Storage save converts them (see
+// boot/storage-shared-aad.js). Here it only records the era, in which an old-style (`enc:v1:`) or
+// plaintext value is REFUSED, and only once EVERY paired peer advertises `sa>=2` (the fleet gate):
+// for an env-only install (no credential rows), or when both rows are ALREADY bound and open for
+// the stored address (an owner save that committed before the process died). Anything else is left
+// as it is for the next owner save. Never throws; a closed gate or missing identity records nothing.
 try {
   const { runStorageSharedAadBoot } = await import("./boot/storage-shared-aad.js");
   const { resolveCrowHome, resolveInstanceDataDir } = await import("../shared/crow-home.js");
