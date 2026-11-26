@@ -50,6 +50,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import net from "node:net";
 import WebSocket from "ws";
+import { readTrace } from "./fixtures/read-trace.mjs";
 
 const RELAY = fileURLToPath(new URL("../bundles/browser/cdp-relay.mjs", import.meta.url));
 const FIXTURE = fileURLToPath(new URL("./fixtures/fake-chromium-gate.mjs", import.meta.url));
@@ -299,9 +300,7 @@ async function startSupervised(t, extraEnv = {}) {
   child.stdout.on("data", (d) => { logs += d; });
   child.stderr.on("data", (d) => { logs += d; });
   ctx.exited = new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
-  ctx.trace = () => {
-    try { return readFileSync(ctx.tracePath, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; }
-  };
+  ctx.trace = () => readTrace(ctx.tracePath);
   ctx.records = (type) => ctx.trace().filter((r) => r.t === type);
   ctx.stop = async () => {
     const pid = ctx.records("pid")[0]?.pid;
