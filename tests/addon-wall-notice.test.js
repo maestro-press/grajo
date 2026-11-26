@@ -519,3 +519,70 @@ test("the words module is a leaf: it imports nothing", () => {
   const src = readFileSync(new URL("../scripts/addon-sandbox/words.mjs", import.meta.url), "utf8");
   assert.doesNotMatch(src, /^\s*import\s/m, "words.mjs must not import anything");
 });
+// ─── the boot notice rings once per distinct state ──────────────────────────
+
+const unwalled = (id) => entry(id, { mode: "unwalled", reason: "your choice", source: "owner" });
+const bootOnce = (crowHome, env, entries, createNotification, lang = "en") =>
+  runAddonWallNotices({ db: emptyDb(), crowHome, env, entries, createNotification, lang });
+const hadWalled = (crowHome) =>
+  writeFileSync(addonWallsPath(crowHome), JSON.stringify({ walledNoticeV1: true, noticeV1: true }, null, 2) + "\n", { mode: 0o600 });
+
+for (const [label, env] of [["walls on", WALLED], ["kill switch", KILLED]]) {
+  test(`${label}: the same unwalled set on two boots rings once`, async () => {
+    const crowHome = scratchHome();
+    hadWalled(crowHome);
+    const { calls, createNotification } = collector();
+    const entries = [unwalled("notes"), entry("studio", walledWall())];
+    const first = await bootOnce(crowHome, env, entries, createNotification);
+    const second = await bootOnce(crowHome, env, entries, createNotification);
+    assert.equal(first.boot, true);
+    assert.equal(second.boot, false);
+    assert.equal(calls.length, 1);
+    assert.match(readAddonWalls(crowHome).bootNoticeDigest, /^[0-9a-f]{64}$/);
+    assert.equal(readAddonWalls(crowHome).noticeV1, true, "the one-time markers are untouched");
+  });
+
+  test(`${label}: a changed set (add-on added, then removed) rings again`, async () => {
+    const crowHome = scratchHome();
+    hadWalled(crowHome);
+    const { calls, createNotification } = collector();
+    await bootOnce(crowHome, env, [unwalled("notes")], createNotification);
+    await bootOnce(crowHome, env, [unwalled("notes"), unwalled("studio")], createNotification);
+    await bootOnce(crowHome, env, [unwalled("notes")], createNotification);
+    assert.equal(calls.length, 3);
+  });
+
+  test(`${label}: a language change rings again`, async () => {
+    const crowHome = scratchHome();
+    hadWalled(crowHome);
+    const { calls, createNotification } = collector();
+    const entries = [unwalled("notes")];
+    await bootOnce(crowHome, env, entries, createNotification, "en");
+    await bootOnce(crowHome, env, entries, createNotification, "es");
+    await bootOnce(crowHome, env, entries, createNotification, "es");
+    assert.equal(calls.length, 2);
+  });
+
+  test(`${label}: a send that throws stores no digest, so the next boot rings`, async () => {
+    const crowHome = scratchHome();
+    hadWalled(crowHome);
+    await bootOnce(crowHome, env, [unwalled("notes")], async () => { throw new Error("bell down"); });
+    assert.equal(readAddonWalls(crowHome).bootNoticeDigest, undefined);
+    const { calls, createNotification } = collector();
+    await bootOnce(crowHome, env, [unwalled("notes")], createNotification);
+    assert.equal(calls.length, 1);
+  });
+}
+
+test("everything walled clears the digest, so the same unwalled set rings again later", async () => {
+  const crowHome = scratchHome();
+  hadWalled(crowHome);
+  const { calls, createNotification } = collector();
+  const bad = [unwalled("notes")];
+  await bootOnce(crowHome, WALLED, bad, createNotification);
+  await bootOnce(crowHome, WALLED, [entry("notes", walledWall())], createNotification);
+  assert.equal("bootNoticeDigest" in readAddonWalls(crowHome), false, "the digest is cleared");
+  assert.equal(readAddonWalls(crowHome).noticeV1, true, "other keys are kept");
+  await bootOnce(crowHome, WALLED, bad, createNotification);
+  assert.equal(calls.length, 2);
+});

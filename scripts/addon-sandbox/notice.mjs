@@ -21,6 +21,7 @@
  * addon-wall-status.js's addonWallWord, so a notice and the status page never
  * call the same add-on two different things. Nothing here throws.
  */
+import { createHash } from "node:crypto";
 import { unwatchFile, watchFile } from "node:fs";
 import {
   addonWallsPath,
@@ -153,6 +154,21 @@ async function send(createNotification, db, notice, extra) {
   await createNotification(db, opts);
 }
 
+/** Digest of one boot notice (title and body, so a language change counts). */
+function noticeDigest(notice) {
+  return createHash("sha256").update(`${notice.title}\n${notice.body}`).digest("hex");
+}
+
+/** The digest of the last boot notice sent, or null. */
+function storedBootDigest(crowHome) {
+  try {
+    const d = readAddonWalls(crowHome).bootNoticeDigest;
+    return typeof d === "string" ? d : null;
+  } catch {
+    return null;
+  }
+}
+
 /** The one-time notice markers this host already carries. */
 function noticeFlags(crowHome) {
   try {
@@ -198,9 +214,18 @@ export async function runAddonWallNotices({ db = null, crowHome = null, env = pr
     const sendBoot = async () => {
       try {
         const boot = bootNoticeFor({ entries, env, lang: L });
-        if (!boot) return;
+        if (!boot) {
+          // Nothing to say: forget the last one, so the same set coming back rings again.
+          if (storedBootDigest(crowHome) !== null) setAddonWallsFlag(crowHome, "bootNoticeDigest", undefined);
+          return;
+        }
+        const digest = noticeDigest(boot);
+        // The same notice as the last one sent: do not ring it again on every boot.
+        if (storedBootDigest(crowHome) === digest) return;
         await send(createNotification, db, boot, { action_url: ADDONS_HREF });
         out.boot = true;
+        // Only after the note went out: a throw above leaves the next boot to retry.
+        setAddonWallsFlag(crowHome, "bootNoticeDigest", digest);
       } catch { /* a notice is never worth a failed boot */ }
     };
 

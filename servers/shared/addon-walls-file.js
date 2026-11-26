@@ -24,6 +24,9 @@
  *    notice, which is also the rollout notice on a walled host.
  *  - `noticeV1: true` — this host has already had the one-time rollout notice,
  *    whichever it was (the walled one, or the one worded for the kill switch).
+ *  - `bootNoticeDigest: "<sha256 hex>"` — a digest of the last boot notice that
+ *    actually went out, so an unchanged state does not ring again on every boot.
+ *    Cleared (the key removed) when a boot has no boot notice.
  *    Flags are written through `setAddonWallsFlag`, which takes a fixed
  *    allowlist of keys and keeps every other key of the document.
  *
@@ -113,7 +116,7 @@ const pendingDiffs = [];
 let pendingDropped = 0;
 
 /** The keys this store may write outside `keptData` and `modes`. */
-const FLAG_KEYS = Object.freeze(["walledNoticeV1", "noticeV1"]);
+const FLAG_KEYS = Object.freeze(["walledNoticeV1", "noticeV1", "bootNoticeDigest"]);
 
 /** How many outside diffs are held while no listener is set (the oldest go first). */
 export const MAX_PENDING_OUTSIDE_DIFFS = 64;
@@ -264,7 +267,13 @@ export function setAddonWallsOutsideListener(fn) {
 export function setAddonWallsFlag(crowHome, key, value) {
   if (!FLAG_KEYS.includes(key)) return false;
   const doc = readAddonWalls(crowHome);
-  doc[key] = value;
+  // `undefined` removes the key (a flag that was never set and is cleared writes nothing).
+  if (value === undefined) {
+    if (!(key in doc)) return true;
+    delete doc[key];
+  } else {
+    doc[key] = value;
+  }
   writeAddonWalls(crowHome, doc);
   return true;
 }
